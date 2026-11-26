@@ -88,14 +88,20 @@ const staging = (c, size) => c.dev.createBuffer({ size, usage: MAP_READ | COPY_D
 // ---- frames
 function target(c, w, h) {  // the texture frames are drawn into: headless, the picture; a window, copied to its canvas
   if (c.target && c.w == w && c.h == h) return;
-  c.target?.destroy();
+  c.target?.destroy(), c.depth?.destroy();
   c.w = w, c.h = h;
   c.target = c.dev.createTexture({ size: [w, h], format: c.format, usage: RENDER_ATTACHMENT | TEX_COPY_SRC | TEX_COPY_DST | TEXTURE_BINDING });
   c.view = c.target.createView();
+  c.depth = c.dev.createTexture({ size: [w, h], format: "depth24plus", usage: RENDER_ATTACHMENT });  // pipelines made with depth test it
+  c.depthView = c.depth.createView();
 }
 function pass(c, pipe, bind, vbuf, count) {  // one render pass, submitted: the frame's first clears it
   const enc = c.dev.createCommandEncoder();
-  const p = enc.beginRenderPass({ colorAttachments: [{ view: c.view, loadOp: c.cleared ? "load" : "clear", storeOp: "store", clearValue: c.clear }] });
+  const load = c.cleared ? "load" : "clear";
+  const p = enc.beginRenderPass({
+    colorAttachments: [{ view: c.view, loadOp: load, storeOp: "store", clearValue: c.clear }],
+    depthStencilAttachment: { view: c.depthView, depthLoadOp: load, depthStoreOp: "store", depthClearValue: 1 },
+  });
   if (pipe) {
     p.setPipeline(pipe);
     if (bind) p.setBindGroup(0, bind);
@@ -283,6 +289,8 @@ const TOPOLOGIES = ["triangle-list", "point-list", "line-list", "triangle-strip"
 export async function fg_render(g, shader, vs, fs, attrs, topology) {
   const c = ctx(g), s = c ? get(g, shader, SHADER) : null;
   if (!s) return 0;
+  const depth = (topology & 8) != 0;  // 8: test and write the depth buffer (nearer fragments win)
+  topology &= ~8;
   if (!(topology >= 0 && topology <= 4)) return fail("fg_render: topology is 0 triangle-list, 1 point-list, 2 line-list, 3 triangle-strip, 4 line-strip"), 0;
   const va = [];
   let stride = 0;
@@ -295,6 +303,7 @@ export async function fg_render(g, shader, vs, fs, attrs, topology) {
     vertex: { module: s.p, entryPoint: vs || undefined, buffers: va.length ? [{ arrayStride: stride, stepMode: "vertex", attributes: va }] : [] },
     fragment: { module: s.p, entryPoint: fs || undefined, targets: [{ format: c.format }] },
     primitive: { topology: TOPOLOGIES[topology] },
+    depthStencil: { format: "depth24plus", depthWriteEnabled: depth, depthCompare: depth ? "less" : "always" },
   };
   let p = null;
   const ok = await scoped(c, () => void (p = c.dev.createRenderPipeline(d)));

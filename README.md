@@ -699,6 +699,7 @@ while present() {
 ```
 
 - **Compute:** `g.compute({shader, entry: "main", bind: [buffers], size: 64})` and `g.run(p, n)` run `ceil(n / size)` workgroups. `g.storage(f32s)` makes a buffer a shader can read and write, which a draw can also use as vertices. `buf.read(nil)` waits for the GPU and gives its contents as `f32s`.
+- **Depth:** `g.render({..., depth: true})` keeps a fragment only if it is nearer (its position's z, 0 to 1) than what the frame already has there, so 3D scenes draw in any order. Each frame has a depth buffer, cleared with its color; pipelines without `depth` ignore it, as before.
 - **Layouts:** `layout.pack(maps, asStruct)` fills an `f32s` from maps, checking each field (`[2].color must be a list of 3 numbers (vec3f)`): packed tight for vertices, or with WGSL's alignment for uniform and storage buffers (a `vec3f` takes 4 floats there).
 - **Errors** are fut errors that say what went wrong, with WGSL's own messages and line numbers for a shader: `gpu shader: 1:56: expected ';' for return statement`. A bad handle or binding is an error, not a crash.
 - **Headless:** `gpu.open({headless: true, width: 64, height: 64})` draws into a picture of its own, which `g.pixels()` reads back as `u8s` (RGBA, rows top first). `std/gpu/gpu_test.fut` tests compute and drawing this way.

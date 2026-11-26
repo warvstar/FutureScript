@@ -206,7 +206,8 @@ pub class Gpu {
     return p
   }
   // {shader: wgsl, vertex: "vs", fragment: "fs", layout: its vertices' Layout (nil: no vertex buffer),
-  //  bind: [buffers, in binding order], draw: "triangles" | "points" | "lines" | "strip" | "linestrip"}
+  //  bind: [buffers, in binding order], draw: "triangles" | "points" | "lines" | "strip" | "linestrip",
+  //  depth: true (a fragment is kept only if nearer, by its position's z from 0 to 1, than what the frame has there)}
   fn render(o: map): Pipeline {
     var tops = {triangles: 0, points: 1, lines: 2, strip: 3, linestrip: 4}
     var top = o.draw || "triangles"
@@ -214,7 +215,7 @@ pub class Gpu {
     var p = Pipeline()
     p.g = self
     var attrs = o.layout == nil ? "" : o.layout.attrs
-    p.h = check(fg_render(self.h, self.shader(o.shader), o.vertex || "vs", o.fragment || "fs", attrs, tops[top]), "gpu render pipeline")
+    p.h = check(fg_render(self.h, self.shader(o.shader), o.vertex || "vs", o.fragment || "fs", attrs, tops[top] + (o.depth == true ? 8 : 0)), "gpu render pipeline")
     p.bind = bindings(self, p, o.bind)
     return p
   }

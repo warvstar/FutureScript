@@ -69,6 +69,9 @@ struct Ctx {
   WGPUColor clear{0, 0, 0, 1};
   WGPUTexture tex = nullptr;  // the frame's texture (window: the surface's, owned until present)
   WGPUTextureView texView = nullptr;
+  WGPUTexture depth = nullptr;  // every pass's depth buffer, the frame's size (pipelines made with depth test it)
+  WGPUTextureView depthView = nullptr;
+  uint32_t dw = 0, dh = 0;
 };
 struct Obj {
   Kind kind;
@@ -188,12 +191,26 @@ static void configure(Ctx* c, uint32_t w, uint32_t h) {
   wgpuSurfaceConfigure(c->surface, &cfg);
   c->w = w, c->h = h;
 }
+static void ensureDepth(Ctx* c) {  // a depth buffer the size of the frame
+  if (c->depth && c->dw == c->w && c->dh == c->h) return;
+  if (c->depthView) wgpuTextureViewRelease(c->depthView);
+  if (c->depth) wgpuTextureRelease(c->depth);
+  WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+  td.size = {c->w, c->h, 1}, td.format = WGPUTextureFormat_Depth24Plus, td.usage = WGPUTextureUsage_RenderAttachment;
+  c->depth = wgpuDeviceCreateTexture(c->dev, &td);
+  c->depthView = wgpuTextureCreateView(c->depth, nullptr);
+  c->dw = c->w, c->dh = c->h;
+}
 static bool pass(Ctx* c, WGPURenderPipeline pipe, WGPUBindGroup bind, WGPUBuffer vbuf, uint32_t count) {  // one render pass, submitted
+  ensureDepth(c);
   WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(c->dev, nullptr);
   WGPURenderPassColorAttachment a = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
   a.view = c->texView, a.loadOp = c->cleared ? WGPULoadOp_Load : WGPULoadOp_Clear, a.storeOp = WGPUStoreOp_Store, a.clearValue = c->clear;
+  WGPURenderPassDepthStencilAttachment da = WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
+  da.view = c->depthView, da.depthLoadOp = c->cleared ? WGPULoadOp_Load : WGPULoadOp_Clear, da.depthStoreOp = WGPUStoreOp_Store;
+  da.depthClearValue = 1;
   WGPURenderPassDescriptor rp = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
-  rp.colorAttachmentCount = 1, rp.colorAttachments = &a;
+  rp.colorAttachmentCount = 1, rp.colorAttachments = &a, rp.depthStencilAttachment = &da;
   WGPURenderPassEncoder p = wgpuCommandEncoderBeginRenderPass(enc, &rp);
   if (pipe) {
     wgpuRenderPassEncoderSetPipeline(p, pipe);
@@ -233,6 +250,8 @@ static void closeCtx(Ctx* c) {
   if (c->frame && !c->headless) wgpuTextureViewRelease(c->texView), wgpuTextureRelease(c->tex);
   if (c->targetView) wgpuTextureViewRelease(c->targetView);
   if (c->target) wgpuTextureRelease(c->target);
+  if (c->depthView) wgpuTextureViewRelease(c->depthView);
+  if (c->depth) wgpuTextureRelease(c->depth);
   if (c->surface) {
     if (c->w) wgpuSurfaceUnconfigure(c->surface);
     wgpuSurfaceRelease(c->surface);
@@ -528,6 +547,8 @@ API int64_t fg_render(int64_t g, int64_t shader, const char* vs, const char* fs,
   static const WGPUPrimitiveTopology topologies[] = {WGPUPrimitiveTopology_TriangleList, WGPUPrimitiveTopology_PointList,
                                                      WGPUPrimitiveTopology_LineList, WGPUPrimitiveTopology_TriangleStrip,
                                                      WGPUPrimitiveTopology_LineStrip};
+  bool depth = topology & 8;  // 8: test and write the depth buffer (nearer fragments win)
+  topology &= ~8;
   if (topology < 0 || topology > 4) return fail("fg_render: topology is 0 triangle-list, 1 point-list, 2 line-list, 3 triangle-strip, 4 line-strip"), 0;
   std::vector<WGPUVertexAttribute> va;
   uint64_t stride = 0;
@@ -553,6 +574,10 @@ API int64_t fg_render(int64_t g, int64_t shader, const char* vs, const char* fs,
   d.vertex.bufferCount = va.empty() ? 0 : 1, d.vertex.buffers = &vb;
   d.primitive.topology = topologies[topology];
   d.fragment = &frag;
+  WGPUDepthStencilState ds = WGPU_DEPTH_STENCIL_STATE_INIT;
+  ds.format = WGPUTextureFormat_Depth24Plus, ds.depthWriteEnabled = depth ? WGPUOptionalBool_True : WGPUOptionalBool_False;
+  ds.depthCompare = depth ? WGPUCompareFunction_Less : WGPUCompareFunction_Always;
+  d.depthStencil = &ds;
   WGPURenderPipeline p = nullptr;
   if (!scoped(c, [&] { return (p = wgpuDeviceCreateRenderPipeline(c->dev, &d)) != nullptr; }))
     return p ? wgpuRenderPipelineRelease(p) : void(), 0;

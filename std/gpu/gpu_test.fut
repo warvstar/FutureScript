@@ -43,6 +43,31 @@ test "render: a triangle in a uniform's color, read back as pixels" {
   expect at(61, 2) == [255, 0, 0, 255]   // outside: the frame's red
 }
 
+var AT_Z = "
+struct U \{ color: vec4f }
+@group(0) @binding(0) var<uniform> u: U;
+@vertex fn vs(@location(0) pos: vec3f) -> @builtin(position) vec4f \{ return vec4f(pos, 1.0); }
+@fragment fn fs() -> @location(0) vec4f \{ return u.color; }"
+
+test "depth: with depth: true, a nearer triangle drawn first stays in front" {
+  var V = gpu.layout({pos: "vec3f"})
+  var U = gpu.layout({color: "vec4f"})
+  var near = g.uniform(U)
+  near.set({color: [0, 1, 0, 1]})
+  var far = g.uniform(U)
+  far.set({color: [0, 0, 1, 1]})
+  var tri = fn(z) { return g.vertices(V.pack([{pos: [-1, -1, z]}, {pos: [3, -1, z]}, {pos: [-1, 3, z]}], false)) }
+  var a = g.render({shader: AT_Z, layout: V, bind: [near], depth: true})
+  var b = g.render({shader: AT_Z, layout: V, bind: [far], depth: true})
+  g.frame(0).draw(a, tri(0.2), 3).draw(b, tri(0.8), 3)
+  var px = g.pixels()
+  expect [px[0], px[1], px[2]] == [0, 255, 0]       // the near one, though drawn first
+  var c = g.render({shader: AT_Z, layout: V, bind: [far]})  // without depth: the last draw wins, as before
+  g.frame(0).draw(a, tri(0.2), 3).draw(c, tri(0.8), 3)
+  px = g.pixels()
+  expect [px[0], px[1], px[2]] == [0, 0, 255]
+}
+
 test "layouts: vertices packed tight, structs aligned as WGSL lays them out" {
   var L = gpu.layout({pos: "vec2f", color: "vec3f", w: "f32"})
   expect L.stride == 6 && L.size == 8 && L.attrs == "float32x2 float32x3 float32"
