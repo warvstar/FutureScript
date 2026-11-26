@@ -209,6 +209,14 @@ struct Gen : CState {
     else fast(o);
     set(R0), hasLit = false;
   }
+  void neg(bool num) {  // r0 = -r0: a negate when it is a number; else 0 - r0, in rt_binop (which raises)
+    auto fneg = [&] { get(R0), op(F64_REINTERPRET), op(F64_NEG), op(I64_REINTERPRET); };
+    if (num) fneg();
+    else isNumber(0), open(IF, I64, LIKELY), fneg(), op(ELSE), mv(1, 0), imm(0, 0), slowOp(O_SUB), get(R0), close();
+    set(R0);
+  }
+  void unload(u32, int) {}  // see the arm64 generator: V8 drops the dead load
+  void beginFun() {}
   void notOp() { i64c(FALSE_), i64c(TRUE_), truthy(), op(SELECT), set(R0); }
   int shortBegin(bool isAnd) { truthy(); if (!isAnd) op(I32_EQZ); open(IF); return 0; }
   void shortEnd(int) { close(); }

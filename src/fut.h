@@ -452,6 +452,8 @@ constexpr u32 fcmpz(u32 n) { return 0x1e602008 | n << 5; }                      
 constexpr u32 fcvtzu(u32 d, u32 n) { return 0x9e790000 | n << 5 | d; }                // x = (uint64) d, truncating
 constexpr u32 ucvtf(u32 d, u32 n) { return 0x9e630000 | n << 5 | d; }                 // d = (double) x, unsigned
 constexpr u32 sub(u32 d, u32 n, u32 m) { return 0xcb000000 | m << 16 | n << 5 | d; }
+constexpr u32 fneg(u32 d, u32 n) { return 0x1e614000 | n << 5 | d; }
+constexpr u32 fmovdd(u32 d, u32 n) { return 0x1e604000 | n << 5 | d; }
 constexpr u32 fmovi(u32 d, u32 imm8) { return 0x1e601000 | imm8 << 13 | d; }  // fmov d, #imm (see fimm8)
 constexpr u32 FMOV1 = fmovi(1, 0x70);                                            // fmov d1, #1.0
 constexpr u32 farith(int op, u32 d, u32 n, u32 m) {  // fadd/fsub/fmul/fdiv d, n, m (op: O_ADD..O_DIV)

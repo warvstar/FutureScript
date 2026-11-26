@@ -339,20 +339,24 @@ struct Compiler : Gen {
   void combine(int s, int op) { mv(1, 0), ld(0, s), F->depth--, binop(op); }  // left in slot s, right in x0
   // x0 = x0 op <operand binding tighter than p>; returns whether the result is known to be a number
   bool rhs(int op, int p = 0, bool lnum = false, int lh = NOH) {  // lh: the left operand's local, if any
-    bool rnum = right(p);
+    bool rnum = right(p, true, lh);
     int rh = rHome;
     binop(op, lnum, rnum), proveOperands(op, lnum, rnum, lh, rh);
     return (lnum && rnum && op <= O_MOD) || op >= O_BAND;
   }
   int rHome = NOH;  // the local right() loaded, if it was one
-  bool right(int p, bool keep = true) {  // x1 = the right operand (x0 kept, if keep); returns whether it is known to be a number
+  // x1 = the right operand (x0 kept, if keep); returns whether it is known to be a number. lh: the local x0 was just
+  // loaded from, if any. Then x0 need not be saved around the right operand: it is loaded again after (no expression
+  // can assign a local), which also keeps it in its FP register for the arithmetic, when it lives in one.
+  bool right(int p, bool keep = true, int lh = NOH) {
     rHome = NOH;
     if (int k = simpleOperand(p)) return k == 2;
     int s = slot();
-    if (keep) st(0, s);
+    if (keep && lh != NOH) unload(0, lh);
+    else if (keep) st(0, s);
     bool num = expr(p + 1);
     mv(1, 0), F->depth--, rHome = NOH;
-    if (keep) ld(0, s);
+    if (keep) lh != NOH ? ldl(0, lh) : ld(0, s);
     return num;
   }
 
@@ -553,7 +557,8 @@ struct Compiler : Gen {
   LV unary() {
     if (accept('-')) {
       if (accept(T_NUM)) return imm(0, box(-prev.n)), NUM;
-      return operand(), mv(1, 0), imm(0, 0), binop(O_SUB), LV{};
+      bool num = operand();
+      return neg(num), num ? NUM : LV{};
     }
     if (accept('!')) return operand(), notOp(), LV{};
     if (accept('~')) return operand(), hasLit = true, lit = -1, binop(O_BXOR), NUM;  // ~x is x ^ -1
@@ -597,7 +602,7 @@ struct Compiler : Gen {
     if (int t = cur.t, p = prec(t); p == 3 || p == 4) {
       next();
       int op = opOf(t);
-      bool rnum = right(p);
+      bool rnum = right(p, true, lh);
       if (at('{')) {
         int rh = rHome;
         Cond c = compareCond(op, lnum, rnum);
@@ -876,7 +881,7 @@ struct Compiler : Gen {
   int function(Fun& f, int cls, bool init, const std::string& nm, u32* stub, Fn* fn) {
     f.cls = cls, f.init = init, f.k.name = nm, f.k.file = file;
     Fun* outer = F;
-    F = &f, f.noRegs = hasTry();
+    F = &f, f.noRegs = hasTry(), beginFun();
     if (cls < 0 && !f.lambda && !f.test) f.stub = stub;
     std::vector<int> homes;
     std::vector<std::pair<int, Ty>> ptys;  // each declared parameter's symbol and type

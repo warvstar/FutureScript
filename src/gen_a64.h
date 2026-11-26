@@ -23,9 +23,18 @@ struct Gen : CState {
     }
     auto& ln = F->k.lines;
     if (ln.empty() || ln.back().second != prev.line) ln.push_back({(int)F->k.c.size(), prev.line});
-    return c.push_back(i), (int)c.size() - 1;
+    return emitted++, c.push_back(i), (int)c.size() - 1;
   }
-  int here() { return F->label = (int)F->k.c.size(); }  // a branch target: peepholes must not cross it
+  int here() { return labels++, F->label = (int)F->k.c.size(); }  // a branch target: peepholes must not cross it
+  // Which d-registers hold the same bits as x0 and x1, right here: arithmetic then reads its operands from the FP
+  // registers instead of moving them over from x0/x1 (a move each way is several cycles on a loop-carried chain).
+  // Valid only until the next instruction is emitted (or one is dropped) or a branch target is made.
+  struct Mirror { long at = -1, labels = 0; int d[2] = {-1, -1}; } mirror;
+  long labels = 0, emitted = 0;  // branch targets made, instructions emitted or dropped: in every function
+  void beginFun() { mirror = {}; }
+  Mirror mirrored() { return mirror.at == emitted && mirror.labels == labels ? mirror : Mirror{}; }
+  int mir(u32 x) { return x < 2 ? mirrored().d[x] : -1; }
+  void noteMirror(Mirror m) { m.at = emitted, m.labels = labels, mirror = m; }
   void patch(int at, int to = -1) {  // fix up a b / b.cond / cbz emitted at `at` to jump to `to` (default: here)
     u32& i = F->k.c[at];
     u32 d = u32((to < 0 ? here() : to) - at);
@@ -39,7 +48,11 @@ struct Gen : CState {
       if (u32 part = (v >> (16 * hw)) & 0xffff) E(first ? movz(r, part, hw) : movk(r, part, hw)), first = false;
     if (first) E(movz(r, 0, 0));
   }
-  void mv(u32 d, u32 s) { E(mov(d, s)); }
+  void mv(u32 d, u32 s) {
+    Mirror m = mirrored();
+    E(mov(d, s));
+    if (d < 2) m.d[d] = s < 2 ? m.d[s] : -1, noteMirror(m);
+  }
   void addImm(u32 r, u32 k) { E(addi(r, r, k)); }  // r += k, as a raw integer
   void gmem(u32 r, int g, bool store = false) {  // ldr/str r, globals[g]; far slots go through x16
     u32 off = GOFF(g), base = 28;
@@ -71,14 +84,32 @@ struct Gen : CState {
   static u32 dOf(int h) { return u32(-h - 100); }
   static u32 regOf(int h) { return u32(18 - h); }
   void ldl(u32 r, int h) {
-    if (isF(h)) E(fmovxd(r, dOf(h)));
-    else if (h >= 0) ld(r, h);
+    if (isF(h)) {
+      Mirror m = mirrored();
+      E(fmovxd(r, dOf(h)));
+      if (r < 2) m.d[r] = (int)dOf(h), noteMirror(m);
+    } else if (h >= 0) ld(r, h);
     else if (r != regOf(h)) E(mov(r, regOf(h)));
+  }
+  // A load that right() makes again after the right operand (see Compiler::right): drop it if it was the last
+  // instruction emitted.
+  void unload(u32 r, int h) {
+    auto& c = F->k.c;
+    u32 i = isF(h) ? fmovxd(r, dOf(h)) : h >= 0 ? ldr(r, SP, h * 8) : mov(r, regOf(h));
+    if ((int)c.size() <= F->label + 1 || c.back() != i || (h < 0 && !isF(h) && r == regOf(h))) return;
+    c.pop_back(), emitted++;
+    if (!F->k.lines.empty() && F->k.lines.back().first == (int)c.size()) F->k.lines.pop_back();
   }
   void stl(u32 r, int h) {
     unprove(h);
-    if (isF(h)) E(fmovdx(dOf(h), r));
-    else if (h >= 0) st(r, h);
+    if (isF(h)) {
+      Mirror m = mirrored();
+      int s = mir(r);
+      if (s != (int)dOf(h)) E(s >= 0 ? fmovdd(dOf(h), s) : fmovdx(dOf(h), r));  // from the FP side when it has it
+      for (int& d : m.d) if (d == (int)dOf(h)) d = -1;
+      if (r < 2) m.d[r] = (int)dOf(h);
+      noteMirror(m);
+    } else if (h >= 0) st(r, h);
     else if (r != regOf(h)) E(mov(regOf(h), r));
   }
   void param(int i, int h) { i < 8 ? stl(i, h) : (E(ldr(9, 8, 8 * i)), stl(9, h)); }  // x8: the argument window
@@ -92,7 +123,7 @@ struct Gen : CState {
   Code finish() {
     int end = (int)F->k.c.size();
     if (F->rets.empty() || F->rets.back() != end - 1 || F->label >= end) F->init ? ldl(0, F->selfHome) : (void)E(mov(0, 27));
-    else F->k.c.pop_back(), F->rets.pop_back();  // ends in an unbranched-to `return`: fall into the epilogue
+    else F->k.c.pop_back(), F->rets.pop_back(), emitted++;  // ends in an unbranched-to `return`: fall into the epilogue
     if (F->maxd > 4000) fail("function too large");
     if (F->noRegs) F->maxreg = 7, F->maxfreg = 8;
     int pairs = (F->maxreg + 1) / 2, fpairs = (F->maxfreg + 1) / 2;  // x19.. then d8.. pairs, just below x29
@@ -127,14 +158,21 @@ struct Gen : CState {
   static constexpr u32 CC[] = {EQ, NE, MI, LS, GT, GE};  // O_EQ..O_GE after fcmp (false when unordered)
   // A number-literal right operand is not loaded into x1: the fast path materialises it straight into d1
   // (one fmov), and only the slow path boxes it into x1.
-  void d1Right() {
+  u32 d1Right(int rd = -1) {  // the d-register holding the right operand: rd if x1 is mirrored there, else d1
+    if (!hasLit && rd >= 0) return rd;
     int k = hasLit ? fimm8(lit) : -1;
     if (hasLit && k < 0 && lit != 0) imm(1, box(lit));
     E(k >= 0 ? fmovi(1, k) : fmovdx(1, hasLit && lit == 0 ? 31 : 1));  // 31: xzr, i.e. +0.0
+    return 1;
   }
-  void numCheck(Jumps& slow, bool lnum, bool rnum) {  // branch to slow unless x0 and x1 are numbers
+  // Branch to slow unless x0 and x1 are numbers; returns the d-registers holding them (from the FP registers
+  // they mirror, when they do: see Mirror).
+  std::pair<u32, u32> numCheck(Jumps& slow, bool lnum, bool rnum) {
+    Mirror m = mirrored();
     for (u32 r = 0; r < 2; r++) if (!(r ? rnum : lnum)) E(mvn(9, r)), E(tstq(9)), slow.push_back(E(bcond(EQ)));
-    E(fmovdx(0, 0)), d1Right();
+    int l = m.d[0], rd = hasLit ? -1 : m.d[1];
+    if (l < 0) l = rd == 0 ? 2 : 0, E(fmovdx(l, 0));
+    return {(u32)l, d1Right(rd)};
   }
   void slowOp(const Jumps& slow, int op) {  // the rt_binop path, reached by the branches in slow
     for (int j : slow) patch(j);
@@ -146,14 +184,26 @@ struct Gen : CState {
     Jumps slow;
     int done = -1;
     if (op != O_MOD) {
-      numCheck(slow, lnum, rnum);
-      if (op <= O_DIV) E(farith(op, 0, 0, 1)), E(fmovxd(0, 0));
-      else E(fcmp(0, 1)), E(addi(10, 27, 1)), E(cinc(0, 10, CC[op - O_EQ]));
+      auto [l, r] = numCheck(slow, lnum, rnum);
+      if (op <= O_DIV) E(farith(op, 0, l, r)), E(fmovxd(0, 0));
+      else E(fcmp(l, r)), E(addi(10, 27, 1)), E(cinc(0, 10, CC[op - O_EQ]));
       if (slow.n) done = E(B);
     }
     if (op == O_MOD || slow.n) slowOp(slow, op);
+    if (done >= 0 && op <= O_DIV) E(fmovdx(0, 0));  // both ways in, d0 = x0
     if (done >= 0) patch(done);
+    if (op <= O_DIV) noteMirror({.d = {0, -1}});
     hasLit = false;
+  }
+  void neg(bool num) {  // x0 = -x0: a negate when it is a number; else 0 - x0, in rt_binop (which raises)
+    int d = mir(0), skip = num ? -1 : (E(mvn(9, 0)), E(tstq(9)), E(bcond(EQ)));
+    if (d < 0) E(fmovdx(0, 0)), d = 0;
+    E(fneg(0, d)), E(fmovxd(0, 0));
+    if (skip >= 0) {
+      int done = E(B);
+      patch(skip), mv(1, 0), imm(0, 0), imm(2, O_SUB), helper(H_BINOP), E(fmovdx(0, 0)), patch(done);
+    }
+    noteMirror({.d = {0, -1}});
   }
   void notOp() { falsy(), E(addi(10, 27, 1)), E(cinc(0, 10, EQ)); }  // x0 = !x0
   int shortBegin(bool isAnd) { return falsy(), E(bcond(isAnd ? EQ : NE)); }  // && / ||: skip the right side
@@ -162,8 +212,8 @@ struct Gen : CState {
   // ---- conditions and control flow ----
   Cond compareCond(int op, bool lnum, bool rnum) {  // `a < b {`: compare and branch, no boolean built
     Jumps no, slow;
-    numCheck(slow, lnum, rnum);
-    E(fcmp(0, 1)), no.push_back(E(bcond(CC[op - O_EQ] ^ 1)));
+    auto [l, r] = numCheck(slow, lnum, rnum);
+    E(fcmp(l, r)), no.push_back(E(bcond(CC[op - O_EQ] ^ 1)));
     if (slow.n) {
       int yes = E(B);
       slowOp(slow, op), falsy(), no.push_back(E(bcond(EQ))), patch(yes);
@@ -222,10 +272,11 @@ struct Gen : CState {
   bool isFReg(int h) { return isF(h); }
   void fpAssign(int h, int op, bool rnum) {  // local in d-register h op= x1
     u32 d = dOf(h);
+    int rd = mir(1);
     Jumps slow;
     E(fmovxd(9, d)), E(mvn(9, 9)), E(tstq(9)), slow.push_back(E(bcond(EQ)));  // off the d -> d dependency chain
     if (!rnum) E(mvn(9, 1)), E(tstq(9)), slow.push_back(E(bcond(EQ)));
-    d1Right(), E(farith(op, d, d, 1));
+    E(farith(op, d, d, d1Right(rd)));
     int done = E(B);
     for (int j : slow) patch(j);
     E(fmovxd(0, d)), slowOp({}, op), E(fmovdx(d, 0)), patch(done);
