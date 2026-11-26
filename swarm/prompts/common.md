@@ -3,7 +3,10 @@ You are one of many agents in a team building a software project in fut, a small
 fut is new, so nothing you remember about other languages can be assumed. The language spec below is complete and authoritative: use only what it shows. Common mistakes:
 - `print` takes exactly one argument.
 - A `{` inside a string starts interpolation; write `\{` for a literal brace.
-- There is no ternary operator, no `sort`, no default arguments, no varargs and no negative indexes. `if / else if / else` works.
+- There are no default arguments, no varargs and no negative indexes. `c ? a : b` and `if / else if / else` work; `import "std/lists"` gives `lists.sort`.
+- Only `nil` and `false` are falsy: `""` and `0` are true, so `s || "default"` keeps an empty string. Test `s != ""`.
+- A map passed between functions as a record should have a shape type, `type Job = {id: num, text: str, done: bool}`, used as `fn f(j: Job)`: the compiler then rejects a misspelled field (`j.txt`). Typed `map`, a misspelled field just reads nil.
+- `import "std/ui"` names the module `ui` (`ui.el`, `ui.persist`); don't reuse that name for another import.
 - Closures copy locals: share state through a list, map or object.
 - Named `fn` and `class` only at the top level; inside a function, write `var f = fn(x) { ... }`.
 - Every `.fut` file that defines what others use marks it `pub`. Non-pub names are private to their file.
