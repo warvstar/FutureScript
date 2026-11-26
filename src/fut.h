@@ -409,6 +409,8 @@ constexpr u32 ldrw(u32 t, u32 n, u32 off) { return 0xb9400000 | (off / 4) << 10 
 constexpr u32 ldrb(u32 t, u32 n) { return 0x39400000 | n << 5 | t; }
 constexpr u32 ldrreg(u32 t, u32 n, u32 m) { return 0xf8607800 | m << 16 | n << 5 | t; }  // ldr t, [n, m, lsl #3]
 constexpr u32 strreg(u32 t, u32 n, u32 m) { return 0xf8207800 | m << 16 | n << 5 | t; }
+constexpr u32 strregw(u32 t, u32 n, u32 m) { return 0xf8205800 | m << 16 | n << 5 | t; }  // str t, [n, w(m), uxtw #3]
+constexpr u32 tbz32(u32 t, u32 skip) { return 0xb6000000 | skip << 5 | t; }              // tbz t, #32, +skip instructions
 constexpr u32 strpost(u32 t, u32 n, u32 imm) { return 0xf8000400 | (imm & 0x1ff) << 12 | n << 5 | t; }  // str t, [n], #imm
 constexpr u32 addxw(u32 d, u32 n, u32 m) { return 0x8b204000 | m << 16 | n << 5 | d; }                 // add d, n, w(m), uxtw
 constexpr u32 addlsr(u32 d, u32 n, u32 m, u32 sh) { return 0x8b400000 | m << 16 | sh << 10 | n << 5 | d; }  // add d, n, m, lsr #sh

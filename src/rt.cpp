@@ -206,7 +206,8 @@ static V rt_setf(V o, uint64_t s, V v, IC* ic) {
   }
   const Class::FieldType* ty = in->cls->typed((int)s);
   if (ty && !typeAccepts(ty->type, v)) typeFail(ty->site, v, RA());
-  if (ic && !vm.txn && !ty) *ic = {header(in), i};  // a typed field's stores all come here, to be checked
+  // A `num` field's store sites check inline (bit 32 of the slot tells them to); other typed fields' stores come here.
+  if (ic && !vm.txn && (!ty || ty->type == TY_NUM)) *ic = {header(in), i | (ty ? 1ull << 32 : 0)};
   return in->slots[i] = v;
 }
 #define INDEX(i, n) (isNum(i) && num(i) >= 0 && num(i) < (n) ? (size_t)num(i) : (ERR("index %s out of range (len %zu)", toStr(i).c_str(), (size_t)(n)), 0))

@@ -331,7 +331,10 @@ struct Gen : CState {
     isObject(miss);
     E(ldr(10, 9, 0)), E(ldr(11, ic, lo)), E(cmp(10, 11)), miss.push_back(E(bcond(NE)));  // same class and slot count
     E(ldr(11, ic, lo + 8)), E(ldr(10, 9, INST_SLOTS));
-    if (set) E(strreg(2, 10, 11)), E(mov(0, 2));
+    if (set) {  // bit 32 of the slot: a `num` field (rt_setf), so the value must be a number
+      E(tbz32(11, 4)), E(mvn(12, 2)), E(tstq(12)), miss.push_back(E(bcond(EQ)));
+      E(strregw(2, 10, 11)), E(mov(0, 2));
+    }
     else E(ldrreg(10, 10, 11)), E(addi(12, 27, 4)), E(cmp(10, 12)), miss.push_back(E(bcond(EQ))), E(mov(0, 10));  // ABSENT: slow
     int done = E(B);
     for (int m : miss) patch(m);

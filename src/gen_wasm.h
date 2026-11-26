@@ -323,6 +323,7 @@ struct Gen : CState {
     open(BLOCK), open(BLOCK);  // $done, $miss
     isPtr(0, false), br(BR_IF, F->blocks, UNLIKELY);
     addr(0), mem(I64_LOAD, 3, 0), i32c(0), mem(I64_LOAD, 3, ic), op(I64_NE), br(BR_IF, F->blocks, UNLIKELY);
+    if (store) i32c(0), mem(I32_LOAD, 2, ic + 12), isNumber(2), op(I32_EQZ), op(I32_AND), br(BR_IF, F->blocks, UNLIKELY);  // a `num` field (high half)
     addr(0), mem(I32_LOAD, 2, INST_SLOTS), i32c(0), mem(I32_LOAD, 2, ic + 8), i32c(3), op(I32_SHL), op(I32_ADD), set(T);  // the slot (low half)
     if (store) get(T), get(R0 + 2), mem(I64_STORE, 3, 0), mv(0, 2);
     else get(T), mem(I64_LOAD, 3, 0), op(LOCAL_TEE), u(R0 + 3), i64c(ABSENT), op(I64_EQ), br(BR_IF, F->blocks, UNLIKELY), mv(0, 3);  // ABSENT: slow
