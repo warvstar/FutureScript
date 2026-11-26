@@ -162,6 +162,7 @@ static u32 slot() {
   return freeSlots.pop_back(), s;
 }
 u32* newStub() { return (u32*)(uintptr_t)slot(); }
+void discardStub(u32* stub) { freeSlots.push_back(wa::slotOf(stub)); }
 u32* jitInstall(Code& k) {
   u32 s = slot();
   batch.push_back({std::move(k), s});
@@ -444,11 +445,17 @@ struct Guard {
 #endif
   }
 };
-bool guardCompile(void (*f)(void*), void* ctx, std::string* err) {  // a compile outside fut_compile (tier 2, a test body)
+bool guardCompile(void (*f)(void*), void* ctx, std::string* err, bool* atEnd) {  // a compile outside fut_compile (tier 2, a test body)
   jmp_buf jb;
   Guard g;
   compileJmp = &jb;
-  if (setjmp(jb)) return g.landed(), err ? (void)(*err = compileErr) : batch.clear(), false;
+  if (setjmp(jb)) {
+    g.landed();
+    if (err) *err = compileErr;
+    else batch.clear();
+    if (atEnd) *atEnd = compileAtEnd;
+    return false;
+  }
   f(ctx), compileJmp = g.outer;
   return true;
 }

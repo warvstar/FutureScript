@@ -7,7 +7,22 @@
 #include <cstdarg>
 #include <cstdlib>
 #include <functional>
+#include <map>
 #include <unordered_map>
+
+struct CompileDiagnostic {
+  std::string file, message, code;
+  int line = 1, column = 1;  // one-based byte positions
+};
+struct CompileCheck {
+  using Buffers = std::vector<std::pair<std::string, std::string_view>>;
+  struct Import { std::string from, to; int line, column; };
+  const Buffers& buffers;  // paths normalized with normalize; these sources take precedence over disk
+  std::string (*normalize)(const std::string&) = canonicalPath;
+  std::vector<Import> imports;  // filled even if the compile fails
+};
+// Requires rtInit(). Checks source and tests without loading externs, writing traces or installing code.
+std::vector<CompileDiagnostic> compileDiagnostics(const std::string& path, CompileCheck& check);
 
 // ---------------- lexer ----------------
 enum { T_EOF = 256, T_NUM, T_STR, T_ID, T_EQ, T_NE, T_LE, T_GE, T_DOTDOT, T_AND, T_OR, T_ADDEQ, T_SUBEQ, T_MULEQ, T_DIVEQ, T_SHL, T_SHR, T_POW, T_OPT_DOT, T_ERR };
@@ -157,7 +172,7 @@ inline int prec(int t) { return t <= T_SHR ? BIN[t].first : 0; }
 inline int opOf(int t) { return BIN[t].second; }
 
 // ---------------- compiler state ----------------
-enum { LV_NONE = -1, LV_VAL, LV_LOCAL, LV_GLOBAL, LV_FIELD, LV_INDEX, LV_CAP, LV_SHARED };  // LV_SHARED: a shared var (a: its cell)
+enum { LV_NONE = -1, LV_VAL, LV_LOCAL, LV_GLOBAL, LV_FIELD, LV_INDEX, LV_CAP, LV_SHARED, LV_BAD };  // LV_SHARED: a shared var (a: its cell)
 struct LV { int k = LV_VAL, a = 0, b = 0; bool ro = false, num = false, own = false; };  // own: self.name  // a not-yet-loaded place, so `x = ...` can store
 constexpr LV NUM{LV_VAL, 0, 0, false, true};  // a value known to be a number
 struct Jumps {  // a few forward branches to patch to one place (no heap allocation)
@@ -230,6 +245,8 @@ struct CState {
   Fun* F = nullptr;
   u32* deopt = nullptr;  // tier 2: the tier-1 body a failed entry guard runs instead
   bool lexAtEnd = false;
+  bool collectErrors = false;
+  CompileCheck* editorCheck = nullptr;
   std::string file;
   const char* srcStart = "";
   // A number-literal right operand is not loaded into a register; the binop fast path uses it directly.
@@ -238,23 +255,38 @@ struct CState {
   int pinLine = 0;  // nonzero: the line code is attributed to (a spec's clauses, compiled into the function they describe)
   int line() const { return pinLine ? pinLine : prev.line; }
 
-  [[noreturn]] void failAt(const char* pos, int line, const char* fmt, ...) {  // file:line:col, the line, a caret
-    const char* code = takeCode(fmt);
-    char b[256];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(b, sizeof b, fmt, ap);
-    va_end(ap);
-    const char *ls = pos, *le = pos;
-    while (ls > srcStart && ls[-1] != '\n') ls--;
-    while (*le && *le != '\n') le++;
-    std::string caret;
-    for (const char* c = ls; c < pos; c++) caret += *c == '\t' ? '\t' : ' ';
-    compileFail(file + ":" + std::to_string(line) + ":" + std::to_string(pos - ls + 1) + ": error: " + b +
-                    (code ? " [" + std::string(code) + "]" : "") + "\n  " +
-                    std::string(ls, le) + "\n  " + caret + "^", !*pos || lexAtEnd);
-  }
+  struct ParseError {};
+#if __wasm__
+  jmp_buf* recovery = nullptr;
+#else
+  bool recovery = false;
+#endif
+  struct Report { CompileDiagnostic diag; std::string rendered; };
+  std::vector<Report> reports;
+  std::string failureText;
+  const char* errorPos = nullptr;
+  void report(const char* pos, int line, const char* fmt, va_list ap);
+  void diagnose(const char* pos, int line, const char* fmt, ...);
+  [[noreturn]] void failAt(const char* pos, int line, const char* fmt, ...);
   template <class... A> [[noreturn]] void fail(const char* fmt, A... a) { failAt(cur.p, cur.line, fmt, a...); }
+  void sortReports();
+  std::string diagnosticText();
+  [[noreturn]] void reportFailure();
+  int firstIC = -1;
+  int cache(bool store = false) {
+    if (editorCheck || !reports.empty()) return 0;
+    int ic = newIC(store);
+    if (firstIC < 0) firstIC = ic;
+    return ic;
+  }
+  std::map<int, Global> declarations;
+  std::vector<int> newGlobals;
+  bool stageGlobals = false;
+  Global* findGlobal(int sym) {
+    auto it = declarations.find(sym);
+    return it == declarations.end() ? ::findGlobal(sym) : &it->second;
+  }
+  Global& global(int sym);
   int slot() { F->maxd = std::max(F->maxd, F->depth + 1); return F->depth++; }
   // ---- locals proven to be numbers: rt_binop raises unless the operands of -, *, /, % are numbers (and of
   // <, <=, >, >= when the other side is one), so once such an operation has run, a local operand stays a

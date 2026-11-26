@@ -122,8 +122,9 @@ def exercise(client, exe, folder, timings):
     assert "undefined name 'missing'" in explain and "Fix:" in explain, explain
     assert "explanation" in diagnostic["data"], diagnostic
 
-    # Two edits arriving together debounce into one check. The code itself would print and fail if run.
-    fixed = bad.replace("missing", "3") + 'print(note)\nthrow "must not execute"\n'
+    # Two edits arriving together debounce into one check. Checking neither loads externs nor runs code.
+    fixed = (bad.replace("missing", "3") + f'extern "{folder / "missing.dylib"}" fn outside(): void\n'
+             'test "check only" { throw "must not run tests" }\nprint(note)\nthrow "must not execute"\n')
     client.change(local, 2, bad + "oops\n")
     client.change(local, 3, fixed)
     assert client.diagnostics(local, 3) == []
@@ -133,6 +134,30 @@ def exercise(client, exe, folder, timings):
     assert client.doc("hover", local, 0, 5)["contents"]["value"] == "fn twice(x)"
     items = {i["label"]: i for i in client.doc("completion", local, 0, 0)}
     assert items["fn"]["kind"] == 14 and items["twice"]["kind"] == 3 and items["note"]["kind"] == 6, items
+
+    multiple = (folder / "multiple.fut").as_uri()
+    broken = """fn broken() {
+  var damaged = )
+  print(missing)
+}
+fn target(x) { return x }
+fn later() {
+  return target()
+}
+"""
+    expected = [("syntax", 1, 16, 17), ("undefined-name", 2, 8, 15), ("arity", 6, 9, 15)]
+
+    def check_errors(uri, version, expected):
+        diagnostics = client.diagnostics(uri, version)
+        assert [(d["code"], d["range"]) for d in diagnostics] == [
+            (code, {"start": {"line": line, "character": start}, "end": {"line": line, "character": end}})
+            for code, line, start, end in expected
+        ], diagnostics
+
+    client.open(multiple, broken)
+    check_errors(multiple, 1, expected)
+    client.change(multiple, 2, broken.replace("damaged = )", "damaged = 1"))
+    check_errors(multiple, 2, expected[1:])
 
     bench = ROOT / "examples" / "bench.fut"
     bench_uri = bench.as_uri()
@@ -159,22 +184,25 @@ def exercise(client, exe, folder, timings):
 
     root, inner, lib = (folder / name for name in ("root.fut", "inner.fut", "lib.fut"))
     inner.write_text('import "./lib.fut"\n')
-    lib.write_text("pub fn fromLib() { return badName }\n")
+    lib.write_text("pub fn fromLib() { return badName }\nfn other() { return alsoBad }\n")
     client.open(lib.as_uri(), lib.read_text())
-    [own] = client.diagnostics(lib.as_uri(), 1)
-    assert own["range"]["start"] == {"line": 0, "character": 26}, own
-    client.open(root.as_uri(), '\n  import "./inner.fut"\n')
-    [imported] = client.diagnostics(root.as_uri(), 1)
-    assert imported["range"]["start"] == {"line": 1, "character": 2}, imported
-    assert imported["relatedInformation"][0]["location"]["uri"] == lib.as_uri(), imported
+    check_errors(lib.as_uri(), 1, [("undefined-name", 0, 26, 33), ("undefined-name", 1, 20, 27)])
+    client.open(root.as_uri(), '\n  import "./inner.fut"\nimport "./inner.fut"\n')
+    imported = client.diagnostics(root.as_uri(), 1)
+    assert [d["range"]["start"] for d in imported] == [{"line": 1, "character": 2}, {"line": 2, "character": 0}], imported
+    for d in imported:
+        [related] = d["relatedInformation"]
+        assert related["location"] == {
+            "uri": lib.as_uri(),
+            "range": {"start": {"line": 0, "character": 26}, "end": {"line": 0, "character": 33}},
+        }, d
     assert any(i["label"] == "fromLib" for i in client.doc("completion", root.as_uri(), 0, 0))
     client.change(lib.as_uri(), 2, "pub fn fromLib() { return 42 }\n")
     assert client.diagnostics(lib.as_uri(), 2) == []
     assert client.diagnostics(root.as_uri(), 1) == []
     client.notify("textDocument/didClose", {"textDocument": {"uri": lib.as_uri()}})
     assert client.diagnostics(lib.as_uri(), None) == []
-    [again] = client.diagnostics(root.as_uri(), 1)
-    assert again["code"] == "undefined-name", again
+    assert [d["code"] for d in client.diagnostics(root.as_uri(), 1)] == ["undefined-name", "undefined-name"]
 
     # Resolve an import to a newly created buffer before the editor writes it to disk.
     new = (folder / "new.fut").as_uri()

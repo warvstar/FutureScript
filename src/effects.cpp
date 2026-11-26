@@ -62,8 +62,12 @@ int effSite(const std::string& fn, uint64_t mask, const std::string& text) {
   if (fresh) sites.push_back({fn, text, mask});
   return it->second;
 }
-uint64_t effBit(int sym) {
+uint64_t effBit(int sym, int* probe) {
   if (auto it = userBits.find(sym); it != userBits.end()) return it->second;
+  if (probe) {
+    *probe = std::max(*probe, nextBit);
+    return *probe == EFF_LEVEL ? 0 : 1ull << (*probe)++;
+  }
   if (nextBit == EFF_LEVEL) return 0;
   effName[nextBit] = symName(sym);
   return userBits[sym] = 1ull << nextBit++;
