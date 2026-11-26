@@ -479,8 +479,19 @@ export async function createFut(opts) {
   const call = (slot) => enter(() => callP(slot));
   const applyFn = (id, json) => enter(async () => fromFut(cstr(await withStrAsync(json(), (p) => applyP(id, p)))));
   const applyRaw = (id, json) => enter(async () => cstr(await withStrAsync(json, (p) => applyP(id, p))));
+  // Threads (unseeded: on the pool's threads): a reload patches code that isolates the program started run too, so it
+  // stops them first (as main.cpp's hotReload does). Otherwise (one thread, or seeded) the others aren't running.
+  const stopping = () => shared && !!opts.threads && !opts.seed && !!ex.fut_isolates_stop;
+  async function compileStopped(f) {
+    const stopped = stopping() && ex.fut_isolates_stop();
+    try {
+      const s = await compileWith(f);
+      if (stopped && s > 0) ex.fut_isolates_sync();
+      return s;
+    } finally { if (stopped) ex.fut_isolates_verdict(1); }
+  }
   async function evalRepl(more) {  // compile and run replBuf, unless it is unfinished and `more` may follow
-    const s = await compileWith(() => withStr(replBuf, (p) => withStr("<repl>", (n) => ex.fut_compile(n, 0, 1, p))));
+    const s = await compileStopped(() => withStr(replBuf, (p) => withStr("<repl>", (n) => ex.fut_compile(n, 0, 1, p))));
     if (s == -1 && more) return;
     if (s == -1) write(2, cstr(ex.fut_info(2)) + "\n");
     if (s > 0) {
@@ -508,24 +519,32 @@ export async function createFut(opts) {
     polling++;
     try { await evalInbox(), await runCallbacks(); } finally { polling--; }
     if (!fileChanged) return;
-    // Isolates the program started share its code, but not its globals: a reload waits until they have ended.
-    if (ex.fut_isolates() > 1) return void setTimeout(poke, 50);
+    // Isolates the program started share its code, but not its globals. On the pool's threads a reload stops them,
+    // and each runs the new top level and reload() too (see stopping); otherwise it waits until they have ended.
+    if (ex.fut_isolates() > 1 && !stopping()) return void setTimeout(poke, 50);
     fileChanged = false;
+    const stopped = stopping() && !!ex.fut_isolates_stop();
     const c = await load(true);
-    if (!c) return;  // compile error: keep running the old code
+    if (!c) return void (stopped && ex.fut_isolates_verdict(1));  // compile error: keep running the old code
+    if (stopped) ex.fut_isolates_sync();
     const restart = mainChanged && inMain;
     // The new top level and the reload() hook (which migrates state) run as one transaction. If either fails, the
     // reload is undone: the data they changed, then the code. The program goes on as if the file had not changed.
+    // With isolates, each runs them in a transaction of its own, and all commit or all roll back.
     ex.fut_txn_begin();
+    const undo = () => (ex.fut_retire(c), ex.fut_reload_failed(), stopped && (ex.fut_isolates_sync(), ex.fut_isolates_verdict(0)));
     try {
       await call(c);
       const r = withStr("reload", (p) => ex.fut_fn(p));
       if (r) await call(r);
+      const failed = stopped ? cstr(ex.fut_isolates_parts(c, r)) : "";
+      if (failed) return write(2, `[fut] reload failed in ${failed}\n`), undo();
     } catch (e) {
       if (e instanceof Restart || e instanceof Exit) throw e;
-      return report(e), ex.fut_retire(c), ex.fut_reload_failed();
+      return report(e), undo();
     }
     ex.fut_retire(c), ex.fut_txn_commit();
+    if (stopped) ex.fut_isolates_verdict(1);
     if (restart) throw new Restart();
   }
   async function runCode(slot) {  // 0 ok, 1 runtime error, 2 restart requested

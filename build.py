@@ -276,9 +276,10 @@ def hot_isolates(exe):
     """A reload with isolates running: each stops, runs the new top level and reload() in a transaction of its own,
     and all commit or all roll back. Here a part that fails in a worker only undoes the reload everywhere (main's
     reload() too), and the next one gives each isolate its own new var and reload() run. Main waits in recv() all
-    along, and reloads from there. (Native only: in wasm, spawn raises.)"""
-    if exe.suffix == ".wasm":
-        return True, "native only"
+    along, and reloads from there. (Native, and fut-mt.wasm: in fut.wasm, isolates run on one thread, and a reload
+    waits until they have ended.)"""
+    if exe.name == "fut.wasm":
+        return True, "not in fut.wasm"
     head = "var who = \"main\"\nvar reloads = 0\nfn reload() { reloads += 1 }\n"
     rest = ("fn worker(i, c) { who = \"w{i}\"  var last = 0\n"
             "  while true { var v = tick()\n    if v != last { c.send(report(i, v))  last = v }\n    if v == 3 { return }\n    sleep(0.01) } }\n"

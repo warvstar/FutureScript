@@ -215,12 +215,14 @@ static void section(std::vector<uint8_t>& m, uint8_t id, const std::vector<uint8
 static void name(std::vector<uint8_t>& o, const std::string& s) { wa::uleb(o, s.size()), o.insert(o.end(), s.begin(), s.end()); }
 void jitCollect() {  // install the batch as one module, then make the queued table changes
   using namespace wa;
-  for (u32 s : retired) {
+  // (an interpreted body may still run on another thread, which a compiled one's module keeps alive: those wait
+  // until the program is down to one isolate)
+  for (u32 s : interpMode && isolates > 1 ? std::vector<u32>{} : retired) {
     ops.push_back((int32_t)s), ops.push_back(-1), freeSlots.push_back(s);
     if (interpMode) interpRetire(s);
     if (auto it = lineTabs.find(s); it != lineTabs.end()) mods[it->second.mod].refs--, lineTabs.erase(it);
   }
-  retired.clear();
+  if (!(interpMode && isolates > 1)) retired.clear();
   std::map<u32, u32> next = stubTo;  // where each stub leads once the queued changes are made
   for (size_t i = 0; i < ops.size(); i += 2) if (ops[i + 1] >= 0) next[ops[i]] = ops[i + 1];
   std::map<u32, u32> inBatch;        // body slot -> function index
@@ -712,3 +714,14 @@ EXPORT(fut_txn_begin) void futTxnBegin() { txnBegin(); }
 EXPORT(fut_txn_commit) void futTxnCommit() { txnCommit(); }
 EXPORT(fut_txn_unwind) void futTxnUnwind(u32 depth) { txnUnwind(depth); }
 EXPORT(fut_reload_failed) void futReloadFailed() { rollbackReload(last.newVars); }
+#if !ONE_THREAD
+// A reload with isolates running (hostPoll in fut.js), as main.cpp's hotReload: stop the others (1 if there were
+// any), patch, copy the globals to them (sync), have each run the new top level and reload() in a transaction of its
+// own (parts: "" or the first error), then all commit or all roll back (verdict).
+EXPORT(fut_isolates_stop) int futIsolatesStop() { return isolatesStop(); }
+EXPORT(fut_isolates_sync) void futIsolatesSync() { isolatesSync(); }
+EXPORT(fut_isolates_parts) const char* futIsolatesParts(u32 chunk, u32 hook) {
+  return (text = isolatesParts((void*)(uintptr_t)chunk, hook ? (void*)(uintptr_t)hook : nullptr)).c_str();
+}
+EXPORT(fut_isolates_verdict) void futIsolatesVerdict(int commit) { isolatesVerdict(commit); }
+#endif
