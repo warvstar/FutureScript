@@ -234,6 +234,7 @@ A program computes the same numbers on every platform, so a simulation can run o
 - **Supplying what isn't:** a handler answers an effect's operations, so a deterministic run gets its time and its input from the caller: `handle { tick(world) } with clock() { return frame * dt } with key(k) { return inputs[frame].has(k) }` (each frame's held keys, a map). Recording what the handlers answered is enough to replay a run.
 - **Budgets:** `budget(n, f)` runs `f()` and stops it after `n` steps, a step being a loop iteration or a call, with a `[budget]` error at the step that ran out. Steps, unlike time, are the same on every platform and in every run, warm or cold, so code someone else wrote (a mod, a player's script) can be given a limit per frame and cut off at the same point everywhere. A `try` inside `f` that catches the error raises it again at its next step, so only code outside the budget gets past it; an inner budget gets at most what the outer one has left, and gives back what it doesn't use. `stepCount()` is the steps taken so far in the innermost budget. A builtin's own work isn't counted, only the fut code it calls back. Counting costs up to about 15% on call-heavy code, and more on the tightest loops in wasm (a 1 ns loop body takes 60% longer), so only a program that mentions `budget` or `stepCount` counts; the rest compile as before.
 - **Record and replay:** `fut --record log file.fut` writes down, in order, what each builtin that reads the outside world returned (`clock`, `time`, an unseeded `random`, `key` and the mouse, `readFile`, `env`, `exec`, `fetch`), one per line (`clock 0.25`, `key true`); `fut --replay log file.fut` answers them from the log instead, and skips `sleep`, so the run repeats exactly and as fast as it can, on any platform. Each `print` is checked against the recording: the first operation or line that differs raises `[replay]` with both sides, which is how a change that broke determinism shows where. A wasm host does the same with `fut_replay_begin(log, record)` and `fut_replay_log()`.
+- **An example:** `examples/flock.fut` puts these together: a seeded world, a step function that takes its input as data, behaviours under budgets, and a fingerprint of the state, which the native and wasm suites must both reproduce.
 - **Collections and isolates:** maps iterate in insertion order, so they repeat too; the order in which isolates' messages arrive does not, which is why `spawn` and `chan` are effects.
 
 ## Errors
@@ -595,6 +596,7 @@ while present() {                    // show the frame, handle input, wait for t
 ```
 
 `build/fut -w examples/paddle.fut` is a small game to live-code.
+`build/fut examples/flock.fut` is a simulation that runs the same everywhere. Its boids' behaviours are ordinary functions, each run under a step budget, so a behaviour that loops forever (hold space) is cut off on the same tick everywhere. Its test blocks (`fut test examples/flock.fut`, run by both suites) check that a seeded run's state matches a fingerprint, every bit, natively and in wasm.
 
 ## Hot reload (`-w`)
 

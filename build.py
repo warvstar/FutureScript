@@ -84,6 +84,8 @@ def test(exe, only=()):
             + [("specs/" + t.name, lambda t=t: spec(t)) for t in sorted((ROOT / "tests" / "specs").glob("*.fut"))
                if not (exe.suffix == ".wasm" and t.name in NATIVE_SPECS)]
             + [("std/" + t.name, lambda t=t: spec(t, "std")) for t in sorted((ROOT / "std").glob("*/*_test.fut"))]
+            + [("examples/" + t.name, lambda t=t: spec(t, "examples")) for t in sorted((ROOT / "examples").glob("*.fut"))
+               if 'test "' in t.read_text()]  # examples with test blocks
             + [(n, lambda n=n, f=f: check(n, f)) for n, f in RUNNER_TESTS]
             + (isolateJobs(exe, 4) if exe == OUT else []))  # the plain native build: wasm runs one isolate (docs/isolates.md,
     # phase 5), and the sanitizer builds are slow enough that more load makes timed tests (expect grows) flaky
