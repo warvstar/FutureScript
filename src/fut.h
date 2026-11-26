@@ -302,6 +302,7 @@ void patchStub(u32* stub, void* target);
 u32* staleThunk(int sym);
 void tierUp(void* tier, u32 numArgs);  // compile a hot function again (numArgs: which arguments were numbers)
 extern bool verbose;
+extern bool noTier;  // no tier 2: no code compiled while the program runs (a Cloudflare Worker can't compile any)
 struct Ext { void* fn; int n, sym; char ret, sig[8]; };  // an extern fn. sig/ret: d(ouble) i(nt) l(ong) p(ointer) s(tring) v(oid)
 u32* ffiThunk(void* fn, const std::string& sig, char ret, int sym);  // code calling C function fn (see extern)
 u32* ffiCode(Ext*);            // the platform's thunk for it
@@ -391,7 +392,7 @@ int expectSite(ExpectSite);  // its number, passed to the expect@ native
 struct PropSite { std::string file, text, discard; int line = 0, expect = -1; bool cls = false; std::vector<std::string> names; std::vector<std::vector<uint64_t>> types; };
 int propSite(PropSite);
 void testInit();
-void sysInit();  // fetch, exec, files, env, time, JSON (native; the wasm build has none yet)
+void sysInit();  // fetch, exec, files, env (native; the wasm build has fetch and fetchAll, through its host)
 V binopValue(V a, V b, int op);  // a op b, as the language computes it (raises on bad operands)
 struct TestRun { bool json = false; std::string filter; double timeout = 10; int isolates = 0; bool changed = false; };
 extern std::string mainFile;  // the program's file: run() finds relative files next to it
@@ -527,6 +528,7 @@ int printMap(const Compiled&, bool pubOnly, bool json, const std::string& only, 
 std::string toJs(V v);                // raises for what can't cross (an instance, a map with non-string keys, ...)
 V fromJs(const std::string& json);
 V jsPinned(int id);                   // the function pinned as id (nil if none)
+int jsPin(V f);                       // pin f for JavaScript: its id
 void jsUnpin(int id);                 // JavaScript dropped it
 void jsMark(void (*mark)(V));         // GC roots: what JavaScript holds, and what fromJs is building
 void refFree(Ref*);                   // the GC found a Ref dead: JavaScript may let the value go

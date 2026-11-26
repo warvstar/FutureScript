@@ -3,7 +3,12 @@
 // resumes fiber stacks with JSPI, and drives the program: run it, reload changed files at safepoints, rerun main().
 //
 // createFut(opts) options:
-//   wasm: bytes of fut.wasm           read(path): file bytes or null      write(fd, bytes): stdout (1) / stderr (2)
+//   wasm: fut.wasm (its bytes, or a WebAssembly.Module)
+//   module(bytes): the WebAssembly.Module for a module the compiler emitted (default: compile it; a Cloudflare Worker,
+//     which can't compile code, finds the one compiled ahead of time -- web/worker.mjs)
+//   noTier: bool -- no tier 2, so nothing compiles once the program has loaded
+//   fetch(url, init): the platform's fetch, for fut's fetch() and fetchAll() (default: globalThis.fetch)
+//           read(path): file bytes or null      write(fd, bytes): stdout (1) / stderr (2)
 //   verbose: bool                     getenv(name): string or undefined   window(w, h): bool, present(rgba, w, h): Promise
 //   run(args, file, source, timeout): {code, out, err, timedOut} -- fut in a child process (run()), if possible
 //   save(path, text): bool -- write a file (text null: remove it), for `fut api`
@@ -12,6 +17,7 @@
 //   std: the directory of the standard library's packages (import "std/strings")
 export class Restart extends Error {}  // unwinds to the driver, which reruns main()
 export class Exit extends Error { constructor(code) { super("exit " + code), (this.code = code); } }
+export class FutError extends Error { constructor(text) { super(text.split("\n")[0]), (this.text = text); } }  // from apply()
 
 export async function createFut(opts) {
   const enc = new TextEncoder(), dec = new TextDecoder();
@@ -323,6 +329,16 @@ export async function createFut(opts) {
     }
   }
 
+  async function httpFetch(f, q) {  // -> {status, body, headers}, or {status: 0, error} when nothing came back
+    try {
+      const init = { method: q.method ?? "GET", headers: q.headers ?? {}, redirect: "follow", signal: AbortSignal.timeout((q.timeout ?? 60) * 1000) };
+      if (q.body != null) init.body = q.body;
+      const r = await f(q.url, init), body = init.method == "HEAD" ? "" : await r.text(), headers = {};
+      r.headers.forEach((v, k) => (headers[k] = v));
+      return { status: r.status, body, headers };
+    } catch (e) { return { status: 0, error: String(e?.message ?? e) }; }
+  }
+
   // ---- instantiate ----
   const S = (f) => new WebAssembly.Suspending(f);
   const env = {};
@@ -331,7 +347,7 @@ export async function createFut(opts) {
       if (mod) {
         const bytes = u8().slice(mod, mod + len);
         opts.dump?.(bytes);
-        const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), { env });
+        const inst = new WebAssembly.Instance(opts.module ? opts.module(bytes) : new WebAssembly.Module(bytes), { env });
         for (const [k, f] of Object.entries(inst.exports)) table.set(+k, f);
       }
       const o = new Int32Array(mem.buffer, ops, nops * 2).slice();
@@ -360,6 +376,13 @@ export async function createFut(opts) {
       held = new Uint8Array(head.length + out.length + err.length);
       return held.set(head), held.set(out, head.length), held.set(err, head.length + out.length), held.length;
     },
+    fetch: S(async (p) => {  // fetch(), fetchAll(): the requests (checked in wasm.cpp) at once; results in order, as sys.cpp's
+      const f = opts.fetch ?? globalThis.fetch;
+      if (!f) return -1;
+      const reqs = JSON.parse(cstr(p)).map((q) => (typeof q == "string" ? { url: q } : q));
+      held = enc.encode(JSON.stringify(await Promise.all(reqs.map((q) => httpFetch(f, q)))));
+      return held.length;
+    }),
     window: (w, h) => (opts.window?.(w, h) ? 1 : 0),
     present: S(async (px, w, h) => {
       const src = new Uint8Array(mem.buffer, px, w * h * 4), rgba = new Uint8ClampedArray(w * h * 4);
@@ -367,16 +390,47 @@ export async function createFut(opts) {
       return (await opts.present(rgba, w, h)) ? 1 : 0;
     }),
   };
-  const inst = await WebAssembly.instantiate(await WebAssembly.compile(opts.wasm), { host, wasi_snapshot_preview1: wasi });
+  const wasmMod = opts.wasm instanceof WebAssembly.Module ? opts.wasm : await WebAssembly.compile(opts.wasm);
+  const inst = await WebAssembly.instantiate(wasmMod, { host, wasi_snapshot_preview1: wasi });
   ex = inst.exports, (mem = ex.memory), (table = ex.__indirect_function_table), (spG = ex.__stack_pointer);
   Object.assign(env, { memory: mem, table, sp: spG, tag });
   const callP = WebAssembly.promising(ex.fut_call), applyP = WebAssembly.promising(ex.fut_apply);
   fiberStart = WebAssembly.promising(ex.fut_fiber_start);
-  ex._initialize(), ex.fut_init(opts.verbose ? 1 : 0), (pollAt = ex.fut_poll());
+  ex._initialize(), ex.fut_init((opts.verbose ? 1 : 0) | (opts.noTier ? 2 : 0)), (pollAt = ex.fut_poll());
   if (opts.std) withStr(opts.std, (p) => ex.fut_std(p));  // where the standard library's packages are
+
+  const pinned = new Map();  // name -> id, for apply()
+  let applying = Promise.resolve();  // one apply at a time: they share the main shadow stack
 
   return {
     exports: ex,
+    async compile(file) { return (path = file), !!(await load(false)); },  // compile only (errors printed): did it compile?
+    async start(file) {  // compile, then run the top level (not main()): 0 ok, 1 runtime error, 2 compile error
+      path = file;
+      const c = await load(false);
+      if (!c) return 2;
+      const st = await runCode(c);
+      return ex.fut_retire(c), st;
+    },
+    // Call the program's top-level function name with args (JSON data): its result. Calls queue, one at a time (each
+    // may wait on fetch() meanwhile). A fut error rejects with a FutError (its text: the message and trace).
+    apply(name, args) {
+      const go = async () => {
+        let id = pinned.get(name);
+        if (id == null) {
+          if ((id = withStr(name, (p) => ex.fut_pin_fn(p))) < 0) throw new Error(`the program has no function ${name}()`);
+          pinned.set(name, id);
+        }
+        const sp = spG.value, txn = ex.fut_txn_depth(), eff = ex.fut_eff_enter();
+        try { return fromFut(cstr(await withStrAsync(toFut(args), (p) => applyP(id, p)))); }
+        catch (e) {
+          spG.value = sp, ex.fut_txn_unwind(txn);
+          throw e instanceof Restart || e instanceof Exit ? e : new FutError(errorText(e));
+        } finally { ex.fut_eff_leave(eff); }
+      };
+      const r = applying.then(go, go);
+      return (applying = r.catch(() => {})), r;
+    },
     changed() { (fileChanged = true), poke(); },   // a watched file changed
     type(line) { inbox.push(line), poke(); },      // a line typed into the running program
     async run(file, watch) {  // exit status

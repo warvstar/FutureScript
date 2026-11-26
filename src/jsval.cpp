@@ -29,6 +29,7 @@ static int pin(V f) {
   else id = (int)pins.size(), pins.push_back(f);
   return id;
 }
+int jsPin(V f) { return pin(f); }
 void refFree(Ref* r) {
   if (auto it = refs.find(r->id); it != refs.end() && it->second == r) refs.erase(it);
   if (refRelease) refRelease(r->id);

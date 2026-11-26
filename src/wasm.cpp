@@ -31,6 +31,8 @@ HOST(fiber_gone) void host_fiber_gone(Fiber* f);
 HOST(sleep) void host_sleep(double seconds);                   // suspending
 HOST(poll) void host_poll();                                   // suspending: run typed lines, reload changed files
 HOST(run) int host_run(const char* args, const char* source, double timeout);  // run(): the result's length (in take), -1: none
+HOST(fetch) int host_fetch(const char* reqs);                  // suspending: HTTP requests (a JSON list), at once; their
+                                                               // results' JSON length (in take), -1: the host has no fetch
 }
 static void* getsp() { void* p; asm volatile("global.get __stack_pointer\n\tlocal.set %0" : "=r"(p)); return p; }
 static void setsp(void* p) { asm volatile("local.get %0\n\tglobal.set __stack_pointer" : : "r"(p)); }
@@ -62,7 +64,44 @@ u32* jitInstall(Code& k) {
   batch.push_back({std::move(k), s});
   return (u32*)(uintptr_t)s;
 }
-void sysInit() {}  // fetch, exec and files: not in the browser build yet
+// fetch and fetchAll, as in sys.cpp, but the host makes the requests (its fetch(), all at once); exec and files:
+// not in this build yet.
+static void checkReq(V v, const char* fn) {
+  auto str = [&](V x, const char* what) { if (!is(x, K::Str)) ERR("%s(): %s must be a string, got %s", fn, what, typeName(x)); };
+  if (is(v, K::Str)) return str(v, "the url");
+  if (!is(v, K::Map)) ERR("%s() expects a url or {url, method, headers, body, timeout}, got %s", fn, typeName(v));
+  bool url = false;
+  for (auto& [k, x] : as<Map>(v)->e) {
+    str(k, "an option name");
+    std::string_view key = as<Str>(k)->sv();
+    if (key == "url") str(x, "url"), url = as<Str>(x)->sv().size();
+    else if (key == "method") str(x, "method");
+    else if (key == "body") str(x, "body");
+    else if (key == "timeout") { if (!isNum(x) || num(x) <= 0) ERR("%s(): timeout must be a positive number", fn); }
+    else if (key == "headers") {
+      if (!is(x, K::Map)) ERR("%s(): headers must be a map of strings", fn);
+      for (auto& [hk, hv] : as<Map>(x)->e) str(hk, "a header name"), str(hv, "a header value");
+    } else ERR("%s(): unknown option '%s' (url, method, headers, body, timeout)", fn, std::string(key).c_str());
+  }
+  if (!url) ERR("%s(): no url", fn);
+}
+static V fetchList(const std::string& json, const char* fn) {  // -> the list of results
+  int n = host_fetch(json.c_str());
+  if (n < 0) ERR("%s(): this host cannot make HTTP requests", fn);
+  std::string r(n, 0);
+  host_take(r.data());
+  return fromJs(r);
+}
+static V n_fetch(V req) {
+  checkReq(req, "fetch");
+  return as<List>(fetchList("[" + toJs(req) + "]", "fetch"))->v.at(0);
+}
+static V n_fetchAll(V reqs) {
+  if (!is(reqs, K::List)) ERR("fetchAll() expects a list, got %s", typeName(reqs));
+  for (V v : as<List>(reqs)->v) checkReq(v, "fetchAll");
+  return fetchList(toJs(reqs), "fetchAll");
+}
+void sysInit() { native<n_fetch>("fetch"), native<n_fetchAll>("fetchAll"); }
 void patchStub(u32* stub, void* target) { ops.push_back((int32_t)wa::slotOf(stub)), ops.push_back((int32_t)wa::slotOf(target)); }
 void jitRetire(u32* body) { retired.push_back(wa::slotOf(body)); }
 void jitShiftLines(u32* body, int delta) {
@@ -366,7 +405,8 @@ void platformInit() {
 static std::string text;  // what the last string-returning export returned
 static Compiled last;
 EXPORT(fut_std) void futStd(const char* dir) { stdRoot = canonicalPath(dir); }  // the host says where std/ is
-EXPORT(fut_init) void futInit(int v) { verbose = v, rtInit(), jitCollect(), refRelease = host_ref_gone; }  // installs the natives' adapters
+// flags: 1 verbose, 2 no tier 2 (nothing compiles after a program loads: a Cloudflare Worker can't compile code)
+EXPORT(fut_init) void futInit(int flags) { verbose = flags & 1, noTier = flags & 2, rtInit(), jitCollect(), refRelease = host_ref_gone; }  // installs the natives' adapters
 EXPORT(fut_alloc) char* futAlloc(u32 n) { return (char*)malloc(n); }
 EXPORT(fut_free) void futFree(char* p) { free(p); }
 // Compile a file (text null) or REPL input; returns the chunk's slot, 0 after an error (printed), -1 if input ended early,
@@ -397,6 +437,10 @@ EXPORT(fut_main_changed) int futMainChanged() { return last.mainChanged; }
 EXPORT(fut_fn) int futFn(const char* nm) {  // a top-level fn of no arguments: its stub, else 0
   Global* g = findGlobal(intern(nm));
   return g && g->kind == 'f' && g->o && ((Fn*)g->o)->arity == 0 ? (int)wa::slotOf(g->stub) : 0;
+}
+EXPORT(fut_pin_fn) int futPinFn(const char* nm) {  // a top-level fn, pinned for fut_apply: its id, else -1
+  Global* g = findGlobal(intern(nm));
+  return g && g->kind == 'f' && g->o ? jsPin(box(g->o)) : -1;
 }
 EXPORT(fut_call) V futCall(int slot) { return vmCall((void*)(uintptr_t)slot); }
 EXPORT(fut_retire) void futRetire(int slot) { jitRetire((u32*)(uintptr_t)slot); }

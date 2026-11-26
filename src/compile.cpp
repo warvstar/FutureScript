@@ -1112,7 +1112,7 @@ struct Compiler : Gen {
     if (edecl) effectsIn(emask, effSite(display(nm), emask, etext));
     if (spec || inv) contract(f, nm, nameTok.line, spec, inv, ptys, homes, first);
     Tier* tier = nullptr;  // (tier 2 compiles a function again without its contract: one with a contract stays in tier 1)
-    if (!f.lambda && !f.test && !tiering && !spec && !inv) hotCounter(tier = &tiers[nm], first, homes);
+    if (!f.lambda && !f.test && !tiering && !spec && !inv && !noTier) hotCounter(tier = &tiers[nm], first, homes);
     if (!f.arrow) block();
     else scope([&] { while (!accept('}')) at(T_EOF) ? fail("@syntax expected '}'") : (void)stmt(); });
     if (f.live) f.retNum = false;  // can end without a return: returns nil
