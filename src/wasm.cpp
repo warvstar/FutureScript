@@ -168,7 +168,8 @@ u32* jitInstall(Code& k) {
   return (u32*)(uintptr_t)s;
 }
 // fetch and fetchAll, as in sys.cpp, but the host makes the requests (its fetch(), all at once); readFile and
-// writeFile go to the host's read and save (a page: its files, or browser storage). exec: not in this build yet.
+// writeFile go to the host's read and save (a page: its files, or browser storage); env has no variables (nil), as
+// a page has none. exec: not in this build yet.
 static V fetchList(const std::string& json, const char* fn) {  // -> the list of results
   int n = host_fetch(json.c_str());
   if (n < 0) ERR("@host %s(): this host cannot make HTTP requests", fn);
@@ -194,8 +195,9 @@ static V n_writeFile(V path, V text) {
   if (!saveFile(p, &s)) ERR("@host writeFile(): could not write '%s'", p.c_str());
   return NIL;
 }
+static V n_env(V name) { strViewArg(name, "env", "the name"); return NIL; }
 void sysInit() {
-  native<n_fetch>("fetch"), native<n_fetchAll>("fetchAll");
+  native<n_fetch>("fetch"), native<n_fetchAll>("fetchAll"), native<n_env>("env");
   native<n_readFile>("readFile"), native<n_writeFile>("writeFile");
 }
 void patchStub(u32* stub, void* target) { ops.push_back((int32_t)wa::slotOf(stub)), ops.push_back((int32_t)wa::slotOf(target)); }
