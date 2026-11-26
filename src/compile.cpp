@@ -1305,9 +1305,11 @@ struct Compiler : Gen {
         continue;
       }
       if (atKw(S_invariant) && !peek().nl) {  // (the prescan has it: compiled into the methods)
+        if (!cur.nl && prev.t != '{') fail("an invariant goes on its own line");
         next();
         for (int d = 0; !(d == 0 && (at('}') || cur.nl)); next()) {
           if (at(T_EOF)) fail("expected '}'");
+          if (d == 0 && at('{')) fail("an invariant ends at the end of its line (wrap a lambda in parentheses)");
           d += nesting(cur);
         }
         continue;
