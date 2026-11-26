@@ -153,7 +153,7 @@ extern uintptr_t* stackTop;
   X(true) X(false) X(nil) X(self) X(super) X(import) X(extern) X(yield) X(try) X(catch) X(throw)
 #define SYM_ENUM(k) K_##k,
 #define SYM_STR(k) #k,
-#define EXTRA_SYMS(X) X(init) X(main) X(push) X(pop) X(len) X(has) X(remove) X(keys) X(values) X(reload) X(resume) X(send) X(done) X(as) X(test) X(expect) X(throws) X(prints) X(pub) X(override) X(atomic) X(effect) X(handle) X(with)
+#define EXTRA_SYMS(X) X(init) X(main) X(push) X(pop) X(len) X(has) X(remove) X(keys) X(values) X(reload) X(resume) X(send) X(done) X(as) X(test) X(expect) X(throws) X(prints) X(pub) X(override) X(atomic) X(effect) X(handle) X(with) X(requires) X(invariant)
 #define SYM_S(k) S_##k,
 enum { KEYWORDS(SYM_ENUM) NKW, S_FIRST = NKW - 1, EXTRA_SYMS(SYM_S) };
 int intern(std::string_view);
@@ -282,7 +282,9 @@ extern std::string* outSink;  // when set, print() appends here instead of writi
 extern std::string* errSink;  // when set, an uncaught error's message and trace go here instead of to stderr
 
 // ---- tests (test.cpp): `expect` sites, and the runner behind `fut test` ----
-struct ExpectSite { std::string file, text, left, right; int line = 0, op = -1; bool throws = false; };  // op < 0: truthiness
+// op < 0: truthiness. A contract's check (`requires`, `invariant`) is one too: its message is head + text + tail,
+// and it is not a test's failed expect.
+struct ExpectSite { std::string file, text, left, right; int line = 0, op = -1; bool throws = false, contract = false; std::string head, tail; };
 int expectSite(ExpectSite);  // its number, passed to the expect@ native
 void testInit();
 V binopValue(V a, V b, int op);  // a op b, as the language computes it (raises on bad operands)
@@ -314,6 +316,10 @@ bool txnAtomic();               // is an atomic block open? (io can't be undone 
 void txnMark(void (*mark)(V));  // GC roots: what rollbacks would put back
 extern bool txnPollLater;       // a reload or typed line waits for the transactions to end
 int globalCount();              // global slots in use
+
+// ---- contracts: a class's invariants compile to a hidden method of this name; calling it on anything without
+// one returns the receiver (rt_prep) ----
+int invariantSym();
 
 // ---- types (types.cpp): optional annotations, checked at run time where they are written ----
 // A type is a kind, TY_OPT if nil is allowed too (`str?`), and for a class its symbol (bits 8..).

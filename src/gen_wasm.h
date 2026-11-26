@@ -336,8 +336,9 @@ struct Gen : CState {
     if (numFast) close();
   }
   // A function that declares effects (see gen_a64.h): the caller's vm.allowed and vm.who go to two i64 locals.
-  void effectsIn(uint64_t mask, int site) {
-    u32 a = F->effHome = L0 + (u32)F->k.wlocals.size(), w = a + 1;
+  void effectsIn(uint64_t mask, int site) { F->effHome = effNarrow(mask, site); }
+  int effNarrow(uint64_t mask, int site) {  // for part of a function (a contract): effEnd puts the old state back
+    u32 a = L0 + (u32)F->k.wlocals.size(), w = a + 1;
     F->k.wlocals.push_back(I64), F->k.wlocals.push_back(I64);
     i32c(0), mem(I64_LOAD, 3, slotOf(&vm.allowed)), set(a);
     i64c((int64_t)mask), get(a), i64c(-1), op(I64_XOR), op(I64_AND), i64c(0), op(I64_NE);  // any declared effect not allowed?
@@ -345,6 +346,11 @@ struct Gen : CState {
     i32c(0), mem(I32_LOAD, 2, slotOf(&vm.who)), op(I64_EXTEND_U), set(w);
     i32c(0), get(a), i64c(EFF_LEVEL), op(I64_SHR_U), i64c(1), op(I64_ADD), i64c(EFF_LEVEL), op(I64_SHL), i64c((int64_t)mask), op(I64_OR);
     mem(I64_STORE, 3, slotOf(&vm.allowed)), i32c(0), i32c(site), mem(I32_STORE, 2, slotOf(&vm.who));
+    return (int)a;
+  }
+  void effEnd(int a) {
+    i32c(0), get(a), mem(I64_STORE, 3, slotOf(&vm.allowed));
+    i32c(0), get(a + 1), op(I32_WRAP), mem(I32_STORE, 2, slotOf(&vm.who));
   }
   void capAddr() { base(F->cloHome), mem(I64_LOAD, 3, off(F->cloHome)), op(I32_WRAP); }  // this closure object
   void capLoad(int i) { capAddr(), mem(I64_LOAD, 3, CLO_ENV + 8 * i), set(R0); }

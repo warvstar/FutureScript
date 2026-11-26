@@ -223,8 +223,21 @@ def hot_packages(exe):
     return ok, f"out: {out!r}\n  err: {err!r}"
 
 
+def hot_invariant(exe):
+    """An invariant added by a reload applies to existing instances, at calls made by code compiled after it."""
+    prog = ("class C {{ var n = 0 {inv} fn step() {{ self.n += 1 }} }}\n"
+            "fn tick(c) {{ c.step() return c.n }}\n"
+            "fn main() {{ var c = C()\n"
+            "  while true {{ if tick(c) == 1 {{ print(\"running\") }}\n"
+            "    sleep(0.01) }} }}\n")
+    out, err = live(exe, {"i.fut": prog.format(inv="")}, [("i.fut", prog.format(inv="invariant self.n < 0"))], timeout=1)
+    ok = out.split() == ["running"] and "C's invariant self.n < 0 does not hold" in err
+    return ok, f"stdout: {out!r}\n  stderr: {err!r}"
+
+
 HOT_TESTS = [("methods, errors, main restart", hot_methods_and_main),
              ("packages: per-package recompiles, JS modules", hot_packages),
+             ("an invariant added by a reload", hot_invariant),
              ("a changed effect declaration takes effect", hot_effects),
              ("a changed result type recompiles callers", hot_result_type),
              ("a failed reload rolls back", hot_reload_rollback),
@@ -308,7 +321,11 @@ def runner_api(exe):
     fx = run("test", main)
     ok = ok and fx.returncode == 1 and "  - fn sq(x: num): num\n  + fn sq(x: num): num ! io\n" in fx.stdout
     t = fx
-    return ok, f"missing: {a.stdout!r}\n  api: {w.stdout!r} -> {api!r}\n  after: {b.stdout!r}\n  private edit: {c.stdout!r}\n  changed: {e.stdout!r}\n  json: {j.stdout!r}\n  check: {k.stdout!r}\n  typed: {t.stdout!r}"
+    run("api", main)
+    (d / "lib.fut").write_text(lib.replace("pub fn sq(x)", "pub fn sq(x: num): num ! io requires x > 0"))  # so is a contract
+    r = run("test", main)
+    ok = ok and r.returncode == 1 and "  + fn sq(x: num): num ! io requires x > 0\n" in r.stdout
+    return ok, f"missing: {a.stdout!r}\n  api: {w.stdout!r} -> {api!r}\n  after: {b.stdout!r}\n  private edit: {c.stdout!r}\n  changed: {e.stdout!r}\n  json: {j.stdout!r}\n  check: {k.stdout!r}\n  typed: {t.stdout!r}\n  contract: {r.stdout!r}"
 
 
 def tree(d, files):  # write files {relative path: text} under d, afresh

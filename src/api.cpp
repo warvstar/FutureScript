@@ -66,10 +66,24 @@ struct Scan {
     if (s.next().t != '!') return end;
     L = s, end = s.p;
     for (Lexer d = L;; d = L) {
-      int t = d.next().t;
-      if (t != T_ID && t != ',' && t != '.') return end;
+      Tok k = d.next();
+      int t = k.t;
+      if ((t != T_ID || k.sym == S_requires) && t != ',' && t != '.') return end;
       L = d, end = d.p;
     }
+  }
+  // `requires <conditions>` clauses next: through the last, which ends at the body's `{` (outside brackets)
+  const char* contract(const char* end) {
+    for (Lexer s = L; s.next().t == T_ID && [&] { Lexer c = L; return c.next().sym == S_requires; }(); s = L) {
+      int d = 0;
+      for (Lexer c = L;; c = L) {
+        Tok t = c.next();
+        if (t.t == T_EOF || (d == 0 && t.t == '{')) break;
+        d += (t.t == '(' || t.t == '[') - (t.t == ')' || t.t == ']');
+        L = c, end = c.p;
+      }
+    }
+    return end;
   }
   void skipBody(Tok& t) {  // t is '{': through the matching '}'
     for (int d = 0; t.t != T_EOF; t = next()) if ((d += (t.t == '{') - (t.t == '}')) == 0) return;
@@ -85,6 +99,7 @@ static void itemsOf(const std::string& text, std::vector<Item>& items) {
   auto params = [&](Tok& t) { return S.params(t); };
   auto typed = [&](const char* e) { return S.typed(e); };
   auto effects = [&](const char* e) { return S.effects(e); };
+  auto contract = [&](const char* e) { return S.contract(e); };
   auto skipBody = [&](Tok& t) { S.skipBody(t); };
   int depth = 0;
   for (Tok t = next(); t.t != T_EOF; t = next()) {
@@ -102,7 +117,7 @@ static void itemsOf(const std::string& text, std::vector<Item>& items) {
     } else if (k.sym == K_fn) {
       Tok n = next(), p = next();
       const char* end = params(p);
-      it = {symName(n.sym), "pub " + squash(k.p, effects(typed(end)))};
+      it = {symName(n.sym), "pub " + squash(k.p, contract(effects(typed(end))))};
     } else if (k.sym == K_extern) {
       Tok n = next();
       while (n.t != T_EOF && !isKw(n, K_fn)) n = next();
@@ -130,8 +145,22 @@ static void itemsOf(const std::string& text, std::vector<Item>& items) {
       while (b.t != '{' && b.t != T_EOF) b = next();
       it.name = symName(n.sym), it.text = "pub " + squash(k.p, b.p) + " {\n";
       std::vector<std::pair<std::string, std::string>> fields, methods;
+      std::string invs;  // invariants, in source order, first
       for (Tok m = next(); m.t != '}' && m.t != T_EOF; m = next()) {
         std::string d = docs(src, m.p, "  ");
+        if (isKw(m, S_invariant)) {  // through the end of its line, or the next member on the same line
+          const char* end = m.p;
+          int depth = 0;
+          for (Lexer c = L;; c = L) {
+            Tok t = c.next();
+            bool member = t.t == T_ID && (t.sym == K_fn || t.sym == K_var || t.sym == S_override || t.sym == S_invariant);
+            if (t.t == T_EOF || (depth == 0 && (t.nl || t.t == '}' || member))) break;
+            depth += (t.t == '(' || t.t == '[' || t.t == '{') - (t.t == ')' || t.t == ']' || t.t == '}');
+            L = c, end = c.p;
+          }
+          invs += d + "  " + squash(m.p, end) + "\n";
+          continue;
+        }
         if (isKw(m, K_var)) {
           Tok f = next();
           typed(f.p);
@@ -147,13 +176,14 @@ static void itemsOf(const std::string& text, std::vector<Item>& items) {
         if (isKw(m, S_override)) m = next();
         if (!isKw(m, K_fn)) continue;
         Tok nm = next(), p = next();
-        const char* end = effects(typed(params(p)));
+        const char* end = contract(effects(typed(params(p))));
         methods.push_back({symName(nm.sym), d + "  " + squash(first.p, end) + "\n"});
         Tok body = next();
         skipBody(body);
       }
       auto byName = [](auto& a, auto& b) { return before(a.first, b.first); };
       std::stable_sort(fields.begin(), fields.end(), byName), std::stable_sort(methods.begin(), methods.end(), byName);
+      it.text += invs;
       for (auto& [_, s] : fields) it.text += s;
       for (auto& [_, s] : methods) it.text += s;
       it.text += "}";

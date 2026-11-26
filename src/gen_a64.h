@@ -348,8 +348,10 @@ struct Gen : CState {
   }
   // A function that declares effects: its caller must be allowed them (else rt_effect raises), and until it returns
   // only they are allowed. vm.allowed = (level + 1) << EFF_LEVEL | mask; vm.who = site. The old values go to two slots.
-  void effectsIn(uint64_t mask, int site) {
-    int s = F->effHome = slot();
+  void effectsIn(uint64_t mask, int site) { F->effHome = effNarrow(mask, site); }
+  // The same for part of a function (a contract): returns the slots holding the old state, which effEnd puts back.
+  int effNarrow(uint64_t mask, int site) {
+    int s = slot();
     slot();
     E(ldr(9, 28, EOFF)), imm(10, mask), E(bicsz(10, 9));  // any declared effect not allowed?
     int ok = E(bcond(EQ));
@@ -357,7 +359,9 @@ struct Gen : CState {
     st(9, s), E(ldrw(11, 28, EOFF + 16)), st(11, s + 1);
     E(lsri(11, 9, EFF_LEVEL)), E(addi(11, 11, 1)), E(orrlsl(10, 10, 11, EFF_LEVEL)), E(str(10, 28, EOFF));
     imm(11, (V)site), E(strw(11, 28, EOFF + 16));
+    return s;
   }
+  void effEnd(int s) { ld(9, s), E(str(9, 28, EOFF)), ld(9, s + 1), E(strw(9, 28, EOFF + 16)), F->depth = s; }
   void cloEnv() { ldl(9, F->cloHome), E(andaddr(9, 9)); }  // x9 = this closure object
   void capLoad(int i) { cloEnv(), E(ldr(0, 9, CLO_ENV + 8 * i)); }
   void capStore(int i) {  // inside a transaction, rt_capset saves the closure first

@@ -42,6 +42,10 @@ static EffOps effectOps;
 static std::unordered_map<std::string, Sig> sigs;
 struct Rec { uint64_t text, env; int line, arity; u32* body; std::vector<u32*> lambdas; bool repl; };  // what is installed now
 static std::unordered_map<std::string, Rec> recs;
+// Has the program declared an invariant? Then calls and field stores on objects other than self check them. Once
+// true it stays true (part of every package's environment hash), so code compiled without the checks is compiled again with them.
+static bool invariantsOn;
+static std::unordered_map<std::string, u32*> invariantBodies;  // each class's hidden invariant method, installed
 static std::unordered_map<int, uint64_t> varText;  // top-level var -> hash of its declaration's source
 static std::map<std::pair<int, int>, Fn*> methodFns;  // (class sym, method sym): one Fn per method, kept across reloads
 // Files: every imported file has a prefix (its stem, made unique). Its private top-level names are "prefix.name",
@@ -400,11 +404,24 @@ struct Compiler : Gen {
     if (n) st(0, slot());
     callWindow(base, n, S_push, false);
   }
-  void call(int sym, bool super) { int base = slot(); st(0, base), callWindow(base, exprList(')'), sym, super); }
+  void call(int sym, bool super, bool check = false) {  // check: then the receiver's invariants
+    int base = slot();
+    st(0, base), callWindow(base, exprList(')'), sym, super);
+    if (check) invariantAfter(base);
+  }
+  // After a call or a field store on the object in slot base (x0: the result, kept): its class's invariants, by
+  // calling its hidden invariant method (none: rt_prep returns the receiver). Frees base.
+  void invariantAfter(int base) {
+    F->depth = base + 1;
+    int keep = slot(), w = slot();
+    st(0, keep), ld(0, base), st(0, w), callWindow(w, 0, invariantSym(), false), ld(0, keep);
+    F->depth = base;
+  }
   void construct(Global& g) {  // C(args) for a top-level class C
     int base = slot();
     gmem(0, g.slot), st(0, base);
     constructCall(base, exprList(')'));
+    if (invariantsOn) { int w = slot(); st(0, w), callWindow(w, 0, invariantSym(), false); }  // the new instance's
   }
   bool returnsNum(int sym) {  // a top-level fn declared `: num`: its returns check that, so callers may rely on it
     auto it = spans.find(symName(sym));
@@ -541,11 +558,15 @@ struct Compiler : Gen {
       if (accept('.')) {
         Tok ft = cur;
         int s = ident();
-        if (v.k == LV_LOCAL && F->cls >= 0 && v.a == F->selfHome && !tiering && !(at('(') && !cur.nl))
+        bool own = v.k == LV_LOCAL && F->cls >= 0 && v.a == F->selfHome;  // self.name
+        if (own && !tiering && !(at('(') && !cur.nl))
           fieldUses.push_back({F->cls, s, {ft.p, ft.line, file, srcStart}});  // self.name: checked once every class is known
         load(v);
-        v = {LV_FIELD, 0, s};
-        if (at('(') && !cur.nl) next(), s == S_push ? pushCall() : call(s, false), v = {};
+        v = {LV_FIELD, 0, s}, v.own = own;
+        if (at('(') && !cur.nl) {  // a method call; one on another object then checks its invariants (push: not inline)
+          bool check = invariantsOn && !own;
+          next(), s == S_push && !check ? pushCall() : call(s, false, check), v = {};
+        }
       } else if (at('[') && !cur.nl) {
         next(), load(v);
         int t = slot();
@@ -745,13 +766,15 @@ struct Compiler : Gen {
   // expect a op b | expect x | expect throws { ... } [op value] | expect prints { ... } [op value]. Calls
   // expect@(site, left, right), which checks and, on failure, raises an error naming the source text and the values.
   void expectStmt() {
-    int line = cur.line;
-    next();
+    ExpectSite s{file, "", "", "", cur.line};
+    next(), check(std::move(s));
+  }
+  // The condition at cur, checked by expect@ with s (a contract's: a plain condition, no throws or prints).
+  void check(ExpectSite s) {
     int base = slot(), siteAt = slot();
     gmem(0, findGlobal(intern("expect@"))->slot), st(0, base);
-    ExpectSite s{file, "", "", "", line};
     const char* start = tokStart(cur);
-    bool throws = s.throws = atKw(S_throws) && peekIs('{'), prints = atKw(S_prints) && peekIs('{'), lnum = false;
+    bool throws = s.throws = !s.contract && atKw(S_throws) && peekIs('{'), prints = !s.contract && atKw(S_prints) && peekIs('{'), lnum = false;
     int lh = NOH;
     if (prints) {  // what print() wrote inside, as a string; a throw stops the capture and goes on
       next();
@@ -784,8 +807,18 @@ struct Compiler : Gen {
     else imm(0, NIL);
     st(0, slot());
     s.text = throws || prints ? (throws ? "throws { ... }" : "prints { ... }") + std::string(afterLeft, prevEnd) : std::string(start, prevEnd);
-    imm(0, box((double)expectSite(std::move(s)))), st(0, siteAt);
+    bool contract = s.contract;
+    int op = s.op, e = -1;
+    V site = box((double)expectSite(std::move(s)));
+    if (contract) {  // a contract tests inline and calls expect@ only to report a failure
+      if (op >= 0) mv(1, 0), ld(0, ls), binop(op);
+      else ld(0, ls);
+      Cond no = truthyCond();
+      thenBegin(no), e = elseBegin(no, true);
+    }
+    imm(0, site), st(0, siteAt);
     callWindow(base, 3, 0, false);
+    if (contract) ifEnd(e);
   }
   void ifStmt() {
     Cond no = cond();
@@ -867,7 +900,9 @@ struct Compiler : Gen {
       int o = slot();
       st(0, o);
       if (op >= 0) field(v.b, false);
-      value(), mv(2, 0), ld(0, o), field(v.b, true), F->depth--;
+      value(), mv(2, 0), ld(0, o), field(v.b, true);
+      if (invariantsOn && !v.own) invariantAfter(o);
+      else F->depth--;
     } else {  // object in slot v.a, index in x0
       int i = slot();
       st(0, i);
@@ -910,7 +945,7 @@ struct Compiler : Gen {
       }
       if (at('!')) {  // declared effects: ! io, clock (an empty set: performs nothing)
         next(), edecl = true, etext = "!";
-        if (!at('{'))
+        if (!at('{') && !atKw(S_requires))
           do etext += etext.size() > 1 ? ", " : " ", emask |= effectName(etext);
           while (accept(','));
       }
@@ -935,6 +970,18 @@ struct Compiler : Gen {
       if (ty.code == TY_NUM) prove(h);
     }
     if (edecl) effectsIn(emask, effSite(display(nm), emask, etext));
+    if (atKw(S_requires)) {  // requires <condition>[, <condition>]..., checked on entry, performing nothing
+      int h = effNarrow(0, effSite(display(nm) + "'s requires", 0, "!"));
+      while (atKw(S_requires)) {
+        next();
+        do {
+          ExpectSite s{file, "", "", "", cur.line};
+          s.contract = true, s.head = display(nm) + " requires ";
+          check(std::move(s));
+        } while (accept(','));
+      }
+      effEnd(h);
+    }
     Tier* tier = nullptr;
     if (!f.lambda && !f.test && !tiering) hotCounter(tier = &tiers[nm], first, homes);
     block();
@@ -989,8 +1036,18 @@ struct Compiler : Gen {
       if (!g || g->kind != 'c' || cd.super == cd.sym) failAt(prev.p, prev.line, "bad superclass '%s'", name(cd.super));
     }
     expect('{');
+    std::vector<Mark> invs;  // invariant clauses: compiled at the end, into the hidden invariant method
     while (!accept('}')) {
       if (atKw(S_pub)) fail("a class's fields and methods are public when the class is: put 'pub' before 'class'");
+      if (atKw(S_invariant) && !peek().nl) {  // invariant <condition>: parsed here only to find its end
+        next(), invs.push_back(mark());
+        Fun scratch, *outer = F;
+        size_t np = pend.size(), nu = fieldUses.size();
+        scratch.cls = cd.sym, F = &scratch, scratch.selfHome = home(), scratch.locals.push_back({K_self, scratch.selfHome});
+        expr();
+        F = outer, pend.resize(np), fieldUses.resize(nu), hasLit = false;
+        continue;
+      }
       if (atKw(K_var)) {  // var name [= constant]: a declared field
         next();
         int s = ident();
@@ -1006,7 +1063,7 @@ struct Compiler : Gen {
       }
       bool over = atKw(S_override) && peek().t == T_ID && peek().sym == K_fn;
       if (over) next();
-      if (!atKw(K_fn)) fail("expected 'fn', 'override fn' or 'var' in class body");
+      if (!atKw(K_fn)) fail("expected 'fn', 'override fn', 'var' or 'invariant' in class body");
       next();
       Tok mt = cur;
       int m = ident();
@@ -1020,7 +1077,33 @@ struct Compiler : Gen {
       Fun fun;
       owner = q, function(fun, cd.sym, m == S_init, q, (u32*)f->code, f);
     }
+    if (!invs.empty()) invariantMethod(cd, invs);
     classes.push_back(std::move(cd));
+  }
+  // A class's invariants become a hidden method that checks each, performing nothing, then the superclass's; it
+  // returns self. Code outside the class calls it after constructing an instance, calling a method on it, or
+  // storing to one of its fields (see invariantAfter); a method's own calls and stores on self don't, so it may
+  // break an invariant while it works, as long as it is whole again when the caller gets control back.
+  void invariantMethod(ClassDef& cd, const std::vector<Mark>& invs) {
+    int inv = invariantSym();
+    Fn*& fn = methodFns[{cd.sym, inv}];
+    if (!fn) fn = make<Fn>(), fn->code = newStub(), fn->name = inv, consts.push_back(box(fn));
+    cd.methods.push_back({inv, fn});
+    std::string q = symName(cd.sym) + ".invariant";
+    Mark after = mark();
+    Fun f, *outer = F;
+    f.cls = cd.sym, f.init = true, f.k.name = q, f.k.file = file, F = &f;  // init: it returns self
+    f.selfHome = home(), f.locals.push_back({K_self, f.selfHome}), param(0, f.selfHome);
+    effectsIn(0, effSite(symName(cd.sym) + "'s invariant", 0, "!"));
+    for (const Mark& m : invs) {
+      rewind(m);
+      ExpectSite s{file, "", "", "", cur.line};
+      s.contract = true, s.head = symName(cd.sym) + "'s invariant ", s.tail = " does not hold";
+      check(std::move(s));
+    }
+    if (cd.super >= 0) { int b = slot(); ldl(0, f.selfHome), st(0, b), callWindow(b, 0, inv, true); }
+    pend.push_back({(u32*)fn->code, fn, 1, finish(), q + "@", true, {}});  // owner: a method may be named invariant
+    F = outer, rewind(after);
   }
   // extern ["library"] fn name(type, ...) [: type] -- a C function (a host function in wasm); types: num int long ptr str (and void)
   // extern [lib] fn name(types): result. lib: a C library ("libm.dylib"; none: the program's own symbols, or on
@@ -1286,6 +1369,8 @@ struct Compiler : Gen {
         Tok d = q(t);
         declare(d, p.sym == K_class ? 'c' : 'v', 0);
         if (p.sym == K_class) cls = d.sym;
+      } else if (depth == 1 && cls >= 0 && t.t == T_ID && t.sym == S_invariant && [&] { Lexer s = L; return !lex(s).nl; }()) {
+        invariantsOn = true;
       } else if (depth == 1 && cls >= 0 && afterKw && p.sym == K_var) {  // a declared field: methods compile against them
         mixEnv(uint64_t(cls) << 32 | uint64_t(t.sym) << 2 | 1, -2);
       } else if (depth == 0 && t.t == T_STR && p.t == T_ID && p.sym == K_import) {
@@ -1385,6 +1470,8 @@ struct Compiler : Gen {
       surfEnv[P] = h;
     }
     for (auto& [P, _] : pkgImports) envOf.try_emplace(P, 1469598103934665603ull);
+    if (invariantsOn)  // every call and store site, in every package, checks them
+      for (auto& [P, h] : envOf) h = (h ^ 0x1a7a) * 1099511628211ull;
     for (auto& [P, h] : envOf) {
       uint64_t e = h;
       for (auto& D : pkgImports[P]) e = (e ^ surfEnv[D]) * 1099511628211ull;
@@ -1408,14 +1495,14 @@ struct Compiler : Gen {
     for (auto& cd : classes)
       if (cd.sym == sym) {
         v = {cd.super, {}, &cd.fields};
-        for (auto& [m, f] : cd.methods) v.methods.push_back({m, spans.at(symName(sym) + "." + symName(m)).arity});
+        for (auto& [m, f] : cd.methods) if (m != invariantSym()) v.methods.push_back({m, spans.at(symName(sym) + "." + symName(m)).arity});
         return true;
       }
     Global* g = findGlobal(sym);
     if (!g || !g->o || g->o->kind != K::Class) return false;
     Class* c = (Class*)g->o;
     v = {c->super ? (int)c->super->name : -1, {}, &c->fields};
-    for (auto& [m, f] : c->methods) v.methods.push_back({m, f->arity - 1});  // a method's Fn counts self
+    for (auto& [m, f] : c->methods) if (m != invariantSym()) v.methods.push_back({m, f->arity - 1});  // a method's Fn counts self
     return true;
   }
   [[noreturn]] void failHere(const At& a, const char* fmt, const std::string& x, const std::string& y = "", const std::string& z = "", const std::string& w = "") {
@@ -1530,6 +1617,12 @@ struct Compiler : Gen {
         t = std::move(p.tier), t.stub = p.stub, t.body = body;
       }
       if (p.fn) p.fn->arity = p.arity;
+      if (p.lambda && p.owner.ends_with(".invariant@")) {  // a class's invariants, compiled every time: the old body goes
+        u32*& old = invariantBodies[p.owner];
+        if (old) jitRetire(old);
+        old = body;
+        continue;
+      }
       if (p.lambda) { lambdas[p.owner].push_back(body); continue; }
       Span& sp = spans.at(p.owner);
       uint64_t text = fnv(sp.start, sp.end);

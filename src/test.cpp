@@ -72,7 +72,8 @@ static std::vector<std::string> details(const ExpectSite& s, const Failure& f) {
   if (!f.why.empty()) d.push_back(f.why);
   auto bare = [](const std::string& x) { std::string o; for (char c : x) if (c != ' ' && c != '\n' && c != '\t' && c != '"') o += c; return o; };
   auto side = [&](const std::string& src, const std::string& val) { if (!src.empty() && bare(src) != bare(val)) d.push_back(oneLine(src) + " is " + val); };
-  if (f.why.empty()) side(s.left, f.left);
+  bool whole = s.contract && s.op < 0 && s.left.find(' ') != std::string::npos;  // `a || b is false` says nothing new
+  if (f.why.empty() && !whole) side(s.left, f.left);
   if (s.op >= 0 && f.why.empty()) side(s.right, f.right);
   if (!f.what.empty()) d.push_back(f.at.empty() ? f.what : "first difference at " + f.at + ": " + f.what);
   return d;
@@ -83,7 +84,8 @@ static V expectAt(V site, V l, V r) {
   const ExpectSite& s = sites.at((size_t)num(site));
   Failure f;
   bool ok;
-  if (s.throws && l == ABSENT) ok = false, f.why = "nothing was thrown";
+  if (s.contract) ok = false;  // compiled code found it false, and calls only to report it
+  else if (s.throws && l == ABSENT) ok = false, f.why = "nothing was thrown";
   else if (s.op < 0) ok = s.throws || (l != NIL && l != FALSE_);
   else if (s.op == O_EQ || s.op == O_NE) {
     ok = same(l, r, f.at, f.what) == (s.op == O_EQ);
@@ -96,10 +98,10 @@ static V expectAt(V site, V l, V r) {
   f.set = true, f.site = (int)num(site);
   if (l != ABSENT) f.left = show(l);
   if (s.op >= 0) f.right = show(r);
-  std::string msg = "expect failed: " + oneLine(s.text);
+  std::string msg = (s.contract ? s.head : "expect failed: ") + oneLine(s.text) + s.tail;
   auto d = details(s, f);
   for (size_t i = 0; i < d.size(); i++) msg += (i ? ", " : " (") + d[i] + (i + 1 == d.size() ? ")" : "");
-  if (!failure.set) failure = f;
+  if (!failure.set && !s.contract) failure = f;
   ERR("%s", msg.c_str());
 }
 // expect prints { ... }: print() output inside the block is collected (nested captures stack) and becomes the value.

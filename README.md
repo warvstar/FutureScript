@@ -60,7 +60,7 @@ fn reload() { }                      // optional: runs after every hot reload (m
 - **Operators:** `+ - * / %`, `== != < <= > >=`, `&& ||` (short-circuit, return the operand), `!`, `= += -= *= /=`. Bitwise `& | ^ ~ << >>` work on whole numbers as 64-bit integers (`1.5 & 1` is an error), with Python's precedence: `2 + 3 & 6` is `(2 + 3) & 6`. `+` with a string on either side concatenates.
 - **Builtins:** `print len str int clock sleep random floor sqrt fiber run` (`int` truncates toward zero; `random()` is in [0, 1)), plus graphics (below).
 - **Numbers:** `12`, `1.5`, `2e3`, `0xff8800`.
-- **Keywords:** `var fn class if else while for in return break continue true false nil self super import extern yield try catch throw`. `as`, `pub`, `override`, `atomic`, `effect`, `handle` and `with` are special only where they start an import alias, declaration or block, so they stay usable as names.
+- **Keywords:** `var fn class if else while for in return break continue true false nil self super import extern yield try catch throw`. `as`, `pub`, `override`, `atomic`, `effect`, `handle`, `with`, `requires` and `invariant` are special only where they start an import alias, declaration, block or contract, so they stay usable as names.
 - **Methods:** `list.push/pop/len`, `map.has/remove/keys/values/len`, `str.len/has` (`has`: contains a substring), `fiber.resume/send/done`.
 - **Closures:** a closure captures the enclosing variables by value. The closure can still change its own copy, so counters work, but it does not see later changes in the enclosing function.
 - **Interpolation:** expressions inside `{...}` in a string can't contain `"`. Write `\{` for a literal brace.
@@ -170,6 +170,32 @@ An `effect` declares operations without bodies, at the top level (`pub` makes it
 - **Hot reload:** changing a function's declared effects takes effect at its next call, from any caller, like a changed result type. Its callers are not recompiled, since the check is in the function itself. Frames already running keep their old declaration until they return.
 - **Cost:** none for functions that declare nothing: they contain no extra code. A declaring function checks and narrows the allowed set on entry with about a dozen instructions and no call, and puts it back in its epilogue with four. 5M calls of `fn f(x) ! { return x + 1 }` take 11 ms against 8 ms undeclared (wasm: 20 vs 18). The set is a bitmask in the VM block (44 effects, the rest of the word counts nested narrowings). A builtin that performs an effect is checked when it is called, inside the runtime call that already resolves it. Entering a `try` saves three more words. A handled operation is a list walk and a call through the runtime.
 - `effect`, `handle` and `with` are special only where they start a declaration or a block, so they stay usable as names. `io`, `clock`, `random` and `yield` are effect names only after `!`.
+
+## Contracts
+
+```
+class Account {
+  var balance: num = 0
+  invariant self.balance >= 0
+  fn withdraw(n: num): num
+    requires n > 0, n <= self.balance
+  { self.balance -= n return self.balance }
+}
+```
+
+```
+a.withdraw(40)   // -> Account.withdraw() requires n <= self.balance (n is 40, self.balance is 30)
+a.balance = -5   // -> Account's invariant self.balance >= 0 does not hold (self.balance is -5)
+```
+
+- **`requires`** comes after a function's types and effects. It lists conditions, separated by commas or in more `requires` clauses, that are checked when the function is entered, after its argument types. A failure names the function, the condition and the values in it, like `expect`.
+- **`invariant`** in a class body states a condition about `self`. A class's invariants, and those of its superclasses, are checked after code outside the object constructs it, calls one of its methods, or stores to one of its fields. A method's own calls and stores on `self` don't trigger a check, so a method may break an invariant while it works, as long as it holds again when the outside caller gets control back.
+- **Contracts perform nothing.** Their conditions run with no effects allowed (see [Effects](#effects)), so a contract can't print, read the clock, or change anything outside, and checking it never changes what the program does. `requires print("x") == nil` is an error.
+- **With `atomic`,** a call that breaks an invariant changes nothing: `atomic { acct.withdraw(n) }` rolls the withdrawal back before the error reaches whoever catches it.
+- **In tests,** a contract failure is an error of the code under test, not a failed `expect`: `expect throws { stack.pop() }` passes on an empty stack.
+- **Interfaces:** `requires` clauses and invariants are part of `.api` files, so tightening a `pub` function's precondition is an interface change that `fut test` reports.
+- **Hot reload:** contracts change like any other code. The first invariant anywhere in a program recompiles every function, since only then do call and store sites check them. Frames that were already running, such as `main`'s loop, keep their old code until they return, but anything they call is new code.
+- **Cost:** nothing, if the program declares no invariants. A `requires` clause compares inline and calls the runtime only to report a failure: 5M calls of a function with `requires x > 0` take 14 ms against 7 ms without (wasm: 25 vs 17). Once a program has invariants, each method call or field store on an object other than `self` also calls its class's invariant method, which an inline cache sends straight back for classes without one. 5M calls of a method on a class with an invariant take 35 ms against 26 ms (wasm: 53 vs 29).
 
 ## Errors
 

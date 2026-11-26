@@ -69,7 +69,8 @@ inline int opOf(int t) { return BIN[t].second; }
 
 // ---------------- compiler state ----------------
 enum { LV_NONE = -1, LV_VAL, LV_LOCAL, LV_GLOBAL, LV_FIELD, LV_INDEX, LV_CAP };
-struct LV { int k = LV_VAL, a = 0, b = 0; bool ro = false, num = false; };  // a not-yet-loaded place, so `x = ...` can store
+// A not-yet-loaded place, so `x = ...` can store. own: a field of self (stores to it don't check invariants).
+struct LV { int k = LV_VAL, a = 0, b = 0; bool ro = false, num = false, own = false; };
 constexpr LV NUM{LV_VAL, 0, 0, false, true};  // a value known to be a number
 struct Jumps {  // a few forward branches to patch to one place (no heap allocation)
   int v[6], n = 0;
