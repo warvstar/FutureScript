@@ -98,6 +98,7 @@ struct Gen : CState {
     int pairs = (F->maxreg + 1) / 2, fpairs = (F->maxfreg + 1) / 2;  // x19.. then d8.. pairs, just below x29
     u32 bytes = ((F->maxd * 8 + 15) & ~15) + 16 * (pairs + fpairs);
     for (int r : F->rets) patch(r);
+    if (F->retTy) typeCheck(F->retTy, F->retSite, F->retTy == TY_NUM);  // the result, outside every try: see Fun::retTy
     for (int k = 0; k < pairs; k++) E(ldp_off(19 + 2 * k, 20 + 2 * k, 29, -16 * (k + 1)));
     for (int k = 0; k < fpairs; k++) E(ldpd(8 + 2 * k, 9 + 2 * k, 29, -16 * (pairs + k + 1)));
     E(addi(SP, 29, 0)), E(ldp_post(29, 30)), E(RET);
@@ -248,6 +249,11 @@ struct Gen : CState {
     for (int m : miss) patch(m);
     if (lo) E(addi(ic, ic, lo));
     imm(1, sym), helper(set ? H_SETF : H_GETF), patch(done);
+  }
+  void typeCheck(uint64_t t, int site, bool numFast) {  // x0 must have type t (a number: no call when numFast)
+    int skip = numFast ? (E(mvn(9, 0)), E(tstq(9)), E(bcond(NE))) : -1;
+    imm(1, t), imm(2, (V)site), helper(H_TYPECHK);
+    if (skip >= 0) patch(skip);
   }
   void cloEnv() { ldl(9, F->cloHome), E(andaddr(9, 9)); }  // x9 = this closure object
   void capLoad(int i) { cloEnv(), E(ldr(0, 9, CLO_ENV + 8 * i)); }

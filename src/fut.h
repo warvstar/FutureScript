@@ -61,6 +61,8 @@ struct Class : Obj {
   std::vector<std::pair<int, Fn*>> methods;  // few per class, and looked up only on inline-cache misses
   std::vector<int> layout;                    // field syms; the index is the slot, shared by all instances
   std::vector<std::pair<int, V>> fields;      // fields declared in the class body (`var hp = 10`) and their defaults
+  struct FieldType { int sym; uint64_t type; int site; };
+  std::vector<FieldType> ftypes;              // declared fields with a type (`var hp: num = 10`): checked on every store
   Fn* find(int s) {
     for (Class* c = this; c; c = c->super)
       for (auto [m, f] : c->methods) if (m == s) return f;
@@ -69,6 +71,11 @@ struct Class : Obj {
   // A class that declares fields, or inherits declared ones, is closed: it has exactly those fields. A field
   // never assigned reads as its default. Open classes (no declarations) get fields by assignment.
   bool closed() { for (Class* c = this; c; c = c->super) if (!c->fields.empty()) return true; return false; }
+  const FieldType* typed(int s) {
+    for (Class* c = this; c; c = c->super)
+      for (auto& t : c->ftypes) if (t.sym == s) return &t;
+    return nullptr;
+  }
   const V* declared(int s) {
     for (Class* c = this; c; c = c->super)
       for (auto& [f, d] : c->fields) if (f == s) return &d;
@@ -146,7 +153,7 @@ const std::string& symName(int);
 
 // ---- the VM block pinned in x28; JIT code reaches helpers and globals with one ldr ----
 enum Helper { H_POLL, H_STACK, H_BINOP, H_GETF, H_SETF, H_GETI, H_SETI, H_PREP, H_LIST, H_ITER, H_NUMCHK, H_UNDEF,
-              H_MAP, H_CLOSURE, H_STALE, H_ECHO, H_FFI, H_YIELD, H_HOT, H_THROW, H_CAPSET, H_TXUNWIND, NH };
+              H_MAP, H_CLOSURE, H_STALE, H_ECHO, H_FFI, H_YIELD, H_HOT, H_THROW, H_CAPSET, H_TXUNWIND, H_TYPECHK, NH };
 enum Op { O_ADD, O_SUB, O_MUL, O_DIV, O_MOD, O_EQ, O_NE, O_LT, O_LE, O_GT, O_GE, O_BAND, O_BOR, O_BXOR, O_SHL, O_SHR };
 constexpr int MAXG = 1 << 16;
 // Per-site inline cache. key: the receiver's header word (methods compare only its class id); val: slot or code.
@@ -290,6 +297,15 @@ bool txnOpenIn(Fiber*);         // does f have a transaction open? (it may not y
 void txnMark(void (*mark)(V));  // GC roots: what rollbacks would put back
 extern bool txnPollLater;       // a reload or typed line waits for the transactions to end
 int globalCount();              // global slots in use
+
+// ---- types (types.cpp): optional annotations, checked at run time where they are written ----
+// A type is a kind, TY_OPT if nil is allowed too (`str?`), and for a class its symbol (bits 8..).
+enum : uint64_t { TY_ANY = 1, TY_NUM, TY_STR, TY_BOOL, TY_LIST, TY_MAP, TY_FN, TY_CLS, TY_OPT = 16 };
+constexpr uint64_t tyClass(int sym) { return TY_CLS | uint64_t(sym) << 8; }
+bool typeAccepts(uint64_t type, V v);
+int typeSite(const std::string& what, const std::string& type);  // what a check names when it fails: its number
+[[noreturn]] void typeFail(int site, V v, void* ra);
+void typesInit();
 
 // ---- public interfaces (api.cpp): each file's `pub` declarations, kept in a .api file next to it ----
 struct ApiIssue {

@@ -172,7 +172,22 @@ def hot_reload_rollback(exe):
     return ok, f"stdout: {out!r}\n  stderr: {err!r}"
 
 
+def hot_result_type(exe):
+    """Callers compiled while a function declared `: num` rely on that; changing its result type recompiles them."""
+    prog = ("fn half(n){sig} {{ return {body} }}\n"
+            "fn show() {{ return half(4) + 1 }}\n"
+            "fn main() {{ var last = 0\n"
+            "  while true {{ var v = show()\n"
+            "    if v != last {{ print(v) last = v }}\n"
+            "    if v == \"h1\" {{ return }}\n"
+            "    sleep(0.01) }} }}\n")
+    out, err = live(exe, {"r.fut": prog.format(sig=": num", body="n / 2")}, [("r.fut", prog.format(sig=": str", body="\"h\""))])
+    ok = out.split() == ["3", "h1"]
+    return ok, f"stdout: {out!r}\n  stderr: {err!r}"
+
+
 HOT_TESTS = [("methods, errors, main restart", hot_methods_and_main),
+             ("a changed result type recompiles callers", hot_result_type),
              ("a failed reload rolls back", hot_reload_rollback),
              ("imports, no-op, hook, stale arity", hot_imports_stale_hook),
              ("live REPL, var reset", hot_repl_and_reset),
@@ -245,7 +260,11 @@ def runner_api(exe):
           and e.returncode == 1 and "its public interface changed" in e.stdout and "  - fn sq(x)\n  + fn sq(x, y)\n" in e.stdout
           and rec.get("status") == "changed" and rec.get("removed") == ["fn sq(x)"] and rec.get("added") == ["fn sq(x, y)"]
           and k.returncode == 1 and "- fn sq(x)" in k.stdout)
-    return ok, f"missing: {a.stdout!r}\n  api: {w.stdout!r} -> {api!r}\n  after: {b.stdout!r}\n  private edit: {c.stdout!r}\n  changed: {e.stdout!r}\n  json: {j.stdout!r}\n  check: {k.stdout!r}"
+    (d / "lib.fut").write_text(lib.replace("pub fn sq(x)", "pub fn sq(x: num): num"))  # a type is part of the interface
+    (d / "main.fut").write_text('import "lib.fut"\ntest "sq" { expect sq(3) == 9 }\n')
+    t = run("test", main)
+    ok = ok and t.returncode == 1 and "  - fn sq(x)\n  + fn sq(x: num): num\n" in t.stdout
+    return ok, f"missing: {a.stdout!r}\n  api: {w.stdout!r} -> {api!r}\n  after: {b.stdout!r}\n  private edit: {c.stdout!r}\n  changed: {e.stdout!r}\n  json: {j.stdout!r}\n  check: {k.stdout!r}\n  typed: {t.stdout!r}"
 
 
 RUNNER_TESTS = [("fut test --json: statuses, details, output", runner_json),

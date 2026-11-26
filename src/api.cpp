@@ -55,6 +55,14 @@ std::string interfaceOf(const std::string& path, const std::string& text) {
     for (int d = 0; t.t != T_EOF; t = next()) if ((d += (t.t == '(') - (t.t == ')')) == 0) return t.p + 1;
     return t.p;
   };
+  auto typed = [&](const char* end) {  // `: type` next (a name, maybe module.name, maybe ?): through it
+    Lexer s = L;
+    if (s.next().t != ':' || s.next().t != T_ID) return end;
+    L = s, end = s.p;
+    if (Lexer d = L; d.next().t == '.' && d.next().t == T_ID) L = d, end = d.p;
+    if (Lexer q = L; q.next().t == '?') L = q, end = q.p;
+    return end;
+  };
   auto skipBody = [&](Tok& t) {  // t is '{': through the matching '}'
     for (int d = 0; t.t != T_EOF; t = next()) if ((d += (t.t == '{') - (t.t == '}')) == 0) return;
   };
@@ -73,7 +81,8 @@ std::string interfaceOf(const std::string& path, const std::string& text) {
       it = {symName(n.sym), "pub var " + symName(n.sym)};
     } else if (k.sym == K_fn) {
       Tok n = next(), p = next();
-      it = {symName(n.sym), "pub " + squash(k.p, params(p))};
+      const char* end = params(p);
+      it = {symName(n.sym), "pub " + squash(k.p, typed(end))};
     } else if (k.sym == K_extern) {
       Tok n = next();
       while (n.t != T_EOF && !isKw(n, K_fn)) n = next();
@@ -91,6 +100,7 @@ std::string interfaceOf(const std::string& path, const std::string& text) {
         std::string d = docs(src, m.p, "  ");
         if (isKw(m, K_var)) {
           Tok f = next();
+          typed(f.p);
           Lexer s = L;
           if (s.next().t == '=') {  // its default, a constant: one token, maybe negated
             L = s;
@@ -103,7 +113,7 @@ std::string interfaceOf(const std::string& path, const std::string& text) {
         if (isKw(m, S_override)) m = next();
         if (!isKw(m, K_fn)) continue;
         Tok nm = next(), p = next();
-        const char* end = params(p);
+        const char* end = typed(params(p));
         methods.push_back({symName(nm.sym), d + "  " + squash(first.p, end) + "\n"});
         Tok body = next();
         skipBody(body);

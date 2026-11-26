@@ -111,6 +111,10 @@ struct Fun {  // per-function emission state
   bool noRegs = false;
   std::vector<int> tries;  // slots of the active try records, outermost first
   int atomics = 0;         // atomic blocks open here: return, break and continue commit them
+  // Its declared result type (`fn f(): num`; 0: none), checked in the epilogue every return goes through, so after
+  // the function's own try blocks: a function never catches its own result's failed check.
+  uint64_t retTy = 0;
+  int retSite = -1;
 };
 
 // What the parser and the code generators share: the token stream, the function being emitted, errors.

@@ -133,7 +133,9 @@ struct Gen : CState {
     if (F->maxd > 4000) fail("function too large");
     u32 size = ((F->maxd - F->npar) * 8 + 15) & ~15u;
     if (!size && F->calls) size = 16;      // keeps the stack check for recursion
-    op(ENDOP), get(R0), op(ENDOP);         // the body block; the result
+    op(ENDOP);                             // the body block
+    if (F->retTy) typeCheck(F->retTy, F->retSite, F->retTy == TY_NUM);  // the result, outside every try: see Fun::retTy
+    get(R0), op(ENDOP);
     Code& k = F->k;
     std::vector<uint8_t> body = std::move(k.c);
     auto lines = std::move(k.lines);
@@ -271,6 +273,11 @@ struct Gen : CState {
     else get(T), mem(I64_LOAD, 3, 0), op(LOCAL_TEE), u(R0 + 3), i64c(ABSENT), op(I64_EQ), br(BR_IF, F->blocks, UNLIKELY), mv(0, 3);  // ABSENT: slow
     br(BR, F->blocks - 1), close();
     karg(1, sym), karg(store ? 3 : 2, ic), helper(store ? H_SETF : H_GETF), close();
+  }
+  void typeCheck(uint64_t t, int site, bool numFast) {  // r0 must have type t (a number: no call when numFast)
+    if (numFast) isNumber(0), op(I32_EQZ), open(IF, VOID, UNLIKELY);
+    karg(1, (int64_t)t), karg(2, site), helper(H_TYPECHK);
+    if (numFast) close();
   }
   void capAddr() { base(F->cloHome), mem(I64_LOAD, 3, off(F->cloHome)), op(I32_WRAP); }  // this closure object
   void capLoad(int i) { capAddr(), mem(I64_LOAD, 3, CLO_ENV + 8 * i), set(R0); }

@@ -82,6 +82,33 @@ class Mage : Unit {
 - **Fields** are created by assignment (`self.w = w`) unless the class declares them. A class that declares a field, or inherits one, is **closed**: it has exactly the declared fields. A typo such as `self.hpp = 3` is a compile error inside the class's own methods and a runtime error elsewhere, instead of silently creating a field that nothing reads. A field never assigned reads as its default. Instances that already exist get the default when hot reload adds a declared field.
 - **`override`** is required on a method that replaces a superclass's method, and is an error on one that doesn't. A subclass method can't silently replace a base method that is added later, and renaming or removing a base method can't leave subclass methods quietly orphaned. An overriding method must take as many parameters as the method it replaces. `init` is exempt.
 
+## Types
+
+Types are optional. Code without them is as dynamic as ever. Where one is written, on a parameter, a result or a declared field, it is checked at run time at that boundary.
+
+```
+pub class Account {
+  var balance: num = 0
+  var note: str? = nil               // ?: nil is allowed too
+  fn withdraw(n: num): num { self.balance -= n return self.balance }
+}
+pub fn transfer(from: Account, to: Account, n: num) { from.withdraw(n) to.deposit(n) }
+fn find(items: list, f: fn): any { }
+```
+
+```
+transfer(a, "bob", 5)  // -> argument 'to' of transfer() must be Account, got the string "bob"
+a.balance = nil        // -> field 'balance' of Account must be num, got nil
+```
+
+- **Types:** `num str bool list map fn any`, and class names, including a module's (`geom.Shape`). A class type accepts instances of its subclasses. `T?` also accepts nil. `any` documents a value that can be anything, nil included.
+- **When they are checked:** an argument when the function is entered, a result as it leaves the function, after the function's own `try` and `atomic` blocks have closed (falling off the end returns nil, which fails unless the type allows it), and a field on every store, from any code. A typed field's default must have its type. A typed field without a default starts as nil until it is set, and only stores are checked. When hot reload changes a field's type, values already stored are not checked again.
+- **Why at run time:** with hot reload and many edits landing at once, a static guarantee would mean rechecking every caller whenever any function changed. Checking at the boundary keeps each change local. A caller compiled against an older version, a line typed at the REPL, or untyped code gets a clean error that names the boundary, rather than a wrong value that travels on.
+- **What the compiler uses:** a `num` parameter is known to be a number throughout the function body (until it is assigned), so arithmetic on it skips type checks. A direct call to a function declared `: num` gives a known number too. Changing a function's result type recompiles its callers on reload. A `num` check is three instructions. Other types call the runtime. A store to a typed field always takes the inline cache's slow path, so it costs about 4 ns more than an untyped store (7 ns in wasm).
+- **Overrides** declare exactly the parameter and result types of the method they replace. Code holding a base-class instance relies on those types.
+- **Interfaces:** types are part of a `.api` file, so changing `n: num` to `n: str` on a `pub` function is an interface change that `fut test` reports.
+- `num`, `str` and the other type names are ordinary names everywhere else. Locals and top-level vars can't have types yet.
+
 ## Errors
 
 ```
@@ -297,6 +324,7 @@ Other differences from arm64: file changes and typed lines are delivered only wh
 | `gfx.cpp` | The window: AppKit through the Objective-C runtime, loaded on first use (a canvas in wasm) |
 | `main.cpp` | Driver: watcher, safepoint reload (as a transaction), `main` restart, REPL, `--asm`, `fut test`, `fut api` |
 | `txn.cpp` | Transactions (`atomic`, reloads): an object is copied before its first write, globals at the start; rollback, nesting |
+| `types.cpp` | Optional types: what each check names, the check compiled code calls, and the one field stores make |
 | `api.cpp` | Public interfaces: a file's `pub` declarations as `.api` text, the check `fut test` runs, `fut api` |
 | `test.cpp` | `expect`'s check (deep equality, failure details) and the test runner's reporting, text and JSON; shared by both platforms |
 

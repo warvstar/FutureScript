@@ -203,7 +203,9 @@ static V rt_setf(V o, uint64_t s, V v, IC* ic) {
     else gcOwn(in);  // the GC frees the slots when the instance dies
     in->slots = s, in->nslots = (uint16_t)n;
   }
-  if (ic && !vm.txn) *ic = {header(in), i};
+  const Class::FieldType* ty = in->cls->typed((int)s);
+  if (ty && !typeAccepts(ty->type, v)) typeFail(ty->site, v, RA());
+  if (ic && !vm.txn && !ty) *ic = {header(in), i};  // a typed field's stores all come here, to be checked
   return in->slots[i] = v;
 }
 #define INDEX(i, n) (isNum(i) && num(i) >= 0 && num(i) < (n) ? (size_t)num(i) : (ERR("index %s out of range (len %zu)", toStr(i).c_str(), (size_t)(n)), 0))
@@ -457,6 +459,7 @@ void rtInit() {
   identCode = callable<+[](V self) { return self; }>();
   platformInit();
   txnInit();
+  typesInit();
   native<n_print>("print"), native<n_str>("str"), native<n_len>("len"), native<n_clock>("clock"), native<n_sleep>("sleep");
   native<+[](V v) { return box(std::trunc(NUMARG(v, "int"))); }>("int");
   native<n_floor>("floor"), native<n_sqrt>("sqrt"), native<newFiber>("fiber");

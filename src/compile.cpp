@@ -23,10 +23,15 @@ struct ClassDef {
   int sym, super;
   std::vector<std::pair<int, Fn*>> methods;
   std::vector<Member> written;
-  std::vector<std::pair<int, V>> fields;  // declared: `var name [= constant]`
+  std::vector<std::pair<int, V>> fields;  // declared: `var name [: type] [= constant]`
+  std::vector<Class::FieldType> ftypes;   // those with a type
 };
 struct FieldUse { int cls, sym; At at; };  // `self.name` in a method: checked against declared fields
-struct Span { const char *start = nullptr, *end = nullptr; int line = 0, endLine = 0, arity = 0; };  // a fn/method in the source
+// A fn/method in the source. retNum: it declares `: num`, so a direct call's result is known to be a number.
+struct Span { const char *start = nullptr, *end = nullptr; int line = 0, endLine = 0, arity = 0; bool retNum = false; };
+// Each fn/method's parameter and result types (0: none), as last compiled: an override must declare the same.
+struct Sig { std::vector<uint64_t> types; std::string text; };
+static std::unordered_map<std::string, Sig> sigs;
 struct Rec { uint64_t text, env; int line, arity; u32* body; std::vector<u32*> lambdas; bool repl; };  // what is installed now
 static std::unordered_map<std::string, Rec> recs;
 static std::unordered_map<int, uint64_t> varText;  // top-level var -> hash of its declaration's source
@@ -75,6 +80,7 @@ struct Compiler : Gen {
 
   static void add(std::string& s, const std::string& n) { s += (s.empty() ? "" : ", ") + n; }
   const char* name(int s) { return symName(s).c_str(); }
+  static std::string display(const std::string& nm) { return nm.starts_with("fn@") ? "the function at line " + nm.substr(3) : nm + "()"; }
   bool isPub(int s) {  // s (as written) is declared `pub` in the current file
     auto it = pubs.find(file);
     return it != pubs.end() && std::find(it->second.begin(), it->second.end(), s) != it->second.end();
@@ -122,6 +128,35 @@ struct Compiler : Gen {
     return next(), prev.sym;
   }
   void konst(std::string_view s) { consts.push_back(box(newStr(s))), imm(0, consts.back()); }
+
+  // ---- types: num str bool list map fn any, or a class (geom.Shape for a module's); `?` after one allows nil ----
+  struct Ty { uint64_t code = 0; std::string text; };  // code 0: none written
+  Ty type() {
+    Tok t = cur;
+    Ty ty;
+    if (atKw(K_fn)) next(), ty.code = TY_FN;
+    else {
+      if (!at(T_ID) || cur.sym < NKW) fail("expected a type (num, str, bool, list, map, fn, any, or a class)");
+      next();
+      static const char* const kinds[] = {"any", "num", "str", "bool", "list", "map"};
+      for (int i = 0; i < 6; i++) if (symName(prev.sym) == kinds[i]) ty.code = TY_ANY + i;
+      if (!ty.code) {
+        Tok n = topName(prev);
+        Global* g = findGlobal(n.sym);
+        if (!g || g->kind != 'c') failAt(t.p, t.line, "unknown type '%s' (num, str, bool, list, map, fn, any, or a class)", std::string(t.p, prevEnd).c_str());
+        ty.code = tyClass(n.sym);
+      }
+    }
+    ty.text = (ty.code & 15) == TY_CLS ? symName(int(ty.code >> 8)) : std::string(t.p, prevEnd);  // a module's class: bank.Account
+    if (at('?') && !cur.nl) {
+      if (ty.code == TY_ANY) fail("'any' already includes nil");
+      next(), ty.code |= TY_OPT, ty.text += "?";
+    }
+    return ty;
+  }
+  void checkType(const Ty& ty, const std::string& what, bool known = false) {  // x0 must have type ty (known: it is a number)
+    if (ty.code && !(known && ty.code == TY_NUM)) typeCheck(ty.code, typeSite(what, ty.text), ty.code == TY_NUM);
+  }
 
   void proveOperands(int op, bool lnum, bool rnum, int lh, int rh) {
     if (op == O_ADD || op == O_EQ || op == O_NE) return;
@@ -192,6 +227,10 @@ struct Compiler : Gen {
     int base = slot();
     gmem(0, g.slot), st(0, base);
     constructCall(base, exprList(')'));
+  }
+  bool returnsNum(int sym) {  // a top-level fn declared `: num`: its returns check that, so callers may rely on it
+    auto it = spans.find(symName(sym));
+    return it != spans.end() && it->second.retNum;
   }
   int arityOf(int sym, Global& g) {
     if (auto it = spans.find(symName(sym)); it != spans.end()) return it->second.arity;
@@ -312,7 +351,7 @@ struct Compiler : Gen {
     t = topName(t);
     Global* g = findGlobal(t.sym);
     if (!g) undefined(t);
-    if (g->kind == 'f' && at('(') && !cur.nl) return next(), directCall(t, *g), t.sym == F->self ? NUM : LV{};
+    if (g->kind == 'f' && at('(') && !cur.nl) return next(), directCall(t, *g), t.sym == F->self || returnsNum(t.sym) ? NUM : LV{};
     if (g->kind == 'c' && at('(') && !cur.nl) return next(), construct(*g), LV{};
     return {LV_GLOBAL, g->slot, 0, g->kind != 'v'};
   }
@@ -437,9 +476,13 @@ struct Compiler : Gen {
         case K_return:
           next();
           if (F->top) fail("'return' outside a function");
-          F->retNum &= at('}') || at(T_EOF) || cur.nl ? (imm(0, NIL), false) : expr();
+        {
+          bool n = at('}') || at(T_EOF) || cur.nl ? (imm(0, NIL), false) : expr();
           for (int i = 0; i < F->atomics; i++) callNative("atomic@end", true);  // passes x0 through
-          return leaveTries(0), ret(), false;  // leaving every try
+          leaveTries(0);                          // leaving every try
+          F->retNum &= n || F->retTy == TY_NUM;  // the epilogue checks the result type
+          return ret(), false;
+        }
         case K_break: case K_continue:
           next();
           if (!F->loop) failAt(prev.p, prev.line, "'%s' outside a loop", name(prev.sym));
@@ -657,6 +700,7 @@ struct Compiler : Gen {
     F = &f, f.noRegs = hasTry();
     if (cls < 0 && !f.lambda && !f.test) f.stub = stub;
     std::vector<int> homes;
+    std::vector<std::pair<int, Ty>> ptys;  // each declared parameter's symbol and type
     if (cls >= 0) homes.push_back(f.selfHome = home()), f.locals.push_back({K_self, f.selfHome});
     if (f.lambda) homes.push_back(f.cloHome = home());  // the closure itself, for captured variables
     int first = (int)homes.size();  // the first declared parameter
@@ -666,8 +710,22 @@ struct Compiler : Gen {
         do {
           int s = ident(), h = home();  // not d8..: arguments arrive, and calls pass them, in x registers
           f.locals.push_back({s, h}), homes.push_back(h);
+          ptys.push_back({s, accept(':') ? type() : Ty{}});
         } while (accept(','));
         expect(')');
+      }
+      Ty r;
+      if (at(':')) {
+        Tok c = cur;
+        next(), r = type();
+        if (init) failAt(c.p, c.line, "init can't declare a result type: it returns the new instance");
+        f.retTy = r.code, f.retSite = typeSite("the result of " + display(nm), r.text);
+      }
+      if (!f.lambda && !tiering) {  // for the override check: "(num, _): str" (_: untyped)
+        Sig& g = sigs[nm];
+        g.types.clear(), g.text = "(";
+        for (auto& [s, ty] : ptys) g.types.push_back(ty.code), g.text += (g.text.size() > 1 ? ", " : "") + (ty.code ? ty.text : "_");
+        g.types.push_back(r.code), g.text += ")" + (r.code ? ": " + r.text : "");
       }
     }
     int arity = (int)homes.size();
@@ -675,6 +733,13 @@ struct Compiler : Gen {
     for (int i = 0; i < arity; i++) param(i, homes[i]);
     for (int i = first; i < arity && i < 8; i++)
       if (f.spec >> (i - first) & 1) f.guard.push_back(i), prove(homes[i]);
+    for (size_t i = 0; i < ptys.size(); i++) {  // tier 2: a number parameter its entry guard proved needs no check
+      auto& [s, ty] = ptys[i];
+      int h = homes[first + i];
+      if (!ty.code || (ty.code == TY_NUM && proven(F, h))) continue;
+      ldl(0, h), checkType(ty, "argument '" + symName(s) + "' of " + display(nm));
+      if (ty.code == TY_NUM) prove(h);
+    }
     Tier* tier = nullptr;
     if (!f.lambda && !f.test && !tiering) hotCounter(tier = &tiers[nm], first, homes);
     block();
@@ -735,7 +800,13 @@ struct Compiler : Gen {
         next();
         int s = ident();
         for (auto& [x, d] : cd.fields) if (x == s) failAt(prev.p, prev.line, "duplicate field '%s'", name(s));
-        cd.fields.push_back({s, accept('=') ? constant() : NIL});
+        Ty ty = accept(':') ? type() : Ty{};
+        bool given = accept('=');
+        Tok dt = cur;
+        V d = given ? constant() : NIL;
+        if (ty.code && given && !typeAccepts(ty.code, d)) failAt(dt.p, dt.line, "field '%s' is %s, but its default is not", name(s), ty.text.c_str());
+        if (ty.code) cd.ftypes.push_back({s, ty.code, typeSite("field '" + symName(s) + "' of " + symName(cd.sym), ty.text)});
+        cd.fields.push_back({s, d});
         continue;
       }
       bool over = atKw(S_override) && peek().t == T_ID && peek().sym == K_fn;
@@ -857,10 +928,17 @@ struct Compiler : Gen {
     Lexer L{src};
     int depth = 0, cls = -1;
     bool ext = false;  // after `extern` (a C function: no body)
-    auto params = [&] {
+    // The parameters after a declaration's name: how many (a name after `(` or `,`; one after `:` is a type), and
+    // whether its result is declared `: num` (and nothing else: `: num?` may be nil).
+    auto params = [&](bool* retNum = nullptr) {
       Lexer s = L;
-      int n = 0;
-      if (lex(s).t == '(') for (Tok a = lex(s); a.t != ')' && a.t != T_EOF; a = lex(s)) n += a.t == T_ID;
+      int n = 0, last = '(';
+      if (lex(s).t != '(') return 0;
+      for (Tok a = lex(s); a.t != ')' && a.t != T_EOF; last = a.t, a = lex(s)) n += a.t == T_ID && (last == '(' || last == ',');
+      if (Lexer r = s; retNum && lex(r).t == ':') {
+        Tok a = lex(r), b = lex(r);
+        *retNum = a.t == T_ID && symName(a.sym) == "num" && !(b.t == '?' && !b.nl);
+      }
       return n;
     };
     for (Tok t = lex(L), p; t.t != T_EOF; p = t, t = lex(L)) {
@@ -883,9 +961,10 @@ struct Compiler : Gen {
         Tok d = depth ? t : q(t);
         std::string qn = depth ? symName(cls) + "." + symName(t.sym) : symName(d.sym);
         if (spans.count(qn)) failAt(t.p, t.line, "'%s' is already defined", qn.c_str());
-        int n = spans[qn].arity = params();
+        Span& sp = spans[qn];
+        int n = sp.arity = params(&sp.retNum);
         open.push_back({qn, p.p, p.line, depth});
-        if (!depth) declare(d, 'f', n);
+        if (!depth) declare(d, 'f', n | (sp.retNum ? 128 : 0));  // callers rely on a `: num` result
       } else if (depth == 0 && afterKw && (p.sym == K_class || p.sym == K_var)) {
         Tok d = q(t);
         declare(d, p.sym == K_class ? 'c' : 'v', 0);
@@ -1013,6 +1092,10 @@ struct Compiler : Gen {
         if (!w.over) failHere(w.at, "'%s' overrides %s: write 'override fn %s' if that is intended", m, symName(owner) + "." + m, m);
         if (int mine = spans.at(q).arity; mine != arity)
           failHere(w.at, "'%s' takes %s, but %s, which it overrides, takes %s", m, params(mine), symName(owner) + "." + m, params(arity));
+        // Callers that hold a superclass's instance rely on its method's types, so an override declares the same.
+        auto a = sigs.find(symName(owner) + "." + m), b = sigs.find(q);
+        if (a != sigs.end() && b != sigs.end() && a->second.types != b->second.types)
+          failHere(w.at, "'%s' must declare the same types as %s, which it overrides: %s, not %s", m, symName(owner) + "." + m, a->second.text, b->second.text);
       }
     // Fields: in a class that declares its fields (or inherits declared ones), self.name must be one of them.
     for (auto& u : fieldUses) {
@@ -1107,7 +1190,7 @@ struct Compiler : Gen {
     for (auto& cd : classes) {
       Class* c = globalObj<Class>(cd.sym);
       c->super = cd.super >= 0 ? (Class*)global(cd.super).o : nullptr;
-      c->methods = cd.methods, c->fields = cd.fields;
+      c->methods = cd.methods, c->fields = cd.fields, c->ftypes = cd.ftypes;
       size_t n = c->layout.size();
       for (auto& [f, d] : cd.fields) if (std::find(c->layout.begin(), c->layout.end(), f) == c->layout.end()) c->layout.push_back(f);
       if (c->layout.size() != n) reshape(c);  // new instances get room for every declared field

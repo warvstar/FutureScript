@@ -1,0 +1,20 @@
+// The public interface of bank.fut, written by `fut api`. `fut test` fails while it is out of date.
+
+// Imported `as bank` by types.fut: a typed public interface.
+pub class Account {
+  var balance: num = 0
+  var note: str? = nil
+  var owner: str = ""
+  fn deposit(n: num): num
+  fn init(owner: str)
+  // Takes n out; returns what is left.
+  fn withdraw(n: num): num
+}
+
+pub fn find(accounts: list, owner: str): Account?
+
+pub class Savings : Account {
+  override fn withdraw(n: num): num
+}
+
+pub fn transfer(from: Account, to: Account, n: num)
