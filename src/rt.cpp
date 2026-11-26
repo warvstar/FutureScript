@@ -200,8 +200,14 @@ static void renderString(std::string& out, std::string_view s) {
       case '\n': out += "\\n"; break;
       case '\t': out += "\\t"; break;
       case '\0': out += "\\0"; break;
+      case '\r': out += "\\r"; break;
       case '"': case '\\': case '{': out += '\\'; [[fallthrough]];
-      default: out += c;
+      default:
+        if ((unsigned char)c < 0x20 || c == 0x7f) {  // other control characters, as the escape that writes them
+          char b[12];
+          snprintf(b, sizeof b, "\\u{%x}", (unsigned)(unsigned char)c);
+          out += b;
+        } else out += c;
     }
   }
   out += '"';
@@ -968,6 +974,28 @@ static V n_pow(V a, V b) {
   return box(std::pow(num(a), num(b)));
 #endif
 }
+static V s_byte(V s, V i) {  // s.byte(i): the byte at index i, 0 to 255 (indexes count bytes, as s[i] does)
+  std::string_view v = as<Str>(s)->sv();
+  if (!isNum(i)) ERR("@argument byte() expects an index, got %s", typeName(i));
+  double d = num(i);
+  if (d != std::trunc(d)) ERR("@index byte(): an index must be a whole number, got %g", d);
+  if (d < 0 || d >= (double)v.size()) ERR("@index index %g out of range (len %zu)", d, v.size());
+  return box((double)(unsigned char)v[(size_t)d]);
+}
+static V n_char(V n) {  // char(code): the text of one Unicode code point, as UTF-8 (char(65) == "A")
+  if (!isNum(n)) ERR("@argument char() expects a code point, got %s", typeName(n));
+  double d = num(n);
+  if (d != std::trunc(d) || d < 0 || d > 0x10FFFF || (d >= 0xD800 && d <= 0xDFFF))
+    ERR("@argument char(): %g isn't a Unicode code point (0 to 0x10FFFF, not 0xD800 to 0xDFFF)", d);
+  uint32_t c = (uint32_t)d;
+  char b[4];
+  size_t k = 0;
+  if (c < 0x80) b[k++] = (char)c;
+  else if (c < 0x800) b[k++] = (char)(0xC0 | c >> 6), b[k++] = (char)(0x80 | (c & 63));
+  else if (c < 0x10000) b[k++] = (char)(0xE0 | c >> 12), b[k++] = (char)(0x80 | (c >> 6 & 63)), b[k++] = (char)(0x80 | (c & 63));
+  else b[k++] = (char)(0xF0 | c >> 18), b[k++] = (char)(0x80 | (c >> 12 & 63)), b[k++] = (char)(0x80 | (c >> 6 & 63)), b[k++] = (char)(0x80 | (c & 63));
+  return box(newStr(std::string_view(b, k)));
+}
 static V n_parseNum(V s) {  // the number a string spells (surrounding spaces allowed), or nil
   std::string t(svArg(s, "parseNum()"));
   const char* p = t.c_str();
@@ -1111,6 +1139,7 @@ void rtInit() {
   method<s_slice>(K::Str, intern("slice")), method<s_find>(K::Str, intern("find")), method<s_split>(K::Str, intern("split"));
   method<s_trim>(K::Str, intern("trim")), method<l_join>(K::List, intern("join")), method<l_slice>(K::List, intern("slice"));
   native<n_parseNum>("parseNum");
+  native<n_char>("char"), method<s_byte>(K::Str, intern("byte"));
   native<+[](V v) { return box(newStr(typeName(v))); }>("typeOf");  // "number", "string", "list", "map", "function", "js value", ...
   // match: is@(value, variant class) tests an arm; match@fail(value, enum) is reached when no arm takes the value
   native<+[](V v, V c) { return boxb(is(v, K::Inst) && is(c, K::Class) && as<Inst>(v)->cls->name == as<Class>(c)->name); }>("is@");

@@ -21,4 +21,6 @@ test "lines, words" {
   expect lines("x\r\ny\n\nz") == ["x", "y", "", "z"]
   expect lines("") == []
   expect words("  a b\tc \n") == ["a", "b", "c"]
+  expect lines("bar\nfur\r\nok\r") == ["bar", "fur", "ok"]   // only a carriage return goes, not a final r
+  expect words("error free\r\n") == ["error", "free"]
 }

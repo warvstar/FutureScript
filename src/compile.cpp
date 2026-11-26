@@ -659,6 +659,36 @@ struct Compiler : Gen {
   }
 
   // ---- literals ----
+  // The escape after a backslash (p is at the character after it): appends what it stands for to out and returns its
+  // last character. \u{HEX} is a Unicode code point, written as UTF-8. Any other escape is an error, so a typo
+  // can't quietly become a letter.
+  const char* escape(const char* p, const char* e, std::string& out, int line) {
+    switch (*p) {
+      case 'n': return out += '\n', p;
+      case 't': return out += '\t', p;
+      case 'r': return out += '\r', p;
+      case '0': return out += '\0', p;
+      case '"': case '\\': case '{': case '}': return out += *p, p;
+      case 'u': {
+        const char* q = p + 1;
+        uint32_t cp = 0;
+        int n = 0;
+        auto hex = [](char c) { return dig(c) ? c - '0' : (c | 32) >= 'a' && (c | 32) <= 'f' ? (c | 32) - 'a' + 10 : -1; };
+        if (q < e && *q == '{')
+          for (q++; q < e && hex(*q) >= 0; q++, n++) cp = n < 7 ? cp * 16 + hex(*q) : cp;
+        if (!n || q >= e || *q != '}') failAt(p - 1, line, "@syntax \\u needs a code point in hex between braces, as \\u{e9}");
+        if (n > 6 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))
+          failAt(p - 1, line, "@syntax \\u{%.*s} isn't a Unicode code point (0 to 10FFFF, not D800 to DFFF)", n, p + 2);
+        if (cp < 0x80) out += (char)cp;
+        else if (cp < 0x800) out += (char)(0xC0 | cp >> 6), out += (char)(0x80 | (cp & 63));
+        else if (cp < 0x10000) out += (char)(0xE0 | cp >> 12), out += (char)(0x80 | (cp >> 6 & 63)), out += (char)(0x80 | (cp & 63));
+        else out += (char)(0xF0 | cp >> 18), out += (char)(0x80 | (cp >> 12 & 63)), out += (char)(0x80 | (cp >> 6 & 63)), out += (char)(0x80 | (cp & 63));
+        return q;
+      }
+    }
+    if (*p > ' ' && *p < 0x7f) failAt(p - 1, line, "@syntax unknown escape '\\%c': use \\n \\t \\r \\0 \\\" \\\\ \\{ \\} or \\u{hex}", *p);
+    failAt(p - 1, line, "@syntax unknown escape: a backslash goes before n t r 0 \" \\ { } or u{hex}");
+  }
   void strLit(const Tok& t) {  // "text {expr} text": interpolation compiles to concatenation
     const char *p = t.p, *e = t.p + t.len;
     std::string lit;
@@ -671,8 +701,7 @@ struct Compiler : Gen {
     };
     for (; p < e; p++) {
       if (*p == '\\' && p + 1 < e) {
-        char c = *++p;
-        lit += c == 'n' ? '\n' : c == 't' ? '\t' : c == '0' ? '\0' : c;
+        p = escape(p + 1, e, lit, t.line + (int)std::count(t.p, p, '\n'));
       } else if (*p == '{') {
         flush(true);  // always start from a string, so `"{x}"` is a string even when x is a number
         int s = slot(), line = t.line + (int)std::count(t.p, p, '\n');
@@ -1911,8 +1940,7 @@ struct Compiler : Gen {
     for (const char *p = cur.p, *e = p + cur.len; p < e; p++) {
       if (*p == '{') fail("@class a field's default can't interpolate: set it in init");
       if (*p != '\\' || p + 1 == e) { s += *p; continue; }
-      char c = *++p;
-      s += c == 'n' ? '\n' : c == 't' ? '\t' : c == '0' ? '\0' : c;
+      p = escape(p + 1, e, s, cur.line + (int)std::count(cur.p, p, '\n'));
     }
     next();
     return consts.push_back(box(newStr(s))), consts.back();

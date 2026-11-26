@@ -21,7 +21,7 @@ node web/run.mjs ...           the same CLI on WebAssembly
 
 ```fut
 var a = 1; var b = 2               // ; optional. A line starting ( [ - begins a new statement
-expect "{a + b}\{\n" == "3\{\n"     // "{expr}" interpolates (strings inside too: "{xs.join(", ")}"), so a literal { is \{ (JSON: "\{\"k\": 1}"); escapes \n \t \0 \" \\
+expect "{a + b}\{\n" == "3\{\n"     // "{expr}" interpolates (strings inside too: "{xs.join(", ")}"), so a literal { is \{ (JSON: "\{\"k\": 1}"); escapes \n \t \r \0 \" \\ \{ \} \u{hex} (others are errors)
 expect "{3.14159:.2}|{7:>3}|{255:x}|{a=}" == "3.14|  7|ff|a = 1"  // {expr[=][:spec]}, spec: [fill][< > ^][+][0][width][,][.precision][f e x X b o]
 expect 0 && ""                     // only nil, false are falsy
 expect (nil || 2) == 2             // && || return an operand
@@ -72,7 +72,7 @@ execAll([cmd, ...])  fetchAll([req, ...])   run at once, results in order
 l.push(v) -> l   l.pop() -> v   l.len()   l.slice(a, b)   l.join(sep) -> str
 m.has(k)   m.remove(k) -> v   m.keys()   m.values()   m.len()
 s.len()    s.has(sub)   s[i] -> 1-char str   s.find(sub) -> i | -1   s.slice(a, b)   s.split(sep)   s.trim()
-parseNum(s) -> num | nil   (indexes count bytes; slice excludes b, clamps)
+s.byte(i) -> 0..255   char(code) -> str (UTF-8)   parseNum(s) -> num | nil   (indexes count bytes; slice excludes b, clamps)
 window(w, h)   present() -> false once closed (once per frame, waits 1/60 s)
 clear(rgb)   rect(x, y, w, h, rgb)   circle(x, y, r, rgb)     rgb = 0xRRGGBB, origin top-left
 key(name) -> bool   "a".."z" "0".."9" space enter escape tab up down left right
