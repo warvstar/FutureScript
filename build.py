@@ -19,7 +19,7 @@ WASM_LINK = ["-mexec-model=reactor", "-lsetjmp", "-Wl,--export=__stack_pointer",
 # 768 MB (reserved, touched as used): growing it while threads run is slow to reach the others (wasm.cpp's sbrk)
 WASM_MT_FLAGS = ["--target=wasm32-wasip1-threads", "-pthread", *WASM_FLAGS[1:]]
 WASM_MT_LINK = [*WASM_LINK, "-Wl,--import-memory,--shared-memory,--max-memory=4294967296", "-Wl,--initial-memory=805306368"]
-NATIVE_ONLY, WASM_ONLY = {"main.cpp", "jit.cpp", "sys.cpp"}, {"wasm.cpp", "interp.cpp"}
+NATIVE_ONLY, WASM_ONLY = {"main.cpp", "jit.cpp", "lsp.cpp", "sys.cpp"}, {"wasm.cpp", "interp.cpp"}
 NATIVE_SPECS = {"gpu_test.fut", "gpu_particles.fut", "gpu_shader.fut", "ui_native.fut"}  # specs only the native build runs (std/gpu: Dawn, as a C library; ui_native: std/ui's DOM stubs)
 GPU_SPECS = {"gpu_test.fut", "gpu_particles.fut", "gpu_shader.fut"}  # these need build/libfutgpu.dylib (python3 build.py gpu)
 WASM_SPECS = {"hello_ui.fut", "ui_test.fut", "views.fut", "garden.fut", "dashboard.fut", "templates.fut", "components.fut", "keep.fut", "inspect.fut"}  # std/ui is the DOM's (a JavaScript module): the wasm build only
@@ -127,7 +127,7 @@ def test(exe, only=()):
                if not (exe.suffix != ".wasm" and t.name in WASM_SPECS) and not (exe.suffix == ".wasm" and t.name in NATIVE_SPECS)]
             + [("examples/" + t.name, lambda t=t: spec(t, "examples")) for t in sorted((ROOT / "examples").glob("*.fut"))
                if 'test "' in t.read_text() and not (exe.suffix == ".wasm" and t.name in NATIVE_SPECS)]  # examples with test blocks
-            + [(n, lambda n=n, f=f: check(n, f)) for n, f in RUNNER_TESTS]
+            + [(n, lambda n=n, f=f: check(n, f)) for n, f in RUNNER_TESTS if exe.suffix != ".wasm" or f != runner_lsp]
             + (isolateJobs(exe, 4) if exe == OUT else []))  # the plain native build: wasm runs one isolate (docs/isolates.md,
     # phase 5), and the sanitizer builds are slow enough that more load makes timed tests (expect grows) flaky
     jobs = [job for name, job in jobs if not only or any(w in name for w in only)]
@@ -910,12 +910,19 @@ def runner_fetch_idle(exe):
     return ok, f"want: {want}\n  got: {r.stdout.splitlines()}\n  stderr: {r.stderr[-800:]!r}\n  bad: {bad.returncode} {bad.stderr[-300:]!r}"
 
 
+def runner_lsp(exe):
+    r = subprocess.run([sys.executable, str(ROOT / "tests" / "lsp_test.py"), str(exe)],
+                       capture_output=True, text=True, timeout=60)
+    return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
 RUNNER_TESTS = [("std/math: within 1 ulp of libm, exact cases exact", runner_fmath),
                 ("fetch idleTimeout: a silent server fails fast, a trickling one doesn't", runner_fetch_idle),
                 ("fut --record / --replay: the same run again, sleeps skipped", runner_replay),
                 ("fut test --json: statuses, details, output", runner_json),
                 ("packages: names, interfaces, boundaries, versions", runner_packages),
                 ("fut map: packages, files, declarations", runner_map),
+                ("fut lsp: diagnostics, outline, hover and completion over stdio", runner_lsp),
                 ("foreign modules: js, wasm, c", runner_modules),
                 ("fut test: tests first, filter, compile error, todo()", runner_text),
                 ("fut api: interfaces written, checked by fut test", runner_api),

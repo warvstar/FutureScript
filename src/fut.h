@@ -488,8 +488,20 @@ struct CompileError : std::runtime_error {  // atEnd: the source ended too early
   bool atEnd;
   CompileError(const std::string& m, bool end) : std::runtime_error(m), atEnd(end) {}
 };
+struct CompileDiagnostic {
+  std::string file, message, code;
+  int line = 1, column = 1;  // one-based byte positions
+};
+CompileDiagnostic compileDiagnostic(std::string_view message);
+struct CompileCheck {  // editor buffers take precedence over disk; import sites survive a failed compile
+  struct Import { std::string from, to; int line, column; };
+  const std::vector<std::pair<std::string, std::string_view>>& buffers;
+  std::string (*normalize)(const std::string&);
+  std::vector<Import> imports;
+};
 // tests: compile `test` blocks into Compiled::tests (otherwise they are skipped)
-Compiled compile(const std::string& path, bool reload, bool echo, const std::string* text = nullptr, bool tests = false);
+Compiled compile(const std::string& path, bool reload, bool echo, const std::string* text = nullptr, bool tests = false,
+                 CompileCheck* check = nullptr);
 bool guardCompile(void (*f)(void*), void* ctx, std::string* err = nullptr);  // f(ctx); false if it failed with a compile error (*err)
 // Undo a failed reload's transaction and restore the previous code.
 void rollbackReload(const std::vector<int>& newVars);
@@ -742,6 +754,17 @@ std::vector<ApiIssue> checkInterfaces(const Compiled&);
 int reportInterfaces(const std::vector<ApiIssue>&, bool json, const std::string& program);  // fut test; the number
 int writeInterfaces(const Compiled&, const std::string& program);                           // fut api; the number
 int printMap(const Compiled&, bool pubOnly, bool json, const std::string& only, const std::string& program);  // fut map
+// The token scan shared by fut map, fut api and the language server.
+struct Decl {
+  std::string kind, name, sig, owner, mod;
+  bool pub;
+  int line, end;
+  std::string doc;
+  std::vector<std::string> clauses;
+  size_t start, stop, nameAt;  // byte offsets into the original source
+  std::string alias;           // explicit import alias
+};
+std::vector<Decl> declsOf(const std::string& text);
 
 // ---- values crossing into JavaScript (jsval.cpp): JSON text, lists and maps copied; a function fut code passes
 // is pinned (an id JavaScript calls it by); a JavaScript value that is not data comes back as a Ref (by its id) ----
@@ -771,6 +794,7 @@ const char* raisedCode(V v);          // the code of a runtime error's message v
 std::string errorLine(V v);           // its text, then " [code]" if it has one
 std::string splitCode(std::string& line);  // takes a trailing " [code]" off a message line: the code, or ""
 int explain(const char* code);        // fut explain [code]
+std::string errorExplanation(std::string_view code);
 
 // ---- arm64 encoders (checked against the system assembler) ----
 namespace a64 {
