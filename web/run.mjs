@@ -5,15 +5,18 @@ import { spawnSync } from "node:child_process";
 import { readFileSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createFut } from "./fut.js";
 
-let file = "", watch = false, verbose = false, json = false, filter = "", check = false;
-const argv = process.argv.slice(2), testing = argv[0] == "test", api = argv[0] == "api";
-const usage = "usage: node web/run.mjs [-w | -v] [file.fut]   (no file: REPL)\n       node web/run.mjs test [--json] [--filter text] file.fut\n       node web/run.mjs api [--check] file.fut\n";
-for (let i = testing || api ? 1 : 0; i < argv.length; i++) {
+let file = "", watch = false, verbose = false, json = false, filter = "", check = false, pub = false, only = "";
+const argv = process.argv.slice(2), testing = argv[0] == "test", api = argv[0] == "api", map = argv[0] == "map";
+const usage = "usage: node web/run.mjs [-w | -v] [file.fut]   (no file: REPL)\n       node web/run.mjs test [--json] [--filter text] file.fut\n       node web/run.mjs api [--check] file.fut\n       node web/run.mjs map [--pub] [--json] file.fut [package | file]\n";
+for (let i = testing || api || map ? 1 : 0; i < argv.length; i++) {
   const a = argv[i];
-  if (api && a == "--check") check = true;
+  if (map && a == "--pub") pub = true;
+  else if (map && a == "--json") json = true;
+  else if (map && file && a[0] != "-") only = a;
+  else if (api && a == "--check") check = true;
   else if (testing && a == "--json") json = true;
   else if (testing && a == "--filter" && i + 1 < argv.length) filter = argv[++i];
   else if (testing && a == "--timeout" && i + 1 < argv.length) i++;  // tests share one process here: no per-test timeout
@@ -35,6 +38,8 @@ const fut = await createFut({
   save(p, text) { try { return text == null ? rmSync(p) : writeFileSync(p, text), true; } catch { return false; } },
   write: writeAll,
   getenv: (n) => process.env[n],
+  importModule: (p, stamp) => import(pathToFileURL(p).href + "?v=" + (stamp ?? 0)),  // a new URL loads it again
+  stamp(p) { try { return statSync(p).mtimeMs; } catch { return 0; } },
   files: (f) => ((watched = f), rewatch()),
   run(args, file, source, timeout) {  // run(): this script again, in a child process
     let tmp = null;
@@ -58,9 +63,9 @@ function listen(onLine) {
   process.stdin.on("end", () => onLine(null));
 }
 
-if (testing || api) {
+if (testing || api || map) {
   if (!file) process.stderr.write(usage), process.exit(2);
-  process.exit(testing ? await fut.test(file, json, filter) : fut.api(file, check));
+  process.exit(testing ? await fut.test(file, json, filter) : api ? await fut.api(file, check) : await fut.map(file, pub, json, only));
 }
 if (!file) {  // REPL
   listen((l) => { if (l == null) ended = true; else lines.push(l); waiting?.(), (waiting = null); });

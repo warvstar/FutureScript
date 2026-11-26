@@ -153,7 +153,7 @@ static int runTests(const TestRun& o) {
   int st = run(c.chunk);
   jitRetire((u32*)c.chunk);
   // A public interface out of date fails the run too, reported last so it is what the reader sees with the status.
-  auto api = [&](int st) { return reportInterfaces(checkInterfaces(c.sources), o.json, path) ? std::max(st, 1) : st; };
+  auto api = [&](int st) { return reportInterfaces(checkInterfaces(c), o.json, path) ? std::max(st, 1) : st; };
   if (st) return errSink = nullptr, reportTopError(err), api(1);
   for (auto& t : c.tests)
     if (void* code = testStart(t)) isolated(t, code, o.timeout);
@@ -166,8 +166,16 @@ static int apiCommand(bool check) {
   try {
     c = compile(path, false, false);
   } catch (std::exception& e) { return fflush(stdout), fprintf(stderr, "%s\n", e.what()), 2; }
-  if (check) return reportInterfaces(checkInterfaces(c.sources), false, path) ? 1 : 0;
-  return writeInterfaces(c.sources, path), 0;
+  if (check) return reportInterfaces(checkInterfaces(c), false, path) ? 1 : 0;
+  return writeInterfaces(c, path) < 0 ? 1 : 0;  // a breaking change without a version bump is held back
+}
+// fut map [--pub] [--json] file.fut [package | file]: the packages, files and declarations the program uses
+static int mapCommand(bool pubOnly, bool json, const std::string& only) {
+  Compiled c;
+  try {
+    c = compile(path, false, false);
+  } catch (std::exception& e) { return fflush(stdout), fprintf(stderr, "%s\n", e.what()), 2; }
+  return printMap(c, pubOnly, json, only, path) || only.empty() ? 0 : (fprintf(stderr, "nothing matches '%s'\n", only.c_str()), 1);
 }
 
 static int repl() {
@@ -194,12 +202,19 @@ static int dumpAsm() {  // assemble the emitted words with clang and disassemble
 int main(int argc, char** argv) {
   bool watch = false, asmMode = false, testMode = argc > 1 && std::string(argv[1]) == "test";
   bool apiMode = argc > 1 && std::string(argv[1]) == "api", apiCheck = false;
+  bool mapMode = argc > 1 && std::string(argv[1]) == "map", mapPub = false, mapJson = false;
+  std::string mapOnly;
   TestRun topts;
   const char* usage = "usage: fut [-w | -v | --asm] [file.fut]   (no file: REPL)\n       fut test [--json] [--filter text] [--timeout s] file.fut\n"
-                      "       fut api [--check] file.fut\n";
-  for (int i = 1 + (testMode || apiMode); i < argc; i++) {
+                      "       fut api [--check] file.fut\n       fut map [--pub] [--json] file.fut [package | file]\n";
+  for (int i = 1 + (testMode || apiMode || mapMode); i < argc; i++) {
     std::string a = argv[i];
-    if (apiMode) {
+    if (mapMode) {
+      if (a == "--pub") mapPub = true;
+      else if (a == "--json") mapJson = true;
+      else if (a[0] == '-') return fputs(usage, stderr), 2;
+      else (path.empty() ? path : mapOnly) = a;
+    } else if (apiMode) {
       if (a == "--check") apiCheck = true;
       else if (a[0] == '-') return fputs(usage, stderr), 2;
       else path = a;
@@ -213,7 +228,8 @@ int main(int argc, char** argv) {
     else path = a;
   }
   rtInit();
-  if ((testMode || apiMode) && path.empty()) return fputs(usage, stderr), 2;
+  if ((testMode || apiMode || mapMode) && path.empty()) return fputs(usage, stderr), 2;
+  if (mapMode) return mapCommand(mapPub, mapJson, mapOnly);
   if (testMode) return runTests(topts);
   if (apiMode) return apiCommand(apiCheck);
   if (path.empty()) return repl();

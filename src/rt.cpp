@@ -67,7 +67,7 @@ static uint64_t header(Obj* o) { uint64_t h; memcpy(&h, o, 8); return h; }
 const char* typeName(V v) {
   if (isNum(v)) return "number";
   if (!isObj(v)) return v == NIL ? "nil" : "bool";
-  static const char* n[] = {"string", "list", "function", "class", "instance", "map", "function", "fiber"};
+  static const char* n[] = {"string", "list", "function", "class", "instance", "map", "function", "fiber", "js value"};
   return n[(int)obj(v)->kind];
 }
 std::string toStr(V v, bool quote) {
@@ -95,6 +95,7 @@ std::string toStr(V v, bool quote) {
     case K::Class: return "<class " + symName(((Class*)o)->name) + ">";
     case K::Inst: return "<" + symName(((Inst*)o)->cls->name) + ">";
     case K::Fiber: return "<fiber>";
+    case K::Ref: return "<js value>";
     default: return "?";
   }
 }
@@ -382,8 +383,9 @@ V rt_yield(V v) {
 }
 char ffiCheck(Ext* e, int i, V v) {
   char t = e->sig[i];
-  if (t == 's' ? !is(v, K::Str) : !isNum(v) || (t != 'd' && !(std::fabs(num(v)) < 9.2e18)))
-    ERR("%s() argument %d: expected %s, got %s", symName(e->sym).c_str(), i + 1, t == 's' ? "a string" : "a number", typeName(v));
+  if (t == 'a') return t;  // any: toJs checks what it can pass
+  if (t == 'f' ? !is(v, K::Fn) && !is(v, K::Clo) : t == 's' ? !is(v, K::Str) : !isNum(v) || (t != 'd' && !(std::fabs(num(v)) < 9.2e18)))
+    ERR("%s() argument %d: expected %s, got %s", symName(e->sym).c_str(), i + 1, t == 'f' ? "a function" : t == 's' ? "a string" : "a number", typeName(v));
   return t;
 }
 u32* ffiThunk(void* fn, const std::string& sig, char ret, int sym) {

@@ -1,7 +1,10 @@
 // Single-pass compiler: the parser emits machine code directly (no AST, no IR), through a code generator:
 // gen_a64.h (arm64) natively, gen_wasm.h in the WebAssembly build.
 #include "compile.h"
+#include <functional>
 #include <map>
+#include <set>
+#include <unordered_set>
 #if __wasm__
 #include "gen_wasm.h"
 #else
@@ -16,7 +19,7 @@ static uint64_t fnv(const char* a, const char* b) {
 // A function's source and where it is installed, so it can be compiled again once it is hot.
 struct Tier { std::string name, text, file; int line = 0, cls = -1, sym = -1; bool init = false; u32 *stub = nullptr, *body = nullptr, *fast = nullptr; Fn* fn = nullptr; bool failed = false; };
 static std::unordered_map<std::string, Tier> tiers;  // by owner; nodes are stable, so tier-1 code embeds their address
-struct Pend { u32* stub; Fn* fn; int arity; Code k; std::string owner; bool lambda; Tier tier; };  // body to install + stub to repoint
+struct Pend { u32* stub; Fn* fn; int arity; Code k; std::string owner; bool lambda; Tier tier; uint64_t env = 0; };  // body to install + stub to repoint
 struct At { const char* p; int line; std::string file; const char* src; };  // a place in the source, for errors found later
 struct Member { int sym; bool over; At at; };                                // a method as written (for the override check)
 struct ClassDef {
@@ -49,6 +52,19 @@ static std::unordered_map<std::string, std::string> nsOf;                       
 static std::unordered_map<std::string, bool> isModule;                                // imported file -> imported `as`
 static std::unordered_map<std::string, std::unordered_map<int, std::string>> aliases;  // file -> its `as` names
 static std::string base(const std::string& path) { return path.substr(path.rfind('/') + 1); }
+// Packages (pkg.cpp). The program's own package (entryDir) has no prefix, like a program without one. Every other
+// package has a prefix (its name, made unique), and the `pub` names of its plainly imported files are
+// "prefix.name": visible across the package, and to other packages through `import "name"` (the alias) when its
+// root file declares them or re-exports their file with `pub import`. Its files' prefixes are "prefix/stem".
+static std::string entryDir;
+std::vector<std::string> modulesPending;
+static std::unordered_map<std::string, std::string> pkgPreOf;  // package dir -> prefix
+static std::unordered_map<std::string, std::unordered_set<int>> surfaceOf;  // prefix -> its interface's names
+static bool prefixTaken(const std::string& p, const std::string& self) {  // a file's or a package's prefix
+  for (auto& [f, q] : nsOf) if (f != self && q == p) return true;
+  for (auto& [d, q] : pkgPreOf) if (d != self && q == p) return true;
+  return false;
+}
 // The sources of the code running now, and of the code the last compile replaced (what a failed reload goes back
 // to); while revertReload compiles, files are read from `overlay` rather than from disk.
 using Sources = std::vector<std::pair<std::string, std::string>>;
@@ -70,7 +86,24 @@ struct Compiler : Gen {
   std::unordered_map<std::string, Span> spans;
   std::vector<char> declKind;  // by symbol
   std::vector<std::pair<std::string, int>> shifts;
-  uint64_t envHash = 1469598103934665603ull;
+  // What a body compiles against, per package: the declarations of its own package, and the interfaces of the
+  // packages it imports. A body whose text and environment are as last compiled is reused, so a new declaration
+  // in one package recompiles that package and those that import it (if it is in the interface), not every file.
+  std::unordered_map<std::string, uint64_t> envOf, envFinal;                     // package prefix -> hash
+  std::unordered_map<std::string, std::vector<std::pair<int, uint64_t>>> pubDecls;  // (name as written, or -2: always)
+  std::unordered_map<std::string, std::set<std::string>> pkgImports;             // package prefix -> those it imports
+  int pubRaw = -1;  // the declaration the prescan is at is pub (this name, as written) in a plainly imported file
+  void mixEnv(uint64_t v, int raw) {
+    const std::string& P = pkgPrefix(file);
+    auto [it, fresh] = envOf.try_emplace(P, 1469598103934665603ull);
+    it->second = (it->second ^ v) * 1099511628211ull;
+    if (raw != -1) pubDecls[P].push_back({raw, v});
+  }
+  uint64_t envFor(const std::string& f) {
+    const std::string& P = pkgPrefix(f);
+    auto it = envFinal.find(P);
+    return it != envFinal.end() ? it->second : 1469598103934665603ull;
+  }
   std::vector<Pend> pend;
   std::vector<ClassDef> classes;
   std::vector<FieldUse> fieldUses;
@@ -85,6 +118,27 @@ struct Compiler : Gen {
   EffOps effOps;                                            // effects this compile declares (the prescan finds them)
   struct EffectDef { int sym; std::vector<EffOpDef> ops; };
   std::vector<EffectDef> effDefs;                           // installed by commit
+  std::unordered_map<std::string, std::vector<std::string>> reexports;  // file -> files it imports with `pub import`
+  std::unordered_map<std::string, std::string> pkgRootOf;               // package prefix -> its root file
+  std::unordered_map<std::string, std::string> pkgNamed;                // package name -> its dir (one per name)
+  std::unordered_map<std::string, const Package*> pkgCache;             // file -> its package
+  std::vector<std::string> pkgDirs;                                     // the packages this compile uses
+  std::vector<std::string> modFiles;                                    // the js and wasm modules it binds (watched)
+  const Package* pkgOf(const std::string& f) {
+    auto [it, fresh] = pkgCache.try_emplace(f, nullptr);
+    if (fresh) {
+      it->second = packageOf(f.empty() || f[0] == '<' ? mainFile : f);
+      if (it->second && std::find(pkgDirs.begin(), pkgDirs.end(), it->second->dir) == pkgDirs.end()) pkgDirs.push_back(it->second->dir);
+    }
+    return it->second;
+  }
+  const std::string& pkgPrefix(const std::string& f) {  // "" in the program's own package, or outside any
+    static const std::string none;
+    const Package* p = pkgOf(f);
+    if (!p || p->dir == entryDir) return none;
+    auto it = pkgPreOf.find(p->dir);
+    return it == pkgPreOf.end() ? none : it->second;
+  }
 
   static void add(std::string& s, const std::string& n) { s += (s.empty() ? "" : ", ") + n; }
   const char* name(int s) { return symName(s).c_str(); }
@@ -95,25 +149,55 @@ struct Compiler : Gen {
   }
   int qualify(int s) {  // the symbol of a name declared at the top level of the current file
     auto it = nsOf.find(file);
-    if (it == nsOf.end() || (!isModule[file] && isPub(s))) return s;
+    if (it == nsOf.end()) return s;
+    if (!isModule[file] && isPub(s)) {
+      const std::string& P = pkgPrefix(file);
+      return P.empty() ? s : intern(P + "." + symName(s));
+    }
     return intern(it->second + "." + symName(s));
   }
   Tok topName(Tok t) {  // the top-level name t (just read) refers to; reads `.name` after a module alias
     const std::string* m = moduleAlias(t.sym);
     if (!m) return t.sym = globalSym(t.sym), t;
-    if (!accept('.')) failAt(t.p, t.line, "'%s' is a module: use %s.name", name(t.sym), name(t.sym));
+    auto root = pkgRootOf.find(*m);
+    auto surface = surfaceOf.find(*m);
+    bool pkg = root != pkgRootOf.end() || surface != surfaceOf.end();  // tier 2 has only the surface
+    if (!accept('.')) failAt(t.p, t.line, "'%s' is a %s: use %s.name", name(t.sym), pkg ? "package" : "module", name(t.sym));
     Tok n = cur;
     n.sym = intern(*m + "." + symName(ident()));
-    if ((size_t)n.sym >= declKind.size() || !declKind[n.sym]) failAt(n.p, n.line, "module '%s' has no '%s'", name(t.sym), name(prev.sym));
+    int raw = prev.sym;
+    bool declared = declKind.empty() ? findGlobal(n.sym) != nullptr : (size_t)n.sym < declKind.size() && declKind[n.sym];  // tier 2, the REPL: as installed
+    if (pkg) {
+      if (surface != surfaceOf.end() && surface->second.count(raw) && declared) return n;
+      std::string rf = root != pkgRootOf.end() ? ::base(root->second) : "its root file";
+      if (declared)
+        failAt(n.p, n.line, "'%s' is pub inside package %s but not part of its interface: only what %s makes pub (or re-exports with pub import) is", name(raw), name(t.sym), rf.c_str());
+      failAt(n.p, n.line, "package %s has no '%s' in its interface (what %s makes pub, or re-exports with pub import)", name(t.sym), name(raw), rf.c_str());
+    }
+    if (!declared) failAt(n.p, n.line, "module '%s' has no '%s'", name(t.sym), name(prev.sym));
     if ((size_t)n.sym >= pubSym.size() || !pubSym[n.sym]) failAt(n.p, n.line, "'%s' is private to module '%s' (mark it pub there to use it here)", name(prev.sym), name(t.sym));
     return n;
   }
   [[noreturn]] void undefined(const Tok& t) {
-    if (auto it = privateIn.find(t.sym); it != privateIn.end() && it->second != file)
-      failAt(t.p, t.line, "'%s' is private to %s (mark it pub there to use it here)", name(t.sym), ::base(it->second).c_str());
-    failAt(t.p, t.line, "undefined name '%s'", name(t.sym));
+    const std::string& full = symName(t.sym);
+    int s = intern(full.substr(full.rfind('.') + 1));  // as written: globalSym may have put a package's prefix on it
+    if (auto it = privateIn.find(s); it != privateIn.end() && it->second != file && pkgOf(it->second) == pkgOf(file))
+      failAt(t.p, t.line, "'%s' is private to %s (mark it pub there to use it here)", name(s), ::base(it->second).c_str());
+    if (const std::string& P = pkgPrefix(file); !P.empty())
+      if (Global* g = findGlobal(s); g && g->kind != 'n')
+        failAt(t.p, t.line, "undefined name '%s' (package %s sees its own names, its dependencies' through their names, and builtins; not the program's)", name(s), pkgOf(file)->name.c_str());
+    failAt(t.p, t.line, "undefined name '%s'", name(s));
   }
-  int globalSym(int s) { int q = qualify(s); return q != s && findGlobal(q) ? q : s; }  // own module first, then global
+  int globalSym(int s) {  // the file's own names first, then its package's, then global (builtins only, in a package)
+    if (auto it = nsOf.find(file); it != nsOf.end())
+      if (int q = intern(it->second + "." + symName(s)); findGlobal(q)) return q;
+    const std::string& P = pkgPrefix(file);
+    if (P.empty()) return s;
+    int q = intern(P + "." + symName(s));
+    if (findGlobal(q)) return q;
+    Global* g = findGlobal(s);
+    return g && g->kind == 'n' ? s : q;
+  }
   const std::string* moduleAlias(int s) {
     auto f = aliases.find(file);
     auto it = f == aliases.end() ? decltype(f->second.end()){} : f->second.find(s);
@@ -842,7 +926,7 @@ struct Compiler : Gen {
     if (!f.lambda && !f.test && !tiering) hotCounter(tier = &tiers[nm], first, homes);
     block();
     if (f.live) f.retNum = false;  // can end without a return: returns nil
-    pend.push_back({stub, fn, arity, finish(), owner, f.lambda || f.test, {}});  // a test body is installed like a lambda
+    pend.push_back({stub, fn, arity, finish(), owner, f.lambda || f.test, {}, envFor(file)});  // a test body is installed like a lambda
     if (tier) {
       Span& sp = spans.at(nm);
       pend.back().tier = {nm, std::string(sp.start, sp.end), file, sp.line, cls, cls < 0 ? intern(nm) : -1, init, stub, nullptr, nullptr, fn, false};
@@ -854,7 +938,7 @@ struct Compiler : Gen {
     present.push_back(q);
     Span& sp = spans.at(q);
     auto it = recs.find(q);
-    if (it == recs.end() || it->second.text != fnv(sp.start, sp.end) || it->second.env != envHash) return false;
+    if (it == recs.end() || it->second.text != fnv(sp.start, sp.end) || it->second.env != envFor(file)) return false;
     if (it->second.line != sp.line) shifts.push_back({q, sp.line - it->second.line});
     lx.p = sp.end, lx.line = sp.endLine, next();
     return true;
@@ -926,23 +1010,49 @@ struct Compiler : Gen {
     classes.push_back(std::move(cd));
   }
   // extern ["library"] fn name(type, ...) [: type] -- a C function (a host function in wasm); types: num int long ptr str (and void)
+  // extern [lib] fn name(types): result. lib: a C library ("libm.dylib"; none: the program's own symbols, or on
+  // wasm the host's JavaScript), or a module of this file's package (its fut.pkg lists it: js, wasm or c).
   void externDecl() {
-    std::string lib;
+    std::string lib, shownLib;
     Tok lt = cur;
-    if (accept(T_STR)) lib.assign(prev.p, prev.len);
+    const ForeignMod* fm = nullptr;
+    if (accept(T_STR)) lib.assign(prev.p, prev.len), shownLib = "'" + lib + "'";
+    else if (at(T_ID) && !atKw(K_fn)) {
+      std::string m = symName(ident());
+      const Package* p = pkgOf(file);
+      if (!p) failAt(lt.p, lt.line, "'%s' would be a module of a package, and %s is in no package (a package's fut.pkg lists its modules: js %s ./%s.js)", m.c_str(), ::base(file).c_str(), m.c_str(), m.c_str());
+      fm = p->module(m, !WASM);
+      if (!fm) failAt(lt.p, lt.line, "package %s has no module '%s': add 'js %s ./file.js' (or wasm, or c) to %s", p->name.c_str(), m.c_str(), m.c_str(), p->manifest.c_str());
+      if (WASM && fm->kind == "c") failAt(lt.p, lt.line, "module %s is a C library (c %s %s), which only the native build loads: add a js or wasm version of it to %s", m.c_str(), m.c_str(), fm->target.c_str(), p->manifest.c_str());
+      if (!WASM && fm->kind != "c") failAt(lt.p, lt.line, "module %s is %s (%s %s %s), which only the wasm build loads: add a C version (c %s <library>) to %s", m.c_str(), fm->kind == "js" ? "JavaScript" : "WebAssembly", fm->kind.c_str(), m.c_str(), ::base(fm->target).c_str(), m.c_str(), p->manifest.c_str());
+      lib = fm->kind == "c" ? fm->target : fm->kind + ":" + fm->target, shownLib = "module " + m + " (" + fm->target + ")";
+      if (fm->kind != "c" && std::find(modFiles.begin(), modFiles.end(), fm->target) == modFiles.end()) modFiles.push_back(fm->target);
+    }
     if (!atKw(K_fn)) fail("expected 'fn'");
     next();
     Tok t = cur;
     int s = ident();
     const char* err = nullptr;
     void* fn = externLookup(lib, symName(s), &err);
-    if (err) failAt(lt.p, lt.line, "cannot load '%s'", lib.c_str());
-    if (!fn) failAt(t.p, t.line, "no C function '%s'", name(s));
+    if (err && !strcmp(err, "pending")) {  // the host loads it, then compiles again
+      if (std::find(modulesPending.begin(), modulesPending.end(), lib) == modulesPending.end()) modulesPending.push_back(lib);
+      fn = (void*)1;
+    } else if (err) failAt(lt.p, lt.line, "cannot load %s", shownLib.c_str());
+    if (!fn) failAt(t.p, t.line, fm && fm->kind != "c" ? "module %s has no function '%s'" : "no C function '%s'", fm ? fm->name.c_str() : name(s), name(s));
+    // any: a value copied as JSON (lists and maps; functions and JS objects by reference); fn: a fut function
+    // JavaScript can call. Both only into JavaScript; a wasm module's functions take numbers.
+    bool js = WASM && (!fm || fm->kind == "js");
     auto type = [&](bool ret) {
-      int ty = ident();
-      for (const char* n : {"num", "int", "long", "ptr", "str", "void"})
-        if (symName(ty) == n && (ret || n[0] != 'v')) return n[0] == 'n' ? 'd' : n[0];
-      failAt(prev.p, prev.line, "unknown C type '%s' (num, int, long, ptr, str%s)", name(ty), ret ? ", void" : "");
+      int ty = atKw(K_fn) ? (next(), K_fn) : ident();
+      std::string n = ty == K_fn ? "fn" : symName(ty);
+      bool num = n == "num" || n == "int" || n == "long" || (ret && n == "void");
+      if (fm && fm->kind == "wasm" && !num) failAt(prev.p, prev.line, "a wasm module's functions take and return numbers (num, int, long%s)", ret ? ", void" : "");
+      if ((n == "any" || (n == "fn" && !ret)) && !js) failAt(prev.p, prev.line, "'%s' values cross only into JavaScript (a js module, or the wasm build's host)", n.c_str());
+      if (n == "any") return 'a';
+      if (n == "fn" && !ret) return 'f';
+      for (const char* c : {"num", "int", "long", "ptr", "str", "void"})
+        if (n == c && (ret || c[0] != 'v')) return c[0] == 'n' ? 'd' : c[0];
+      failAt(prev.p, prev.line, "unknown extern type '%s' (num, int, long, ptr, str%s%s)", n.c_str(), js ? ", any, fn" : "", ret ? ", void" : "");
     };
     std::string sig;
     expect('(');
@@ -1042,12 +1152,58 @@ struct Compiler : Gen {
     else k = kind;
     g.kind = kind;
     if (kind == 'f' && !g.stub) g.stub = newStub();
-    envHash = (envHash ^ (uint64_t(t.sym) << 16 | uint64_t(kind) << 8 | uint64_t(arity))) * 1099511628211ull;
+    mixEnv(uint64_t(t.sym) << 16 | uint64_t(kind) << 8 | uint64_t(arity), pubRaw), pubRaw = -1;
   }
   std::string resolvePath(std::string_view rel) {
     std::string p(rel);
     if (size_t d = file.rfind('/'); p[0] != '/' && d != std::string::npos) p = file.substr(0, d + 1) + p;
     return canonicalPath(p);
+  }
+  // What `import "x"` names: a file of this package, by path; or another package, by name (one its manifest lists
+  // with `dep`), meaning that package's root file. pkg: the package's prefix (its alias), when imported by name.
+  struct Target { std::string path, pkg; };
+  Target importTarget(const Tok& t) {
+    std::string s(t.p, (size_t)t.len);
+    const Package* here = pkgOf(file);
+    if (s.empty()) failAt(t.p, t.line, "expected a file or package name");
+    if (s.find('/') == std::string::npos && !s.ends_with(".fut")) {  // a package
+      if (!here) failAt(t.p, t.line, "'%s' is a package name, and %s is in no package: put a fut.pkg next to it (name app, then dep %s <its directory>), or import a file by path (\"./%s.fut\")", s.c_str(), ::base(file).c_str(), s.c_str(), s.c_str());
+      if (s == here->name) failAt(t.p, t.line, "this file is in package %s: import its files by path (\"./file.fut\")", s.c_str());
+      const PackageDep* d = nullptr;
+      for (auto& x : here->deps) if (x.name == s) d = &x;
+      if (!d) failAt(t.p, t.line, "package %s does not list '%s': add 'dep %s <its directory>' to %s", here->name.c_str(), s.c_str(), s.c_str(), here->manifest.c_str());
+      const Package* p = packageAt(d->dir);
+      std::string at = here->manifest + ":" + std::to_string(d->line);
+      if (!p) failAt(t.p, t.line, "%s has no fut.pkg (dep %s, %s)", d->dir.c_str(), s.c_str(), at.c_str());
+      if (p->name != s) failAt(t.p, t.line, "the package in %s is named '%s', not '%s' (%s)", d->dir.c_str(), p->name.c_str(), s.c_str(), at.c_str());
+      std::vector<std::string> chain{here->name};  // packages depend on each other in one direction only
+      std::unordered_set<std::string> seen;
+      std::function<bool(const Package*)> reaches = [&](const Package* q) {
+        chain.push_back(q->name);
+        if (q == here) return true;
+        if (seen.insert(q->dir).second)
+          for (auto& e : q->deps) if (const Package* r = packageAt(e.dir); r && reaches(r)) return true;
+        return chain.pop_back(), false;
+      };
+      if (reaches(p)) {
+        std::string c;
+        for (auto& n : chain) c += (c.empty() ? "" : " -> ") + n;
+        failAt(t.p, t.line, "packages can't depend on each other in a cycle: %s (move what both need into a package of its own)", c.c_str());
+      }
+      if (std::string& o = pkgNamed[p->name]; o.empty()) o = p->dir;
+      else if (o != p->dir) failAt(t.p, t.line, "two packages are named '%s': %s and %s", s.c_str(), o.c_str(), p->dir.c_str());
+      pkgOf(p->root);
+      std::string& pre = pkgPreOf[p->dir];
+      if (pre.empty()) for (pre = p->name; prefixTaken(pre, p->dir);) pre += "_";
+      pkgRootOf[pre] = p->root, pkgImports[pkgPrefix(file)].insert(pre);
+      return {p->root, pre};
+    }
+    std::string ip = resolvePath(s);
+    if (const Package* there = pkgOf(ip); there != here) {
+      if (there) failAt(t.p, t.line, "'%s' is in package %s: import it by name (import \"%s\")%s", s.c_str(), there->name.c_str(), there->name.c_str(), here ? "" : ", from a package that lists it with dep");
+      failAt(t.p, t.line, "'%s' is outside package %s: a package's files are the ones below its fut.pkg (%s)", s.c_str(), here->name.c_str(), here->dir.c_str());
+    }
+    return {ip, ""};
   }
   // Token pre-pass: learn every top-level name, arity and fn/method source span, following imports.
   void prescan(const std::string& path, const char* src) {
@@ -1058,6 +1214,7 @@ struct Compiler : Gen {
     auto q = [&](Tok t) {  // a top-level name as declared: note whether it is public, then its symbol
       if (pubNext) pubs[path].push_back(t.sym);
       else if (nsOf.count(path)) privateIn.emplace(t.sym, path);
+      pubRaw = pubNext && !isModule[path] ? t.sym : -1;
       t.sym = qualify(t.sym);
       if (pubNext) growAt(pubSym, t.sym) = true;
       return pubNext = false, t;
@@ -1086,7 +1243,7 @@ struct Compiler : Gen {
       if (t.t == T_ID && t.sym == S_pub && !depth) {
         Lexer s = L;
         Tok n = lex(s);
-        pubNext = n.t == T_ID && !n.nl && (n.sym == K_fn || n.sym == K_class || n.sym == K_var || n.sym == K_extern || n.sym == S_effect);
+        pubNext = n.t == T_ID && !n.nl && (n.sym == K_fn || n.sym == K_class || n.sym == K_var || n.sym == K_extern || n.sym == S_effect || n.sym == K_import);
       } else if (t.t == T_ID && t.sym == K_extern && !depth) ext = true;
       else if (ext && afterKw && p.sym == K_fn) declare(q(t), 'x', params()), ext = false; else if (t.t == '{') depth++;
       else if (t.t == '}') {
@@ -1099,7 +1256,7 @@ struct Compiler : Gen {
       } else if (afterKw && p.sym == K_fn && depth == 1 && eff >= 0) {  // an effect's operation
         int n = params();
         effOps[eff].push_back({t.sym, n});
-        envHash = (envHash ^ (uint64_t(eff) << 40 | uint64_t(t.sym) << 8 | uint64_t(n))) * 1099511628211ull;
+        mixEnv(uint64_t(eff) << 40 | uint64_t(t.sym) << 8 | uint64_t(n), -2);
       } else if (depth == 0 && afterKw && p.sym == S_effect && !t.nl && [&] { Lexer s = L; return lex(s).t == '{'; }()) {
         Tok d = q(t);
         declare(d, 'e', 0);
@@ -1117,25 +1274,27 @@ struct Compiler : Gen {
         declare(d, p.sym == K_class ? 'c' : 'v', 0);
         if (p.sym == K_class) cls = d.sym;
       } else if (depth == 1 && cls >= 0 && afterKw && p.sym == K_var) {  // a declared field: methods compile against them
-        envHash = (envHash ^ (uint64_t(cls) << 32 | uint64_t(t.sym) << 2 | 1)) * 1099511628211ull;
+        mixEnv(uint64_t(cls) << 32 | uint64_t(t.sym) << 2 | 1, -2);
       } else if (depth == 0 && t.t == T_STR && p.t == T_ID && p.sym == K_import) {
-        std::string ip = resolvePath({t.p, (size_t)t.len});
+        bool re = pubNext;
+        pubNext = false;
+        Target tg = importTarget(t);
+        std::string ip = tg.path;
+        Lexer s = L;
+        Tok a = lex(s), n = a.t == T_ID && a.sym == S_as ? lex(s) : Tok{};
+        if (a.t == T_ID && a.sym == S_as && (n.t != T_ID || n.sym < NKW)) failAt(n.p, n.line, "expected a %s name after 'as'", tg.pkg.empty() ? "module" : "package");
+        if (re && !tg.pkg.empty()) failAt(t.p, t.line, "'pub import' re-exports a file of this package; a package's dependencies are not part of its interface");
+        if (re && n.t == T_ID) failAt(n.p, n.line, "'pub import' re-exports the file's pub names as they are: leave out 'as'");
+        if (re) reexports[path].push_back(ip);
+        if (!tg.pkg.empty()) aliases[path][n.t == T_ID ? n.sym : intern({t.p, (size_t)t.len})] = tg.pkg;  // the package's name
         if (sources.count(ip) && !nsOf.count(ip)) continue;  // the program's own file: already here, with global names
         std::string& pre = nsOf[ip];
-        if (pre.empty()) {  // the file's stem, made unique
+        if (pre.empty()) {  // the file's stem (after its package's prefix), made unique
           pre = ip.substr(ip.rfind('/') + 1), pre = pre.substr(0, pre.find('.'));
-          for (bool clash = true; clash;) {
-            clash = false;
-            for (auto& [f, p2] : nsOf) clash |= f != ip && p2 == pre;
-            if (clash) pre += "_";
-          }
+          if (const std::string& P = pkgPrefix(ip); !P.empty()) pre = P + "/" + pre;
+          while (prefixTaken(pre, ip)) pre += "_";
         }
-        Lexer s = L;
-        if (Tok a = lex(s); a.t == T_ID && a.sym == S_as) {  // import "file" as name: a module
-          Tok n = lex(s);
-          if (n.t != T_ID || n.sym < NKW) failAt(n.p, n.line, "expected a module name after 'as'");
-          aliases[path][n.sym] = pre, isModule[ip] = true;
-        }
+        if (tg.pkg.empty() && n.t == T_ID) aliases[path][n.sym] = pre, isModule[ip] = true;  // import "file" as name: a module
         if (sources.count(ip)) continue;
         std::string& text = sources[ip].text;
         if (!readSource(ip, text)) failAt(t.p, t.line, "cannot read '%s'", ip.c_str());
@@ -1149,7 +1308,7 @@ struct Compiler : Gen {
   bool atPub() {  // `pub` before a top-level declaration (the prescan noted it); elsewhere `pub` is an ordinary name
     if (!atKw(S_pub)) return false;
     Tok n = peek();
-    return n.t == T_ID && !n.nl && (n.sym == K_fn || n.sym == K_class || n.sym == K_var || n.sym == K_extern || n.sym == S_effect);
+    return n.t == T_ID && !n.nl && (n.sym == K_fn || n.sym == K_class || n.sym == K_var || n.sym == K_extern || n.sym == S_effect || n.sym == K_import);
   }
   void topLevel() {
     while (!at(T_EOF)) {
@@ -1161,9 +1320,9 @@ struct Compiler : Gen {
       if (atKw(S_test) && peekIs(T_STR)) { next(), testDecl(); continue; }
       if (atKw(K_import)) {
         next();
-        if (!at(T_STR)) fail("expected a file name");
+        if (!at(T_STR)) fail("expected a file or package name");
         next();
-        std::string ip = resolvePath({prev.p, (size_t)prev.len});
+        std::string ip = importTarget(prev).path;
         if (at(T_ID) && cur.sym == S_as) next(), ident();
         if (Source& s = sources.at(ip); !s.compiled) s.compiled = true, detour(ip, s.text.c_str(), s.text.c_str(), 1, [&] { topLevel(); });
         continue;
@@ -1191,10 +1350,38 @@ struct Compiler : Gen {
   Compiled run(const std::string& path, const char* src) {
     files.push_back(path), sources[path].compiled = true;
     prescan(path, src);
+    for (auto& [pre, root] : pkgRootOf) {  // each package's interface: its root file's pub names, and re-exports'
+      auto& names = surfaceOf[pre];
+      names.clear();
+      std::vector<std::string> todo{root};
+      std::unordered_set<std::string> seen;
+      while (!todo.empty()) {
+        std::string f = todo.back();
+        todo.pop_back();
+        if (!seen.insert(f).second) continue;
+        if (auto it = pubs.find(f); it != pubs.end()) names.insert(it->second.begin(), it->second.end());
+        if (auto it = reexports.find(f); it != reexports.end()) todo.insert(todo.end(), it->second.begin(), it->second.end());
+      }
+    }
+    std::unordered_map<std::string, uint64_t> surfEnv;  // each package's interface, as hashed for its importers
+    for (auto& [P, decls] : pubDecls) {
+      uint64_t h = 1469598103934665603ull;
+      auto names = surfaceOf.find(P);
+      for (auto [raw, v] : decls)
+        if (raw == -2 || (names != surfaceOf.end() && names->second.count(raw))) h = (h ^ v) * 1099511628211ull;
+      surfEnv[P] = h;
+    }
+    for (auto& [P, _] : pkgImports) envOf.try_emplace(P, 1469598103934665603ull);
+    for (auto& [P, h] : envOf) {
+      uint64_t e = h;
+      for (auto& D : pkgImports[P]) e = (e ^ surfEnv[D]) * 1099511628211ull;
+      envFinal[P] = e;
+    }
     file = path, srcStart = src, lx = Lexer{src}, next();
     Fun top;
     top.top = true, top.noRegs = topTry, top.k.name = "<top>", top.k.file = path, F = &top;
     topLevel();
+    if (!modulesPending.empty()) compileFail("waiting for the host to load modules", false);
     checkClasses();
     Code chunk = finish();
     return commit(chunk);
@@ -1289,6 +1476,25 @@ struct Compiler : Gen {
     Compiled out;
     out.files = files, out.tests = std::move(tests);
     for (auto& f : files) out.sources.push_back({f, sources.at(f).text});
+    for (auto& f : files) {  // interfaces: a file's outside packages; a package's (its root's, with re-exports) inside
+      if (f.empty() || f[0] == '<') continue;
+      const Package* p = pkgOf(f);
+      if (!p) { out.apis.push_back({f, apiPath(f), ::base(f), {f}, "", ""}); continue; }
+      if (canonicalPath(f) != p->root) continue;
+      ApiUnit u{f, apiPath(f), "package " + p->name, {}, p->name, p->version};
+      std::vector<std::string> todo{f};
+      while (!todo.empty()) {
+        std::string g = todo.front();
+        todo.erase(todo.begin());
+        if (std::find(u.parts.begin(), u.parts.end(), g) != u.parts.end()) continue;
+        u.parts.push_back(g);
+        if (auto it = reexports.find(g); it != reexports.end()) todo.insert(todo.end(), it->second.begin(), it->second.end());
+      }
+      out.apis.push_back(std::move(u));
+    }
+    out.packages = pkgDirs;
+    for (auto& d : pkgDirs) if (const Package* p = packageAt(d)) out.files.push_back(p->manifest);  // watched too
+    for (auto& m : modFiles) out.files.push_back(m);
     // A function whose parameter count changed gets a fresh stub; the old stub now traps stale callers.
     std::unordered_map<void*, void*> remap;
     for (auto [s, a] : fnDefs) {
@@ -1319,7 +1525,7 @@ struct Compiler : Gen {
         jitRetire(old->second.body), add(patched, p.owner);
         if (p.owner == "main" && reload && old->second.text != text) out.mainChanged = true;
       } else if (reload) add(added, p.owner);
-      recs[p.owner] = {text, envHash, sp.line, p.arity, body, std::move(lambdas[p.owner]), echo};
+      recs[p.owner] = {text, p.env, sp.line, p.arity, body, std::move(lambdas[p.owner]), echo};
     }
     for (auto& [q, d] : shifts) {
       Rec& r = recs[q];
@@ -1386,7 +1592,12 @@ Compiled compile(const std::string& path, bool reload, bool echo, const std::str
   delete active;
   Compiler& c = *(active = new Compiler);
   c.reload = reload, c.echo = echo, c.testing = tests;
-  if (!echo) mainFile = path;
+  packagesReset(), modulesPending.clear();
+  if (!echo) {
+    mainFile = path;
+    const Package* p = packageOf(path);
+    entryDir = p ? p->dir : "";
+  }
   std::string& src = c.sources[path].text;
   if (text) src = *text;
   else if (!readSource(path, src)) compileFail("cannot read " + path, false);

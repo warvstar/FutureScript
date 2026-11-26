@@ -44,26 +44,24 @@ std::string apiPath(const std::string& file) {
   return (dot == std::string::npos || (slash != std::string::npos && dot < slash) ? file : file.substr(0, dot)) + ".api";
 }
 
-std::string interfaceOf(const std::string& path, const std::string& text) {
-  const char* src = text.c_str();
-  struct Item { std::string name, text; };
-  std::vector<Item> items;
-  Lexer L{src};
-  auto next = [&] { Tok t = L.next(); return t.t == T_ERR ? Tok{T_EOF} : t; };
-  auto isKw = [](const Tok& t, int k) { return t.t == T_ID && t.sym == k; };
-  auto params = [&](Tok& t) {  // t is '(': through the matching ')'; returns just past it
+// Declarations read from tokens, without compiling: what interfaces and `fut map` show.
+struct Scan {
+  Lexer L;
+  Tok next() { Tok t = L.next(); return t.t == T_ERR ? Tok{T_EOF} : t; }
+  static bool isKw(const Tok& t, int k) { return t.t == T_ID && t.sym == k; }
+  const char* params(Tok& t) {  // t is '(': through the matching ')'; returns just past it
     for (int d = 0; t.t != T_EOF; t = next()) if ((d += (t.t == '(') - (t.t == ')')) == 0) return t.p + 1;
     return t.p;
-  };
-  auto typed = [&](const char* end) {  // `: type` next (a name, maybe module.name, maybe ?): through it
+  }
+  const char* typed(const char* end) {  // `: type` next (a name, maybe module.name, maybe ?): through it
     Lexer s = L;
     if (s.next().t != ':' || s.next().t != T_ID) return end;
     L = s, end = s.p;
     if (Lexer d = L; d.next().t == '.' && d.next().t == T_ID) L = d, end = d.p;
     if (Lexer q = L; q.next().t == '?') L = q, end = q.p;
     return end;
-  };
-  auto effects = [&](const char* end) {  // `! io, geom.Log` next (or a bare `!`): through it
+  }
+  const char* effects(const char* end) {  // `! io, geom.Log` next (or a bare `!`): through it
     Lexer s = L;
     if (s.next().t != '!') return end;
     L = s, end = s.p;
@@ -72,10 +70,22 @@ std::string interfaceOf(const std::string& path, const std::string& text) {
       if (t != T_ID && t != ',' && t != '.') return end;
       L = d, end = d.p;
     }
-  };
-  auto skipBody = [&](Tok& t) {  // t is '{': through the matching '}'
+  }
+  void skipBody(Tok& t) {  // t is '{': through the matching '}'
     for (int d = 0; t.t != T_EOF; t = next()) if ((d += (t.t == '{') - (t.t == '}')) == 0) return;
-  };
+  }
+};
+struct Item { std::string name, text; };
+static void itemsOf(const std::string& text, std::vector<Item>& items) {
+  const char* src = text.c_str();
+  Scan S{Lexer{src}};
+  Lexer& L = S.L;
+  auto next = [&] { return S.next(); };
+  auto isKw = Scan::isKw;
+  auto params = [&](Tok& t) { return S.params(t); };
+  auto typed = [&](const char* e) { return S.typed(e); };
+  auto effects = [&](const char* e) { return S.effects(e); };
+  auto skipBody = [&](Tok& t) { S.skipBody(t); };
   int depth = 0;
   for (Tok t = next(); t.t != T_EOF; t = next()) {
     if (t.t == '{') depth++;
@@ -151,11 +161,32 @@ std::string interfaceOf(const std::string& path, const std::string& text) {
     it.text = doc + it.text;
     items.push_back(std::move(it));
   }
+}
+static std::string render(const std::string& what, std::vector<Item>& items) {
   if (items.empty()) return "";
   std::stable_sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return before(a.name, b.name); });
-  std::string o = "// The public interface of " + base(path) + ", written by `fut api`. `fut test` fails while it is out of date.\n";
+  std::string o = "// The public interface of " + what + ", written by `fut api`. `fut test` fails while it is out of date.\n";
   for (auto& it : items) o += "\n" + it.text + "\n";
   return o;
+}
+std::string interfaceOf(const std::string& path, const std::string& text) {
+  std::vector<Item> items;
+  itemsOf(text, items);
+  return render(base(path), items);
+}
+// A package's: its root file's pub declarations and those of the files it re-exports, under its name and version.
+static std::string packageInterface(const ApiUnit& u, const Compiled& c) {
+  std::vector<Item> items;
+  for (auto& f : u.parts)
+    for (auto& [file, text] : c.sources) if (file == f) itemsOf(text, items);
+  return render("package " + u.pkg + " " + u.version + " (" + base(u.file) + ")", items);
+}
+static std::string versionIn(const std::string& api) {  // what an interface file says its package's version is
+  size_t at = api.find("of package ");
+  if (at == std::string::npos) return "";
+  at = api.find(' ', at + 11);
+  size_t end = api.find(' ', at + 1);
+  return at == std::string::npos || end == std::string::npos ? "" : api.substr(at + 1, end - at - 1);
 }
 
 // The declarations an interface text lists, one per line ("fn area(r)", "Circle: var r = 1"), sorted: what a
@@ -180,27 +211,46 @@ static std::vector<std::string> entries(const std::string& text) {
   return std::sort(e.begin(), e.end()), e;
 }
 
-std::vector<ApiIssue> checkInterfaces(const std::vector<std::pair<std::string, std::string>>& sources) {
+// A package whose interface lost (or changed) declarations must say so in its version: 0.x.y -> 0.(x+1).0, and
+// from 1.0.0 on, x.y.z -> (x+1).0.0. "" if v is enough after `was`, else the least version that is.
+static std::string bumpNeeded(const std::string& was, const std::string& v) {
+  int a[3], b[3];
+  if (!parseVersion(was, a) || !parseVersion(v, b)) return "";
+  bool ok = a[0] == 0 ? b[0] > 0 || b[1] > a[1] : b[0] > a[0];
+  return ok ? "" : a[0] == 0 ? "0." + std::to_string(a[1] + 1) + ".0" : std::to_string(a[0] + 1) + ".0.0";
+}
+std::vector<ApiIssue> checkInterfaces(const Compiled& c) {
   std::vector<ApiIssue> out;
-  for (auto& [file, text] : sources) {
-    if (file.empty() || file[0] == '<') continue;  // the REPL
-    std::string want = interfaceOf(file, text), have, api = apiPath(file);
-    bool exists = readFile(api, have);
+  for (auto& u : c.apis) {
+    std::string want, have;
+    if (u.pkg.empty()) {
+      for (auto& [file, text] : c.sources) if (file == u.file) want = interfaceOf(file, text);
+    } else want = packageInterface(u, c);
+    bool exists = readFile(u.api, have);
     if (exists ? have == want : want.empty()) continue;
-    ApiIssue is{file, api, !exists ? "missing" : want.empty() ? "stale" : "changed", {}, {}, want};
+    ApiIssue is{u.file, u.api, !exists ? "missing" : want.empty() ? "stale" : "changed", {}, {}, want};
     auto a = entries(have), b = entries(want);
     std::set_difference(a.begin(), a.end(), b.begin(), b.end(), std::back_inserter(is.removed));
     std::set_difference(b.begin(), b.end(), a.begin(), a.end(), std::back_inserter(is.added));
+    if (std::string was = versionIn(have); exists && !u.pkg.empty() && !is.removed.empty() && !was.empty())
+      if (std::string need = bumpNeeded(was, u.version); !need.empty()) is.status = "breaking", is.version = u.version, is.needs = need;
     out.push_back(std::move(is));
   }
   return out;
 }
 
-// A path as the reader knows it: relative to the program's directory when it is under it.
+// A path as the reader knows it: relative to the program's directory
+// (with ../ when it shares a directory with the program's, other than / itself), else as given.
 static std::string shown(const std::string& file, const std::string& program) {
   std::string dir = canonicalPath(program), f = file[0] == '/' ? file : canonicalPath(file);
   dir = dir.substr(0, dir.rfind('/') + 1);
-  return f.starts_with(dir) ? f.substr(dir.size()) : file;
+  if (f.starts_with(dir)) return f.substr(dir.size());
+  size_t common = 0;  // the length of the shared directory, through its '/'
+  for (size_t i = 0; i < dir.size() && i < f.size() && dir[i] == f[i]; i++) if (dir[i] == '/') common = i + 1;
+  if (common <= 1) return file;
+  std::string up;
+  for (size_t i = common; i < dir.size(); i++) if (dir[i] == '/') up += "../";
+  return up + f.substr(common);
 }
 static std::string json(const std::string& s) {
   std::string o = "\"";
@@ -217,6 +267,7 @@ int reportInterfaces(const std::vector<ApiIssue>& issues, bool asJson, const std
     std::string s;
     if (asJson) {
       s = "{\"type\":\"api\",\"file\":" + json(is.file) + ",\"interface\":" + json(is.api) + ",\"status\":\"" + is.status + "\"";
+      if (is.status == "breaking") s += ",\"version\":" + json(is.version) + ",\"needs\":" + json(is.needs);
       for (auto [key, list] : {std::pair{"removed", &is.removed}, {"added", &is.added}}) {
         s += std::string(",\"") + key + "\":[";
         for (size_t i = 0; i < list->size(); i++) s += (i ? "," : "") + json((*list)[i]);
@@ -228,6 +279,8 @@ int reportInterfaces(const std::vector<ApiIssue>& issues, bool asJson, const std
       s = "API     " + shown(is.file, program) + ": " +
           (is.status == "missing" ? "has pub declarations but no " + api + " yet; " + fix + "writes it\n"
            : is.status == "stale" ? "has no pub declarations, but " + api + " exists; " + fix + "removes it\n"
+           : is.status == "breaking" ? "its package's interface lost declarations, a breaking change, but its version is still " + is.version +
+                                           ": set 'version " + is.needs + "' (or later) in its fut.pkg, then " + fix + "updates " + api + "\n"
                                   : "its public interface changed; " + fix + "updates " + api + "\n");
       if (is.status != "missing") {
         for (auto& r : is.removed) s += "  - " + r + "\n";
@@ -239,15 +292,203 @@ int reportInterfaces(const std::vector<ApiIssue>& issues, bool asJson, const std
   }
   return (int)issues.size();
 }
-int writeInterfaces(const std::vector<std::pair<std::string, std::string>>& sources, const std::string& program) {  // fut api
-  int n = 0;
-  for (auto& is : checkInterfaces(sources)) {
+int writeInterfaces(const Compiled& c, const std::string& program) {  // fut api
+  int n = 0, held = 0;
+  for (auto& is : checkInterfaces(c)) {
+    if (is.status == "breaking") {
+      printf("not writing %s: its package's interface lost declarations, so its version must become at least %s (it is %s)\n", shown(is.api, program).c_str(), is.needs.c_str(), is.version.c_str());
+      for (auto& r : is.removed) printf("  - %s\n", r.c_str());
+      held++;
+      continue;
+    }
     bool ok = saveFile(is.api, is.status == "stale" ? nullptr : &is.want);
     printf("%s %s\n", !ok ? "could not write" : is.status == "stale" ? "removed" : "wrote", shown(is.api, program).c_str());
     for (auto& r : is.removed) printf("  - %s\n", r.c_str());
     for (auto& a : is.added) printf("  + %s\n", a.c_str());
     n += ok ? 1 : 0;
   }
-  if (!n) printf("every interface is up to date\n");
+  if (!n && !held) printf("every interface is up to date\n");
+  return held ? -held : n;
+}
+
+// ---- fut map: every package, file and top-level declaration the program uses, with line ranges ----
+// Generated from the sources each time (never committed, so never stale), in fut's own syntax, for readers who
+// want the layout of a program without reading it: agents deciding where to work, people new to it.
+struct Decl {
+  std::string kind, name, sig, owner, mod;  // owner: the class or effect a member is in; mod: an extern's module
+  bool pub;
+  int line, end;
+};
+static std::vector<Decl> declsOf(const std::string& text) {
+  std::vector<Decl> out;
+  Scan S{Lexer{text.c_str()}};
+  auto& L = S.L;
+  auto isKw = Scan::isKw;
+  int depth = 0;
+  for (Tok t = S.next(); t.t != T_EOF; t = S.next()) {
+    if (t.t == '{') depth++;
+    if (t.t == '}') depth--;
+    if (depth || t.t != T_ID) continue;
+    bool pub = false;
+    Tok k = t;
+    if (isKw(t, S_pub)) {
+      Lexer save = L;
+      Tok n = S.next();
+      if (n.t != T_ID || n.nl || !(n.sym == K_fn || n.sym == K_class || n.sym == K_var || n.sym == K_extern || n.sym == S_effect || n.sym == K_import)) { L = save; continue; }
+      pub = true, k = n;
+    }
+    const char* from = pub ? t.p : k.p;
+    if (isKw(k, K_fn)) {
+      Tok n = S.next(), p = S.next();
+      if (n.t != T_ID || p.t != '(') continue;
+      const char* e = S.effects(S.typed(S.params(p)));
+      Tok b = S.next();
+      int end = b.line;
+      if (b.t == '{') S.skipBody(b), end = b.line;
+      out.push_back({"fn", symName(n.sym), squash(from, e), "", "", pub, k.line, end});
+    } else if (isKw(k, K_var)) {
+      Tok n = S.next();
+      if (n.t != T_ID) continue;
+      out.push_back({"var", symName(n.sym), squash(from, S.typed(L.p)), "", "", pub, k.line, k.line});
+    } else if (isKw(k, K_import)) {
+      Tok f = S.next();
+      if (f.t != T_STR) continue;
+      const char* e = f.p + f.len + 1;
+      Lexer s = L;
+      if (Tok a = s.next(); isKw(a, S_as)) if (Tok n = s.next(); n.t == T_ID) L = s, e = s.p;
+      out.push_back({"import", std::string(f.p, f.len), squash(from, e), "", "", pub, k.line, k.line});
+    } else if (isKw(k, K_extern)) {
+      Tok n = S.next();
+      std::string mod = n.t == T_ID && !isKw(n, K_fn) ? symName(n.sym) : n.t == T_STR ? std::string(n.p, n.len) : "";
+      while (n.t != T_EOF && !isKw(n, K_fn)) n = S.next();
+      Tok nm = S.next(), p = S.next();
+      const char* e = S.params(p);
+      if (Lexer s = L; s.next().t == ':') s.next(), e = s.p, L = s;
+      out.push_back({"extern", symName(nm.sym), squash(from, e), "", mod, pub, k.line, k.line});
+    } else if (isKw(k, S_effect) || isKw(k, K_class)) {
+      bool eff = isKw(k, S_effect);
+      Lexer save = L;
+      Tok n = S.next(), b = S.next();
+      if (n.t != T_ID || (eff && b.t != '{')) { L = save; continue; }
+      while (b.t != '{' && b.t != T_EOF) b = S.next();
+      size_t at = out.size();
+      out.push_back({eff ? "effect" : "class", symName(n.sym), squash(from, b.p), "", "", pub, k.line, k.line});
+      for (Tok m = S.next(); m.t != '}' && m.t != T_EOF; m = S.next()) {
+        if (isKw(m, K_var) && !eff) {
+          Tok f = S.next();
+          S.typed(f.p);
+          if (Lexer s = L; s.next().t == '=') {
+            L = s;
+            if (S.next().t == '-') S.next();
+          }
+          out.push_back({"field", symName(f.sym), squash(m.p, L.p), symName(n.sym), "", pub, m.line, m.line});
+          continue;
+        }
+        Tok first = m;
+        if (isKw(m, S_override)) m = S.next();
+        if (!isKw(m, K_fn)) continue;
+        Tok nm = S.next(), p = S.next();
+        const char* e = S.effects(S.typed(S.params(p)));
+        int end = m.line;
+        if (!eff) {
+          Tok body = S.next();
+          if (body.t == '{') S.skipBody(body), end = body.line;
+        }
+        out.push_back({eff ? "op" : "method", symName(nm.sym), squash(first.p, e), symName(n.sym), "", pub, first.line, end});
+      }
+      out[at].end = L.line;
+    } else if (isKw(k, S_test) && !pub) {
+      Lexer save = L;
+      Tok n = S.next();
+      if (n.t != T_STR) { L = save; continue; }
+      Tok b = S.next();
+      int end = b.line;
+      if (b.t == '{') S.skipBody(b), end = b.line;
+      out.push_back({"test", std::string(n.p, n.len), squash(k.p, n.p + n.len + 1), "", "", false, k.line, end});
+    }
+  }
+  return out;
+}
+int printMap(const Compiled& c, bool pubOnly, bool asJson, const std::string& only, const std::string& program) {
+  struct Group { const Package* pkg; std::vector<const std::pair<std::string, std::string>*> files; };
+  std::vector<Group> groups{{nullptr, {}}};  // first: the files outside any package
+  for (auto& d : c.packages) if (const Package* p = packageAt(d)) groups.push_back({p, {}});
+  for (auto& src : c.sources) {
+    if (src.first.empty() || src.first[0] == '<') continue;
+    const Package* p = packageOf(src.first);
+    for (auto& g : groups) if (g.pkg == p) g.files.push_back(&src);
+  }
+  auto inInterface = [&](const Package* p, const std::string& f) {  // --pub: a package shows only its interface
+    if (!p) return true;
+    for (auto& u : c.apis) if (u.pkg == p->name) return std::find(u.parts.begin(), u.parts.end(), f) != u.parts.end();
+    return false;
+  };
+  int n = 0;
+  std::string o;
+  auto emit = [&] { fflush(stdout), fwrite(o.data(), 1, o.size(), stdout), o.clear(); };
+  for (auto& g : groups) {
+    const Package* p = g.pkg;
+    std::string dir = p ? p->dir + "/" : "";
+    auto rel = [&](const std::string& f) { return p && f.starts_with(dir) ? f.substr(dir.size()) : shown(f, program); };
+    std::vector<const std::pair<std::string, std::string>*> files;
+    for (auto* f : g.files)
+      if ((only.empty() || (p && only == p->name) || rel(f->first) == only || shown(f->first, program) == only || f->first == only) &&
+          (!pubOnly || inInterface(p, f->first)))
+        files.push_back(f);
+    if (files.empty() && !(p && only == p->name)) continue;
+    if (p) std::stable_partition(files.begin(), files.end(), [&](auto* f) { return canonicalPath(f->first) == p->root; });
+    std::vector<std::vector<Decl>> decls;
+    std::unordered_map<std::string, std::vector<std::string>> binds;  // module -> the extern fns bound to it
+    for (auto* f : files) {
+      decls.push_back(declsOf(f->second));
+      for (auto& d : decls.back()) if (d.kind == "extern" && !d.mod.empty()) binds[d.mod].push_back(d.name);
+    }
+    if (p) {
+      if (asJson) o += "{\"type\":\"package\",\"name\":" + json(p->name) + ",\"version\":" + json(p->version) + ",\"dir\":" + json(shown(p->dir, program)) +
+                       ",\"root\":" + json(shown(p->root, program)) + "}\n";
+      else o += "pkg " + p->name + " " + p->version + "  // " + shown(p->manifest, program) + "\n";
+      for (auto& m : p->mods) {
+        std::string t = m.kind == "c" && m.target.find('/') == std::string::npos ? m.target : rel(m.target), b;
+        if (asJson) {
+          for (auto& x : binds[m.name]) b += (b.empty() ? "" : ",") + json(x);
+          o += "{\"type\":\"module\",\"package\":" + json(p->name) + ",\"kind\":\"" + m.kind + "\",\"name\":" + json(m.name) + ",\"target\":" + json(t) + ",\"binds\":[" + b + "]}\n";
+        } else {
+          for (auto& x : binds[m.name]) b += (b.empty() ? "" : ", ") + x;
+          o += "  " + m.kind + " " + m.name + " " + t + (b.empty() ? "" : "  // " + b) + "\n";
+        }
+      }
+    }
+    std::string ind = p ? "  " : "";
+    for (size_t i = 0; i < files.size(); i++) {
+      const std::string& f = files[i]->first;
+      std::vector<const Decl*> shownDecls;
+      for (auto& d : decls[i]) if (!pubOnly || d.pub) shownDecls.push_back(&d);
+      if (asJson) {
+        o += "{\"type\":\"file\"" + (p ? ",\"package\":" + json(p->name) : "") + ",\"file\":" + json(shown(f, program)) + "}\n";
+        for (auto* d : shownDecls) {
+          o += "{\"type\":\"" + d->kind + "\"" + (p ? ",\"package\":" + json(p->name) : "") + ",\"file\":" + json(shown(f, program)) + ",\"name\":" + json(d->name);
+          if (!d->owner.empty()) o += ",\"in\":" + json(d->owner);
+          if (!d->mod.empty()) o += ",\"module\":" + json(d->mod);
+          o += std::string(",\"pub\":") + (d->pub ? "true" : "false") + ",\"sig\":" + json(d->sig) + ",\"line\":" + std::to_string(d->line) + ",\"end\":" + std::to_string(d->end) + "}\n";
+          n++;
+        }
+        emit();
+        continue;
+      }
+      o += ind + rel(f) + (p && canonicalPath(f) == p->root ? "  // root" : "") + "\n";
+      size_t w = 0;
+      for (auto* d : shownDecls) w = std::max(w, d->sig.size() + (d->owner.empty() ? 0 : 2));
+      w = std::min<size_t>(w, 56);
+      for (auto* d : shownDecls) {
+        std::string l = ind + "  " + (d->owner.empty() ? "" : "  ") + d->sig;
+        size_t col = ind.size() + 2 + w + 2;
+        l += std::string(l.size() < col ? col - l.size() : 2, ' ');
+        l += "// " + std::to_string(d->line) + (d->end != d->line ? "-" + std::to_string(d->end) : "") + "\n";
+        o += l, n++;
+      }
+      emit();
+    }
+    emit();
+  }
   return n;
 }

@@ -21,7 +21,10 @@ HOST(read) int host_read(const char* path);                    // a file's size 
 HOST(take) void host_take(char* dst);                          // copy out what the host holds
 HOST(save) int host_save(const char* path, const char* text);  // write a file (text null: remove it); 0 if it failed
 HOST(extern) int host_extern(const char* lib, const char* name);  // a host function's index, -1: none, -2: no such library
-HOST(ffi) double host_ffi(int fn, const char* sig, const double* args, int ret);  // a string result: its length (in take)
+HOST(ffi) double host_ffi(int fn, const char* sig, const double* args, int ret, int* failed);  // a string or any result:
+                                                                                              // its length (in take);
+                                                                                              // failed: the message's
+HOST(ref_gone) void host_ref_gone(u32 id);                     // no fut code holds JavaScript value id any more
 HOST(resume) void host_resume(Fiber* f, int start);            // suspending: run f until it yields, returns or fails
 HOST(yield) void host_yield(Fiber* f);                         // suspending: back to f's resumer
 HOST(fiber_gone) void host_fiber_gone(Fiber* f);
@@ -198,15 +201,25 @@ u32* staleThunk(int sym) {  // rt_stale(sym)
 }
 static V rt_ffi(V* w, Ext* e) {
   double a[8] = {};
+  std::string json[8];  // any and fn arguments, as JSON text
   for (int i = 0; i < e->n; i++) {
     V v = w[i];
-    a[i] = ffiCheck(e, i, v) == 's' ? (double)(uintptr_t)as<Str>(v)->s() : num(v);
+    char t = ffiCheck(e, i, v);
+    if (t == 'a' || t == 'f') json[i] = toJs(v), a[i] = (double)(uintptr_t)json[i].c_str();
+    else a[i] = t == 's' ? (double)(uintptr_t)as<Str>(v)->s() : num(v);
   }
-  double r = host_ffi((int)(uintptr_t)e->fn - 1, e->sig, a, e->ret);
-  if (e->ret == 's') {
+  int failed = 0;
+  double r = host_ffi((int)(uintptr_t)e->fn - 1, e->sig, a, e->ret, &failed);
+  if (failed) {  // it threw: a fut error here, which try can catch
+    std::string m((size_t)r, 0);
+    host_take(m.data());
+    ERR("%s(): %s", symName(e->sym).c_str(), m.c_str());
+  }
+  if (e->ret == 's' || e->ret == 'a') {
     if (r < 0) return NIL;
     std::string s((size_t)r, 0);
-    return host_take(s.data()), box(newStr(s));
+    host_take(s.data());
+    return e->ret == 'a' ? fromJs(s) : box(newStr(s));
   }
   return e->ret == 'v' ? NIL : box(e->ret == 'i' ? (double)(int32_t)(int64_t)r : r);
 }
@@ -228,6 +241,7 @@ void* futAdapter(void* cpp) {
 void* externLookup(const std::string& lib, const std::string& name, const char** err) {
   int i = host_extern(lib.c_str(), name.c_str());
   if (i == -2) *err = "cannot load";
+  if (i == -3) *err = "pending";  // a module the host has not loaded yet
   return i < 0 ? nullptr : (void*)(uintptr_t)(i + 1);
 }
 V vmEnter(void* code, V* args) {  // fut code runs below this C++ frame
@@ -345,15 +359,17 @@ void platformInit() {
 // ---------------- the host's entry points ----------------
 static std::string text;  // what the last string-returning export returned
 static Compiled last;
-EXPORT(fut_init) void futInit(int v) { verbose = v, rtInit(), jitCollect(); }  // installs the natives' adapters
+EXPORT(fut_init) void futInit(int v) { verbose = v, rtInit(), jitCollect(), refRelease = host_ref_gone; }  // installs the natives' adapters
 EXPORT(fut_alloc) char* futAlloc(u32 n) { return (char*)malloc(n); }
 EXPORT(fut_free) void futFree(char* p) { free(p); }
-// Compile a file (text null) or REPL input; returns the chunk's slot, 0 after an error (printed), -1 if input ended early.
+// Compile a file (text null) or REPL input; returns the chunk's slot, 0 after an error (printed), -1 if input ended early,
+// -2 if it needs modules the host has not loaded yet (fut_info(3) lists them).
 EXPORT(fut_compile) int futCompile(const char* path, int reload, int echo, const char* src, int tests) {
   jmp_buf jb, *outer = compileJmp;
   compileJmp = &jb;
   if (setjmp(jb)) {
     compileJmp = outer, batch.clear(), ops.clear();
+    if (!modulesPending.empty()) return -2;  // the host loads them (fut_info(3)) and compiles again
     if (echo && compileAtEnd) return -1;
     if (tests) return reportCompileError(compileErr), 0;
     return fflush(stdout), fprintf(stderr, "%s\n", compileErr.c_str()), 0;
@@ -363,9 +379,11 @@ EXPORT(fut_compile) int futCompile(const char* path, int reload, int echo, const
   compileJmp = outer;
   return (int)wa::slotOf(last.chunk);
 }
-EXPORT(fut_info) const char* futInfo(int what) {  // 0: the reload log, 1: the files compiled, 2: the last compile error
+// 0: the reload log, 1: the files compiled, 2: the last compile error, 3: the modules it waits for
+EXPORT(fut_info) const char* futInfo(int what) {
   text = what == 0 ? last.log : what == 2 ? compileErr : "";
   if (what == 1) for (auto& f : last.files) text += f + "\n";
+  if (what == 3) for (auto& m : modulesPending) text += m + "\n";
   return text.c_str();
 }
 EXPORT(fut_main_changed) int futMainChanged() { return last.mainChanged; }
@@ -393,9 +411,35 @@ EXPORT(fut_test_top_error) void futTestTopError(const char* err) { reportTopErro
 EXPORT(fut_tests_end) int futTestsEnd() { return testsEnd(); }
 // The last compile's interfaces: mode 0 reports them as text, 1 as JSON, 2 writes them (fut api); the number
 EXPORT(fut_api) int futApi(int mode, const char* program) {
-  return mode == 2 ? writeInterfaces(last.sources, program) : reportInterfaces(checkInterfaces(last.sources), mode == 1, program);
+  return mode == 2 ? writeInterfaces(last, program) : reportInterfaces(checkInterfaces(last), mode == 1, program);
 }
 EXPORT(fut_poll) u32* futPoll() { return &vm.poll; }
+// fut map: the declarations of the last compile; the number shown
+EXPORT(fut_map) int futMap(int pub, int json, const char* only, const char* program) { return printMap(last, pub, json, only, program); }
+// A fut function JavaScript holds (pinned as id), called with args (a JSON array): its result as JSON text. An
+// error in it propagates as a fut exception. Called directly while an extern call is in progress (a callback, as
+// Array.map makes), else at a safepoint, through a promising wrapper.
+static std::string applied;
+EXPORT(fut_apply) const char* futApply(int id, const char* args) {
+  V f = jsPinned(id);
+  if (f == NIL) ERR("a fut function called from JavaScript after it was released");
+  V a = fromJs(args);
+  std::vector<V>& v = as<List>(a)->v;
+  Fn* fn = is(f, K::Clo) ? as<Clo>(f)->fn : as<Fn>(f);
+  int want = fn->arity - is(f, K::Clo);
+  if ((int)v.size() > want) v.resize(want);  // JavaScript passes extra arguments freely (index, array, ...)
+  while ((int)v.size() < want) v.push_back(NIL);
+  if (want > 7) ERR("a function called from JavaScript takes at most 7 parameters");
+  V args8[8] = {};
+  int k = 0;
+  if (is(f, K::Clo)) args8[k++] = f;
+  for (V x : v) args8[k++] = x;
+  volatile V keep = a;  // the arguments stay alive while it runs
+  V r = vmEnter(fn->code, args8);
+  (void)keep;
+  return (applied = toJs(r)).c_str();
+}
+EXPORT(fut_unpin) void futUnpin(int id) { jsUnpin(id); }
 // Transactions, for the host: a hot reload's top level and reload() hook run inside one (see hostPoll in fut.js),
 // and an error that reaches the host rolls back those opened since the call began.
 EXPORT(fut_txn_depth) u32 futTxnDepth() { return vm.txn; }

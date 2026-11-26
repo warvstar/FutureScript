@@ -12,6 +12,7 @@ build/fut file.fut             # run
 build/fut test file.fut        # run its `test` blocks (--json: one JSON object per line; --filter text; --timeout s)
 build/fut -w file.fut          # run and hot-reload on save (file and its imports); type lines to run them inside it
 build/fut api file.fut         # write each imported file's .api (its pub declarations); `fut test` checks them
+build/fut map file.fut         # every package, file and declaration the program uses, with line ranges
 build/fut --asm file.fut       # disassemble the generated code (uses clang + otool)
 build/fut                      # REPL
 python3 build.py wasm          # -> build/fut.wasm (compiler + runtime for WebAssembly)
@@ -284,6 +285,67 @@ API     lib/geom.fut: its public interface changed; `fut api main.fut` updates g
 
 With `--json` this is `{"type":"api", "file", "interface", "status": "missing" | "changed" | "stale", "removed": [...], "added": [...]}`. So a change to what other files depend on never happens by accident: it appears as its own diff, in a small file that is easy to review. Two changes to the same interface conflict there, at merge time, rather than at run time. Edits to private code and to function bodies don't touch the `.api` file. A reader, human or agent, can learn a file's contract from its `.api` without opening the source. `fut api --check main.fut` only reports.
 
+## Packages
+
+A directory with a `fut.pkg` file is a package. Its files are the `.fut` files below it, down to the next `fut.pkg`.
+
+```
+// geom/fut.pkg
+name geom                    // how other packages import it
+version 0.3.0                // major.minor.patch (default 0.0.0)
+root geom.fut                // its root file (default: <name>.fut)
+dep units ../units           // a package it imports: the name, and where it is
+js draw ./draw.js            // foreign modules (see Foreign modules)
+```
+
+Other packages import it by name, and reach it through that name (or the one after `as`):
+
+```
+// app/fut.pkg: name app, dep geom ../geom
+import "geom"
+var v = geom.Vec(3, 4)
+import "geom" as g           // the same package, under another name
+```
+
+A package has two levels of visibility. Inside it, `pub` makes a name visible to the package's other files, which import each other by path, as above. Outside it, only the package's interface is visible: what its root file makes `pub`, and the `pub` names of files the root re-exports with `pub import "./vec.fut"`. Anything else is a compile error that says where the boundary is:
+
+```
+error: 'sq' is pub inside package geom but not part of its interface: only what geom.fut makes pub (or re-exports with pub import) is
+```
+
+The rest follows from that:
+- A package sees its own names, its dependencies' (through their names), and builtins. It never sees the program's names, so it means the same thing in every program that uses it.
+- `import "name"` needs a `dep` line. A path into another package is an error (`'../geom/util.fut' is in package geom: import it by name`), and so is a path out of the package.
+- Dependencies go one way. A cycle is a compile error that names it (`app -> geom -> app`).
+- The program's own package, and files that are in no package, work as described in [Modules and visibility](#modules-and-visibility).
+
+**One interface file per package.** `fut api` writes a single `.api` for a package, next to its root file. It holds the package's whole interface, re-exported files included, under the package's name and version (`// The public interface of package geom 0.3.0 (geom.fut)`). Files inside the package get no `.api` of their own, because their `pub` names are not visible outside it. When the interface loses or changes a declaration, the version must move: from 0.x.y to at least 0.(x+1).0, and from 1.0.0 on, to the next major version. Until it does, `fut test` fails (`its package's interface lost declarations, a breaking change, but its version is still 0.3.0: set 'version 0.4.0'`, status `breaking` in JSON) and `fut api` won't write the file. Additions need no bump.
+
+**Reloads stop at package boundaries.** A function body is reused when its text and its environment are unchanged. Its environment is its own package's declarations plus the interfaces of the packages it imports. So a new private function in `geom` recompiles only `geom`, an addition to `geom`'s interface also recompiles the packages that import it, and an edit in the program recompiles no dependency. Manifests are watched too.
+
+### fut map
+
+`fut map main.fut` prints the layout of a program: each package, the files of it the program uses, and every top-level declaration, with line ranges, in fut syntax. It is generated from the sources each time, so it is never stale and never committed. It is for readers who want to know where things are before reading any code, such as an agent picking where to work.
+
+```
+pkg app 0.0.0  // fut.pkg
+  main.fut
+    import "geom"  // 1
+    fn main()      // 3-9
+pkg geom 0.3.0  // ../geom/fut.pkg
+  js draw draw.js  // line, fill
+  geom.fut  // root
+    pub import "./vec.fut"  // 1
+    pub fn area(r)          // 3-5
+    fn hidden()             // 6
+  vec.fut
+    pub class Vec    // 1-4
+      var x = 0      // 2
+      fn len()       // 3
+```
+
+Private names are included. `--pub` shows only what other packages can use: each package's interface, and the `pub` names of files in no package. `--json` prints one object per line (`{"type":"fn", "package", "file", "name", "in", "pub", "sig", "line", "end"}`, plus `package`, `module` and `file` records). A last argument keeps one package (`fut map main.fut geom`) or one file.
+
 ## Fibers
 
 A fiber runs a function on a stack of its own. `yield` suspends it from any depth of calls, not just its top function, and hands a value to whoever resumed it.
@@ -314,6 +376,35 @@ print(hypot(3, 4))
 
 Types: `num` (double), `int` (32-bit), `long` (64-bit), `ptr` (a pointer, as a number), `str` (a `const char*`; a returned one is copied, NULL becomes nil). The return type defaults to `void` (nil). Up to 7 parameters; variadic C functions such as `printf` are not supported. A call is a thunk that branches to one generic marshaller: integer and floating-point arguments travel in separate registers (`x0`–`x7` and `d0`–`d7`), so passing all of them suits every signature. Arguments are type-checked, but what the C function does with them is not.
 
+## Foreign modules
+
+A package can include JavaScript, WebAssembly and C, listed in its `fut.pkg` and bound with `extern <module> fn`:
+
+```
+// fut.pkg
+name auth
+js jwt ./jwt.js              // a JavaScript module (wasm build)
+wasm zlib ./zlib.wasm        // a WebAssembly module (wasm build)
+c jwt libjwt.dylib           // a C library (native build): the same name, for the other target
+
+// auth.fut
+extern jwt fn sign(any, str): str
+extern zlib fn crc32(int, int): int
+pub fn token(user) { return sign({"sub": user.name, "roles": user.roles}, secret) }
+```
+
+Each build binds the version it can load: the native build uses `c`, the wasm build uses `js` or `wasm`. A module the build can't load is a compile error that says which version to add. Mistakes are compile errors too: a module the package doesn't list, a function the module doesn't export, or a type a wasm module can't take.
+
+Into JavaScript, besides the C types:
+- **`any`** copies data. Numbers, strings, bools, nil (`null`), lists (arrays) and maps with string keys (objects) are copied both ways, nested as deep as they go. A JS object that is not plain data, such as a class instance, a DOM node or a function, comes back as a handle (`<js value>`). Fut code can keep a handle, compare it, and pass it back to JavaScript, which gets the same object. When fut no longer holds it, JavaScript can collect it. A fut instance or fiber can't cross: pass a map.
+- **`fn`** passes a fut function, which JavaScript gets as a function. If JavaScript calls it during the extern call, as `Array.map` does, it runs at once and returns its result. If JavaScript calls it later, from an event or a timer, it runs at the program's next safe point, and the call returns a Promise of its result. JavaScript may call it as long as it keeps it.
+- **Promises.** If a JS function returns a Promise, the fut code that called it waits for the result, as `sleep()` does, without blocking the page. In a fiber, the fiber and its resumer wait.
+- **Exceptions.** A JS exception becomes a fut error (`sign(): invalid key`), which `try` catches.
+
+A wasm module's functions take and return numbers (`long` is a BigInt on the JavaScript side). A C module is a library loaded by `dlopen`, and works as described in [C functions](#c-functions).
+
+**Hot reload.** Under `-w`, a module's file is watched with the rest of the program. When it changes, it is loaded again, and the fut functions bound to it call the new version, with no restart. If the new version doesn't load (a syntax error), the old one stays in place and the error is printed. `fut map` lists each module and the functions bound to it.
+
 ## Graphics
 
 One window with a pixel buffer; colors are `0xRRGGBB`. AppKit is loaded only when `window()` is first called.
@@ -337,7 +428,7 @@ while present() {                    // show the frame, handle input, wait for t
 
 - **Safe points.** A watcher thread only sets a flag. Compiled loops check it at each back-edge, so a reload always happens on the main thread at a safe point.
 - **Stubs.** Every function and method is called through a one-instruction `b body` stub. A reload installs new bodies, then rewrites each stub with a single aligned 4-byte store and an icache flush.
-- **Incremental.** Every function and method is hashed by its source text and by the set of top-level declarations. Unchanged ones are skipped; a function that only moved has its line table shifted instead.
+- **Incremental.** Every function and method is hashed by its source text and by the declarations it can see: its own package's, and the interfaces of the packages it imports (see [Packages](#packages)). Unchanged ones are skipped; a function that only moved has its line table shifted instead.
 - **Compile errors** are reported with file:line:col and a caret, and nothing is patched. **Runtime errors** print a stack trace; under `-w`, fut then waits for a fix and reruns `main`.
 - **A failed reload is undone.** The new top level (initializers of new and edited vars) and `reload()` run as one transaction, as if inside `atomic`. If either throws, the data they changed is rolled back. The previous code is then compiled again from the sources it was built from, without being run. The program carries on as though the file had not been saved, after printing the error and `[fut] reload rolled back`. The next save tries again.
 - **State survives.** Globals keep their values. A `var`'s initializer runs again only if the var is new or its declaration line was edited, so changing `var gravity = 0.15` to `0.3` takes effect at once while untouched state is kept. Class method tables are rebuilt in place, so existing instances see new, changed and removed methods. After each patch, `reload()` runs if it is defined.
@@ -362,7 +453,7 @@ How it maps:
 - **Code size.** V8 inlines a wasm callee only while the caller stays within about 1.1× its size (600 bytes below that), so the emitter keeps bodies small. Tag tests use shifts with one- or two-byte immediates instead of 10-byte NaN-box constants. Helper arguments that are constants go straight onto the stack. `local.set x; local.get x` becomes `local.tee x`. Known-number range bounds skip the runtime check and the frame store.
 - **try/throw** use wasm exceptions. Uncaught errors print a stack trace mapped from V8's module offsets to fut lines.
 - **Fibers** each get their own shadow stack. The host suspends and resumes their wasm stacks with JSPI (`WebAssembly.Suspending` / `promising`).
-- **`extern fn`** calls JavaScript instead of C. With no library it looks in a small libc shim (`strlen`, `atoi`, `getenv`, ...), then `Math`, then globals. `extern "console" fn log(str): void` names an object.
+- **`extern fn`** calls JavaScript instead of C. With no library it looks in a small libc shim (`strlen`, `atoi`, `getenv`, ...), then `Math`, then globals. `extern "console" fn log(str): void` names an object. A package's `js` and `wasm` modules (see [Foreign modules](#foreign-modules)) are loaded before the compile that binds them: the compile names the ones it is missing, the host imports them (Node: dynamic `import()`; the browser: the same, from the server), and the compile runs again. The extern call import is a `WebAssembly.Suspending` function, so a Promise result suspends the calling stack.
 
 Performance, as best of 5 runs after warm-up (wasm vs arm64): float loop 18 vs 18 ms, `fib(32)` 16 vs 12 ms, 5M method calls 20 vs 15 ms, 1M allocations 6.8 vs 4.4 ms. The first call of a function runs in V8's baseline compiler, and V8 has no on-stack replacement for wasm, so a long loop in a function called only once (the first run of the float loop: 77 ms) stays at baseline speed. Functions called repeatedly, such as the ones a game loop calls each frame, are optimized after a few calls. In Node, `node --no-liftoff web/run.mjs` optimizes everything up front, at about 200 ms of extra startup.
 
@@ -383,11 +474,13 @@ Other differences from arm64: file changes and typed lines are delivered only wh
 | `web/` | `fut.js` (JS host: instantiation, installs, traces, fibers, driver), `run.mjs` (Node CLI), `serve.mjs` + `index.html` (browser) |
 | `gc.cpp` | Allocator using 64 KB pages with size classes (O(1) "is this a heap pointer?"); mark bitmap, no sweep, conservative over stack and registers |
 | `gfx.cpp` | The window: AppKit through the Objective-C runtime, loaded on first use (a canvas in wasm) |
-| `main.cpp` | Driver: watcher, safepoint reload (as a transaction), `main` restart, REPL, `--asm`, `fut test`, `fut api` |
+| `main.cpp` | Driver: watcher, safepoint reload (as a transaction), `main` restart, REPL, `--asm`, `fut test`, `fut api`, `fut map` |
 | `txn.cpp` | Transactions (`atomic`, reloads): an object is copied before its first write, globals at the start; rollback, nesting |
 | `types.cpp` | Optional types: what each check names, the check compiled code calls, and the one field stores make |
 | `effects.cpp` | Effects: declared sets and their checks (entry, perform site), operations and their ids, handler records, `handle`, `random()` |
-| `api.cpp` | Public interfaces: a file's `pub` declarations as `.api` text, the check `fut test` runs, `fut api` |
+| `api.cpp` | Public interfaces: a file's or a package's `pub` declarations as `.api` text, the version check, the check `fut test` runs, `fut api`, `fut map` |
+| `pkg.cpp` | Packages: reading `fut.pkg` manifests, finding a file's package |
+| `jsval.cpp` | Values crossing into JavaScript: JSON both ways, pinned fut functions, handles (`Ref`) for JS objects |
 | `test.cpp` | `expect`'s check (deep equality, failure details) and the test runner's reporting, text and JSON; shared by both platforms |
 
 **Codegen:**

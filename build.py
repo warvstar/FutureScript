@@ -83,6 +83,7 @@ def live(exe, files, edits, settle=0.4, timeout=6):
     d = ROOT / "build" / "hot"
     d.mkdir(parents=True, exist_ok=True)
     for name, text in files.items():
+        (d / name).parent.mkdir(parents=True, exist_ok=True)
         (d / name).write_text(text)
     p = subprocess.Popen([*runner(exe), "-w", str(d / next(iter(files)))], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     for name, text in edits:
@@ -201,7 +202,29 @@ def hot_effects(exe):
     return ok, f"stdout: {out!r}\n  stderr: {err!r}"
 
 
+def hot_packages(exe):
+    """Across packages: a private addition in a dependency recompiles only that package, an edit to its body
+    takes effect, and (wasm) an edited JS module replaces the functions bound to it; a broken edit keeps the old."""
+    wasm = exe.suffix == ".wasm"
+    prog = ('import "geom"\n' + ('extern tag fn tag(str): str\n' if wasm else 'fn tag(s) { return s }\n') +
+            'fn main() { var last = ""\n  for i in 0..80 { var v = tag("" + geom.area(1)) if v != last { print(v) last = v } sleep(0.03) } }\n')
+    files = {"hp/app/main.fut": prog, "hp/app/fut.pkg": "name app\ndep geom ../geom\n" + ("js tag ./tag.js\n" if wasm else ""),
+             "hp/app/tag.js": "export const tag = (s) => s;\n",
+             "hp/geom/fut.pkg": "name geom\n", "hp/geom/geom.fut": "pub fn area(r) { return r * 3 }\n"}
+    edits = [("hp/geom/geom.fut", "pub fn area(r) { return r * 3 }\nfn extra() { return 1 }\n"),
+             ("hp/geom/geom.fut", "pub fn area(r) { return r * 4 }\nfn extra() { return 1 }\n")]
+    if wasm:
+        edits += [("hp/app/tag.js", "export const tag = (s) => {\n"), ("hp/app/tag.js", "export const tag = (s) => s + '!';\n")]
+    out, err = live(exe, files, edits, settle=0.5, timeout=8)
+    logs = [l for l in err.splitlines() if l.startswith("[fut] added") or l.startswith("[fut] patched")]
+    want = ["3", "4"] + (["4!"] if wasm else [])
+    ok = (out.splitlines() == want and logs and "added geom/geom.extra" in logs[0] and "main" not in logs[0]
+          and (not wasm or "cannot load module" in err))
+    return ok, f"out: {out!r}\n  err: {err!r}"
+
+
 HOT_TESTS = [("methods, errors, main restart", hot_methods_and_main),
+             ("packages: per-package recompiles, JS modules", hot_packages),
              ("a changed effect declaration takes effect", hot_effects),
              ("a changed result type recompiles callers", hot_result_type),
              ("a failed reload rolls back", hot_reload_rollback),
@@ -288,7 +311,123 @@ def runner_api(exe):
     return ok, f"missing: {a.stdout!r}\n  api: {w.stdout!r} -> {api!r}\n  after: {b.stdout!r}\n  private edit: {c.stdout!r}\n  changed: {e.stdout!r}\n  json: {j.stdout!r}\n  check: {k.stdout!r}\n  typed: {t.stdout!r}"
 
 
+def tree(d, files):  # write files {relative path: text} under d, afresh
+    shutil.rmtree(d, ignore_errors=True)
+    for name, text in files.items():
+        (d / name).parent.mkdir(parents=True, exist_ok=True)
+        (d / name).write_text(text)
+
+
+PKG_TREE = {
+    "app/fut.pkg": "name app\ndep geom ../geom\n",
+    "app/main.fut": 'import "geom"\nimport "geom" as g\nvar v = geom.Vec(3, 4)\nprint(v.len())\nprint(g.area(2))\nprint(geom.unit().x)\n',
+    "geom/fut.pkg": "// shapes\nname geom\nversion 0.3.0\n",
+    "geom/geom.fut": 'pub import "./vec.fut"\nimport "./util.fut"\npub fn area(r) { return sq(r) * 3 }\nfn hidden() { return 1 }\n',
+    "geom/vec.fut": "pub class Vec {\n  fn init(x, y) { self.x = x self.y = y }\n  fn len() { return sqrt(self.x * self.x + self.y * self.y) }\n}\npub fn unit() { return Vec(1, 0) }\n",
+    "geom/util.fut": "pub fn sq(x) { return x * x }\n",
+}
+
+
+def runner_packages(exe):
+    """Packages: imports by name, the root file's surface (with re-exports), what a dependency can't see, the
+    boundary and cycle errors, and one .api per package whose breaking changes need a version bump."""
+    d = ROOT / "build" / "pkg"
+    tree(d, PKG_TREE)
+    run = lambda *a: subprocess.run([*runner(exe), *a], capture_output=True, text=True, timeout=60)
+    main, e = str(d / "app" / "main.fut"), d / "app" / "e.fut"
+    def err(src, *setup):
+        for f, t in setup:
+            (d / f).write_text(t)
+        e.write_text(src)
+        return run(str(e)).stderr
+    r = run(main)
+    errs = [err('import "geom"\nprint(geom.sq(2))\n'), err('import "geom"\nprint(geom.hidden())\n'),
+            err('import "../geom/util.fut"\n'), err('import "nope"\n'),
+            err('import "geom"\nvar secret = 1\nprint(geom.area(1))\n', ("geom/util.fut", PKG_TREE["geom/util.fut"] + "pub fn peek() { return secret }\n")),
+            err('import "geom"\n', ("geom/util.fut", PKG_TREE["geom/util.fut"]), ("geom/fut.pkg", PKG_TREE["geom/fut.pkg"] + "dep app ../app\n"),
+                ("geom/vec.fut", 'import "app"\n' + PKG_TREE["geom/vec.fut"]))]
+    tree(d, PKG_TREE)
+    loose = d / "loose.fut"
+    loose.write_text('import "geom"\n')
+    errs.append(run(str(loose)).stderr)
+    want = ["is pub inside package geom but not part of its interface", "package geom has no 'hidden' in its interface",
+            "is in package geom: import it by name", "package app does not list 'nope'", "not the program's",
+            "packages can't depend on each other in a cycle: app -> geom -> app", "is in no package"]
+    a = run("api", main)
+    api = (d / "geom" / "geom.api").read_text() if (d / "geom" / "geom.api").exists() else ""
+    t = run("test", main)
+    (d / "geom" / "vec.fut").write_text(PKG_TREE["geom/vec.fut"].replace("pub fn unit", "fn unit"))
+    (d / "app" / "main.fut").write_text(PKG_TREE["app/main.fut"].replace("print(geom.unit().x)\n", ""))
+    b, held = run("test", main), run("api", main)
+    (d / "geom" / "fut.pkg").write_text(PKG_TREE["geom/fut.pkg"].replace("0.3.0", "0.4.0"))
+    w = run("api", main)
+    ok = (r.stdout.splitlines() == ["5", "12", "1"] and all(x in y for x, y in zip(want, errs))
+          and a.returncode == 0 and "package geom 0.3.0" in api and "pub fn unit()" in api and "pub class Vec {" in api
+          and "sq" not in api and "hidden" not in api and not (d / "app" / "main.api").exists() and t.returncode == 0
+          and b.returncode == 1 and "set 'version 0.4.0'" in b.stdout and held.returncode == 1 and "not writing" in held.stdout
+          and w.returncode == 0 and "package geom 0.4.0" in (d / "geom" / "geom.api").read_text())
+    return ok, f"run: {r.stdout!r} {r.stderr!r}\n  errors: {errs!r}\n  api: {a.stdout!r} {api!r}\n  breaking: {b.stdout!r} {held.stdout!r}\n  bumped: {w.stdout!r}"
+
+
+def runner_map(exe):
+    """fut map: packages, files and declarations with line ranges; --pub (the interface), --json, a filter."""
+    d = ROOT / "build" / "map"
+    tree(d, PKG_TREE)
+    run = lambda *a: subprocess.run([*runner(exe), "map", *a], capture_output=True, text=True, timeout=60)
+    main = str(d / "app" / "main.fut")
+    t, p, j, f, none = run(main), run("--pub", main), run("--json", main), run(main, "geom"), run(main, "nothing")
+    recs = [json.loads(l) for l in j.stdout.splitlines() if l.startswith("{")]
+    area = next((r for r in recs if r.get("name") == "area"), {})
+    ln = next((r for r in recs if r.get("name") == "len"), {})
+    ok = (t.returncode == 0 and "pkg app 0.0.0  // fut.pkg" in t.stdout and "pkg geom 0.3.0  // ../geom/fut.pkg" in t.stdout
+          and "  geom.fut  // root" in t.stdout and "    fn hidden()" in t.stdout and "      fn len()" in t.stdout
+          and "pub class Vec  // 1-4" in t.stdout.replace("   ", " ").replace("  //", "  //")
+          and "hidden" not in p.stdout and "util.fut" not in p.stdout and "pub fn area(r)" in p.stdout
+          and area.get("package") == "geom" and area.get("line") == 3 and area.get("pub") is True
+          and ln.get("in") == "Vec" and ln.get("line") == 3 and ln.get("end") == 3
+          and "pkg app" not in f.stdout and "pkg geom" in f.stdout and none.returncode == 1)
+    return ok, f"text: {t.stdout!r}\n  pub: {p.stdout!r}\n  json: {j.stdout[:400]!r}\n  filtered: {f.stdout!r}"
+
+
+def runner_modules(exe):
+    """Foreign modules in a package: on wasm, a JS module (data copied, functions as callbacks, JS objects as
+    handles, Promises suspending the caller, exceptions as fut errors) and a wasm module; natively, a C library,
+    and a clear error for a JS-only module."""
+    d = ROOT / "build" / "mods"
+    wasmb = bytes.fromhex("0061736d01000000011203" "60027f7f017f60027c7c017c60017e017e" "030403000102" "071303036164640000036d756c00010364626c0002"
+                          "0a1903" "0700200020016a0b070020002001a20b0700200020007c0b")
+    js = ("export const info = (m) => ({ keys: Object.keys(m), n: m.n * 2, list: [1, [2]], ok: true, none: null });\n"
+          "export const mapWith = (xs, f) => xs.map((x) => f(x));\n"
+          "export const later = (v) => new Promise((r) => setTimeout(() => r(v), 10));\n"
+          "export const boom = () => { throw new Error('kaboom'); };\n"
+          "class Counter { n = 0; inc() { return ++this.n; } }\n"
+          "export const counter = () => new Counter();\nexport const bump = (c) => c.inc();\n")
+    tree(d, {"app/fut.pkg": "name app\njs util ./util.js\nwasm m ./m.wasm\nc libm libm.dylib\n", "app/util.js": js})
+    (d / "app" / "m.wasm").write_bytes(wasmb)
+    run = lambda f: subprocess.run([*runner(exe), str(d / "app" / f)], capture_output=True, text=True, timeout=60)
+    if exe.suffix != ".wasm":
+        (d / "app" / "c.fut").write_text("extern libm fn cbrt(num): num\nprint(cbrt(27))\n")
+        (d / "app" / "j.fut").write_text("extern util fn info(any): any\n")
+        c, j = run("c.fut"), run("j.fut")
+        ok = c.stdout == "3\n" and j.returncode != 0 and "only the wasm build loads: add a C version" in j.stderr
+        return ok, f"c: {c.stdout!r} {c.stderr!r}\n  js: {j.stderr!r}"
+    (d / "app" / "main.fut").write_text(
+        "extern util fn info(any): any\nextern util fn mapWith(any, fn): any\nextern util fn later(any): any\n"
+        "extern util fn boom(): void\nextern util fn counter(): any\nextern util fn bump(any): num\n"
+        "extern m fn add(int, int): int\nextern m fn dbl(long): long\n"
+        'print(info({"n": 21, "s": "x"}))\nprint(mapWith([1, 2], fn(x) { return x * 10 }))\nprint(later([true, nil]))\n'
+        'try { boom() } catch e { print(e) }\nvar c = counter()\nbump(c)\nprint(bump(c))\nprint(c)\n'
+        "print(add(2, 3))\nprint(dbl(4000000000))\n")
+    r = run("main.fut")
+    want = ['{"keys": ["n", "s"], "n": 42, "list": [1, [2]], "ok": true, "none": nil}', "[10, 20]", "[true, nil]",
+            "boom(): kaboom", "2", "<js value>", "5", "8000000000"]
+    return r.stdout.splitlines() == want, f"got: {r.stdout!r}\n  stderr: {r.stderr!r}"
+
+
 RUNNER_TESTS = [("fut test --json: statuses, details, output", runner_json),
+                ("packages: names, interfaces, boundaries, versions", runner_packages),
+                ("fut map: packages, files, declarations", runner_map),
+                ("foreign modules: js, wasm, c", runner_modules),
                 ("fut test: spec first, filter, compile error", runner_text),
                 ("fut api: interfaces written, checked by fut test", runner_api)]
 

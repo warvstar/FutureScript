@@ -42,6 +42,7 @@ function write(fd, bytes) {
   out.append(s), (out.scrollTop = out.scrollHeight);
 }
 let watched = new Set();
+const stamps = new Map();  // path -> how many times it changed: a package's JS modules load again when it moves
 const fut = await createFut({
   wasm: await (await fetch("/build/fut.wasm")).arrayBuffer(),
   verbose: true,
@@ -55,6 +56,8 @@ const fut = await createFut({
   },
   write,
   files: (f) => (watched = new Set(f)),
+  importModule: (p, stamp) => import(p + "?v=" + stamp),
+  stamp: (p) => stamps.get(p) ?? 0,
   window(w, h) { canvas.width = w, canvas.height = h, (canvas.style.display = "block"), canvas.focus(); return true; },
   async present(rgba, w, h) {
     ctx.putImageData(new ImageData(rgba, w, h), 0, 0);
@@ -86,7 +89,7 @@ $("form").addEventListener("submit", async (e) => {
 });
 if (file) {
   const path = "/" + file.replace(/^\/+/, "");
-  new EventSource("/events").onmessage = (e) => watched.has(e.data) && fut.changed();
+  new EventSource("/events").onmessage = (e) => watched.has(e.data) && (stamps.set(e.data, (stamps.get(e.data) ?? 0) + 1), fut.changed());
   const st = await fut.run(path, true);
   running = false, write(2, new TextEncoder().encode(`[fut] exited (${st})\n`));
 }

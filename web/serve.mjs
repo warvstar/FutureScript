@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Serve fut in the browser: node web/serve.mjs [port]  then open http://localhost:8000/?file=examples/paddle.fut
 // Files are served from the repository root (fut reads them with synchronous requests); /events streams the paths of
-// changed files (server-sent events) so the page hot-reloads them.
+// changed files (server-sent events) so the page hot-reloads them (fut files, fut.pkg manifests, js and wasm modules).
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { watch } from "node:fs";
@@ -12,7 +12,7 @@ const root = fileURLToPath(new URL("..", import.meta.url)), port = +(process.arg
 const types = { ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript", ".wasm": "application/wasm" };
 const clients = new Set();
 watch(root, { recursive: true }, (_, f) => {
-  if (f && f.endsWith(".fut")) for (const c of clients) c.write(`data: /${f}\n\n`);
+  if (f && /(\.fut|\.js|\.wasm|\/fut\.pkg|^fut\.pkg)$/.test(f)) for (const c of clients) c.write(`data: /${f}\n\n`);  // a program's files, its packages' manifests and modules
 });
 createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");

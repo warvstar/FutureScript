@@ -34,7 +34,7 @@ inline V box(double d) { return std::bit_cast<V>(d); }
 inline V boxb(bool b) { return b ? TRUE_ : FALSE_; }
 
 // ---- heap objects (no vtables: JIT code reads Inst fields at fixed offsets) ----
-enum class K : uint8_t { Str, List, Fn, Class, Inst, Map, Clo, Fiber, Free = 0xff };
+enum class K : uint8_t { Str, List, Fn, Class, Inst, Map, Clo, Fiber, Ref, Free = 0xff };
 // For an Inst, `nslots` and `cid` (its class id) are in the header and are zero for every other kind, so one
 // 64-bit compare of the header checks kind, class and slot count together (the field inline cache).
 // `zero` stays 0 for that compare (mark bits live in the GC's side bitmap, not here).
@@ -90,6 +90,7 @@ struct Inst : Obj {  // slots point at the inline area sized when constructed, o
 };
 // Entries in insertion order, plus an open-addressing index: entry + 1, 0 empty, ~0u deleted (`used` counts both).
 struct Map : Obj { static constexpr K KIND = K::Map; std::vector<std::pair<V, V>> e; std::vector<u32> idx; u32 used = 0; };
+struct Ref : Obj { static constexpr K KIND = K::Ref; u32 id; };  // a JavaScript value fut code holds (wasm)
 struct Clo : Obj { static constexpr K KIND = K::Clo; Fn* fn; u32 n; V* env() { return (V*)(this + 1); } };
 // A fiber runs a function on a stack of its own; `yield` switches back to whoever resumed it.
 struct Fiber : Obj {
@@ -138,7 +139,7 @@ void gcOwn(Obj*);  // o holds malloc'd memory: finalize it when the GC finds it 
 template <class T> T* make(size_t extra = 0) {
   T* o = new (gcAlloc(sizeof(T) + extra)) T();
   o->kind = T::KIND;
-  if constexpr (T::KIND == K::List || T::KIND == K::Map || T::KIND == K::Class || T::KIND == K::Fiber) gcOwn(o);
+  if constexpr (T::KIND == K::List || T::KIND == K::Map || T::KIND == K::Class || T::KIND == K::Fiber || T::KIND == K::Ref) gcOwn(o);
   return o;
 }
 Str* newStr(std::string_view, std::string_view = {});
@@ -224,6 +225,9 @@ V vmEnter(void* code, V* args);  // args: 8 values
 extern std::string* asmListing;
 
 struct TestCase { std::string name, file, pending; int line = 0; void* code = nullptr; };  // a `test "name" { }` block
+// An interface file: the `pub` declarations of a file outside any package, or a package's surface (its root file's,
+// and those it re-exports), with the package's name and version.
+struct ApiUnit { std::string file, api, label; std::vector<std::string> parts; std::string pkg, version; };
 struct Compiled {
   void* chunk = nullptr;
   bool mainChanged = false;
@@ -232,6 +236,8 @@ struct Compiled {
   std::vector<std::pair<std::string, std::string>> sources;  // each file compiled and its text
   std::vector<TestCase> tests;
   std::vector<int> newVars;  // top-level vars it initialized for the first time
+  std::vector<ApiUnit> apis;  // the interface files its sources have
+  std::vector<std::string> packages;  // directories of the packages it uses (fut map)
 };
 struct CompileError : std::runtime_error {  // atEnd: the source ended too early (the REPL reads more)
   bool atEnd;
@@ -343,17 +349,45 @@ void effLeave(u32 depth);   // and back
 void effMark(void (*mark)(V));
 void effectsInit();
 
-// ---- public interfaces (api.cpp): each file's `pub` declarations, kept in a .api file next to it ----
+// ---- packages (pkg.cpp): a directory with a fut.pkg manifest ----
+struct ForeignMod { std::string kind, name, target; int line; };  // kind: js, wasm or c; target: its file or library
+struct PackageDep { std::string name, dir; int line; };
+struct Package {
+  std::string dir, manifest, name, version, root;  // root: the file whose pub names are the package's interface
+  std::vector<PackageDep> deps;
+  std::vector<ForeignMod> mods;
+  const ForeignMod* module(const std::string& name, bool native) const;  // the one for this target, else any, else null
+};
+extern std::vector<std::string> modulesPending;  // wasm: modules ("js:/path") a compile waits for the host to load
+const Package* packageOf(const std::string& file);  // the nearest fut.pkg at or above the file's directory, or null
+const Package* packageAt(const std::string& dir);   // dir's own fut.pkg, or null
+void packagesReset();                               // each compile reads the manifests again
+bool parseVersion(const std::string& v, int out[3]);
+
+// ---- public interfaces (api.cpp): `pub` declarations, kept in .api files ----
 struct ApiIssue {
-  std::string file, api, status;           // status: "missing" (no .api yet), "changed", "stale" (nothing is pub now)
+  std::string file, api, status;           // status: "missing" (no .api yet), "changed", "stale" (nothing is pub
+                                           // now), "breaking" (declarations went, and the version did not move)
   std::vector<std::string> removed, added;  // declarations, one per line
   std::string want;                         // the .api text it should have
+  std::string version, needs;               // breaking: the version, and the least it must become
 };
 std::string interfaceOf(const std::string& path, const std::string& text);  // "" if it declares nothing pub
 std::string apiPath(const std::string& file);                               // geom.fut -> geom.api
-std::vector<ApiIssue> checkInterfaces(const std::vector<std::pair<std::string, std::string>>& sources);
+std::vector<ApiIssue> checkInterfaces(const Compiled&);
 int reportInterfaces(const std::vector<ApiIssue>&, bool json, const std::string& program);  // fut test; the number
-int writeInterfaces(const std::vector<std::pair<std::string, std::string>>& sources, const std::string& program);  // fut api; the number
+int writeInterfaces(const Compiled&, const std::string& program);                           // fut api; the number
+int printMap(const Compiled&, bool pubOnly, bool json, const std::string& only, const std::string& program);  // fut map
+
+// ---- values crossing into JavaScript (jsval.cpp): JSON text, lists and maps copied; a function fut code passes
+// is pinned (an id JavaScript calls it by); a JavaScript value that is not data comes back as a Ref (by its id) ----
+std::string toJs(V v);                // raises for what can't cross (an instance, a map with non-string keys, ...)
+V fromJs(const std::string& json);
+V jsPinned(int id);                   // the function pinned as id (nil if none)
+void jsUnpin(int id);                 // JavaScript dropped it
+void jsMark(void (*mark)(V));         // GC roots: what JavaScript holds, and what fromJs is building
+void refFree(Ref*);                   // the GC found a Ref dead: JavaScript may let the value go
+extern void (*refRelease)(u32 id);    // the host's side of that (wasm)
 
 [[noreturn]] void throwValue(V v, void* ra);  // to the innermost try, else report it (ra: where, for the trace)
 [[noreturn]] void rtError(void* ra, const char* fmt, ...);

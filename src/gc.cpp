@@ -163,6 +163,7 @@ void finalize(Obj* o) {
     case K::Class: ((Class*)o)->~Class(); break;
     case K::Inst: if (((Inst*)o)->slots != ((Inst*)o)->inl()) free(((Inst*)o)->slots); break;
     case K::Fiber: fiberFree((Fiber*)o); break;
+    case K::Ref: refFree((Ref*)o); break;
     default: break;
   }
   o->kind = K::Free;
@@ -188,6 +189,7 @@ void collect() {
   for (V v : vm.globals) markV(v);
   for (V v : consts) markV(v);
   txnMark(markV);
+  jsMark(markV);
   effMark(markV);
   for (auto& g : globals) mark(g.o);
   while (!work.empty()) {
