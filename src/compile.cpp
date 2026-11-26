@@ -149,7 +149,7 @@ struct Compiler : Gen {
   std::vector<TypedUse> typedUses;
   std::vector<std::pair<int, int>> fnDefs;  // (sym, arity)
   std::vector<int> inits;                   // top-level vars initialised by this chunk
-  struct Extern { int sym; void* fn; std::string sig; char ret; bool pure; };  // pure: declared `!`, performs nothing
+  struct Extern { int sym; void* fn; std::string sig; char ret; bool pure, rt = false; };  // pure: declared `!`, performs nothing; rt: fn is the runtime's Fn
   std::vector<Extern> externs;
   std::string patched, added, removed, reset;  // for the reload log
   std::unordered_map<std::string, std::vector<int>> pubs;  // file -> its top-level names marked `pub`
@@ -1888,7 +1888,10 @@ struct Compiler : Gen {
     Tok t = cur;
     int s = ident();
     const char* err = nullptr;
-    void* fn = externLookup(lib, symName(s), &err);
+    // extern "fut": a function of the runtime's own (fmath.cpp: math with the same results on every platform)
+    Global* rtg = lib == "fut" ? findGlobal(intern("fut@" + symName(s))) : nullptr;
+    if (lib == "fut" && !rtg) failAt(t.p, t.line, "@extern the runtime has no function '%s'", name(s));
+    void* fn = rtg ? (void*)rtg->o : externLookup(lib, symName(s), &err);
     if (err && !strcmp(err, "pending")) {  // the host loads it, then compiles again
       if (std::find(modulesPending.begin(), modulesPending.end(), lib) == modulesPending.end()) modulesPending.push_back(lib);
       fn = (void*)1;
@@ -1921,7 +1924,10 @@ struct Compiler : Gen {
     // Without it, a call performs io.
     bool pure = at('!') && !cur.nl;
     if (pure && (next(), at(T_ID) && !cur.nl)) fail("@extern an extern fn performs io, or with a bare '!' nothing: it can't declare other effects");
-    externs.push_back({qualify(s), fn, sig, ret, pure});
+    if (rtg && (sig != std::string(((Fn*)rtg->o)->arity, 'd') || ret != 'd' || !pure))
+      failAt(t.p, t.line, "@extern the runtime's %s takes %d numbers and returns one, performing nothing: (%s): num !", name(s), ((Fn*)rtg->o)->arity,
+             ((Fn*)rtg->o)->arity == 1 ? "num" : "num, num");
+    externs.push_back({qualify(s), fn, sig, ret, pure, rtg != nullptr});
   }
   // effect Name { fn op(params) [: type] ... }: operations with no body. Code performs one as Name.op(args); the
   // nearest handler for it answers (handle { } with Name.op(params) { }).
@@ -2767,7 +2773,8 @@ struct Compiler : Gen {
     }
     for (auto& e : externs) {
       Fn* f = globalObj<Fn>(e.sym);
-      f->code = ffiThunk(e.fn, e.sig, e.ret, e.sym), f->arity = (int)e.sig.size(), f->op = e.pure ? 0 : OP_EXTERN;  // performs io
+      if (e.rt) f->code = ((Fn*)e.fn)->code, f->arity = ((Fn*)e.fn)->arity, f->op = 0;
+      else f->code = ffiThunk(e.fn, e.sig, e.ret, e.sym), f->arity = (int)e.sig.size(), f->op = e.pure ? 0 : OP_EXTERN;  // performs io
     }
     for (auto& d : effDefs) effDefine(d.sym, symName(d.sym), d.ops);
     for (auto& [s, c] : typeDefs) global(s).type = c;  // named types: checks look them up when they run

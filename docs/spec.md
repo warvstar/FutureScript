@@ -51,6 +51,7 @@ int(n)  floor(n)  sqrt(n)   int truncates toward 0 (numbers only)
 clock()                  seconds (monotonic)
 sleep(s)                 seconds
 random()                 in [0, 1)
+seed(n)                  random() then repeats a fixed sequence (whole n; per isolate)
 fiber(fn(x) { ... })     f.resume()  f.send(v)  f.done()
 channel(n)  cores()      see Isolates
 run(path)  run({source, args, timeout})   fut in a child process -> {code, out, err, timedOut}
@@ -136,6 +137,8 @@ expect throws { bad() }
 A list or map that passes `list<T>`/`map<K, V>` keeps that type for good: any later store into it, through any reference, throws unless it fits, and later checks of it cost nothing. A union or a failed check doesn't do this; `slice()` makes an unchecked copy. A shape is checked only when the value crosses the boundary, so a map can change after it passes; use a class to keep fields checked.
 
 Effects: `io` (print, run, extern, graphics, files, env, exec, fetch) `clock` (clock, sleep, time) `random` `yield` `spawn` `chan` (every channel/task op), declared ones; json is pure. A handler's return is the op's result, no resumption.
+
+Determinism: numbers (`+ - * / %`, sqrt, floor, std/math) give the same bits on every platform. Code whose declared effects leave out `io`, `clock`, `spawn` and `chan` is deterministic, given `seed(n)` if it has `random`; supply the clock with `handle { } with clock() { }`.
 
 ## Errors, atomic, contracts
 

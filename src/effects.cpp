@@ -16,6 +16,7 @@
 // that were in force where it was installed, so a handler for print may itself print (to the real output, or to an
 // outer handler).
 #include "fut.h"
+#include <cmath>
 #include <unordered_map>
 
 namespace {
@@ -250,9 +251,16 @@ static V rt_inventer(V self, uint64_t* rec) {
   return boxb(outer);
 }
 
-static TLS uint64_t rng;
+static TLS uint64_t rng;  // this isolate's generator
 ISO_LOCAL(rng);
-static V n_random() {  // xorshift64*, seeded from the clock: [0, 1)
+// seed(n): random() from now on gives the sequence n fixes, the same on every platform (integer arithmetic only).
+static V n_seed(V v) {
+  if (!isNum(v) || num(v) != std::trunc(num(v)) || std::fabs(num(v)) > 0x1p53) ERR("@argument seed() expects a whole number, got %s", toStr(v, true).c_str());
+  uint64_t z = (uint64_t)(int64_t)num(v) + 0x9E3779B97F4A7C15ull;  // splitmix64: nearby seeds give unrelated sequences
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull, z = (z ^ (z >> 27)) * 0x94D049BB133111EBull, z ^= z >> 31;
+  return rng = z ? z : 1, NIL;
+}
+static V n_random() {  // xorshift64*, seeded from the clock unless seed() was called: [0, 1)
   if (!rng) rng = (uint64_t)(now() * 1e9) | 1;
   rng ^= rng >> 12, rng ^= rng << 25, rng ^= rng >> 27;
   return box((double)((rng * 0x2545F4914F6CDD1Dull) >> 11) * 0x1p-53);
@@ -264,7 +272,7 @@ void effectsInit() {
   ops[OP_YIELD] = {"yield", EFF_YIELD, 1}, ops[OP_EXTERN] = {"extern", EFF_IO, -1};
   effOps[3] = {OP_YIELD}, effOps[0] = {OP_EXTERN};  // externs can't be handled, so no handle allows io as a whole
   vm->helpers[H_EFFECT] = (void*)rt_effect;
-  native<n_random>("random");
+  native<n_random>("random"), native<n_seed>("seed");
   native<handleBegin>("handle@begin"), native<handleEnd>("handle@end");
   vm->helpers[H_INVENTER] = (void*)rt_inventer;
   invokeCode = callable<invokeHandler>();
@@ -272,7 +280,7 @@ void effectsInit() {
            {"print", EFF_IO}, {"run", EFF_IO}, {"window", EFF_IO}, {"present", EFF_IO}, {"clear", EFF_IO}, {"rect", EFF_IO},
            {"circle", EFF_IO}, {"key", EFF_IO}, {"mousex", EFF_IO}, {"mousey", EFF_IO}, {"mousedown", EFF_IO},
            {"fetch", EFF_IO}, {"fetchAll", EFF_IO}, {"exec", EFF_IO}, {"execAll", EFF_IO}, {"readFile", EFF_IO},
-           {"writeFile", EFF_IO}, {"env", EFF_IO}, {"time", EFF_CLOCK}, {"clock", EFF_CLOCK}, {"sleep", EFF_CLOCK}, {"random", EFF_RANDOM}}) {
+           {"writeFile", EFF_IO}, {"env", EFF_IO}, {"time", EFF_CLOCK}, {"clock", EFF_CLOCK}, {"sleep", EFF_CLOCK}, {"random", EFF_RANDOM}, {"seed", EFF_RANDOM}}) {
     int sym = intern(name);
     Global* g = findGlobal(sym);
     if (!g || !g->o || g->o->kind != K::Fn) continue;

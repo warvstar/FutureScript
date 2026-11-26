@@ -169,7 +169,9 @@ static std::vector<Decl> declsOf(const std::string& text) {
       if (Lexer s = L; s.next().t == ':') s.next(), e = s.p, L = s;  // its result type
       Lexer s = L;
       if (Tok b = s.next(); b.t == '!' && !b.nl) e = s.p, L = s;  // pure: a bare ! on its line
-      out.push_back({"extern", symName(nm.sym), squash(from, e), "", mod, pub, k.line, k.line, doc, {}});
+      std::string sig = squash(from, e);
+      if (mod == "fut") sig.erase(sig.find(" \"fut\""), 6);  // the runtime's own: where it is implemented is not its interface
+      out.push_back({"extern", symName(nm.sym), sig, "", mod, pub, k.line, k.line, doc, {}});
     } else if (isKw(k, S_effect) || isKw(k, K_class)) {
       bool eff = isKw(k, S_effect);
       Lexer save = L;

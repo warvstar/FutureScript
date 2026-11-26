@@ -416,6 +416,7 @@ template <auto f> void* callable() {
 #endif
 }
 void native(const char* name, void* f, int arity);
+void fmathInit();  // fmath.cpp: sin, cos, exp, log, pow, ... that give the same bits on every platform
 void method(K k, int sym, void* f, int arity);
 template <auto f> void native(const char* name) { native(name, callable<f>(), nargs(f)); }
 template <auto f> void method(K k, int sym) { method(k, sym, callable<f>(), nargs(f)); }

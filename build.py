@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "build" / "fut"
-FLAGS = ["-std=c++23", "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-missing-field-initializers", "-Wno-invalid-offsetof"]
+FLAGS = ["-std=c++23", "-ffp-contract=off", "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-missing-field-initializers", "-Wno-invalid-offsetof"]
 
 
 # The WebAssembly build uses Homebrew's LLVM and WASI libc/libc++ (brew install llvm lld wasi-libc wasi-runtimes).
@@ -706,7 +706,22 @@ def runner_worker(exe):
         p.terminate()
 
 
-RUNNER_TESTS = [("fut test --json: statuses, details, output", runner_json),
+def runner_fmath(exe):
+    """std/math's functions (src/fmath.cpp) against the platform's libm: within 1 ulp over random arguments in every
+    range, exact where exact is representable (tools/fmathcheck.cpp)."""
+    if exe.suffix == ".wasm":
+        return True, ""  # (it compares with the native libm; determinism.fut checks wasm's bits)
+    out = ROOT / "build" / "fmathcheck"
+    c = subprocess.run(["clang++", "-O2", "-ffp-contract=off", "-DFMATH_ONLY", "-std=c++23", "-o", str(out),
+                        str(ROOT / "tools" / "fmathcheck.cpp"), str(ROOT / "src" / "fmath.cpp")], capture_output=True, text=True)
+    if c.returncode:
+        return False, c.stderr
+    r = subprocess.run([str(out), "200000"], capture_output=True, text=True, timeout=120)
+    return r.returncode == 0, r.stdout
+
+
+RUNNER_TESTS = [("std/math: within 1 ulp of libm, exact cases exact", runner_fmath),
+                ("fut test --json: statuses, details, output", runner_json),
                 ("packages: names, interfaces, boundaries, versions", runner_packages),
                 ("fut map: packages, files, declarations", runner_map),
                 ("foreign modules: js, wasm, c", runner_modules),

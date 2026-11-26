@@ -1,21 +1,22 @@
-// Numbers. The functions of C's libm natively, of JavaScript's Math under wasm; they perform nothing.
+// Numbers. The runtime's own functions (extern "fut"): the same results, to the last bit, on every platform (arm64,
+// wasm), within 1 ulp of exact, and exact where that is representable (pow(10, 3), log2(8), cbrt(27)). They perform nothing.
 
-pub extern fn pow(num, num): num !
-pub extern fn exp(num): num !
-pub extern fn log(num): num !
-pub extern fn log2(num): num !
-pub extern fn log10(num): num !
-pub extern fn cbrt(num): num !
-pub extern fn hypot(num, num): num !
-pub extern fn sin(num): num !
-pub extern fn cos(num): num !
-pub extern fn tan(num): num !
-pub extern fn asin(num): num !
-pub extern fn acos(num): num !
-pub extern fn atan(num): num !
-pub extern fn atan2(num, num): num !
-pub extern fn ceil(num): num !
-pub extern fn trunc(num): num !
+pub extern "fut" fn pow(num, num): num !
+pub extern "fut" fn exp(num): num !
+pub extern "fut" fn log(num): num !
+pub extern "fut" fn log2(num): num !
+pub extern "fut" fn log10(num): num !
+pub extern "fut" fn cbrt(num): num !
+pub extern "fut" fn hypot(num, num): num !
+pub extern "fut" fn sin(num): num !
+pub extern "fut" fn cos(num): num !
+pub extern "fut" fn tan(num): num !
+pub extern "fut" fn asin(num): num !
+pub extern "fut" fn acos(num): num !
+pub extern "fut" fn atan(num): num !
+pub extern "fut" fn atan2(num, num): num !
+pub extern "fut" fn ceil(num): num !
+pub extern "fut" fn trunc(num): num !
 
 pub var pi = 3.141592653589793
 pub var e = 2.718281828459045

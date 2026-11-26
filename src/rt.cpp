@@ -987,6 +987,7 @@ void rtInit() {
     ERR("@match match on %s got %s, which is not one of its variants", symName(as<Class>(e)->name).c_str(), toStr(v, true).c_str());
     return NIL;
   }>("match@fail");
+  fmathInit();
   method<+[](V m) { return mapList(m, true); }>(K::Map, S_keys);
   method<+[](V m) { return mapList(m, false); }>(K::Map, S_values);
   testInit();
