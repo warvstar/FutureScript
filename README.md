@@ -454,8 +454,32 @@ The rest follows from that:
 - **`strings`:** replace, startsWith, endsWith, count, repeat, padStart, padEnd, upper, lower, lines, words, reverse.
 - **`lists`:** sort (stable, of numbers or of strings), sortBy, map, filter, reduce, find, any, all, count, indexOf, contains, reverse, unique, flatten, range, sum, min, max. None changes the list it is given.
 - **`math`:** pow, exp, log, log2, log10, cbrt, hypot, the trigonometric functions, ceil and trunc are the runtime's own (`src/fmath.cpp`, bound with `extern "fut"`): within 1 ulp of exact, exact where that is representable, and the same bits on every platform (see [Determinism](#determinism)); abs, min, max, clamp, sign, round, isNaN, pi and e in fut.
+- **`reactive`:** signal (get, set, update, peek), effect, computed, batch, untrack, onCleanup, root. An effect reruns when a signal it read on its last run changes; effects made while one runs belong to it and stop when it reruns.
+- **`ui`** (wasm build: the DOM is JavaScript's): el, mount, each, field, check, button, style. A child or prop given as a function shows its current value, and only that part of the page changes when a signal it read does. See [Pages](#pages).
 
 The binary finds `std/` next to the directory it is in (`build/fut` uses `std/`), or at `$FUT_STD`; the WebAssembly hosts pass its location. `std/x` and a program's own package `x` can both be used. `fut test` checks the contracts of std functions only when the test file is itself in `std/`, so a program's tests don't rerun the library's. `python3 build.py test` runs `std/*/*_test.fut`.
+
+### Pages
+
+`std/ui` builds a page from functions over `std/reactive` signals. There is no virtual DOM and no re-rendering of a whole view. Each child or prop given as a function is an effect that updates its own nodes: text in place, anything else replaced between two markers.
+
+```
+import "std/ui"
+import "std/reactive" as r
+var name = r.signal("")
+var clicks = r.signal(0)
+ui.mount("#ui", fn() {
+  return ui.el("div", {"class": "page"}, [
+    ui.field(name, {placeholder: "Your name"}),
+    ui.button("Click me", fn(e) { clicks.update(fn(c) { return c + 1 }) }),
+    fn() { return "Hi, {name.get()}! You clicked {clicks.get()} times." }
+  ])
+})
+```
+
+- **Elements:** `ui.el(tag, props, children)`. A child can be text, a number, a node, a list of children, or a function whose result is shown and kept current. Props whose names start with `on` are event handlers, which get `{type, value, checked, key}`. A prop given as a function is kept current. `class` is a keyword, so write it as `"class"`.
+- **Lists:** `ui.each(items, key, view)` keeps one view per item, reused while the item's key and value stay the same. Changing one item redraws only that item, and reordering moves nodes without redrawing them. Signals held inside an item, as `examples/hello-ui.fut` keeps each task's `done` and `effort`, update just their part of that item.
+- **Running it:** `node web/serve.mjs`, then open `http://localhost:8000/?file=examples/hello-ui.fut`. The page mounts into `#ui`. Once the program finishes, the page keeps handling its events, and edits reload it. Under Node, `std/ui/dom.js` uses a small document of its own, so `fut test` can drive a page with `ui.trigger` and read it with `ui.htmlOf` (`tests/specs/hello_ui.fut`).
 
 ### Error codes
 

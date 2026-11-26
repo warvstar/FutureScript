@@ -1,0 +1,31 @@
+// The public interface of package ui 0.1.0 (ui.fut), written by `fut api`. `fut test` fails while it is out of date.
+
+// A button that calls onclick.
+pub fn button(label, onclick: fn): any
+
+// A checkbox showing s (a signal of true or false), which ticking sets, with its label (props: the box's).
+pub fn check(s: r.Signal, label, props): any
+
+// A list kept in step with items() (a list), one view per item, reused while the item's key(item) and value stay the
+// same: changing one item redraws that item, and reordering moves nodes rather than redrawing them.
+pub fn each(items: fn, key: fn, view: fn): fn
+
+// An element: its tag, its props (a map, or nil), and its children (one child or a list).
+pub fn el(tag: str, props, kids): any
+
+// A text field showing s (a signal), which typing sets.
+pub fn field(s: r.Signal, props): any
+
+pub fn find(selector: str): any
+
+// The HTML a node is now, and an event on it as a user would cause it ({value} typed, {checked} ticked): for tests.
+pub fn htmlOf(n): str
+
+// Show view() in target (a selector or a node), replacing what was there. The returned function takes it down: its
+// effects stop.
+pub fn mount(target, view: fn): fn
+
+// A style sheet for the page.
+pub fn style(sheet: str)
+
+pub fn trigger(n, event: str, data)

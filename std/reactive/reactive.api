@@ -1,0 +1,34 @@
+// The public interface of package reactive 0.1.0 (reactive.fut), written by `fut api`. `fut test` fails while it is out of date.
+
+// f(), with the effects that its changes rerun run once, after it.
+pub fn batch(f: fn)
+
+// A signal that holds f(), recomputed when what f read changes.
+pub fn computed(f: fn): Signal
+
+// Run f now, and again whenever a signal it read last time changes. dispose() on the result stops it.
+pub fn effect(f: fn)
+
+// Run f before the running effect reruns or is disposed (to undo what it did outside signals).
+pub fn onCleanup(f: fn)
+
+// f() as an owner of the effects it makes, which live until the returned function is called (not when the effect
+// running now reruns: a root belongs to no one).
+pub fn root(f: fn): fn
+
+// A value that effects can depend on. get() reads it (and subscribes the running effect); set() changes it and reruns
+// the effects that read it, unless the new value == the old.
+pub class Signal {
+  var subs
+  var value
+  fn get()
+  fn init(v)
+  fn peek()
+  fn set(v)
+  fn update(f: fn)
+}
+
+pub fn signal(v): Signal
+
+// f(), reading signals without subscribing the running effect to them.
+pub fn untrack(f: fn)

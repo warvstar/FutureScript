@@ -17,6 +17,7 @@ WASM_LINK = ["-mexec-model=reactor", "-lsetjmp", "-Wl,--export=__stack_pointer",
              "-Wl,-z,stack-size=8388608", "-Wl,--stack-first"]
 NATIVE_ONLY, WASM_ONLY = {"main.cpp", "jit.cpp", "sys.cpp"}, {"wasm.cpp", "interp.cpp"}
 NATIVE_SPECS = set()  # specs only the native build runs
+WASM_SPECS = {"hello_ui.fut", "ui_test.fut"}  # std/ui is the DOM's (a JavaScript module): the wasm build only
 
 
 def build(debug=False, wasm=False, tsan=False):
@@ -82,8 +83,9 @@ def test(exe, only=()):
     jobs = ([("hot reload: " + n, lambda n=n, f=f: check("hot reload: " + n, f)) for n, f in HOT_TESTS]  # the slowest (they sleep) start first
             + [(t.name, lambda t=t: program(t)) for t in sorted((ROOT / "tests").glob("*.fut"))]
             + [("specs/" + t.name, lambda t=t: spec(t)) for t in sorted((ROOT / "tests" / "specs").glob("*.fut"))
-               if not (exe.suffix == ".wasm" and t.name in NATIVE_SPECS)]
-            + [("std/" + t.name, lambda t=t: spec(t, "std")) for t in sorted((ROOT / "std").glob("*/*_test.fut"))]
+               if not (exe.suffix == ".wasm" and t.name in NATIVE_SPECS) and not (exe.suffix != ".wasm" and t.name in WASM_SPECS)]
+            + [("std/" + t.name, lambda t=t: spec(t, "std")) for t in sorted((ROOT / "std").glob("*/*_test.fut"))
+               if not (exe.suffix != ".wasm" and t.name in WASM_SPECS)]
             + [("examples/" + t.name, lambda t=t: spec(t, "examples")) for t in sorted((ROOT / "examples").glob("*.fut"))
                if 'test "' in t.read_text()]  # examples with test blocks
             + [(n, lambda n=n, f=f: check(n, f)) for n, f in RUNNER_TESTS]
@@ -820,7 +822,8 @@ def isolated(exe, t, n):
 
 
 def isolateJobs(exe, n):
-    return [(f"isolates: specs/{t.name}", lambda t=t: isolated(exe, t, n)) for t in sorted((ROOT / "tests" / "specs").glob("*.fut"))]
+    return [(f"isolates: specs/{t.name}", lambda t=t: isolated(exe, t, n)) for t in sorted((ROOT / "tests" / "specs").glob("*.fut"))
+            if t.name not in WASM_SPECS]
 
 
 def isolates(exe, n, only=()):

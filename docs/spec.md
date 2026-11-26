@@ -209,6 +209,8 @@ always seeded (default 1); a reload waits for the isolates to end.
 - `std/strings`: replace startsWith endsWith count repeat padStart padEnd upper lower lines words reverse
 - `std/lists`: sort sortable sortBy map filter reduce find any all count indexOf contains reverse unique flatten range sum min max
 - `std/math`: pow exp log log2 log10 cbrt hypot sin cos tan asin acos atan atan2 ceil trunc abs min max clamp sign round isNaN pi e
+- `std/reactive`: signal(v) (.get .set .update .peek) effect computed batch untrack onCleanup root — effects rerun when a signal read on their last run changes
+- `std/ui` (wasm): el(tag, props, kids) mount(sel|node, view) each(items, key, view) field(sig, props) check(sig, label, props) button(label, f) style(css) find htmlOf trigger; a fn child/prop stays current; `on<event>` props: handlers given {type, value, checked, key}; write `"class"`
 
 ```fut
 import "std/lists"
