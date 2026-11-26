@@ -5,3 +5,4 @@ Approve when the change does what the task asks, its tests really check the beha
 "Tests:" above is the harness's own run of every test file on the change rebased onto main; it is the verification. The worker can't run commands or show raw output, so don't ask for command output, logs or extra verification steps, and don't reject because a done condition "was not shown" when the tests above cover it. Judge the diff and that result.
 
 The tests may show failures that also fail, or are pending, on main (the harness allows those: a pending test that starts to run and fails shows a gap elsewhere). They aren't this change's fault; judge only what the change does.
+A change that deliberately alters a behavior may update an existing test's assertion of the old behavior, outside its owned files, if the worker names it. Accept that when the task asks for the new behavior.

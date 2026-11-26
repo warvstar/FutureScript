@@ -14,3 +14,4 @@ Rules:
 - When a tool reports an error, read it carefully: it is usually exact about the line and the cause.
 - Be efficient: every message costs time. Batch several tool calls in one turn when they don't depend on each other.
 - Verification is the harness's job: when you call `done` it runs every test file on your change and the reviewer sees the result. If the task asks for command output, flags or reports your tools can't produce, skip that part: make the code and tests right, run `test` (on the file, then all), and call `done`. That is never a reason to call `blocked`.
+- If your task deliberately changes a behavior and an existing test elsewhere asserts the old behavior, update that assertion (only that) and name it in done's summary. That is in scope; don't call `blocked` for it.
