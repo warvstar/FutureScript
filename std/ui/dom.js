@@ -77,10 +77,11 @@ export function fire(n, type, data) {  // as a user would: set what they typed o
   if (data && "checked" in data) n.checked = data.checked;
   if (data && "top" in data) n.scrollTop = data.top;
   if (data && "height" in data && !globalThis.document) n.clientHeight = data.height;
-  n.dispatchEvent(globalThis.document ? new KeyboardEvent(type, { bubbles: true, key: data?.key ?? "" }) : { type, target: n, key: data?.key });
+  n.dispatchEvent(globalThis.document ? new KeyboardEvent(type, { bubbles: true, key: data?.key ?? "" }) : { type, target: n, key: data?.key, files: data?.files });
 }
 
 // ---- data, timers, the address, storage, SVG ----
+
 const fakes = new Map();  // url -> response, for tests and demos without a server
 export const fake = (url, res) => void fakes.set(url, typeof res == "string" ? { status: 200, body: res, headers: {} } : res);
 const later = (f, ...a) => { const p = f(...a); if (p && typeof p.catch == "function") p.catch(() => {}); };
@@ -91,6 +92,65 @@ export function request(req, f) {  // fetch, then f({status, body, headers}), or
   fetch(url, init).then(async (x) => later(f, { status: x.status, body: await x.text(), headers: Object.fromEntries(x.headers) }),
     (e) => later(f, { status: 0, error: String(e?.message ?? e) }));
 }
+// ---- files ----
+// A file as fut sees it: {name, size, type, file} (file: the File itself, held by reference).
+const fileOf = (f) => ({ name: f.name, size: f.size ?? 0, type: f.type ?? "", file: f });
+// A zone (a label holding an <input type=file>) whose files f gets: chosen, or dropped on it (class "over" while a drag is
+// over it). Under Node, trigger(zone, "drop", {files}) drops plain {name, size, type, text} maps.
+export function filesFrom(zone, input, f) {
+  const give = (list) => list && list.length && later(f, [...list].map(fileOf));
+  input.addEventListener("change", () => { give(input.files); if (globalThis.document) input.value = ""; });
+  let depth = 0;  // dragenter and dragleave come for each child crossed
+  const over = (on) => zone.classList ? zone.classList.toggle("over", on) : on ? zone.setAttribute("data-over", "") : zone.removeAttribute("data-over");
+  zone.addEventListener("dragenter", (e) => { e.preventDefault?.(); depth++; over(true); });
+  zone.addEventListener("dragover", (e) => e.preventDefault?.());  // (else the browser opens the file)
+  zone.addEventListener("dragleave", () => { if (--depth <= 0) depth = 0, over(false); });
+  zone.addEventListener("drop", (e) => {
+    e.preventDefault?.();
+    depth = 0, over(false);
+    let list = e.dataTransfer?.files ?? e.files;
+    if (list && !(input.multiple ?? input.hasAttribute("multiple"))) list = [...list].slice(0, 1);
+    give(list);
+  });
+}
+// A file's contents: as "text", or "url" (a data: URL, for an <img>), then f({value}) or f({error}).
+export function readFile(file, as, f) {
+  const fl = file?.file ?? file;
+  if (typeof FileReader == "undefined" || !(fl instanceof Blob))  // Node: a dropped map's text
+    return void Promise.resolve().then(() => later(f, fl?.text != null ? { value: as == "url" ? `data:${fl.type};base64,` + btoa(fl.text) : fl.text } : { error: "no file to read" }));
+  const r = new FileReader();
+  r.onload = () => later(f, { value: r.result });
+  r.onerror = () => later(f, { error: String(r.error?.message ?? r.error) });
+  as == "url" ? r.readAsDataURL(fl) : r.readAsText(fl);
+}
+// An address that shows a file (an image's preview), until the page goes: blob:...
+export const fileUrl = (file) => { const fl = file?.file ?? file; return typeof URL.createObjectURL == "function" && fl instanceof Blob ? URL.createObjectURL(fl) : ""; };
+// Send a file (or {name: file|text}, as a form) to req's url: progress(sent, total) as it goes, then done({status, body})
+// or done({status: 0, error}). A url respond() faked answers at once. Returns what stopUpload() takes.
+export function sendFile(req, body, progress, done) {
+  const url = typeof req == "string" ? req : req.url;
+  if (fakes.has(url)) return void Promise.resolve().then(() => { later(progress, 1, 1); later(done, fakes.get(url)); }), null;
+  const x = new XMLHttpRequest();
+  x.open(req.method ?? "POST", url);
+  for (const [k, v] of Object.entries(req.headers ?? {})) x.setRequestHeader(k, v);
+  x.upload.onprogress = (e) => later(progress, e.loaded, e.lengthComputable ? e.total : 0);
+  x.onload = () => later(done, { status: x.status, body: x.responseText });
+  x.onerror = () => later(done, { status: 0, error: "the upload failed: no answer from " + url });
+  x.onabort = () => later(done, { status: 0, error: "stopped" });
+  let data = body?.file ?? body;
+  if (data && typeof data == "object" && !(data instanceof Blob)) {
+    const form = new FormData();
+    for (const [k, v] of Object.entries(data)) {
+      const x = v?.file ?? v;
+      x instanceof Blob ? form.append(k, x, v?.name ?? x.name) : form.append(k, typeof x == "string" ? x : JSON.stringify(x));
+    }
+    data = form;
+  }
+  x.send(data);
+  return x;
+}
+export const stopUpload = (x) => void x?.abort?.();
+
 export function timer(ms, repeat, f) {  // an id for stopTimer; under Node it doesn't keep the process alive
   const t = (repeat ? setInterval : setTimeout)(() => later(f), ms);
   t?.unref?.();
@@ -113,6 +173,46 @@ export function modal(n, on) {  // a <dialog> shown modally, or closed (once it 
   if (on && !n.isConnected) return void queueMicrotask(() => modal(n, on));
   if (on && !n.open) n.showModal();
   else if (!on && n.open) n.close();
+}
+export const focus = (n) => void n.focus?.();
+// A menu's button b and its list: the list is a popover b toggles (light dismiss: a click outside or Escape closes it),
+// placed under b; choosing an item closes it; the arrow keys move between its items. Without popovers (or a page), the
+// list is hidden until b is clicked.
+export function dropdown(b, list) {
+  const items = () => [...(list.querySelectorAll?.("button, a[href], [role=menuitem]") ?? [])];
+  const pop = typeof list.showPopover === "function";
+  const open = () => (pop ? list.matches(":popover-open") : !list.hasAttribute("hidden"));
+  const show = (on) => {
+    if (pop) return void (on ? list.showPopover() : list.hidePopover());
+    on ? list.removeAttribute("hidden") : list.setAttribute("hidden", "");
+    b.setAttribute("aria-expanded", String(on));
+  };
+  if (pop) {
+    list.setAttribute("popover", "auto");
+    b.popoverTargetElement = list;  // b toggles it, and a click on b isn't one outside
+    list.addEventListener("beforetoggle", (e) => {
+      if (e.newState !== "open") return;
+      const r = b.getBoundingClientRect();
+      list.style.top = `${r.bottom + 4}px`;
+      list.style.left = `${Math.min(r.left, innerWidth - list.offsetWidth - 8)}px`;
+    });
+    list.addEventListener("toggle", (e) => {
+      b.setAttribute("aria-expanded", String(e.newState === "open"));
+      if (e.newState === "open") for (const it of items()) it.setAttribute("role", "menuitem");
+      if (e.newState === "open") items()[0]?.focus();
+    });
+  } else {
+    list.setAttribute("hidden", "");
+    b.addEventListener("click", () => show(!open()));
+  }
+  list.addEventListener("click", (e) => { if (e.target !== list) show(false); });
+  list.addEventListener("keydown", (e) => {
+    const all = items(), at = all.indexOf(doc.activeElement);
+    const to = { ArrowDown: at + 1, ArrowUp: at - 1, Home: 0, End: all.length - 1 }[e.key];
+    if (to === undefined || !all.length) return;
+    e.preventDefault?.();
+    all[(to + all.length) % all.length].focus();
+  });
 }
 export const measure = (n) => ({ top: n.scrollTop ?? 0, height: n.clientHeight ?? 0 });
 export const createSvg = fresh((tag) => doc.createElementNS ? doc.createElementNS("http://www.w3.org/2000/svg", tag) : doc.createElement(tag));
@@ -149,6 +249,7 @@ function fakeDocument() {
     setAttribute(k, v) { this.attrs.set(k, String(v)); }
     removeAttribute(k) { this.attrs.delete(k); }
     getAttribute(k) { return this.attrs.get(k) ?? null; }
+    hasAttribute(k) { return this.attrs.has(k); }
     shallow() { const e = new Element(this.tagName); e.attrs = new Map(this.attrs); return e; }
     addEventListener(t, f) { (this.listeners[t] ??= []).push(f); }
     dispatchEvent(e) { e.target ??= this; for (let n = this; n; n = n.parentNode) for (const f of n.listeners?.[e.type] ?? []) f(e); }

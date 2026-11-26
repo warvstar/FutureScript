@@ -1,0 +1,5 @@
+{"description": "fwebos from scratch: 20 Haiku workers, Opus planning and review at medium effort, Sonnet approving; the rest of the $40 budget",
+ "target": "fwebos", "workers": 20, "model": "claude-haiku-5-5",
+ "models": {"worker": "claude-haiku-5-5", "planner": "claude-opus-5-5", "approver": "claude-sonnet-5-5", "reviewer": "claude-opus-5-5"},
+ "effort": {"planner": "medium", "reviewer": "medium"},
+ "cap": 26, "minutes": 0}

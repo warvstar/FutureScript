@@ -64,5 +64,5 @@ async function handle(m) {
   else if (m.key) fut.exports.fut_key(...m.key);
   else if (m.mouse) fut.exports.fut_mouse(...m.mouse);
   else if (m.call) reply(m.rid, fut.callRaw(m.call.id, m.call.json));
-  else if (m.unpin != null) fut.exports.fut_unpin(m.unpin);
+  else if (m.unpin != null) fut.unpin(m.unpin);
 }

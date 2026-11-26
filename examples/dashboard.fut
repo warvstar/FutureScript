@@ -118,21 +118,10 @@ fn p95Bars() {
 }
 fn latency(s) { return recent(live24(s.latency, s.name.len())) }
 
-var COLUMNS = [{id: "name", label: "Service", num: false}, {id: "team", label: "Team", num: false},
-               {id: "region", label: "Region", num: false}, {id: "status", label: "Status", num: false},
-               {id: "rpm", label: "Req/min", num: true}, {id: "errors", label: "Errors %", num: true},
-               {id: "p95", label: "p95 ms", num: true}]
-fn ranked(q, only, by, desc) {
-  var l = lists.filter(services(), fn(s) {
-    if only != "all" && s.status != only { return false }
-    var want = strings.lower(q)
-    return q == "" || strings.lower(s.name).has(want) || strings.lower(s.team).has(want)
-  })
-  l = lists.sortBy(l, fn(s) { return s[by] })
-  if desc { l = lists.reverse(l) }
-  return l
-}
-
+var COLUMNS = [{key: "name", label: "Service", show: ServiceName, "class": "name"}, {key: "team", label: "Team"}, {key: "region", label: "Region"},
+               {key: "status", label: "Status", value: fn(s) { return statusWord(s.status) }},
+               {key: "rpm", label: "Req/min", num: true}, {key: "errors", label: "Errors %", num: true},
+               {key: "p95", label: "p95 ms", num: true}]
 // ---- reporting an incident ----
 
 var report = ui.form({title: "", service: "", severity: "medium", details: ""}, {
@@ -294,8 +283,6 @@ view Tile(label, value, note, trend) {
 view Services {
   state query = ""
   state only = "all"
-  state sortKey = "name"
-  state desc = false
   section .panel {
     row .table-tools {
       input .search id: "search" type: "search" placeholder: "Find a service or team" bind: query
@@ -305,36 +292,14 @@ view Services {
         }
       }
     }
-    table .grid {
-      thead {
-        tr {
-          for c in COLUMNS key c.id {
-            th .num: c.num .sorted: sortKey == c.id id: "sort-{c.id}" on click { if sortKey == c.id { desc = !desc } else { sortKey = c.id desc = false } } {
-              "{c.label}"
-              if sortKey == c.id { span .arrow desc ? " ↓" : " ↑" }
-            }
-          }
-        }
-      }
-      tbody {
-        for s in ranked(query, only, sortKey, desc) key s.id {
-          tr .pick id: "row-{s.id}" on click { ui.go("/services/{s.id}") } {
-            td .name {
-              span .lamp class: s.status
-              "{s.name}"
-            }
-            td "{s.team}"
-            td "{s.region}"
-            td "{statusWord(s.status)}"
-            td .num "{s.rpm}"
-            td .num "{s.errors}"
-            td .num "{s.p95}"
-          }
-        }
-      }
-    }
-    if ranked(query, only, sortKey, desc).len() == 0 { p .quiet .empty "No service matches. Clear the search or pick All." }
+    table .grid id: "sort" rows: listed(only) columns: COLUMNS search: query sort: "name" rowId: rowOf on pick { ui.go("/services/{e.id}") } empty: "No service matches. Clear the search or pick All."
   }
+}
+fn listed(only) { return lists.filter(services(), fn(s) { return only == "all" || s.status == only }) }
+fn rowOf(s) { return "row-{s.id}" }
+view ServiceName(s) {
+  span .lamp class: s.status
+  "{s.name}"
 }
 
 view ServicePage(id) {
@@ -531,14 +496,8 @@ button.ghost \{ background: transparent; }
 .search \{ min-width: 240px; flex: 1; max-width: 340px; }
 .chip \{ padding: 4px 12px; border-radius: 999px; font-size: 13px; text-transform: capitalize; }
 .chip.on \{ background: var(--ink); color: var(--bg); border-color: var(--ink); }
-.grid \{ width: 100%; border-collapse: collapse; }
-.grid th \{ text-align: left; font-weight: 500; color: var(--muted); font-size: 12.5px; padding: 6px 10px; border-bottom: 1px solid var(--line); cursor: pointer; user-select: none; white-space: nowrap; }
-.grid th.sorted \{ color: var(--ink); }
-.grid td \{ padding: 9px 10px; border-bottom: 1px solid var(--line); }
-.grid .num \{ text-align: right; font-variant-numeric: tabular-nums; }
 .grid td.name \{ font-weight: 600; }
 .grid td.name .lamp \{ margin-right: 9px; }
-.grid tr.pick \{ cursor: pointer; }
 .grid tr.pick:hover td \{ background: color-mix(in srgb, var(--ink) 4%, transparent); }
 .empty \{ padding: 18px 10px; }
 .back \{ color: var(--muted); text-decoration: none; font-size: 13px; }

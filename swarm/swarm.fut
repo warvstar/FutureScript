@@ -23,7 +23,8 @@ var CF = env("SWARM_CF_URL")                            // set: test files run o
 var DASH = env("SWARM_DASH_URL")                        // set: the dashboard is published to this Worker, and controls the swarm
 var lastPush = 0
 var CAP = 20                                            // this run's dollars, hard: no request starts that could cross it
-var GLOBAL_CAP = parseNum(env("SWARM_GLOBAL_CAP") || "20")   // every run in swarm/results together, hard
+var GLOBAL_CAP = parseNum(env("SWARM_GLOBAL_CAP") || "40")   // every run in swarm/results together, hard
+var EFFORT = {}
 var NWORKERS = 8
 var scenarios = {}      // name -> {target, workers, model, models, cap, minutes, cfTests}
 var control = nil       // the dashboard's last control document: {rev, run, live: {workers, cap, minutes, models}, pause, stop, next}
@@ -93,6 +94,7 @@ fn configure() {  // false: can't run
   if !safeName(TARGET) || readFile(ROOT + "/swarm/targets/" + TARGET + ".md") == nil { print("no target " + TARGET + " (swarm/targets/)") return false }
   MODEL = env("SWARM_MODEL") || sc.model || "claude-haiku-5-5"
   var m = sc.models || {}
+  EFFORT = sc.effort || {}  // per role: low, medium, high (the API's output_config.effort); none: the model's default
   var ENV = {worker: "SWARM_MODEL_WORKER", planner: "SWARM_MODEL_PLANNER", approver: "SWARM_MODEL_APPROVER", reviewer: "SWARM_MODEL_REVIEWER"}
   for role in ROLES {
     MODELS[role] = env(ENV[role]) || m[role] || MODEL
@@ -202,7 +204,7 @@ var PRICES = {}         // dollars per million tokens; Haiku 5.5 has a second ca
 // read: a cache read's price as a fraction of input (Sonnet 5.5's is $0.10 of $2); cache writes (5 min) are 1.25x
 PRICES["claude-haiku-5-5"] = {inp: 0.1, out: 0.5, longInp: 0.5, longOut: 2.5, read: 0.1, maxTok: 16000}
 PRICES["claude-sonnet-5-5"] = {inp: 2, out: 10, read: 0.05, maxTok: 32000}
-PRICES["claude-opus-5-5"] = {inp: 4, out: 20, read: 0.1, maxTok: 32000}
+PRICES["claude-opus-5-5"] = {inp: 4, out: 20, read: 0.05, maxTok: 32000}
 fn price(model, promptTokens) {
   var p = PRICES[model]
   if p.longInp && promptTokens > 100000 { return {inp: p.longInp, out: p.longOut} }
@@ -233,10 +235,10 @@ fn worstCase(r) {  // the most a request can cost: ~2.5 chars a token, all of it
 
 // ---- the API ----
 fn request(role, tools, messages) { return requestAs(role, MODELS[role], tools, messages) }
-fn requestAs(role, model, tools, messages) { return requestWith(system(role), model, tools, messages) }
+fn requestAs(role, model, tools, messages) { return requestWith(system(role), model, tools, messages, EFFORT[role]) }
 fn workerRequest(w) {  // a conversation keeps the prompt it started with: its thinking blocks are bound to that prefix
   if w.prompt == nil || w.messages.len() <= 1 { w.prompt = ROLE.worker }
-  return requestWith([{type: "text", text: COMMON, cache_control: {type: "ephemeral"}}, {type: "text", text: w.prompt}], w.model || MODELS.worker, WORKER_TOOLS, w.messages)
+  return requestWith([{type: "text", text: COMMON, cache_control: {type: "ephemeral"}}, {type: "text", text: w.prompt}], w.model || MODELS.worker, WORKER_TOOLS, w.messages, EFFORT.worker)
 }
 fn stripThinking(w) {  // the API refused the conversation's thinking blocks: go on without them
   for m in w.messages {
@@ -247,8 +249,9 @@ fn stripThinking(w) {  // the API refused the conversation's thinking blocks: go
     }
   }
 }
-fn requestWith(sys, model, tools, messages) {  // {body, model}
+fn requestWith(sys, model, tools, messages, effort) {  // {body, model}
   var body = {model: model, max_tokens: PRICES[model].maxTok, system: sys, messages: messages, cache_control: {type: "ephemeral"}}
+  if effort { body.output_config = {effort: effort} }
   if tools != nil { body.tools = tools }
   return {body: json(body), model: model}
 }

@@ -114,22 +114,26 @@ struct Views {
   // The end of the expression from i: a line break, a bracket closing past it, a comma, a `{` (a block), a
   // `.name` after a space (a class), or a value right after a value (`"a" "b"`, `x label: y`: the next item).
   size_t exprEnd(size_t from, bool stopAtBrace = true, bool stopAtKey = false) {
-    int depth = 0;
+    int depth = 0, body = -1;  // body: the depth a function literal's block opens at (its `{` doesn't end it)
     bool value = false;
     size_t at = from;
     for (bool first = true;; first = false) {
       Tok t = peek(at);
       if (!t.k) return at;
+      if (is(s, t, "fn") && is(s, peek(t.e), "(") && body < 0) body = depth;
       if (depth == 0) {
         if (!first && t.nl) return at;
         if (closer(s, t) || is(s, t, ",")) return at;
-        if (stopAtBrace && is(s, t, "{")) return at;
+        if (stopAtBrace && is(s, t, "{") && body != 0) return at;
         if (!first && is(s, t, ".") && t.sp()) return at;
         if (!first && value && (t.k == 'i' || t.k == 'n' || t.k == 's' || t.k == 'm')) return at;
         if (stopAtKey && t.k == 'i' && is(s, t, "key")) return at;
       }
       if (opener(s, t)) depth++;
-      else if (closer(s, t)) depth--;
+      else if (closer(s, t)) {
+        depth--;
+        if (body == depth && is(s, t, "}")) body = -1;  // the function's block ends
+      }
       value = depth == 0 && operandEnd(s, t);
       at = t.e;
     }
@@ -340,7 +344,8 @@ struct Views {
   }
   static bool templated(const El& e) {  // fut's own tags that do more than an element, binding and SVG: ui.make
     static const std::set<std::string> own = {"field", "choice", "area", "check", "dialog", "link", "svg", "g", "path", "line",
-      "polyline", "polygon", "rect", "circle", "ellipse", "defs", "linearGradient", "stop", "title", "label"};
+      "polyline", "polygon", "rect", "circle", "ellipse", "defs", "linearGradient", "stop", "title", "label", "tabs", "tab", "menu", "files"};
+    if (e.name == "table") for (auto& a : e.attrs) if (std::get<0>(a) == "rows") return false;  // ui.table's
     return e.bind.empty() && !own.count(e.name);
   }
   std::string code(const El& e) {  // the element's code: a template's, else ui.make's

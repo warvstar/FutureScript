@@ -85,6 +85,11 @@ struct Lexer {
     }
     for (int i = 0; i < int(sizeof two / sizeof *two); i++)
       if (p[0] == two[i][0] && p[1] == two[i][1]) return p += 2, k.t = T_EQ + i, k;
+    if ((unsigned char)*p >= 0x80) {  // (a token is ASCII: past it, the compiler would index its tables with it)
+      err = "this character can be in a string or a comment, not in code";
+      for (p++; ((unsigned char)*p & 0xC0) == 0x80; p++) {}
+      return k.t = T_ERR, k;
+    }
     return k.t = *p++, k;
   }
 };
