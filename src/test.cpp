@@ -130,7 +130,7 @@ static V allocsEnd(V start) { return box((double)gcAllocations() - num(start)); 
 // bound: n^k, optionally times log n ("1", "log n", "n", "n log n", "n^2", ...). The body runs for sizes n that double,
 // and the check fits how its cost grows on a log-log scale: it fails if, divided by the growth, the cost still grows
 // (slope over tolerance). Time is the best of 3 runs of a batch lasting 2 ms or more, from the n at which one call
-// takes 50 us; allocations are counted for n = 64..2048 (exact, so their tolerance is tight).
+// takes 50 us, measured afresh up to twice before it fails; allocations are counted for n = 64..2048 (exact, so their tolerance is tight).
 namespace {
 struct Growth { double k = 0; bool lg = false; };
 bool parseGrowth(std::string_view m, Growth& g) {
@@ -191,9 +191,13 @@ static V growsAt(V site, V clo, V growth, V byAllocs) {
         }
       return best;
     };
-    double n = 16, t = measure(n), start = now();
-    while (t < 50e-6 && n < (1 << 20)) t = measure(n *= 2);
-    for (pts.push_back({n, t}); pts.size() < 5 && t < 0.25 && now() - start < 3; pts.push_back({n, t})) t = measure(n *= 2);
+    for (int attempt = 0; attempt < 3; attempt++) {  // a machine under load can bend one fit; a wrong growth bends every one
+      pts.clear();
+      double n = 16, t = measure(n), start = now();
+      while (t < 50e-6 && n < (1 << 20)) t = measure(n *= 2);
+      for (pts.push_back({n, t}); pts.size() < 5 && t < 0.25 && now() - start < 3; pts.push_back({n, t})) t = measure(n *= 2);
+      if (pts.size() < 3 || slope(pts, want) <= 0.4) return NIL;
+    }
   }
   double tol = allocs ? 0.1 : 0.4;
   if (pts.size() < 3 || slope(pts, want) <= tol) return NIL;
