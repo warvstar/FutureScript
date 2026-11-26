@@ -12,7 +12,7 @@ var MODEL = env("SWARM_MODEL") || "claude-haiku-5-5"
 var CAP = parseNum(env("SWARM_CAP") || "20")          // dollars, hard: no request starts that could cross it
 var NWORKERS = parseNum(env("SWARM_WORKERS") || "8")
 var MAXTOK = 16000
-var MAXSTEPS = 45
+var MAXSTEPS = 90
 var MAXCTX = 240000                                     // chars of a worker's conversation (stays under 100K tokens)
 var WORK = DIR + "/work"
 var T0 = time()
@@ -212,21 +212,44 @@ fn loadState() {
 
 // ---- workers ----
 fn newWorker(i) { return {i: i, wt: DIR + "/wt/w" + str(i), task: nil, messages: [], steps: 0, phase: "idle", size: 0} }
-fn startTask(w, t) {
-  sh("git checkout -q -B w" + str(w.i) + " main && git reset -q --hard main && git clean -qfd", w.wt)
-  t.status = "active"
-  t.attempts = (t.attempts || 0) + 1
-  w.task = t
-  w.steps = 0
-  w.phase = "work"
+fn intro(t) {
   var notes = ""
   if t.notes && t.notes.len() > 0 { notes = "\n\nNotes from earlier attempts and reviews:\n- " + t.notes.join("\n- ") }
-  w.messages = [{role: "user", content: "Your task (#" + str(t.id) + "): " + t.title + "\n\n" + t.detail +
-    "\n\nFiles this task owns: " + t.files.join(", ") + notes + "\n\nmain's tests now: " + mainTests.summary}]
-  log("w" + str(w.i) + " starts #" + str(t.id) + " " + t.title)
+  return "Your task (#" + str(t.id) + "): " + t.title + "\n\n" + t.detail + "\n\nFiles this task owns: " + t.files.join(", ") +
+    notes + "\n\nmain's tests now: " + mainTests.summary
+}
+fn progress(w) {  // what the worktree already has, for a conversation that starts over on the same files
+  var stat = sh("git add -A && git diff --cached --stat main", w.wt).out.trim()
+  if stat == "" { return "" }
+  return "\n\nYou already started this task, and the repository keeps your changes so far (compared with main):\n" + clip(stat, 3000) +
+    "\nRead the files you need, run test to see where things stand, and continue."
+}
+fn startTask(w, t) {
+  var resume = t.worker == w.i   // the harness restarted mid-task: this worktree still has the work
+  if !resume { sh("git checkout -q -B w" + str(w.i) + " main && git reset -q --hard main && git clean -qfd", w.wt) }
+  t.status = "active"
+  if !resume { t.attempts = (t.attempts || 0) + 1 }
+  t.worker = w.i
+  w.task = t
+  w.steps = 0
+  w.refreshes = 0
+  w.reviews = 0
+  w.phase = "work"
+  var more = ""
+  if resume { more = progress(w) }
+  w.messages = [{role: "user", content: intro(t) + more}]
+  var how = " starts #"
+  if resume { how = " resumes #" }
+  log("w" + str(w.i) + how + str(t.id) + " " + t.title)
+}
+fn refresh(w) {  // the conversation grew too long: start it over, keeping the files
+  w.refreshes += 1
+  w.messages = [{role: "user", content: intro(w.task) + progress(w) + "\n\n(Your earlier conversation was cleared to save space.)"}]
+  log("w" + str(w.i) + " starts its conversation over on #" + str(w.task.id) + " (" + str(w.refreshes) + ")")
 }
 fn giveUp(w, why) {
   var t = w.task
+  t.worker = nil
   t.notes = t.notes || []
   t.notes.push("attempt " + str(t.attempts) + " stopped: " + why)
   if t.attempts >= 3 { t.status = "failed" rejections.push(t.title + ": failed 3 times, last: " + why) }
@@ -306,8 +329,10 @@ fn workerRound(w, msg) {  // the reply to a worker's request
     results.push({type: "tool_result", tool_use_id: u.id, content: r.text, is_error: r.err || false})
   }
   w.messages.push({role: "user", content: results})
-  if w.phase == "work" && (w.steps >= MAXSTEPS || json(w.messages).len() > MAXCTX) {
-    giveUp(w, "ran out of steps or context after " + str(w.steps) + " steps; split the task or simplify")
+  if w.phase != "work" { return nil }
+  if w.steps >= MAXSTEPS { giveUp(w, "ran out of steps after " + str(w.steps) + "; split the task or simplify") }
+  else if json(w.messages).len() > MAXCTX {
+    if w.refreshes >= 3 { giveUp(w, "its conversation outgrew the context 3 times; split the task or simplify") } else { refresh(w) }
   }
 }
 
@@ -439,9 +464,14 @@ fn main() {
     if readFile(DIR + "/STOP") != nil { log("STOP file: stopping") break }
     ledger.rounds += 1
     // idle workers take queued tasks
+    for w in workers {  // a task resumes on the worker whose worktree has it
+      if w.phase != "idle" { continue }
+      for t in byStatus("queued") { if t.worker == w.i { startTask(w, t) break } }
+    }
     for w in workers {
       if w.phase != "idle" { continue }
-      var q = byStatus("queued")
+      var q = []
+      for t in byStatus("queued") { if t.worker == nil { q.push(t) } }
       if q.len() > 0 { startTask(w, q[0]) }
     }
     // this round's requests
