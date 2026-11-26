@@ -645,12 +645,12 @@ def runner_worker(exe):
     r1, r2 = node("run", str(d / "serve"), "/"), node("run", str(d / "serve"), "/echo", "--method", "POST", "--body", "hi")
     if r1.stdout != '200 application/json\n{"hello":"from fut","hits":1}\n' or '"method":"POST"' not in r2.stdout or '"body":"hi"' not in r2.stdout:
         return False, f"serve: {r1.stdout!r} {r1.stderr!r}\n  {r2.stdout!r} {r2.stderr!r}"
-    specs = [str(ROOT / "tests" / "specs" / f) for f in ("bits.fut", "try.fut", "err_arity.fut", "imports.fut")]
+    specs = [str(ROOT / "tests" / "specs" / f) for f in ("bits.fut", "try.fut", "err_arity.fut", "imports.fut", "isolates.fut")]
     t = node("build", "--tests", "--shards", "2", "--root", str(ROOT / "tests"), str(d / "tests"), *specs)
     m = json.loads((d / "tests" / "manifest.json").read_text()) if not t.returncode else {}
     r = node("test", str(d / "tests"), "--json")
     last = json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else {}
-    if t.returncode or len(m.get("shards", [])) != 2 or r.returncode or last.get("failed") or last.get("errors") or last.get("passed", 0) < 18:
+    if t.returncode or len(m.get("shards", [])) != 2 or r.returncode or last.get("failed") or last.get("errors") or last.get("passed", 0) < 33:
         return False, f"tests: {t.stdout}{t.stderr}\n  {r.stdout[-800:]}{r.stderr[-800:]}"
     bj = d / "serve" / "bundle.json"  # a compile that doesn't match what was compiled ahead of time: a clear 500
     bundle = json.loads(bj.read_text())

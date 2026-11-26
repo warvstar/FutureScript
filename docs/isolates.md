@@ -294,5 +294,7 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
   promising call), as main.cpp does natively.
 - **Limits.** A file reload under `-w` waits until the isolates the program started have ended: other isolates
   share its code but have globals of their own, which nothing copies into them yet (natively, phase 4 does). A
-  call that waits on the host (`sleep`, `fetch`) holds up every isolate. A Worker built ahead of time can't compile
-  `try_call`, so `spawn` there needs it shipped, as the interpreter Worker does.
+  call that waits on the host (`sleep`, `fetch`) holds up every isolate.
+- **Cloudflare Workers.** A Worker can't compile code, so every bundle ships `try_call` compiled (`try.wasm`), and
+  `run()` there takes `--seed n` (and `--threads n`, which does nothing on one thread). `tests/specs/isolates.fut`
+  passes in a bundle compiled ahead of time (`build.py`'s Worker check runs it).

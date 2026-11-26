@@ -40,19 +40,23 @@ export async function runChild(ctx, args, file, source) {
   const id = childId(args, file, source), path = source != null ? `/tmp/fut-run-${sourceKey(source)}.fut` : file;
   const read = (p) => (source != null && p == path ? enc.encode(source) : ctx.read(p)), out = [], err = [];
   const write = (fd, b) => (fd == 2 ? err : out).push(dec.decode(b));
-  let code = 1;
+  let code = 1, seed = 0;
+  args = args.filter((a, i) => {  // --seed n: how its isolates interleave; --threads n: (one thread here)
+    if (a == "--seed" || a == "--threads") return a == "--seed" && (seed = +args[i + 1]), false;
+    return !(i > 0 && (args[i - 1] == "--seed" || args[i - 1] == "--threads"));
+  });
   try {
     if (args.length && args[0] != "test") throw new Error(`run() with args ${JSON.stringify(args)}: a Worker runs a program, or its tests (args: ["test", ...])`);
     const module = ctx.module(id, path);
     if (!module) throw new Error(`run(${source != null ? "a source" : file}): not compiled ahead of time. The build runs the tests to find the programs they run(); one that changes from run to run can't be known`);
-    const fut = await createFut(futOptions({ wasm: ctx.wasm, read, module, write, run: (a, f, s) => runChild(ctx, a, f, s), interp: ctx.interp, tryModule: ctx.tryModule }));
+    const fut = await createFut({ ...futOptions({ wasm: ctx.wasm, read, module, write, run: (a, f, s) => runChild(ctx, a, f, s), interp: ctx.interp, tryModule: ctx.tryModule }), seed });
     const fi = args.indexOf("--filter");
     code = args[0] == "test" ? await fut.test(path, args.includes("--json"), fi > 0 ? args[fi + 1] : "") : await fut.run(path, false);
   } catch (e) { err.push(`fut: ${e?.message ?? e}\n`); }
   return { code, out: out.join(""), err: err.join(""), timedOut: false };
 }
 const bundleCtx = (bundle, read) => ({  // a bundle compiled ahead of time
-  wasm: bundle.wasm, read,
+  wasm: bundle.wasm, read, tryModule: bundle.tryModule,
   module: (id, path) => (bundle.children?.[id] ? aheadOfTime(bundle.modules, bundle.children[id].keys, path) : null),
 });
 
@@ -87,7 +91,7 @@ export function createWorker(bundle) {
     const { main, keys } = bundle.serve, err = [];
     const write = lineWriter((fd, l) => (fd == 2 && err.push(l), logLine(fd, l)));
     try {
-      const fut = await createFut(futOptions({ wasm: bundle.wasm, read, module: aheadOfTime(bundle.modules, keys, main), write }));
+      const fut = await createFut(futOptions({ wasm: bundle.wasm, read, module: aheadOfTime(bundle.modules, keys, main), write, tryModule: bundle.tryModule }));
       const st = await fut.start(main);
       if (st) return { failed: `${main} did not ${st == 2 ? "compile" : "load"}:\n${err.join("\n")}` };
       if (!fut.has("serve")) return { failed: `${main} defines no fn serve(req)` };
