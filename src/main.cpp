@@ -275,6 +275,47 @@ static int apiCommand(bool check) {
   if (check) return reportInterfaces(checkInterfaces(c), false, path) ? 1 : 0;
   return writeInterfaces(c, path) < 0 ? 1 : 0;  // a breaking change without a version bump is held back
 }
+// fut init [dir]: a new package in dir (default: here), named after it: fut.pkg, <name>.fut with a pub function, main
+// and a test, its .api, and .fut-cache/ in .gitignore. Nothing is overwritten: if a file it would write exists, it
+// writes none. (.gitignore is appended to.)
+static int initCommand(int argc, char** argv) {
+  if (argc > 3 || (argc == 3 && argv[2][0] == '-')) return fputs("usage: fut init [dir]\n", stderr), 2;
+  std::string dir = argc == 3 ? argv[2] : ".";
+  while (dir.size() > 1 && dir.back() == '/') dir.pop_back();
+  for (size_t i = 1; i <= dir.size(); i++)  // make dir and its parents
+    if ((i == dir.size() || dir[i] == '/') && mkdir(dir.substr(0, i).c_str(), 0755) && errno != EEXIST)
+      return fprintf(stderr, "fut init: could not make %s: %s\n", dir.substr(0, i).c_str(), strerror(errno)), 1;
+  std::string abs = canonicalPath(dir), name = abs.substr(abs.rfind('/') + 1);
+  for (char& c : name) if (!isalnum((unsigned char)c) && c != '_') c = '_';  // my-app -> my_app: a name is an identifier
+  if (name.empty() || isdigit((unsigned char)name[0])) name = "_" + name;
+  std::string at = dir == "." ? "" : dir + "/", root = at + name + ".fut";
+  for (std::string f : {at + "fut.pkg", root, at + name + ".api"})
+    if (struct stat st; !stat(f.c_str(), &st)) return fprintf(stderr, "fut init: %s already exists, so nothing was written\n", f.c_str()), 1;
+  std::string pkg = "name " + name + "\nversion 0.1.0\n";
+  std::string src = "// " + name + ": `fut " + name + ".fut` runs main, `fut -w " + name + ".fut` reloads it on save, `fut test " + name +
+                    ".fut` runs the tests.\n// pub names are the package's interface, kept in " + name + ".api: `fut api " + name +
+                    ".fut` updates it when they change.\n\n"
+                    "pub fn greet(who: str): str { return \"hello, {who}\" }\n\n"
+                    "fn main() {\n  print(greet(\"world\"))\n}\n\n"
+                    "test \"greet\" {\n  expect greet(\"fut\") == \"hello, fut\"\n}\n";
+  if (!saveFile(at + "fut.pkg", &pkg) || !saveFile(root, &src)) return fprintf(stderr, "fut init: could not write in %s: %s\n", abs.c_str(), strerror(errno)), 1;
+  printf("created %sfut.pkg\ncreated %s\n", at.c_str(), root.c_str());
+  std::string ignore, gi = at + ".gitignore";
+  bool had = readFile(gi, ignore);
+  if (ignore.find(".fut-cache") == std::string::npos) {  // `fut test --changed` keeps its cache there
+    ignore += (ignore.empty() || ignore.back() == '\n' ? "" : "\n") + std::string(".fut-cache/\n");
+    if (saveFile(gi, &ignore)) printf("%s %s\n", had ? "added .fut-cache/ to" : "created", gi.c_str());
+  }
+  path = root;
+  rtInit();
+  try {
+    for (auto& is : checkInterfaces(compile(path, false, false)))
+      if (saveFile(is.api, &is.want)) printf("created %s%s\n", at.c_str(), is.api.substr(is.api.rfind('/') + 1).c_str());
+  } catch (std::exception& e) { return fprintf(stderr, "%s\n", e.what()), 1; }
+  printf("\n%s  fut %s.fut         run it\n  fut test %s.fut    test it\n", dir == "." ? "" : ("  cd " + dir + "\n").c_str(), name.c_str(), name.c_str());
+  return 0;
+}
+
 // fut map [--pub] [--json] file.fut [package | file]: the packages, files and declarations the program uses
 static int mapCommand(bool pubOnly, bool json, const std::string& only) {
   Compiled c;
@@ -341,6 +382,7 @@ int main(int argc, char** argv) {
   findStd();
   if (argc > 1 && std::string(argv[1]) == "explain") return explain(argc > 2 ? argv[2] : nullptr);  // an error code's rule and fix
   if (argc > 1 && std::string(argv[1]) == "worker") return workerCommand(argc, argv);
+  if (argc > 1 && std::string(argv[1]) == "init") return initCommand(argc, argv);
   bool watch = false, asmMode = false, testMode = argc > 1 && std::string(argv[1]) == "test";
   bool apiMode = argc > 1 && std::string(argv[1]) == "api", apiCheck = false;
   bool mapMode = argc > 1 && std::string(argv[1]) == "map", mapPub = false, mapJson = false;
@@ -351,7 +393,7 @@ int main(int argc, char** argv) {
   bool record = false;
   const char* usage = "usage: fut [-w | -v | --asm | --isolates n | --seed n | --threads n | --record log | --replay log] [file.fut]   (no file: REPL)\n"
                       "       fut test [--changed] [--json] [--filter text] [--timeout s] [--isolates n] [--seed n] file.fut...\n"
-                      "       fut api [--check] file.fut\n       fut map [--pub] [--json] file.fut [package | file]\n       fut explain [code]\n"
+                      "       fut init [dir]   (a new package)\n       fut api [--check] file.fut\n       fut map [--pub] [--json] file.fut [package | file]\n       fut explain [code]\n"
                       "       fut worker build ...   (Cloudflare Workers: node web/worker.mjs)\n";
   for (int i = 1 + (testMode || apiMode || mapMode); i < argc; i++) {
     std::string a = argv[i];

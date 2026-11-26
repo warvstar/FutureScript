@@ -13,6 +13,7 @@ build/fut file.fut             # run
 build/fut test file.fut        # run its `test` blocks (--json: one JSON object per line; --filter text; --timeout s)
 build/fut test --changed f.fut # rerun only the tests an edit can affect; the rest are cached passes
 build/fut -w file.fut          # run and hot-reload on save (file and its imports); type lines to run them inside it
+build/fut init [dir]           # a new package: fut.pkg, <dir>.fut (main and a test), its .api, .gitignore
 build/fut api file.fut         # write each imported file's .api (its pub declarations); `fut test` checks them
 build/fut map file.fut         # every package, file and declaration the program uses, with line ranges
 build/fut explain [code]       # an error code's rule and fix ([index], [requires], ...; no code: all of them)

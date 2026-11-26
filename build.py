@@ -770,6 +770,29 @@ def runner_replay(exe):
     return ok, f"record: {rec.stdout!r} {rec.stderr!r}\n  replay: {rep.stdout!r} {rep.stderr!r} fast={fast}\n  changed: {bad.stderr!r}"
 
 
+def runner_init(exe):
+    """fut init: a package that runs and passes its tests as made; a name from the directory; nothing overwritten."""
+    if exe.suffix == ".wasm":
+        return True, "native only"
+    d = Path(tempfile.mkdtemp(dir=ROOT / "build"))
+    run = lambda *a, cwd=d: subprocess.run([str(exe), *a], capture_output=True, text=True, timeout=60, cwd=cwd)
+    try:
+        a = run("init", "my-app")
+        p = d / "my-app"
+        r, t = run("my_app.fut", cwd=p), run("test", "my_app.fut", cwd=p)
+        again = run("init", "my-app")
+        (d / "old").mkdir()
+        (d / "old" / ".gitignore").write_text("node_modules")
+        b = run("init", cwd=d / "old")
+        ok = (a.returncode == 0 and (p / "fut.pkg").read_text().startswith("name my_app\n") and (p / "my_app.api").exists()
+              and r.stdout == "hello, world\n" and t.returncode == 0 and "1 passed" in t.stdout
+              and again.returncode == 1 and "already exists" in again.stderr
+              and b.returncode == 0 and (d / "old" / ".gitignore").read_text() == "node_modules\n.fut-cache/\n" and (d / "old" / "old.fut").exists())
+        return ok, f"init: {a.stdout!r} {a.stderr!r}\n  run: {r.stdout!r} {r.stderr!r}\n  test: {t.stdout!r}\n  again: {again.stderr!r}\n  existing dir: {b.stdout!r} {b.stderr!r}"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 RUNNER_TESTS = [("std/math: within 1 ulp of libm, exact cases exact", runner_fmath),
                 ("fut --record / --replay: the same run again, sleeps skipped", runner_replay),
                 ("fut test --json: statuses, details, output", runner_json),
@@ -778,6 +801,7 @@ RUNNER_TESTS = [("std/math: within 1 ulp of libm, exact cases exact", runner_fma
                 ("foreign modules: js, wasm, c", runner_modules),
                 ("fut test: tests first, filter, compile error, todo()", runner_text),
                 ("fut api: interfaces written, checked by fut test", runner_api),
+                ("fut init: a new package that runs and passes its test", runner_init),
                 ("docs/spec.md: every fut block passes", runner_spec),
                 ("error codes: registered, used, raised, explained", runner_codes),
                 ("fut test --changed: reruns what an edit affects", runner_changed),
