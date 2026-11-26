@@ -269,25 +269,45 @@ struct Views {
     char k;            // 't' literal text, 's' a string with holes (code: a function), 'd' any other child (code), 'e' an element
     std::string code;
     std::shared_ptr<El> el;
+    int ln = 0;        // the source line it starts on
   };
   struct El {
     std::string name, bind;
     std::vector<std::string> fixed;
     std::vector<std::pair<std::string, std::string>> when;
     std::vector<std::tuple<std::string, std::string, bool>> attrs;  // name, code, a handler's
+    std::vector<int> attrLn;  // each attribute's source line
     std::vector<Kid> kids;
+    int ln = 0;
   };
+  // Lines: a template's wiring is one expression, but each live part's code goes on its own source line (padded with
+  // newlines), so an error in a handler points at it. wl: the line the code being made is on; padded: newlines added.
+  std::vector<size_t> nls;  // where the source's newlines are
+  int wl = 0, padded = 0;
+  int lineAt(size_t pos) {
+    if (nls.empty()) { for (size_t q = 0; q < s.size(); q++) if (s[q] == '\n') nls.push_back(q); nls.push_back(SIZE_MAX); }
+    return int(std::lower_bound(nls.begin(), nls.end(), pos) - nls.begin());
+  }
+  void pad(std::string& to, int ln) { while (wl < ln) to += '\n', wl++, padded++; }
+  void leaf(std::string& to, int ln, const std::string& code) {  // code from the source, on its line
+    pad(to, ln);
+    to += code, wl += int(std::count(code.begin(), code.end(), '\n'));
+  }
+  Kid lnKid(Kid k, size_t pos) { return k.ln = lineAt(pos), k; }
   // tag .class .class: cond name: value on event { ... } content... { children }
   void element(int n) {
     size_t at = i;
     std::string was = out, nl;
     auto e = elTree(n, nl);
     if (!e) { i = at, out = was, elementMake(n); return; }  // a block with statements in it: as before
-    out += "_k" + std::to_string(n) + ".push(" + code(*e) + ")" + nl;
+    wl = e->ln, padded = 0;
+    std::string c = code(*e);
+    out += "_k" + std::to_string(n) + ".push(" + c + ")" + std::string(std::max(0, int(nl.size()) - padded), '\n');
   }
   // The element from i as a tree, or nullptr when its block has statements (var, assignments). nl: its newlines.
   std::shared_ptr<El> elTree(int n, std::string& nl) {
     auto e = std::make_shared<El>();
+    e->ln = lineAt(peek().b);
     e->name = textOf(s, take());
     std::string saved = std::exchange(out, "");
     for (;;) {
@@ -304,14 +324,14 @@ struct Views {
         std::string a = textOf(s, t);
         if (a == "class") e->when.push_back({"=" + expr(), "true"});
         else if (a == "bind") e->bind = expr();
-        else e->attrs.push_back({a, expr(), false});
+        else e->attrLn.push_back(lineAt(t.b)), e->attrs.push_back({a, expr(), false});
       } else if (is(s, t, "on") && n2.k == 'i' && is(s, peek(n2.e), "{")) {
         take(), take(), take();
-        e->attrs.push_back({"on" + textOf(s, n2), "fn(e) {" + braceBody() + "}", true});
+        e->attrLn.push_back(lineAt(t.b)), e->attrs.push_back({"on" + textOf(s, n2), "fn(e) {" + braceBody() + "}", true});
       } else if (is(s, t, "{")) {
         if (!kidsTree(n + 1, e->kids)) return out = saved, nullptr;
         break;
-      } else e->kids.push_back(kidOf(expr()));
+      } else e->kids.push_back(lnKid(kidOf(expr()), t.b));
     }
     nl += lines(std::exchange(out, saved));
     return e;
@@ -326,19 +346,19 @@ struct Views {
       out += s.substr(t.tb, t.b - t.tb), i = t.b;  // (only its newlines are kept)
       std::string word = t.k == 'i' ? textOf(s, t) : "";
       Tok n2 = peek(t.e);
-      if (word == "if") { kids.push_back({'d', ifExpr(n), nullptr}); continue; }
-      if (word == "for") { std::string lead; std::string e = forExpr(n, lead); out += lead, kids.push_back({'d', e, nullptr}); continue; }
+      if (word == "if") { kids.push_back(lnKid({'d', ifExpr(n), nullptr}, t.b)); continue; }
+      if (word == "for") { std::string lead; std::string e = forExpr(n, lead); out += lead, kids.push_back(lnKid({'d', e, nullptr}, t.b)); continue; }
       if (word == "var" || (word == "state" && n2.k == 'i')) return false;
-      if (t.k == 's') { kids.push_back(kidOf(expr())); continue; }
-      if (t.k == 'i' && word[0] >= 'A' && word[0] <= 'Z' && is(s, n2, "(") && !n2.sp()) { kids.push_back({'d', expr(), nullptr}); continue; }
+      if (t.k == 's') { kids.push_back(lnKid(kidOf(expr()), t.b)); continue; }
+      if (t.k == 'i' && word[0] >= 'A' && word[0] <= 'Z' && is(s, n2, "(") && !n2.sp()) { kids.push_back(lnKid({'d', expr(), nullptr}, t.b)); continue; }
       if (t.k == 'i' && !assignOp(s, n2) && !((is(s, n2, "(") || is(s, n2, ".")) && !n2.sp())) {
         std::string nl;
         auto c = elTree(n, nl);
         if (!c) return false;
-        out += nl, kids.push_back({'e', "", c});
+        out += nl, kids.push_back(lnKid({'e', "", c}, t.b));
         continue;
       }
-      if (!assignOp(s, peek(exprEnd(i, false)))) { kids.push_back({'d', live(expr(false)), nullptr}); continue; }
+      if (!assignOp(s, peek(exprEnd(i, false)))) { kids.push_back(lnKid({'d', live(expr(false)), nullptr}, t.b)); continue; }
       return false;  // an assignment
     }
   }
@@ -360,34 +380,64 @@ struct Views {
     return "ui.tpl(\"" + std::string(key) + "\", fn() { return " + desc + " }, fn(_n) {" + wire + " })";
   }
   std::string makeCode(const El& e) {
-    std::vector<std::string> props, kids;
-    if (!e.fixed.empty() || !e.when.empty()) props.push_back(classProp(e.fixed, e.when));
-    if (!e.bind.empty()) props.push_back("\"bind\": \x01" + e.bind);
-    for (auto& [a, c, h] : e.attrs) props.push_back(quote(a) + ": " + (h ? c : live(c)));
-    for (auto& k : e.kids) kids.push_back(k.k == 'e' ? code(*k.el) : k.code);
-    return "ui.make(" + quote(e.name) + ", {" + join(props) + "}, [" + join(kids) + "])";
+    std::string r = "ui.make(" + quote(e.name) + ", {";
+    bool first = true;
+    auto prop = [&](int ln, const std::string& code) { if (!first) r += ", "; first = false; leaf(r, ln, code); };
+    if (!e.fixed.empty() || !e.when.empty()) prop(e.ln, classProp(e.fixed, e.when));
+    if (!e.bind.empty()) prop(e.ln, "\"bind\": \x01" + e.bind);
+    for (size_t q = 0; q < e.attrs.size(); q++) {
+      auto& [a, c, h] = e.attrs[q];
+      prop(e.attrLn[q], quote(a) + ": " + (h ? c : live(c)));
+    }
+    r += "}, [";
+    first = true;
+    for (auto& k : e.kids) {
+      if (!first) r += ", ";
+      first = false;
+      if (k.k == 'e') pad(r, k.ln), r += code(*k.el);
+      else leaf(r, k.ln, k.code);
+    }
+    return r + "])";
   }
   // e's part of a template's description (see dom.js's template), and the code wiring its live parts onto the
   // nodes an instance gives (_n[1], _n[2], ...: in this order; the root is _n[0]).
   std::string descOf(const El& e, int& at, std::string& wire, bool root) {
     std::string tag = e.name;
-    std::vector<std::string> fixed = e.fixed, stat, live_;
+    std::vector<std::string> fixed = e.fixed, stat;
+    std::vector<std::pair<int, std::string>> live_;  // (line, code)
     if (tag == "row" || tag == "column" || tag == "text") fixed.insert(fixed.begin(), tag), tag = "div";
-    if (!fixed.empty() || !e.when.empty()) (e.when.empty() ? stat : live_).push_back(classProp(fixed, e.when));
-    for (auto& [a, c, h] : e.attrs) {
+    if (!fixed.empty() || !e.when.empty()) {
+      if (e.when.empty()) stat.push_back(classProp(fixed, e.when));
+      else live_.push_back({e.ln, classProp(fixed, e.when)});
+    }
+    for (size_t q = 0; q < e.attrs.size(); q++) {
+      auto& [a, c, h] = e.attrs[q];
       bool fixedAttr = !h && literal(c) && a != "value" && a != "checked" && a != "disabled";
-      (fixedAttr ? stat : live_).push_back(quote(a) + ": " + (h ? c : live(c)));
+      if (fixedAttr) stat.push_back(quote(a) + ": " + c);
+      else live_.push_back({e.attrLn[q], quote(a) + ": " + (h ? c : live(c))});
     }
     bool slot = e.kids.size() == 1 && e.kids[0].k == 's';  // one string with holes: a text node it keeps current
     int flags = (live_.empty() ? 0 : 1) | (slot ? 2 : 0);
-    if (flags & 1) wire += " ui.wire(_n[" + std::to_string(root ? 0 : ++at) + "], {" + join(live_) + "})";
-    if (slot) wire += " ui.textAt(_n[" + std::to_string(++at) + "], " + e.kids[0].code + ")";
+    if (flags & 1) {
+      wire += " ui.wire(_n[" + std::to_string(root ? 0 : ++at) + "], {";
+      for (size_t q = 0; q < live_.size(); q++) {
+        if (q) wire += ", ";
+        leaf(wire, live_[q].first, live_[q].second);
+      }
+      wire += "})";
+    }
+    if (slot) wire += " ui.textAt(_n[" + std::to_string(++at) + "], ", leaf(wire, e.kids[0].ln, e.kids[0].code), wire += ")";
     std::string d = "[" + quote(tag) + ", {" + join(stat) + "}, " + std::to_string(flags);
     if (!slot)
       for (auto& k : e.kids) {
         if (k.k == 't') { if (k.code != "true" && k.code != "false" && k.code != "nil") d += ", " + k.code; }
         else if (k.k == 'e' && templated(*k.el)) d += ", " + descOf(*k.el, at, wire, false);
-        else d += ", nil", wire += " ui.hole(_n[" + std::to_string(++at) + "], " + (k.k == 'e' ? code(*k.el) : k.code) + ")";
+        else {
+          d += ", nil", wire += " ui.hole(_n[" + std::to_string(++at) + "], ";
+          if (k.k == 'e') pad(wire, k.ln), wire += code(*k.el);
+          else leaf(wire, k.ln, k.code);
+          wire += ")";
+        }
       }
     return d + "]";
   }
@@ -551,6 +601,16 @@ struct State {
       }
     }
   }
+  std::string owner(size_t j) {  // the innermost named function (or view) around token j
+    for (size_t b = encl[j]; b != SIZE_MAX; b = encl[b]) {
+      size_t q = b;
+      while (q > 0 && !is(s, t[q - 1], ")") && !is(s, t[q - 1], "{") && !is(s, t[q - 1], "}") && !t[q].nl) q--;  // past a result type
+      if (q == 0 || !is(s, t[q - 1], ")")) continue;
+      size_t p = match[q - 1];
+      if (p >= 2 && t[p - 1].k == 'i' && is(s, t[p - 2], "fn")) return textOf(s, t[p - 1]);
+    }
+    return "top";
+  }
   void scan() {  // state declarations: top level and in class bodies
     int depth = 0;
     std::vector<size_t> body;  // the open class bodies' `{`, with their depth
@@ -654,7 +714,8 @@ struct State {
           continue;
         }
         if ((!in && tops.count(name)) || localAt(name, j + 1)) {
-          out += pre + "var " + name + " = _state.cell(";
+          bool local = localAt(name, j + 1);  // a view's or function's own: kept across a reload (_state.local)
+          out += pre + "var " + name + (local ? " = _state.local(\"" + owner(j) + "." + name + "\", " : " = _state.cell(");
           size_t e = j + 2;
           if (is(s, t[e], "=")) { size_t x = exprEnd(e + 1); out += s.substr(t[e].tb, t[e].b - t[e].tb); emit(e + 1, x), e = x; }
           else out += "nil";
