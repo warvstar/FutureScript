@@ -233,16 +233,73 @@ pending discounts (cart.fut:10): undefined name 'discount' at cart.fut:10:27
 - **`expect a op b`**, where `op` is a comparison, checks the comparison. On failure it reports the expression's source text and the value of each side that isn't a literal. **`expect x`** checks that `x` is truthy, and `expect a == b && c` checks the whole condition. Inside `expect`, `==` and `!=` compare lists and maps by their contents, ignoring key order, and a failure names the first difference (`first difference at .items[0].qty: 3 vs 4`). The language's own `==` still compares lists and maps by identity.
 - **`expect throws { ... }`** passes if the block throws, and `expect throws { ... } == value` also checks the thrown value.
 - **`expect prints { ... } == "text\n"`** checks exactly what `print` wrote inside the block.
+- **`expect allocs { ... } <= 2000`** compares how many objects the block allocated: lists, maps, strings, instances, closures and fibers, one each however big. Numbers aren't objects. The count is exact and the same natively and in wasm, so it makes a portable performance check. Counting costs nothing: the allocator's bump pointers already record it. Objects a contract check makes (its `old()` values, a clause's calls) aren't counted, so adding a contract doesn't change a count.
+- **`expect grows { n -> parse(lines(n)) } like "n"`** checks how the block's running time grows with `n`. It runs the block for doubling sizes: from the `n` at which one call takes 50 µs, five sizes, stopping early at 0.25 s per call or 3 s in all. Each time is the best of 3 batches of 2 ms or more. The check fits the times on a log-log scale and fails if, divided by the growth, they still grow by more than a tolerance. **`expect grows allocs { ... }`** fits allocation counts instead, for `n` = 64..2048, with a tight tolerance. A growth is `"1"`, `"n"`, `"n^2"` (any `n^k`), optionally followed by `log n` (`"log n"`, `"n log n"`). It is an upper bound: code that grows more slowly passes. A failure names the growth it measured and lists the measurements (`it grows like n^2, not n (n = 256: 0.081 ms, 512: 0.304 ms, ...)`). The tolerance is wide enough to tell `n` from `n^2` reliably, but not `n` from `n log n`.
 - **`run(file)`** or **`run({source: "...", args: [...], timeout: s})`** runs fut on a program in a child process and returns `{code, out, err, timedOut}`. Use it to check what can't be checked in-process: uncaught errors and their stack traces, compile errors, exit codes, and whether `main` runs. A relative `file` is found next to the program, and `args` go before the file (`args: ["test", "--json"]`). In `source`, write `\{` for a literal brace, because `{...}` interpolates.
 - A failed `expect` throws an error. Outside `fut test` it works as an assertion, with the usual stack trace. A test whose `expect` fails is reported as failed even if its own `try` catches that error.
-- **Pending tests support writing the spec first.** A test that names a function, class or module member that isn't defined yet is reported as pending instead of failing the whole compile. Any other compile error is still an error.
+- **Pending tests support writing tests first.** A test that names a function, class or module member that isn't defined yet is reported as pending instead of failing the whole compile. Any other compile error is still an error.
 - **Interfaces:** `fut test` also fails when a file's `.api` file is missing or out of date (see [Modules](#modules-and-visibility)).
 - **Statuses:** `ok`, `FAIL` (an `expect` failed), `ERROR` (an uncaught runtime error, with its trace) and `pending`. Output that a failing test printed is shown under it. The exit status is 0 only when every test passed: 1 means something failed, errored or is pending, and 2 means a compile error.
 - **`--json`** prints one object per line: `{"type":"test", "name", "file", "line", "status", "ms", "output"}`. A failed test adds `"expect": {"file", "line", "expr", "left": {"expr", "value"}, "right": {...}, "diff": {"at", "what"}, "reason"}`. An error adds `"message"` and `"trace"`, and a pending test adds `"reason"`. A final `{"type":"summary", "passed", "failed", "errors", "pending", "ms"}` follows. A compile error is `{"type":"compile_error", "file", "line", "col", "message", "text"}`, and an error in top-level code is `{"type":"error", "message", "trace"}`.
 - **`--filter text`** runs only the tests whose name contains `text`.
 - **Isolation:** natively, each test runs in its own process, forked after the top-level code has run. A test's changes to globals, a crash or a hang stay inside that test. A test that runs longer than `--timeout` seconds (default 10) is stopped and reported as an error. Under WebAssembly, tests share one process and run in order with no timeout, so tests shouldn't depend on each other's state.
-- `test`, `expect`, `throws` and `prints` are reserved only in these positions, so they stay usable as ordinary names.
+- `test`, `expect`, `throws`, `prints`, `allocs`, `grows` and `like` are reserved only in these positions, so they stay usable as ordinary names.
 - **This repository's tests:** `tests/specs/*.fut` are specs, run with `fut test`; the programs they `run()` are in `tests/specs/progs/`. A few files in `tests/*.fut` still use `// expect:` comments that the runner compares with stdout: `basics`, `control`, `cond`, `classes`, `err_compile` and `expect`. They test, without using `expect`, the features `expect` itself depends on.
+
+## Contracts
+
+```
+class Account {
+  var balance = 0
+  invariant self.balance >= 0
+
+  fn init(balance: num)
+    requires balance >= 0
+  {
+    self.balance = balance
+  }
+  fn withdraw(n: num): num !
+    requires n > 0
+    requires n <= self.balance
+    ensures self.balance == old(self.balance) - n
+    ensures result == self.balance
+  {
+    self.balance -= n
+    return self.balance
+  }
+}
+```
+
+```
+$ build/fut bank.fut
+runtime error: the caller broke Account.withdraw()'s contract: requires n <= self.balance (n is 50, self.balance is 10)
+  at Account.withdraw (bank.fut:10)
+  at <top> (bank.fut:21)
+```
+
+A function's contract sits between its signature and its body, one clause per line, so whoever edits the body sees what it must keep. A class's invariants sit in its body. Contracts are checked on every call, like types, in normal runs and in `fut test`; they are part of the package's `.api`, and `fut test` also checks each one on generated inputs.
+
+- **`requires cond`** is checked on entry. A failure is the caller's fault, and the error says so.
+- **`ensures cond`** is checked when the function returns, by any `return` or by reaching its end. A failure is the implementation's fault. In `ensures`, `result` is the value returned and `old(expr)` is `expr`'s value on entry (only those expressions are computed on entry). Parameters mean what was passed, even if the body assigns them.
+- **`invariant cond`** (in a class body) is checked after `init` and whenever an outside call on an instance ends. A method that calls its own object's methods partway through a change doesn't trigger the check in those inner calls, so it may break the invariant temporarily. A call that throws is over: the next outside call checks it. A store to a field from outside the object (`acct.balance = 5`) is checked too. A subclass keeps its superclass's invariants and may add its own, and every method checks all of them, including methods it inherits.
+- **A clause is one line:** its condition runs to the end of the line, or to a `{` or `}` on it (`fn f(n) requires n > 0 { ... }` works for a short one). A condition that needs more room goes in brackets. Write one `requires` per condition rather than joining them with `&&`: adding or removing a clause is then a one-line change, and the `.api` reports each one.
+- **Failures name the part that failed.** A condition joined with `&&` is checked part by part, and the error shows the failing part's source and the value of each side that isn't a literal. A condition with `||` outside brackets is checked as one. A contract error is an ordinary runtime error, so `try` and `expect throws` see it.
+- **Checking changes nothing.** A clause that calls code runs with no effects allowed (it can't print or read the clock), and whatever it changed is put back afterwards, as in an atomic block. Clauses without calls compile to inline comparisons. Helpers a clause calls are ordinary functions, private to the file or package unless marked `pub`.
+- **Interfaces:** each `requires`, `ensures` and `invariant` of a `pub` declaration is written into the `.api`, under its declaration. A change to them is an interface change, classified by clause (an edited clause is one removed and one added): adding a `requires`, or removing an `ensures` or an `invariant`, is breaking, so a package's version must move (see [Packages](#packages)); adding an `ensures` or an `invariant`, or removing a `requires`, is compatible. `fut test` lists each one (`+ Stock.reserve() requires n <= self.available(sku)`).
+- **Property tests:** `fut test` also tests every contract on generated inputs. A function with a contract whose parameters are all typed `num`, `str`, `bool`, `list` or `map` (optionally `?`) is called with 100 valid inputs; one with an untyped parameter gets no property test. An input that breaks a `requires` doesn't count, and the test fails if fewer than 20 of up to 1000 inputs are valid. A class with invariants or methods with contracts gets a stateful test instead: it builds an instance and calls its methods with contracts (every method, if it has only invariants) up to 20 times with generated arguments, so invariants and `ensures` are checked across sequences of calls. Inputs are the same on every run. A failure is shrunk to a small counterexample, with fewer calls first and then smaller values:
+
+  ```
+  FAIL    contract half() on random inputs (half.fut:1)
+    half.fut:1: expect half() to keep its contract on random inputs
+      half(101)
+      half() broke its contract: ensures result * 2 == n (result * 2 is 0, n is 101)
+      (random input 1, shrunk)
+  ```
+- **Contract first:** write a function's signature and contract with **`todo()`** as its body. Calling it throws `f() is not implemented yet`, and under `fut test` it is reported as pending (`pending Account.close() (bank.fut:14): Account.close() is not implemented yet`) and left out of property tests. A stub file of such functions is the skeleton whoever implements it fills in.
+- **Cost:** clauses without calls are inline comparisons, and each `old()` takes one frame slot. A method of a class with invariants (its own, a superclass's or a subclass's) also makes three runtime calls: two to note whether the call is an outside one and, when it is, one to the object's hidden invariant method. Once a program declares an invariant, every store to a field of an object other than `self` also calls that method (a class without invariants answers through the call's inline cache). A function with a contract stays in tier 1, because tier 2 recompiles functions without their contracts.
+- `requires`, `ensures`, `invariant`, `old`, `result` and `todo` are reserved only in these positions.
+
+`examples/store` is a larger example: three packages (`money`, `stock`, `orders`) whose functions and classes state their contracts, plus a program and its tests that use them through `import "orders"` etc. `cd examples/store && ../../build/fut test store_test.fut` runs 7 written tests (output, effects, an atomic checkout, `allocs`, `grows`) and 7 property tests generated from the contracts, including stateful ones for the `Stock` and `Cart` classes and their invariants; each package's `.api` shows its contracts.
 
 ## Modules and visibility
 
@@ -262,7 +319,7 @@ Only the `pub` names of a file are what other files can depend on. Everything el
 
 ### Interface files
 
-`fut api main.fut` writes a `.api` file next to each compiled file that has `pub` declarations. It lists only the signatures, sorted by name, each with the `//` comments right above it, and includes a class's fields and methods:
+`fut api main.fut` writes a `.api` file next to each compiled file that has `pub` declarations. It lists only the signatures, sorted by name, each with the `//` comments right above it and its [contract](#contracts) below it, and includes a class's invariants, fields and methods:
 
 ```
 // The public interface of geom.fut, written by `fut api`. `fut test` fails while it is out of date.
@@ -467,23 +524,23 @@ Other differences from arm64: file changes and typed lines are delivered only wh
 |---|---|
 | `fut.h` | NaN-boxed values, object layouts, VM block, arm64 encoders (all checked against the system assembler) |
 | `compile.h` | Lexer and the parser state shared by both code generators |
-| `compile.cpp` | Single-pass Pratt compiler, generic over the code generator; token pre-pass for names, arities and spans; imports; incremental commit; tier 2 |
+| `compile.cpp` | Single-pass Pratt compiler, generic over the code generator; token pre-pass for names, arities, spans and contracts; contracts woven into functions, invariants into a hidden method per class; imports; incremental commit; tier 2 |
 | `gen_a64.h` / `gen_wasm.h` | Code generators: arm64 machine code / WebAssembly function bodies, behind one interface |
 | `wasm.h` | WebAssembly opcodes, encodings, helper signatures |
 | `rt.cpp` | Portable runtime: helpers, natives, objects, inline caches |
 | `jit.cpp` | arm64 platform: executable memory (free list, reclamation, `--asm`), stack traces and try, fibers, C calls |
 | `wasm.cpp` | WebAssembly platform: module building and table patching, JS calls, JSPI fibers, the exports the JS host drives |
 | `web/` | `fut.js` (JS host: instantiation, installs, traces, fibers, driver), `run.mjs` (Node CLI), `serve.mjs` + `index.html` (browser) |
-| `gc.cpp` | Allocator using 64 KB pages with size classes (O(1) "is this a heap pointer?"); mark bitmap, no sweep, conservative over stack and registers |
+| `gc.cpp` | Allocator using 64 KB pages with size classes (O(1) "is this a heap pointer?"), counting allocations from its runs; mark bitmap, no sweep, conservative over stack and registers |
 | `gfx.cpp` | The window: AppKit through the Objective-C runtime, loaded on first use (a canvas in wasm) |
 | `main.cpp` | Driver: watcher, safepoint reload (as a transaction), `main` restart, REPL, `--asm`, `fut test`, `fut api`, `fut map` |
-| `txn.cpp` | Transactions (`atomic`, reloads): an object is copied before its first write, globals at the start; rollback, nesting |
+| `txn.cpp` | Transactions (`atomic`, reloads, contract checks that call code): an object is copied before its first write, globals at the start; rollback, nesting |
 | `types.cpp` | Optional types: what each check names, the check compiled code calls, and the one field stores make |
-| `effects.cpp` | Effects: declared sets and their checks (entry, perform site), operations and their ids, handler records, `handle`, `random()` |
+| `effects.cpp` | Effects: declared sets and their checks (entry, perform site), operations and their ids, handler records, `handle`, `random()`; the records that tell an outside call for invariants |
 | `api.cpp` | Public interfaces: a file's or a package's `pub` declarations as `.api` text, the version check, the check `fut test` runs, `fut api`, `fut map` |
 | `pkg.cpp` | Packages: reading `fut.pkg` manifests, finding a file's package |
 | `jsval.cpp` | Values crossing into JavaScript: JSON both ways, pinned fut functions, handles (`Ref`) for JS objects |
-| `test.cpp` | `expect`'s check (deep equality, failure details) and the test runner's reporting, text and JSON; shared by both platforms |
+| `test.cpp` | `expect`'s check (deep equality, failure details), `allocs` and `grows` (sizes, timing, the log-log fit), property tests from contracts (generation, shrinking), a failed contract's message, and the test runner's reporting, text and JSON; shared by both platforms |
 
 **Codegen:**
 - Locals live in callee-saved `x19`–`x25`, then in sp-relative slots. A local whose initial value is a number, and every `for` range counter, lives in `d8`–`d15` instead. Arithmetic on it then stays in the FP unit, so `s += x` in a loop is one `fadd` on the loop-carried path.

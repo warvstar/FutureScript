@@ -1,0 +1,31 @@
+// The public interface of package stock 0.1.0 (stock.fut), written by `fut api`. `fut test` fails while it is out of date.
+
+pub class Stock {
+  invariant self.consistent()
+  var counts = nil
+  var held = nil
+  fn add(sku: str, n: num)
+    requires n >= 1
+    requires n == floor(n)
+    ensures self.onHand(sku) == old(self.onHand(sku)) + n
+  fn available(sku: str): num
+  // Nothing held that isn't on hand, and no negative counts.
+  fn consistent(): bool
+  fn heldFor(sku: str): num
+  fn init()
+  fn onHand(sku: str): num
+  fn release(sku: str, n: num)
+    requires n >= 1
+    requires n <= self.heldFor(sku)
+    ensures self.available(sku) == old(self.available(sku)) + n
+  fn reserve(sku: str, n: num)
+    requires n >= 1
+    requires n == floor(n)
+    requires n <= self.available(sku)
+    ensures self.available(sku) == old(self.available(sku)) - n
+  fn ship(sku: str, n: num)
+    requires n >= 1
+    requires n <= self.heldFor(sku)
+    ensures self.onHand(sku) == old(self.onHand(sku)) - n
+    ensures self.available(sku) == old(self.available(sku))
+}

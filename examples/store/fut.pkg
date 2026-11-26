@@ -1,0 +1,4 @@
+name store
+dep money ./money
+dep stock ./stock
+dep orders ./orders

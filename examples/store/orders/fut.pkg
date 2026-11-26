@@ -1,0 +1,4 @@
+name orders
+version 0.1.0
+dep money ../money
+dep stock ../stock

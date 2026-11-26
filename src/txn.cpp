@@ -14,6 +14,8 @@ struct Saved { Obj* o; std::vector<V> v; std::vector<u32> idx; u32 used = 0; }; 
 struct Level {
   Fiber* owner;                  // the fiber that opened it (null: the main stack)
   bool atomic = false;           // an atomic block (not a reload): it takes io away; allowed/who as it found them
+  bool contract = false;         // a spec's checks: no effects at all, and always rolled back; allowed/who as above
+  uint64_t allocs = 0;           // (contract) gcAllocations() when it opened: what the checks allocate isn't counted
   uint64_t allowed = 0;
   u32 who = 0;
   std::vector<V> globals;        // as they were when it opened
@@ -126,9 +128,27 @@ static V atomicEnd(V v) {
   if (!levels.empty() && levels.back().atomic) vm.allowed = levels.back().allowed, vm.who = levels.back().who;
   return txnCommit(), v;
 }
+// contract@begin(who) / contract@end(): around a spec's checks that call code. Checking a contract must not change
+// what the program does, so they run with no effects allowed (who: the contract, for messages) and whatever they
+// changed is put back when they end. A failed check raises, and whatever catches the error rolls back as usual.
+static V contractBegin(V who) {
+  txnBegin();
+  Level& l = levels.back();
+  l.contract = true, l.allowed = vm.allowed, l.who = vm.who, l.allocs = gcAllocations();
+  vm.allowed = ((vm.allowed >> EFF_LEVEL) + 1) << EFF_LEVEL, vm.who = (u32)num(who);
+  return NIL;
+}
+static V contractEnd() {
+  if (levels.empty() || !levels.back().contract) return NIL;
+  Level& l = levels.back();
+  gcUncounted += gcAllocations() - l.allocs;
+  vm.allowed = l.allowed, vm.who = l.who, txnAbort();
+  return NIL;
+}
 static V rt_capset(V v, Clo* c, uint64_t i) { return txnTouch(c), c->env()[i] = v; }  // a captured variable, inside one
 static V rt_txunwind(V v, uint64_t depth) { return txnUnwind((u32)depth), v; }      // a try caught an error
 void txnInit() {
   native<atomicBegin>("atomic@begin"), native<atomicEnd>("atomic@end");
+  native<contractBegin>("contract@begin"), native<contractEnd>("contract@end");
   vm.helpers[H_CAPSET] = (void*)rt_capset, vm.helpers[H_TXUNWIND] = (void*)rt_txunwind;
 }

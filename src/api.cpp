@@ -66,13 +66,33 @@ struct Scan {
     if (s.next().t != '!') return end;
     L = s, end = s.p;
     for (Lexer d = L;; d = L) {
-      int t = d.next().t;
-      if (t != T_ID && t != ',' && t != '.') return end;
+      Tok k = d.next();
+      int t = k.t;
+      if ((t != T_ID && t != ',' && t != '.') || k.nl) return end;  // (a contract's clauses start on the next line)
       L = d, end = d.p;
     }
   }
   void skipBody(Tok& t) {  // t is '{': through the matching '}'
     for (int d = 0; t.t != T_EOF; t = next()) if ((d += (t.t == '{') - (t.t == '}')) == 0) return;
+  }
+  const char* clauseEnd() {  // after a clause's keyword: through its condition (the rest of the line, up to a '{' or '}')
+    const char* e = L.p;
+    for (int d = 0, any = 0;; any = 1) {
+      Lexer r = L;
+      Tok t = r.next();
+      if (t.t == T_EOF || t.t == T_ERR || (d == 0 && (t.nl || (any && (t.t == '{' || t.t == '}'))))) return e;
+      d += (t.t == '(' || t.t == '[' || t.t == '{') - (t.t == ')' || t.t == ']' || t.t == '}');
+      L = r, e = r.p;
+    }
+  }
+  std::string clauses(const char* indent) {  // a function's requires and ensures clauses next: one per line, indented
+    std::string o;
+    for (;;) {
+      Lexer s = L;
+      Tok k = next();
+      if (!isKw(k, S_requires) && !isKw(k, S_ensures)) return L = s, o;
+      o += indent + squash(k.p, clauseEnd()) + "\n";
+    }
   }
 };
 struct Item { std::string name, text; };
@@ -103,6 +123,7 @@ static void itemsOf(const std::string& text, std::vector<Item>& items) {
       Tok n = next(), p = next();
       const char* end = params(p);
       it = {symName(n.sym), "pub " + squash(k.p, effects(typed(end)))};
+      if (std::string c = S.clauses("  "); !c.empty()) it.text += "\n" + c.substr(0, c.size() - 1);  // its contract
     } else if (k.sym == K_extern) {
       Tok n = next();
       while (n.t != T_EOF && !isKw(n, K_fn)) n = next();
@@ -130,8 +151,13 @@ static void itemsOf(const std::string& text, std::vector<Item>& items) {
       while (b.t != '{' && b.t != T_EOF) b = next();
       it.name = symName(n.sym), it.text = "pub " + squash(k.p, b.p) + " {\n";
       std::vector<std::pair<std::string, std::string>> fields, methods;
+      std::string invariants;  // in the order written
       for (Tok m = next(); m.t != '}' && m.t != T_EOF; m = next()) {
         std::string d = docs(src, m.p, "  ");
+        if (isKw(m, S_invariant)) {
+          invariants += d + "  " + squash(m.p, S.clauseEnd()) + "\n";
+          continue;
+        }
         if (isKw(m, K_var)) {
           Tok f = next();
           typed(f.p);
@@ -148,12 +174,13 @@ static void itemsOf(const std::string& text, std::vector<Item>& items) {
         if (!isKw(m, K_fn)) continue;
         Tok nm = next(), p = next();
         const char* end = effects(typed(params(p)));
-        methods.push_back({symName(nm.sym), d + "  " + squash(first.p, end) + "\n"});
+        methods.push_back({symName(nm.sym), d + "  " + squash(first.p, end) + "\n" + S.clauses("    ")});
         Tok body = next();
         skipBody(body);
       }
       auto byName = [](auto& a, auto& b) { return before(a.first, b.first); };
       std::stable_sort(fields.begin(), fields.end(), byName), std::stable_sort(methods.begin(), methods.end(), byName);
+      it.text += invariants;
       for (auto& [_, s] : fields) it.text += s;
       for (auto& [_, s] : methods) it.text += s;
       it.text += "}";
@@ -189,11 +216,12 @@ static std::string versionIn(const std::string& api) {  // what an interface fil
   return at == std::string::npos || end == std::string::npos ? "" : api.substr(at + 1, end - at - 1);
 }
 
-// The declarations an interface text lists, one per line ("fn area(r)", "Circle: var r = 1"), sorted: what a
-// change report compares. Comments are left out (a change to them alone is reported as such).
+// The declarations an interface text lists, one per line ("fn area(r)", "Circle: var r = 1"), and its contracts, one
+// clause per line ("Circle.grow() requires k > 0", "Circle invariant self.r >= 0"), sorted: what a change report
+// compares. Comments are left out (a change to them alone is reported as such).
 static std::vector<std::string> entries(const std::string& text) {
   std::vector<std::string> e;
-  std::string cls;
+  std::string cls, fn;  // the class (or effect) and the function the lines are in
   for (size_t i = 0; i < text.size();) {
     size_t j = text.find('\n', i);
     if (j == std::string::npos) j = text.size();
@@ -201,14 +229,29 @@ static std::vector<std::string> entries(const std::string& text) {
     i = j + 1;
     if (l.empty() || l.starts_with("//")) continue;
     if (l.starts_with("pub ")) l = l.substr(4);
-    if (l == "}") cls.clear();
+    if (l == "}") cls.clear(), fn.clear();
     else if ((l.starts_with("class ") || l.starts_with("effect ")) && l.ends_with("{")) {
       l = squash(l.data(), l.data() + l.size() - 1), e.push_back(l);
       size_t at = l.find(' ') + 1;
-      cls = l.substr(at, l.find(' ', at) - at);
-    } else e.push_back(cls.empty() ? l : cls + ": " + l);
+      cls = l.substr(at, l.find(' ', at) - at), fn.clear();
+    } else if (l.starts_with("requires ") || l.starts_with("ensures ")) e.push_back((cls.empty() ? "" : cls + ".") + fn + "() " + l);
+    else if (l.starts_with("invariant ")) e.push_back(cls + " " + l);
+    else {
+      std::string d = l.starts_with("override ") ? l.substr(9) : l;
+      if (d.starts_with("fn ")) fn = d.substr(3, d.find('(') - 3);
+      e.push_back(cls.empty() ? l : cls + ": " + l);
+    }
   }
   return std::sort(e.begin(), e.end()), e;
+}
+// A change callers may notice: a declaration gone (or changed), a requires added (callers must now meet it), or an
+// ensures or invariant gone (they may have relied on it). An edited clause is one gone and one added. Adding an
+// ensures or invariant, or dropping a requires, is compatible.
+static bool breaks(const std::vector<std::string>& removed, const std::vector<std::string>& added) {
+  auto has = [](const std::string& e, const char* w) { return e.find(w) != std::string::npos; };
+  for (auto& r : removed) if (!has(r, "() requires ")) return true;  // a declaration, an ensures or an invariant
+  for (auto& a : added) if (has(a, "() requires ")) return true;
+  return false;
 }
 
 // A package whose interface lost (or changed) declarations must say so in its version: 0.x.y -> 0.(x+1).0, and
@@ -232,7 +275,7 @@ std::vector<ApiIssue> checkInterfaces(const Compiled& c) {
     auto a = entries(have), b = entries(want);
     std::set_difference(a.begin(), a.end(), b.begin(), b.end(), std::back_inserter(is.removed));
     std::set_difference(b.begin(), b.end(), a.begin(), a.end(), std::back_inserter(is.added));
-    if (std::string was = versionIn(have); exists && !u.pkg.empty() && !is.removed.empty() && !was.empty())
+    if (std::string was = versionIn(have); exists && !u.pkg.empty() && breaks(is.removed, is.added) && !was.empty())
       if (std::string need = bumpNeeded(was, u.version); !need.empty()) is.status = "breaking", is.version = u.version, is.needs = need;
     out.push_back(std::move(is));
   }
@@ -279,7 +322,7 @@ int reportInterfaces(const std::vector<ApiIssue>& issues, bool asJson, const std
       s = "API     " + shown(is.file, program) + ": " +
           (is.status == "missing" ? "has pub declarations but no " + api + " yet; " + fix + "writes it\n"
            : is.status == "stale" ? "has no pub declarations, but " + api + " exists; " + fix + "removes it\n"
-           : is.status == "breaking" ? "its package's interface lost declarations, a breaking change, but its version is still " + is.version +
+           : is.status == "breaking" ? "its package's interface lost declarations or strengthened a contract, a breaking change, but its version is still " + is.version +
                                            ": set 'version " + is.needs + "' (or later) in its fut.pkg, then " + fix + "updates " + api + "\n"
                                   : "its public interface changed; " + fix + "updates " + api + "\n");
       if (is.status != "missing") {
@@ -296,8 +339,9 @@ int writeInterfaces(const Compiled& c, const std::string& program) {  // fut api
   int n = 0, held = 0;
   for (auto& is : checkInterfaces(c)) {
     if (is.status == "breaking") {
-      printf("not writing %s: its package's interface lost declarations, so its version must become at least %s (it is %s)\n", shown(is.api, program).c_str(), is.needs.c_str(), is.version.c_str());
+      printf("not writing %s: its package's interface lost declarations or strengthened a contract, so its version must become at least %s (it is %s)\n", shown(is.api, program).c_str(), is.needs.c_str(), is.version.c_str());
       for (auto& r : is.removed) printf("  - %s\n", r.c_str());
+      for (auto& a : is.added) printf("  + %s\n", a.c_str());
       held++;
       continue;
     }
@@ -342,6 +386,7 @@ static std::vector<Decl> declsOf(const std::string& text) {
       Tok n = S.next(), p = S.next();
       if (n.t != T_ID || p.t != '(') continue;
       const char* e = S.effects(S.typed(S.params(p)));
+      S.clauses("");
       Tok b = S.next();
       int end = b.line;
       if (b.t == '{') S.skipBody(b), end = b.line;
@@ -386,9 +431,14 @@ static std::vector<Decl> declsOf(const std::string& text) {
         }
         Tok first = m;
         if (isKw(m, S_override)) m = S.next();
+        if (isKw(m, S_invariant) && !eff) {
+          S.clauseEnd();  // (fut map shows declarations; the .api shows contracts)
+          continue;
+        }
         if (!isKw(m, K_fn)) continue;
         Tok nm = S.next(), p = S.next();
         const char* e = S.effects(S.typed(S.params(p)));
+        if (!eff) S.clauses("");
         int end = m.line;
         if (!eff) {
           Tok body = S.next();

@@ -1,0 +1,45 @@
+// The public interface of package orders 0.1.0 (orders.fut), written by `fut api`. `fut test` fails while it is out of date.
+
+// What checkout reports. Callers decide where it goes: a log, the console, a list in a test.
+pub effect Audit {
+  fn record(event: str)
+}
+
+pub class Cart {
+  var code: str? = nil
+  var lines = nil
+  // A clause costs what it computes, on every call: `ensures self.subtotal() == old(self.subtotal()) + qty * price`
+  // would make add() O(lines), and building a cart O(lines^2), which store_test.fut's `expect grows` catches. So
+  // these clauses look only at the line added.
+  fn add(sku: str, qty: num, price: num)
+    requires qty >= 1
+    requires qty == floor(qty)
+    requires price >= 0
+    requires price == floor(price)
+    ensures self.lines.len() == old(self.lines.len()) + 1
+    ensures last(self.lines).qty * last(self.lines).price == qty * price
+  fn init()
+  fn subtotal(): num
+}
+
+// Reserves every line or none: one line out of stock rolls back the reservations made for the lines before it.
+pub fn checkout(cart: Cart, st: stock.Stock): map ! Audit
+  ensures result.total == total(cart)
+  ensures result.lines == cart.lines.len()
+
+// SAVE10: 10% off. BULK: 5% off orders of $100 or more. Anything else: nothing.
+pub fn discount(subtotal: num, code: str?): num
+  requires subtotal >= 0
+  requires subtotal == floor(subtotal)
+  ensures result >= 0
+  ensures result <= subtotal
+  ensures result == floor(result)
+
+pub class Line {
+  var price = 0
+  var qty = 0
+  var sku = ""
+  fn init(sku: str, qty: num, price: num)
+}
+
+pub fn total(cart: Cart): num !

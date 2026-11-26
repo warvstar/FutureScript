@@ -6,6 +6,7 @@
 #include <bitset>
 #include <cstdarg>
 #include <cstdlib>
+#include <functional>
 #include <unordered_map>
 
 // ---------------- lexer ----------------
@@ -18,6 +19,7 @@ inline bool dig(char c) { return c >= '0' && c <= '9'; }
 struct Lexer {
   const char* p = "";
   int line = 1;
+  bool internal = false;  // code the compiler writes: names may contain '@' (the runtime's prop@gen), which users' can't
   const char* err = nullptr;  // a T_ERR token's message
   Tok next() {
     Tok k;
@@ -36,7 +38,7 @@ struct Lexer {
       return k.t = T_NUM, k;
     }
     if (idc(*p)) {
-      while (idc(*p) || dig(*p)) p++;
+      while (idc(*p) || dig(*p) || (internal && *p == '@')) p++;
       return k.t = T_ID, k.sym = intern({k.p, size_t(p - k.p)}), k;
     }
     if (*p == '"') {
@@ -69,7 +71,7 @@ inline int opOf(int t) { return BIN[t].second; }
 
 // ---------------- compiler state ----------------
 enum { LV_NONE = -1, LV_VAL, LV_LOCAL, LV_GLOBAL, LV_FIELD, LV_INDEX, LV_CAP };
-struct LV { int k = LV_VAL, a = 0, b = 0; bool ro = false, num = false; };  // a not-yet-loaded place, so `x = ...` can store
+struct LV { int k = LV_VAL, a = 0, b = 0; bool ro = false, num = false, own = false; };  // own: self.name  // a not-yet-loaded place, so `x = ...` can store
 constexpr LV NUM{LV_VAL, 0, 0, false, true};  // a value known to be a number
 struct Jumps {  // a few forward branches to patch to one place (no heap allocation)
   int v[6], n = 0;
@@ -95,6 +97,7 @@ struct Fun {  // per-function emission state
   size_t scopeAt = 0;  // first local of the innermost block
   std::vector<int> rets;  // `b` to the shared epilogue
   bool init = false, top = false, lambda = false, calls = false, test = false;  // test: a `test` block's body (no parameters)
+  bool arrow = false;  // a lambda written `{ n -> body }` (expect grows): one parameter, inside its braces
   std::bitset<1024> facts;  // locals proven to hold numbers here, by home + 128 (see proveOperands)
   bool live = true;        // false after return/break/continue, until the next join point
   Loop* loop = nullptr;
@@ -119,6 +122,9 @@ struct Fun {  // per-function emission state
   // the function's own try blocks: a function never catches its own result's failed check.
   uint64_t retTy = 0;
   int retSite = -1;
+  // Its spec's exit checks (ensures, the class invariant): compiled where every return arrives, after the result's
+  // type check (x0: the result), before the caller's effects are put back.
+  std::function<void()> exit;
 };
 
 // What the parser and the code generators share: the token stream, the function being emitted, errors.
@@ -134,6 +140,8 @@ struct CState {
   // A number-literal right operand is not loaded into a register; the binop fast path uses it directly.
   bool hasLit = false;
   double lit = 0;
+  int pinLine = 0;  // nonzero: the line code is attributed to (a spec's clauses, compiled into the function they describe)
+  int line() const { return pinLine ? pinLine : prev.line; }
 
   [[noreturn]] void failAt(const char* pos, int line, const char* fmt, ...) {  // file:line:col, the line, a caret
     char b[256];

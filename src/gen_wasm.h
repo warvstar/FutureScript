@@ -15,7 +15,7 @@ struct Gen : CState {
   void b(uint8_t x) { F->k.c.push_back(x); }
   void op(uint8_t o) {  // start an instruction (and note its source line)
     auto& ln = F->k.lines;
-    if (ln.empty() || ln.back().second != prev.line) ln.push_back({(int)F->k.c.size(), prev.line});
+    if (ln.empty() || ln.back().second != line()) ln.push_back({(int)F->k.c.size(), line()});
     b(o);
   }
   void u(uint64_t v) { uleb(F->k.c, v); }
@@ -130,11 +130,12 @@ struct Gen : CState {
   // safepoint, then the body in a block that `return` leaves with the result. Nothing to undo on the way out.
   Code finish() {
     if (F->live) F->init ? ldl(0, F->selfHome) : imm(0, NIL);  // falling off the end
+    op(ENDOP);                             // the body block
+    if (F->retTy) typeCheck(F->retTy, F->retSite, F->retTy == TY_NUM);  // the result, outside every try: see Fun::retTy
+    if (F->exit) F->live = true, F->facts.reset(), F->exit();          // its spec's exit checks (they may use the frame)
     if (F->maxd > 4000) fail("function too large");
     u32 size = ((F->maxd - F->npar) * 8 + 15) & ~15u;
     if (!size && F->calls) size = 16;      // keeps the stack check for recursion
-    op(ENDOP);                             // the body block
-    if (F->retTy) typeCheck(F->retTy, F->retSite, F->retTy == TY_NUM);  // the result, outside every try: see Fun::retTy
     if (F->effHome >= 0) {  // the caller's effects
       i32c(0), get(F->effHome), mem(I64_STORE, 3, slotOf(&vm.allowed));
       i32c(0), get(F->effHome + 1), op(I32_WRAP), mem(I32_STORE, 2, slotOf(&vm.who));

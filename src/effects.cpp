@@ -228,6 +228,28 @@ static V handleEnd(V v) {
   return v;
 }
 
+// inv@enter(self) / inv@leave(): around a method of a class whose spec has invariants. The invariant is checked when
+// an outside call ends, not when a method calls its own object's methods partway through a change: inv@enter answers
+// whether a call on self is already running, and records this one as a handler record that answers nothing
+// ([previous, allowed, allowed, who, -1, self]), so a throw that unwinds the call drops it with the handlers.
+static V invEnter(V self) {
+  bool outer = true;
+  for (V h = vm.hstack; h != NIL && outer; h = as<List>(h)->v[0]) {
+    auto& v = as<List>(h)->v;
+    outer = !(v.size() == 6 && v[4] == box(-1.0) && v[5] == self);
+  }
+  uint64_t a = vm.allowed;
+  List* r = make<List>();
+  gcUncounted++;  // bookkeeping: `expect allocs` counts the program's objects
+  r->v = {vm.hstack, box((double)(a & 0xffffffff)), box((double)(a >> 32)), box((double)vm.who), box(-1.0), self};
+  vm.hstack = box(r);
+  return boxb(outer);
+}
+static V invLeave() {
+  if (vm.hstack != NIL) vm.hstack = as<List>(vm.hstack)->v[0];
+  return NIL;
+}
+
 static uint64_t rng;
 static V n_random() {  // xorshift64*, seeded from the clock: [0, 1)
   if (!rng) rng = (uint64_t)(now() * 1e9) | 1;
@@ -243,6 +265,7 @@ void effectsInit() {
   vm.helpers[H_EFFECT] = (void*)rt_effect;
   native<n_random>("random");
   native<handleBegin>("handle@begin"), native<handleEnd>("handle@end");
+  native<invEnter>("inv@enter"), native<invLeave>("inv@leave");
   invokeCode = callable<invokeHandler>();
   for (auto [name, e] : std::initializer_list<std::pair<const char*, uint64_t>>{
            {"print", EFF_IO}, {"run", EFF_IO}, {"window", EFF_IO}, {"present", EFF_IO}, {"clear", EFF_IO}, {"rect", EFF_IO},

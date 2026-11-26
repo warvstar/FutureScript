@@ -1,5 +1,6 @@
 // Tests: the expect@ native behind `expect`, and the runner behind `fut test` (shared by the native and wasm drivers).
 #include "fut.h"
+#include <cmath>
 
 static std::vector<ExpectSite> sites;
 int expectSite(ExpectSite s) { return sites.push_back(std::move(s)), (int)sites.size() - 1; }
@@ -102,6 +103,331 @@ static V expectAt(V site, V l, V r) {
   if (!failure.set) failure = f;
   ERR("%s", msg.c_str());
 }
+// contract@fail(site, left, right, who): a contract's clause was false (the compiled code checked it). Raises an error
+// saying whose fault it is (the site's contract: "the caller broke f()'s contract: requires"), the condition and its
+// values. An invariant's site starts with \x01, for who (the method whose call just ended, or a store to a field).
+static V contractFail(V site, V l, V r, V who) {
+  const ExpectSite& s = sites.at((size_t)num(site));
+  Failure f;
+  f.left = show(l);
+  if (s.op >= 0) f.right = show(r);
+  std::string head = s.contract;
+  if (head.starts_with('\x01')) head = (who != NIL ? toStr(who) : "a call") + head.substr(1);
+  std::string msg = head + " " + oneLine(s.text);
+  auto d = s.op >= 0 ? details(s, f) : std::vector<std::string>{};  // (a condition checked as one: "is false" adds nothing)
+  for (size_t i = 0; i < d.size(); i++) msg += (i ? ", " : " (") + d[i] + (i + 1 == d.size() ? ")" : "");
+  ERR("%s", msg.c_str());
+}
+// expect allocs { ... }: allocs@begin() before the block, allocs@end(what it returned) after: objects allocated between.
+static V allocsBegin() { return box((double)gcAllocations()); }
+static V allocsEnd(V start) { return box((double)gcAllocations() - num(start)); }
+
+// expect grows [allocs] { n -> ... } like "n^2": grows@(site, body, growth, by allocations). The growth is an upper
+// bound: n^k, optionally times log n ("1", "log n", "n", "n log n", "n^2", ...). The body runs for sizes n that double,
+// and the check fits how its cost grows on a log-log scale: it fails if, divided by the growth, the cost still grows
+// (slope over tolerance). Time is the best of 3 runs of a batch lasting 2 ms or more, from the n at which one call
+// takes 50 us; allocations are counted for n = 64..2048 (exact, so their tolerance is tight).
+namespace {
+struct Growth { double k = 0; bool lg = false; };
+bool parseGrowth(std::string_view m, Growth& g) {
+  auto trim = [](std::string_view& v) { while (!v.empty() && v.front() == ' ') v.remove_prefix(1); while (!v.empty() && v.back() == ' ') v.remove_suffix(1); };
+  trim(m);
+  if (m == "1") return g = {0, false}, true;
+  if (m.ends_with("log n")) g.lg = true, m.remove_suffix(5), trim(m);
+  if (m.empty() && g.lg) return g.k = 0, true;
+  if (m.empty() || m[0] != 'n') return false;
+  m.remove_prefix(1);
+  if (m.empty()) return g.k = 1, true;
+  if (m[0] != '^' || m.size() < 2) return false;
+  std::string e(m.substr(1));
+  char* end;
+  g.k = strtod(e.c_str(), &end);
+  return *end == 0 && g.k >= 0 && g.k <= 10;
+}
+std::string growthName(const Growth& g) {
+  char b[32];
+  snprintf(b, sizeof b, "n^%g", g.k);
+  std::string s = g.k == 0 ? "" : g.k == 1 ? "n" : b;
+  return g.lg ? (s.empty() ? "log n" : s + " log n") : s.empty() ? "1" : s;
+}
+double slope(const std::vector<std::pair<double, double>>& p, Growth g) {  // of log(cost / growth) against log n
+  double sx = 0, sy = 0, sxx = 0, sxy = 0, n = (double)p.size();
+  for (auto [x, y] : p) {
+    double lx = log(x), ly = log(std::max(y, 1e-12)) - g.k * lx - (g.lg ? log(lx) : 0);
+    sx += lx, sy += ly, sxx += lx * lx, sxy += lx * ly;
+  }
+  return (n * sxy - sx * sy) / (n * sxx - sx * sx);
+}
+}  // namespace
+static V growsAt(V site, V clo, V growth, V byAllocs) {
+  const ExpectSite& s = sites.at((size_t)num(site));
+  Growth want;
+  if (!is(growth, K::Str) || !parseGrowth(as<Str>(growth)->sv(), want))
+    ERR("expect grows: '%s' is not a growth (\"1\", \"log n\", \"n\", \"n log n\", \"n^2\", \"n^3\")", toStr(growth, false).c_str());
+  volatile V keep = clo;
+  (void)keep;
+  Fn* f = as<Clo>(clo)->fn;
+  auto call = [&](double n) { V a[8] = {clo, box(n)}; vmEnter(f->code, a); };
+  bool allocs = byAllocs == TRUE_;
+  std::vector<std::pair<double, double>> pts;
+  if (allocs)
+    for (double n = 64; n <= 2048; n *= 2) {
+      uint64_t a0 = gcAllocations();
+      call(n);
+      pts.push_back({n, (double)(gcAllocations() - a0)});
+    }
+  else {
+    auto measure = [&](double n) {
+      double best = 1e30;
+      for (int k = 0; k < 3; k++)
+        for (int reps = 1;; reps *= 2) {
+          double t0 = now();
+          for (int i = 0; i < reps; i++) call(n);
+          if (double dt = now() - t0; dt >= 0.002 || reps >= 1 << 20) { best = std::min(best, dt / reps); break; }
+        }
+      return best;
+    };
+    double n = 16, t = measure(n), start = now();
+    while (t < 50e-6 && n < (1 << 20)) t = measure(n *= 2);
+    for (pts.push_back({n, t}); pts.size() < 5 && t < 0.25 && now() - start < 3; pts.push_back({n, t})) t = measure(n *= 2);
+  }
+  double tol = allocs ? 0.1 : 0.4;
+  if (pts.size() < 3 || slope(pts, want) <= tol) return NIL;
+  Growth seen{-1};
+  for (Growth g : {Growth{0}, {0, true}, {1}, {1, true}, {2}, {2, true}, {3}})
+    if (slope(pts, g) <= tol) { seen = g; break; }
+  char b[64];
+  snprintf(b, sizeof b, "n^%.1f", slope(pts, {}));
+  Failure fl;
+  fl.set = true, fl.site = (int)num(site);
+  fl.why = std::string(allocs ? "its allocations grow like " : "it grows like ") + (seen.k < 0 ? b : growthName(seen)) + ", not " + growthName(want) + " (n = ";
+  for (size_t i = 0; i < pts.size(); i++) {
+    char v[48];
+    snprintf(v, sizeof v, allocs ? "%s%g: %.0f" : "%s%g: %.3g ms", i ? ", " : "", pts[i].first, allocs ? pts[i].second : pts[i].second * 1e3);
+    fl.why += v;
+  }
+  fl.why += ")";
+  if (!failure.set) failure = fl;
+  ERR("expect failed: %s (%s)", oneLine(s.text).c_str(), fl.why.c_str());
+}
+// ---- property tests from specs (the compiler writes the loop: see Compiler::specProperties) ----
+static std::vector<PropSite> props;
+int propSite(PropSite p) {
+  p.expect = expectSite({p.file, p.text, "", "", p.line});
+  return props.push_back(std::move(p)), (int)props.size() - 1;
+}
+namespace {
+uint64_t prng = 1;
+uint64_t rnd() { return prng ^= prng >> 12, prng ^= prng << 25, prng ^= prng >> 27, prng * 0x2545F4914F6CDD1Dull; }
+int below(int n) { return n <= 0 ? 0 : (int)(rnd() % (uint64_t)n); }
+double unit() { return double(rnd() >> 11) * 0x1p-53; }
+// A random value of type t; size (1..50) grows with the input's number, so the first inputs are small ones.
+V gen(uint64_t t, int size, int depth = 0) {
+  if ((t & TY_OPT) && !below(8)) return NIL;
+  switch (t & 15) {
+    case TY_NUM: {
+      static const double edge[] = {0, 1, -1, 2, -2, 0.5, -0.5, 3, 10, -10, 100, 1000, 1e6, -1e6, 0.1, 255, 256};
+      switch (below(4)) {
+        case 0: return box(edge[below(sizeof edge / sizeof *edge)]);
+        case 1: return box(double(below(2 * size + 1) - size));
+        case 2: return box(std::round((unit() * 2 - 1) * size * 100) / 100);
+        default: return box(double(below(2 * size * size + 1) - size * size));
+      }
+    }
+    case TY_STR: {
+      static const char* const parts[] = {"a", "b", "c", "x", "y", "z", "A", "Z", "0", "1", "9", " ", "_", "-", ".", ",", "\"", "\\", "\n", "\xc3\xa9"};
+      std::string str;
+      for (int i = below(std::min(size, 12) + 1); i > 0; i--) str += parts[below(sizeof parts / sizeof *parts)];
+      return box(newStr(str));
+    }
+    case TY_BOOL: return boxb(below(2));
+    case TY_LIST: {
+      List* l = make<List>();
+      V lv = box(l);  // on the stack (scanned) while the elements allocate
+      for (int i = below(std::min(size, 8) + 1); i > 0; i--) { V e = gen(depth < 1 ? TY_ANY : TY_NUM, size, depth + 1); l->v.push_back(e); }
+      return lv;
+    }
+    case TY_MAP: {
+      Map* m = make<Map>();
+      V mv = box(m);
+      static const char* const keys[] = {"a", "b", "id", "name", "x", "y", "count", "k"};
+      for (int i = below(std::min(size, 5) + 1); i > 0; i--) mapPut(m, keys[below(8)], gen(depth < 1 ? TY_ANY : TY_NUM, size, depth + 1));
+      return mv;
+    }
+    default: {  // any
+      static const uint64_t kinds[] = {TY_NUM, TY_NUM, TY_STR, TY_STR, TY_BOOL, TY_LIST, TY_MAP};
+      if (!below(10)) return NIL;
+      return gen(kinds[below(depth < 1 ? 7 : 5)], size, depth);
+    }
+  }
+}
+V listOf(const std::vector<V>& v) {  // (each of v must be reachable from elsewhere while this allocates)
+  List* l = make<List>();
+  return l->v = v, box(l);
+}
+V replaced(V list, size_t i, V v) {
+  List* l = make<List>();
+  return l->v = as<List>(list)->v, l->v[i] = v, box(l);
+}
+// Smaller versions of v (a value of type t), biggest steps first, onto out (a list, so the GC sees them).
+void shrinks(V v, uint64_t t, List* out) {
+  auto add = [&](V c) { out->v.push_back(c); };
+  if (v == NIL) return;
+  if ((t & TY_OPT) || (t & 15) == TY_ANY) add(NIL);
+  if (isNum(v)) {
+    double x = num(v);
+    if (x == 0) return;
+    add(box(0.0));
+    if (x != std::trunc(x)) add(box(std::trunc(x)));
+    if (std::fabs(x) >= 4) add(box(std::trunc(x / 2)));
+    if (std::fabs(x) >= 2) add(box(std::trunc(x) - (x > 0 ? 1 : -1)));
+    if (x < 0) add(box(-x));
+  } else if (is(v, K::Str)) {
+    std::string str(as<Str>(v)->sv());
+    if (str.empty()) return;
+    add(box(newStr("")));
+    if (str.size() > 1) add(box(newStr(str.substr(0, str.size() / 2))));
+    for (size_t i = 0; i < str.size() && i < 16; i++) add(box(newStr(str.substr(0, i) + str.substr(i + 1))));
+  } else if (v == TRUE_) add(FALSE_);
+  else if (is(v, K::List)) {
+    auto& e = as<List>(v)->v;
+    if (e.empty()) return;
+    add(listOf({}));
+    if (e.size() > 1) add(listOf({e.begin(), e.begin() + e.size() / 2}));
+    for (size_t i = 0; i < e.size(); i++) {
+      std::vector<V> w = e;
+      w.erase(w.begin() + i), add(listOf(w));
+    }
+    for (size_t i = 0; i < e.size(); i++) {
+      size_t at = out->v.size();
+      shrinks(e[i], TY_ANY, out);
+      for (size_t j = at; j < out->v.size(); j++) out->v[j] = replaced(v, i, out->v[j]);
+    }
+  } else if (is(v, K::Map)) {
+    auto& e = as<Map>(v)->e;
+    if (e.empty()) return;
+    add(box(make<Map>()));
+    for (size_t i = 0; i < e.size(); i++) {
+      Map* m = make<Map>();
+      add(box(m));
+      for (size_t j = 0; j < e.size(); j++) if (j != i) mapPut(m, as<Str>(e[j].first)->sv(), e[j].second);
+    }
+    for (size_t i = 0; i < e.size(); i++) {  // a value
+      size_t at = out->v.size();
+      shrinks(e[i].second, TY_ANY, out);
+      for (size_t j = at; j < out->v.size(); j++) {
+        Map* m = make<Map>();
+        V c = out->v[j];
+        for (size_t k = 0; k < e.size(); k++) mapPut(m, as<Str>(e[k].first)->sv(), k == i ? c : e[k].second);
+        out->v[j] = box(m);
+      }
+    }
+  }
+}
+// Each argument's shrinks, as whole argument lists.
+void shrinkArgs(V args, const std::vector<uint64_t>& types, List* out) {
+  for (size_t i = 0; i < types.size() && i < as<List>(args)->v.size(); i++) {
+    size_t at = out->v.size();
+    shrinks(as<List>(args)->v[i], types[i], out);
+    for (size_t j = at; j < out->v.size(); j++) out->v[j] = replaced(args, i, out->v[j]);
+  }
+}
+std::string showCall(const std::string& f, V args) {
+  std::string s = f + "(";
+  for (size_t i = 0; i < as<List>(args)->v.size(); i++) s += (i ? ", " : "") + show(as<List>(args)->v[i]);
+  return s + ")";
+}
+}  // namespace
+static PropSite& propAt(V site) { return props.at((size_t)num(site)); }
+static V propGen(V site, V n) {
+  PropSite& p = propAt(site);
+  int i = (int)num(n), size = std::min(1 + i / 2, 50);
+  if (!i) {  // the same inputs every run: seeded by the test
+    prng = 1469598103934665603ull;
+    for (char c : p.text) prng = (prng ^ (uint8_t)c) * 1099511628211ull;
+    prng |= 1;
+  }
+  List* in = make<List>();
+  V iv = box(in);
+  auto args = [&](const std::vector<uint64_t>& t) {
+    List* a = make<List>();
+    V av = box(a);
+    for (uint64_t x : t) { V v = gen(x, size); a->v.push_back(v); }
+    return av;
+  };
+  if (!p.cls) return as<List>(iv)->v = as<List>(args(p.types[0]))->v, iv;
+  in->v.push_back(args(p.types[0]));
+  List* calls = make<List>();
+  in->v.push_back(box(calls));
+  for (int k = p.types.size() > 1 ? below(std::min(size, 20) + 1) : 0; k > 0; k--) {
+    int m = below((int)p.types.size() - 1);
+    List* c = make<List>();
+    calls->v.push_back(box(c));
+    c->v.push_back(box((double)m));
+    c->v.push_back(args(p.types[m + 1]));
+  }
+  return iv;
+}
+// The k-th smaller input than `in` (nil: none left). A class's: fewer calls first, then smaller arguments.
+static V propShrink(V site, V in, V k) {
+  PropSite& p = propAt(site);
+  List* out = make<List>();
+  V keep = box(out);
+  if (!p.cls) shrinkArgs(in, p.types[0], out);
+  else {
+    V init = as<List>(in)->v[0], calls = as<List>(in)->v[1];
+    auto& c = as<List>(calls)->v;
+    size_t at = out->v.size();
+    if (c.size() > 1) out->v.push_back(listOf({}));
+    if (c.size() > 2) out->v.push_back(listOf({c.begin(), c.begin() + c.size() / 2}));
+    for (size_t i = 0; i < c.size(); i++) {
+      std::vector<V> w = c;
+      w.erase(w.begin() + i), out->v.push_back(listOf(w));
+    }
+    for (size_t i = 0; i < c.size(); i++) {  // a call's arguments (not which method it calls)
+      V call = c[i];
+      size_t b = out->v.size();
+      shrinkArgs(as<List>(call)->v[1], p.types[(size_t)num(as<List>(call)->v[0]) + 1], out);
+      for (size_t j = b; j < out->v.size(); j++) out->v[j] = replaced(calls, i, replaced(call, 1, out->v[j]));
+    }
+    for (size_t j = at; j < out->v.size(); j++) out->v[j] = replaced(in, 1, out->v[j]);
+    size_t b = out->v.size();
+    shrinkArgs(init, p.types[0], out);
+    for (size_t j = b; j < out->v.size(); j++) out->v[j] = replaced(in, 0, out->v[j]);
+  }
+  size_t i = (size_t)num(k);
+  (void)keep;
+  return i < out->v.size() ? out->v[i] : NIL;
+}
+static V propDiscard(V site, V e) {  // e says the input broke a requires of the function (or a method) under test
+  return boxb(is(e, K::Str) && as<Str>(e)->sv().starts_with(propAt(site).discard));
+}
+[[noreturn]] static void propFailed(PropSite& p, const std::string& why) {
+  Failure f;
+  f.set = true, f.site = p.expect, f.why = why;
+  if (!failure.set) failure = f;
+  std::string one = why;
+  for (size_t i; (i = one.find("\n    ")) != std::string::npos;) one.replace(i, 5, "; ");
+  ERR("expect failed: %s (%s)", p.text.c_str(), one.c_str());
+}
+static V propFail(V site, V in, V e, V n) {
+  PropSite& p = propAt(site);
+  std::string why;
+  if (!p.cls) why = showCall(p.names[0], in);
+  else {
+    why = "var o = " + showCall(p.names[0], as<List>(in)->v[0]);
+    for (V c : as<List>(as<List>(in)->v[1])->v) why += "\n    o." + showCall(p.names[(size_t)num(as<List>(c)->v[0]) + 1], as<List>(c)->v[1]);
+  }
+  char b[64];
+  snprintf(b, sizeof b, "(random input %d, shrunk)", (int)num(n));
+  propFailed(p, why + "\n    " + (is(e, K::Str) ? std::string(as<Str>(e)->sv()) : "threw " + show(e)) + "\n    " + b);
+}
+static V propDone(V site, V ok, V n) {  // too few inputs met the requires to call it tested
+  if (num(ok) >= 20) return NIL;
+  char b[160];
+  snprintf(b, sizeof b, "only %d of %d random inputs met its requires: give its parameters narrower types, or test it by hand", (int)num(ok), (int)num(n));
+  propFailed(propAt(site), b);
+}
 // expect prints { ... }: print() output inside the block is collected (nested captures stack) and becomes the value.
 struct Capture { std::string* prev; std::string buf; };
 static std::vector<Capture*> captures;
@@ -154,7 +480,10 @@ static V n_run(V o) {
 }
 void testInit() {
   native<expectAt>("expect@"), native<captureBegin>("capture@begin"), native<captureEnd>("capture@end");
-  native<captureAbort>("capture@abort"), native<n_run>("run");
+  native<captureAbort>("capture@abort"), native<n_run>("run"), native<contractFail>("contract@fail");
+  native<propGen>("prop@gen"), native<propShrink>("prop@shrink"), native<propDiscard>("prop@discard");
+  native<propFail>("prop@fail"), native<propDone>("prop@done");
+  native<allocsBegin>("allocs@begin"), native<allocsEnd>("allocs@end"), native<growsAt>("grows@");
 }
 
 // ---------------- the runner ----------------

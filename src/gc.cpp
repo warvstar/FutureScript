@@ -34,6 +34,7 @@ size_t bump, inUse, limit = MIN_HEAP;
 std::vector<u32> avail[NCLS];  // pages with live objects (so maybe free cells too), per class
 struct Scan { u32 page = NONE, at = 0; } scans[NCLS];  // the page being searched for free runs, and where
 uintptr_t runStart[NCLS];      // where vm.runs[c] began: [runStart, cur) has been allocated
+uint64_t allocated;            // objects allocated from retired runs, and large ones (see gcAllocations)
 std::vector<Obj*> work, owners;
 
 constexpr auto classOf = [] {  // size class by 16-byte granule
@@ -93,6 +94,7 @@ size_t nextFree(int c, size_t from, size_t lim, size_t g0) {  // first free cell
   return lim;
 }
 void retire(int c) {  // the current run is done with: what was allocated from it is now in `live`
+  allocated += (vm.runs[c].cur - runStart[c]) / sizeClasses[c];
   setCells(c, runStart[c], vm.runs[c].cur);
   runStart[c] = vm.runs[c].cur = vm.runs[c].end = 0;
 }
@@ -241,13 +243,21 @@ void gcInit() {
   pages.resize(NPAGES);
 }
 void gcOwn(Obj* o) { owners.push_back(o); }
+// Objects allocated so far. Each takes one cell of its size class, so the runs being bumped through (by JIT code
+// too) say how many came from them: counting costs allocation nothing.
+uint64_t gcUncounted;
+uint64_t gcAllocations() {
+  uint64_t n = allocated - gcUncounted;
+  for (int c = 0; c < NCLS; c++) n += (vm.runs[c].cur - runStart[c]) / sizeClasses[c];
+  return n;
+}
 void gcCollect() { gcWanted = false, collect(); }
 
 static void* allocLarge(size_t bytes) {
   size_t n = (bytes + PAGE - 1) / PAGE;
   if (inUse + n > limit) inUse += n - 1, due(), inUse -= n - 1;
   size_t i = takePages(n);
-  inUse += n;
+  inUse += n, allocated++;
   pages[i] = {2, 0, false, (u32)n};
   for (size_t j = 1; j < n; j++) pages[i + j] = {3, 0, false, 0};
   set(live, i * PBITS);

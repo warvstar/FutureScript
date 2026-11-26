@@ -32,6 +32,15 @@ struct ClassDef {
 struct FieldUse { int cls, sym; At at; };  // `self.name` in a method: checked against declared fields
 // A fn/method in the source. retNum: it declares `: num`, so a direct call's result is known to be a number.
 struct Span { const char *start = nullptr, *end = nullptr; int line = 0, endLine = 0, arity = 0; bool retNum = false; };
+// A contract's clause: where its condition starts, and whether it calls anything (then the checks run in a
+// transaction that always rolls back, with no effects allowed: checking a contract changes nothing).
+struct Clause { At at; bool calls = false; };
+// A function's contract: the requires and ensures clauses between its signature and its body. fn: its `fn`; olds:
+// each old( in ensures.
+struct SpecFn { At fn; std::string name; std::vector<Clause> pre, post; std::vector<At> olds; bool calls = false; };
+// A class's contract: its invariants, and its methods that have contracts (in order). at: the class's name, as
+// written there (name).
+struct ClassSpec { At at; std::string name; std::vector<Clause> invariants; std::vector<int> methods; };
 // Each fn/method's parameter and result types (0: none), as last compiled: an override must declare the same.
 // eff: it declares effects (effMask, as written: effText), so an override must declare a subset.
 struct Sig { std::vector<uint64_t> types; std::string text; bool eff = false; uint64_t effMask = 0; std::string effText; };
@@ -52,6 +61,11 @@ static std::unordered_map<std::string, std::string> nsOf;                       
 static std::unordered_map<std::string, bool> isModule;                                // imported file -> imported `as`
 static std::unordered_map<std::string, std::unordered_map<int, std::string>> aliases;  // file -> its `as` names
 static std::string base(const std::string& path) { return path.substr(path.rfind('/') + 1); }
+// Has the program declared an invariant? Then a store to a field of an object other than self checks the object's
+// invariants. Once true it stays true (part of every package's environment), so code compiled without that check
+// is compiled again with it.
+static bool invariantsOn;
+static std::unordered_map<std::string, u32*> invBodies;  // each class's hidden invariant method, installed
 // Packages (pkg.cpp). The program's own package (entryDir) has no prefix, like a program without one. Every other
 // package has a prefix (its name, made unique), and the `pub` names of its plainly imported files are
 // "prefix.name": visible across the package, and to other packages through `import "name"` (the alias) when its
@@ -116,6 +130,15 @@ struct Compiler : Gen {
   std::vector<char> pubSym;                                 // by (prefixed) symbol: declared `pub`
   std::unordered_map<int, std::string> privateIn;           // a private name (as written) -> a file declaring it
   EffOps effOps;                                            // effects this compile declares (the prescan finds them)
+  std::map<std::string, SpecFn> specFns;                    // "Account.withdraw" or "sqrt" -> its contract
+  std::vector<std::string> fnSpecs;                         // the top-level functions with one, in order
+  std::map<int, ClassSpec> classSpecs;                      // class symbol -> its invariants and methods with contracts
+  std::vector<int> classOrder;                              // those classes, in order
+  std::unordered_map<int, std::pair<At, int>> classAt;      // each class this compile declares: its name, and where
+  std::unordered_map<int, At> superAt;                      // ... and where its superclass is named
+  std::unordered_set<int> invClasses;                       // classes whose methods check invariants (theirs, a super's or a subclass's)
+  std::vector<std::pair<std::string, At>> todos;            // functions whose body is todo(): pending under fut test
+  const std::unordered_map<const char*, int>* olds = nullptr;  // compiling ensures: each old(...)'s home, by where it is
   struct EffectDef { int sym; std::vector<EffOpDef> ops; };
   std::vector<EffectDef> effDefs;                           // installed by commit
   std::unordered_map<std::string, std::vector<std::string>> reexports;  // file -> files it imports with `pub import`
@@ -504,10 +527,10 @@ struct Compiler : Gen {
     }
     collect(base, n, H_MAP);
   }
-  Fn* lambda(const Tok& t) {  // fn(params) { body }: captures enclosing locals by value into the closure
+  Fn* lambda(const Tok& t, bool arrow = false) {  // fn(params) { body }: captures enclosing locals by value into the closure
     if (tiering) compileFail("tier 2 does not handle lambdas", false);
     Fun f;
-    f.parent = F, f.lambda = true;
+    f.parent = F, f.lambda = true, f.arrow = arrow;
     Fn* fn = make<Fn>();
     consts.push_back(box(fn));
     fn->code = newStub(), fn->name = intern("fn@" + std::to_string(t.line));
@@ -554,9 +577,22 @@ struct Compiler : Gen {
       }
     }
     if (t.sym < NKW) failAt(t.p, t.line, "unexpected '%s'", name(t.sym));
+    if (t.sym == S_old && olds && at('(') && !cur.nl) {  // in ensures: the value it had on entry (computed then)
+      auto it = olds->find(t.p);
+      if (it == olds->end()) failAt(t.p, t.line, "old() is a value as it was on entry: it belongs in an ensures clause");
+      for (int d = 0; next(), d += (prev.t == '(') - (prev.t == ')'), d > 0;) if (at(T_EOF)) fail("expected ')'");
+      return ldl(0, it->second), LV{};
+    }
     if (LV v = resolve(F, t.sym); v.k != LV_NONE) return v;
     t = topName(t);
     Global* g = findGlobal(t.sym);
+    if (!g && t.sym == S_todo && at('(') && !cur.nl) {  // todo(): a body not written yet (fut test: pending)
+      next(), expect(')');
+      Fun* o = F;
+      while (o->lambda && o->parent) o = o->parent;
+      konst(display(o->k.name) + " is not implemented yet"), helper(H_THROW), F->live = false;
+      return {};
+    }
     if (!g) undefined(t);
     if (g->kind == 'f' && at('(') && !cur.nl) return next(), directCall(t, *g), t.sym == F->self || returnsNum(t.sym) ? NUM : LV{};
     if (g->kind == 'c' && at('(') && !cur.nl) return next(), construct(*g), LV{};
@@ -569,10 +605,11 @@ struct Compiler : Gen {
       if (accept('.')) {
         Tok ft = cur;
         int s = ident();
-        if (v.k == LV_LOCAL && F->cls >= 0 && v.a == F->selfHome && !tiering && !(at('(') && !cur.nl))
+        bool own = v.k == LV_LOCAL && F->cls >= 0 && v.a == F->selfHome;  // self.name
+        if (own && !tiering && !(at('(') && !cur.nl))
           fieldUses.push_back({F->cls, s, {ft.p, ft.line, file, srcStart}});  // self.name: checked once every class is known
         load(v);
-        v = {LV_FIELD, 0, s};
+        v = {LV_FIELD, 0, s}, v.own = own;
         if (at('(') && !cur.nl) next(), s == S_push ? pushCall() : call(s, false), v = {};
       } else if (at('[') && !cur.nl) {
         next(), load(v);
@@ -784,7 +821,27 @@ struct Compiler : Gen {
     if (arg) st(0, slot());
     gmem(0, findGlobal(intern(nm))->slot), st(0, base), callWindow(base, arg, 0, false);
   }
-  // expect a op b | expect x | expect throws { ... } [op value] | expect prints { ... } [op value]. Calls
+  // expect grows [allocs] { n -> body } like "n": grows@(site, the body as a closure, the growth, by allocations)
+  // runs it for sizes n that double, fits how its time (or allocations) grows, and fails if faster than the growth.
+  void growsStmt(int base, int siteAt, ExpectSite& s) {
+    next();
+    bool allocs = atKw(S_allocs) ? (next(), true) : false;
+    Tok bt = cur;
+    { Lexer l = lx; Tok a = l.next(), b = l.next(), c = l.next();
+      if (!at('{') || a.t != T_ID || b.t != '-' || c.t != '>') fail("expected { n -> ... }: the code to measure, for a size n"); }
+    lambda(bt, true), st(0, slot());
+    if (!atKw(S_like)) fail("expected 'like' and how it may grow: \"1\", \"log n\", \"n\", \"n log n\", \"n^2\", \"n^3\"");
+    next();
+    const char* gs = tokStart(cur);
+    expr(), st(0, slot());
+    s.right.assign(gs, prevEnd);
+    imm(0, allocs ? TRUE_ : FALSE_), st(0, slot());
+    s.text = std::string(allocs ? "grows allocs" : "grows") + " { ... } like " + s.right;
+    gmem(0, findGlobal(intern("grows@"))->slot), st(0, base);
+    imm(0, box((double)expectSite(std::move(s)))), st(0, siteAt);
+    callWindow(base, 4, 0, false);
+  }
+  // expect a op b | expect x | expect throws/prints/allocs { ... } [op value] | expect grows ... like g. Calls
   // expect@(site, left, right), which checks and, on failure, raises an error naming the source text and the values.
   void expectStmt() {
     int line = cur.line;
@@ -792,10 +849,19 @@ struct Compiler : Gen {
     int base = slot(), siteAt = slot();
     gmem(0, findGlobal(intern("expect@"))->slot), st(0, base);
     ExpectSite s{file, "", "", "", line};
+    if (atKw(S_grows) && !peek().nl && (peekIs('{') || (peek().t == T_ID && peek().sym == S_allocs))) return growsStmt(base, siteAt, s);
     const char* start = tokStart(cur);
     bool throws = s.throws = atKw(S_throws) && peekIs('{'), prints = atKw(S_prints) && peekIs('{'), lnum = false;
+    bool allocs = atKw(S_allocs) && peekIs('{');
     int lh = NOH;
-    if (prints) {  // what print() wrote inside, as a string; a throw stops the capture and goes on
+    if (allocs) {  // how many objects the block allocated (gcAllocations)
+      next();
+      callNative("allocs@begin", false);
+      int a = slot();
+      st(0, a), block(), ld(0, a), F->depth = a;
+      callNative("allocs@end", true);
+      s.left = "allocs { ... }";
+    } else if (prints) {  // what print() wrote inside, as a string; a throw stops the capture and goes on
       next();
       callNative("capture@begin", false);
       TryAt t = tryBlock([&] { callNative("capture@end", false); });
@@ -816,16 +882,17 @@ struct Compiler : Gen {
       expr(p + 1);
       s.op = opOf(t), s.right.assign(rs, prevEnd);
       if (prec(cur.t)) {  // `expect a == b && c`: one condition, checked for truthiness
-        if (throws || prints) fail("expect %s { } compares with one value", throws ? "throws" : "prints");
+        if (throws || prints || allocs) fail("expect %s { } compares with one value", throws ? "throws" : prints ? "prints" : "allocs");
         mv(1, 0), ld(0, ls), binop(s.op);
         bool n = false;
         int h = NOH;
         binRest(1, n, h), st(0, ls), s.op = -1, s.left.assign(start, prevEnd), s.right.clear(), imm(0, NIL);
       }
-    } else if (!throws && !prints) binRest(1, lnum, lh), st(0, ls), s.left.assign(start, prevEnd), imm(0, NIL);
+    } else if (!throws && !prints && !allocs) binRest(1, lnum, lh), st(0, ls), s.left.assign(start, prevEnd), imm(0, NIL);
     else imm(0, NIL);
     st(0, slot());
-    s.text = throws || prints ? (throws ? "throws { ... }" : "prints { ... }") + std::string(afterLeft, prevEnd) : std::string(start, prevEnd);
+    s.text = throws || prints || allocs ? (throws ? "throws { ... }" : prints ? "prints { ... }" : "allocs { ... }") + std::string(afterLeft, prevEnd)
+                                        : std::string(start, prevEnd);
     imm(0, box((double)expectSite(std::move(s)))), st(0, siteAt);
     callWindow(base, 3, 0, false);
   }
@@ -914,7 +981,12 @@ struct Compiler : Gen {
       int o = slot();
       st(0, o);
       if (op >= 0) field(v.b, false);
-      value(), mv(2, 0), ld(0, o), field(v.b, true), F->depth--;
+      value(), mv(2, 0), ld(0, o), field(v.b, true);
+      if (invariantsOn && !v.own) {  // from outside the object: then its invariants must hold
+        int b = slot(), w = slot();
+        ld(0, o), st(0, b), konst("storing to field '" + symName(v.b) + "'"), st(0, w), callWindow(b, 1, invariantSym(), false), F->depth = b;
+      }
+      F->depth--;
     } else {  // object in slot v.a, index in x0
       int i = slot();
       st(0, i);
@@ -927,6 +999,11 @@ struct Compiler : Gen {
   // Compile `(params) { body }` and queue it to be installed behind `stub`. Returns the arity.
   int function(Fun& f, int cls, bool init, const std::string& nm, u32* stub, Fn* fn) {
     f.cls = cls, f.init = init, f.k.name = nm, f.k.file = file;
+    Tok nameTok = prev;  // for errors about the whole function
+    const SpecFn* spec = nullptr;  // its contract
+    if (!f.lambda && !f.test)
+      if (auto it = specFns.find(nm); it != specFns.end()) spec = &it->second;
+    bool inv = cls >= 0 && !f.lambda && !f.test && invClasses.count(cls);  // an outside call checks invariants when it ends
     Fun* outer = F;
     F = &f, f.noRegs = hasTry(), beginFun();
     if (cls < 0 && !f.lambda && !f.test) f.stub = stub;
@@ -938,7 +1015,12 @@ struct Compiler : Gen {
     if (cls >= 0) homes.push_back(f.selfHome = home()), f.locals.push_back({K_self, f.selfHome});
     if (f.lambda) homes.push_back(f.cloHome = home());  // the closure itself, for captured variables
     int first = (int)homes.size();  // the first declared parameter
-    if (!f.test) {
+    if (f.arrow) {  // { n -> body }
+      expect('{');
+      int s = ident(), h = home();
+      f.locals.push_back({s, h}), homes.push_back(h), ptys.push_back({s, Ty{}});
+      expect('-'), expect('>');
+    } else if (!f.test) {
       expect('(');
       if (!accept(')')) {
         do {
@@ -959,9 +1041,16 @@ struct Compiler : Gen {
       }
       if (at('!')) {  // declared effects: ! io, clock (an empty set: performs nothing)
         next(), edecl = true, etext = "!";
-        if (!at('{'))
+        if (!at('{') && !atKw(S_requires) && !atKw(S_ensures))
           do etext += etext.size() > 1 ? ", " : " ", emask |= effectName(etext);
           while (accept(','));
+      }
+      while (atKw(S_requires) || atKw(S_ensures)) {  // its contract (the prescan has it): compiled below
+        next();
+        for (int d = 0; !(d == 0 && (at('{') || at('}') || cur.nl)); next()) {
+          if (at(T_EOF)) fail("expected '{'");
+          d += nesting(cur);
+        }
       }
       if (!f.lambda && !tiering) {  // for the override check: "(num, _): str" (_: untyped)
         Sig& g = sigs[nm];
@@ -984,9 +1073,11 @@ struct Compiler : Gen {
       if (ty.code == TY_NUM) prove(h);
     }
     if (edecl) effectsIn(emask, effSite(display(nm), emask, etext));
-    Tier* tier = nullptr;
-    if (!f.lambda && !f.test && !tiering) hotCounter(tier = &tiers[nm], first, homes);
-    block();
+    if (spec || inv) contract(f, nm, nameTok.line, spec, inv, ptys, homes, first);
+    Tier* tier = nullptr;  // (tier 2 compiles a function again without its contract: one with a contract stays in tier 1)
+    if (!f.lambda && !f.test && !tiering && !spec && !inv) hotCounter(tier = &tiers[nm], first, homes);
+    if (!f.arrow) block();
+    else scope([&] { while (!accept('}')) at(T_EOF) ? fail("expected '}'") : (void)stmt(); });
     if (f.live) f.retNum = false;  // can end without a return: returns nil
     pend.push_back({stub, fn, arity, finish(), owner, f.lambda || f.test, {}, envFor(file)});  // a test body is installed like a lambda
     if (tier) {
@@ -995,6 +1086,156 @@ struct Compiler : Gen {
     }
     F = outer;
     return arity;
+  }
+  // ---- contracts: requires and ensures on a function, invariant in a class ----
+  // A clause's condition is the rest of its line, up to a '{' or '}' there (a function's body, the class's end).
+  static bool clauseEnds(int d, const Tok& p, const Tok& t) { return d == 0 && p.t && (t.t == '{' || t.t == '}' || t.nl || t.t == T_EOF); }
+  static int nesting(const Tok& t) { return (t.t == '(' || t.t == '[' || t.t == '{') - (t.t == ')' || t.t == ']' || t.t == '}'); }
+  bool orAhead() {  // does the condition at cur have a `||` outside brackets?
+    Lexer s = lx;
+    Tok p, t = cur;
+    for (int d = 0; t.t != T_EOF && t.t != T_ERR && !clauseEnds(d, p, t); p = t, t = s.next(), d += nesting(p))
+      if (d == 0 && t.t == T_OR) return true;
+    return false;
+  }
+  // The names a contract's clauses see: self, the function's parameters and, in ensures, result. Code is attributed to
+  // the function's first line.
+  template <class B> void clauses(const std::vector<Fun::Local>& names, int line, B body) {
+    auto saved = std::move(F->locals);
+    size_t sa = F->scopeAt;
+    F->locals = names, F->scopeAt = 0, pinLine = line;
+    body();
+    F->locals = std::move(saved), F->scopeAt = sa, pinLine = 0;
+  }
+  // One condition, compiled to inline checks: each `&&` part on its own, so a failure names the part and its values
+  // (one check, if the condition has a `||` outside brackets). A false part calls contract@fail, which raises.
+  void check(const At& a, const std::string& head, int whoHome = NOH) {  // whoHome: inv@'s who
+    detour(a.file, a.src, a.p, a.line, [&] {
+      int more = orAhead() ? 1 : 3;  // the operators one part goes on through (3: not &&)
+      for (;;) {
+        ExpectSite s{file, "", "", "", cur.line};
+        s.contract = head;
+        int base = slot(), siteAt = slot(), ls = slot(), rs = slot(), ws = slot();
+        const char* start = tokStart(cur);
+        int lh;
+        bool lnum = operand(&lh);
+        binRest(5, lnum, lh);
+        if (int t = cur.t, p = prec(t); p == 3 || p == 4) {
+          s.left.assign(start, prevEnd), next();
+          const char* r0 = tokStart(cur);
+          st(0, ls);
+          bool rnum = expr(p + 1);
+          s.op = opOf(t), s.right.assign(r0, prevEnd);
+          st(0, rs), mv(1, 0), ld(0, ls), hasLit = false, binop(s.op, lnum, rnum);
+          if (prec(cur.t) >= more) {  // `a < b == c`: one value, checked for truthiness
+            bool n = false;
+            int h = NOH;
+            binRest(more, n, h), st(0, ls), s.op = -1, s.right.clear(), s.left.assign(start, prevEnd);
+          }
+        } else {
+          if (prec(cur.t) >= more) binRest(more, lnum, lh);
+          st(0, ls), s.left.assign(start, prevEnd);
+        }
+        s.text.assign(start, prevEnd);
+        notOp();
+        Cond no = truthyCond();
+        thenBegin(no);
+        if (s.op < 0) imm(0, NIL), st(0, rs);
+        gmem(0, findGlobal(intern("contract@fail"))->slot), st(0, base);
+        imm(0, box((double)expectSite(std::move(s)))), st(0, siteAt);
+        whoHome != NOH ? ldl(0, whoHome) : imm(0, NIL), st(0, ws);
+        callWindow(base, 4, 0, false);
+        ifEnd(elseBegin(no, false));
+        F->depth = base;
+        if (more == 1 || !at(T_AND)) break;
+        next();
+      }
+      if (!at('{') && !at('}') && !cur.nl) fail("expected the condition to end here (a clause is one line)");
+    });
+  }
+  // A function with a contract: requires, then each old(...) into a home, on entry; ensures where every return
+  // arrives (Fun::exit). A method of a class with invariants (its own, a superclass's or a subclass's) checks them
+  // when an outside call ends, by calling the object's hidden invariant method: inv@enter tells whether this is one
+  // (no call on the same object is running), so a method calling its own object's methods mid-change is not.
+  void contract(Fun& f, const std::string& nm, int line, const SpecFn* spec, bool inv,
+                const std::vector<std::pair<int, Ty>>& ptys, const std::vector<int>& homes, int first) {
+    bool calls = spec && spec->calls;
+    std::string fn = display(nm);
+    int who = calls ? effSite("the contract of " + fn, 0, "!") : 0;
+    std::vector<Fun::Local> in, out;  // what clauses see: on entry, and on exit (where a parameter the body assigns is a copy)
+    if (f.cls >= 0) in.push_back({K_self, f.selfHome});
+    out = in;
+    for (size_t i = 0; spec && i < ptys.size(); i++) {
+      int h = homes[first + i];
+      in.push_back({ptys[i].first, h});
+      if (!spec->post.empty() && assignedIn(ptys[i].first)) { int c = home(); ldl(0, h), stl(0, c), h = c; }
+      out.push_back({ptys[i].first, h});
+    }
+    auto begin = [=, this] { if (calls) imm(0, box((double)who)), callNative("contract@begin", true); };
+    auto end = [=, this] { if (calls) callNative("contract@end", false); };
+    auto oldAt = std::make_shared<std::unordered_map<const char*, int>>();
+    if (spec && (!spec->pre.empty() || !spec->olds.empty())) {
+      begin();
+      clauses(in, line, [&] {
+        for (auto& c : spec->pre) check(c.at, "the caller broke " + fn + "'s contract: requires");
+        for (auto& o : spec->olds) {
+          int h = home();
+          detour(o.file, o.src, o.p, o.line, [&] { next(), expect('('), expr(), expect(')'); });
+          stl(0, h), (*oldAt)[o.p] = h;
+        }
+      });
+      end();
+    }
+    int outer = -1;  // inv@enter's answer: an outside call
+    if (inv) ldl(0, f.selfHome), callNative("inv@enter", true), stl(0, outer = home());
+    if ((!spec || spec->post.empty()) && !inv) return;
+    f.exit = [=, this] {
+      int rh = home();
+      stl(0, rh);
+      if (spec && !spec->post.empty()) {
+        auto names = out;
+        names.push_back({S_result, rh});
+        olds = oldAt.get(), begin();
+        clauses(names, line, [&] { for (auto& c : spec->post) check(c.at, fn + " broke its contract: ensures"); });
+        end(), olds = nullptr;
+      }
+      if (inv) {
+        ldl(0, outer);
+        Cond no = truthyCond();
+        thenBegin(no);
+        int b = slot(), w = slot();
+        ldl(0, f.selfHome), st(0, b), konst(fn), st(0, w), callWindow(b, 1, invariantSym(), false), F->depth = b;
+        ifEnd(elseBegin(no, false));
+        callNative("inv@leave", false);
+      }
+      ldl(0, rh);
+    };
+  }
+  // A class's invariants as a hidden method, inv@(who): each checked with no effects allowed (and what a clause's
+  // calls change put back), then the superclass's (inv@ on a class without invariants answers the receiver). who
+  // names what the error blames: the method whose call ended, or a store to a field from outside.
+  void invariantMethod(ClassDef& cd, const ClassSpec& cs) {
+    int inv = invariantSym();
+    Fn*& fn = methodFns[{cd.sym, inv}];
+    if (!fn) fn = make<Fn>(), fn->code = newStub(), fn->name = inv, consts.push_back(box(fn));
+    cd.methods.push_back({inv, fn});
+    std::string K = symName(cd.sym), q = K + ".inv@";
+    Fun f, *outer = F;
+    f.cls = cd.sym, f.init = true, f.k.name = q, f.k.file = file, F = &f, beginFun();  // init: it returns self
+    f.selfHome = home(), f.locals.push_back({K_self, f.selfHome});
+    int who = home();
+    param(0, f.selfHome), param(1, who);
+    bool calls = false;
+    for (auto& c : cs.invariants) calls |= c.calls;
+    if (calls) imm(0, box((double)effSite("the invariant of " + K, 0, "!"))), callNative("contract@begin", true);
+    clauses({{K_self, f.selfHome}}, cs.at.line, [&] { for (auto& c : cs.invariants) check(c.at, "\x01 broke " + K + "'s invariant:", who); });
+    if (calls) callNative("contract@end", false);
+    if (cd.super >= 0) {
+      int b = slot(), w = slot();
+      ldl(0, f.selfHome), st(0, b), ldl(0, who), st(0, w), callWindow(b, 1, inv, true), F->depth = b;
+    }
+    pend.push_back({(u32*)fn->code, fn, 2, finish(), q, true, {}, envFor(file)});
+    F = outer;
   }
   bool unchanged(const std::string& q) {  // incremental reload: skip a body whose text and environment match
     present.push_back(q);
@@ -1053,9 +1294,17 @@ struct Compiler : Gen {
         cd.fields.push_back({s, d});
         continue;
       }
+      if (atKw(S_invariant) && !peek().nl) {  // (the prescan has it: compiled into the methods)
+        next();
+        for (int d = 0; !(d == 0 && (at('}') || cur.nl)); next()) {
+          if (at(T_EOF)) fail("expected '}'");
+          d += nesting(cur);
+        }
+        continue;
+      }
       bool over = atKw(S_override) && peek().t == T_ID && peek().sym == K_fn;
       if (over) next();
-      if (!atKw(K_fn)) fail("expected 'fn', 'override fn' or 'var' in class body");
+      if (!atKw(K_fn)) fail("expected 'fn', 'override fn', 'var' or 'invariant' in class body");
       next();
       Tok mt = cur;
       int m = ident();
@@ -1069,6 +1318,7 @@ struct Compiler : Gen {
       Fun fun;
       owner = q, function(fun, cd.sym, m == S_init, q, (u32*)f->code, f);
     }
+    if (auto it = classSpecs.find(cd.sym); it != classSpecs.end() && !it->second.invariants.empty()) invariantMethod(cd, it->second);
     classes.push_back(std::move(cd));
   }
   // extern ["library"] fn name(type, ...) [: type] -- a C function (a host function in wasm); types: num int long ptr str (and void)
@@ -1267,6 +1517,55 @@ struct Compiler : Gen {
     }
     return {ip, ""};
   }
+  // A clause's condition: from L (after its keyword) to the end of its line, or to a '{' or '}' there (a function's
+  // body, the class's end). Notes its calls and (in ensures: olds) each old(...). Leaves L before what ends it.
+  void clauseScan(Lexer& L, Clause& c, std::vector<At>* olds) {
+    Lexer b = L;
+    Tok p, t = lex(L);
+    if (t.nl || t.t == '{' || t.t == '}' || t.t == T_EOF) failAt(t.p, t.line, "expected a condition (on the same line)");
+    c.at = {t.p, t.line, file, srcStart};
+    for (int d = 0; !clauseEnds(d, p, t); b = L, p = t, t = lex(L), d += nesting(p)) {
+      if (t.t != '(' || t.nl || !(p.t == ')' || p.t == ']' || (p.t == T_ID && (p.sym >= NKW || p.sym == K_fn)))) continue;
+      if (p.t != T_ID || p.sym != S_old) c.calls = true;
+      else if (!olds) failAt(p.p, p.line, "old() is a value as it was on entry: it belongs in an ensures clause");
+      else olds->push_back({p.p, p.line, file, srcStart});
+    }
+    L = b;
+  }
+  // After a function's name: its parameters, result type and effects, then its contract (requires and ensures
+  // clauses, one per line) before its body. L is left after the clauses, so a lambda's braces in one aren't taken for
+  // the body's. A body that is just todo() is noted: under fut test the function is pending.
+  void declScan(Lexer& L, const std::string& qn, const Tok& fnTok, int cls, int m) {
+    Lexer s = L;
+    Tok t = lex(s);
+    if (t.t != '(') return;
+    for (int d = 1; d > 0;) if ((t = lex(s)).t == T_EOF) return; else d += nesting(t);
+    SpecFn f;
+    f.fn = {fnTok.p, fnTok.line, file, srcStart}, f.name = symName(m);
+    for (;;) {
+      Tok k = lex(s);
+      if (k.t == '{') {
+        Lexer r = s;
+        Tok a = lex(r), o = lex(r), c = lex(r), e = lex(r);
+        if (a.t == T_ID && a.sym == S_todo && o.t == '(' && c.t == ')' && e.t == '}') todos.push_back({qn, f.fn});
+      }
+      if (k.t == '{' || k.t == '}' || k.t == T_EOF) break;
+      bool post = k.t == T_ID && k.sym == S_ensures;
+      if (!post && !(k.t == T_ID && k.sym == S_requires)) continue;  // its types and effects
+      Clause c;
+      clauseScan(s, c, post ? &f.olds : nullptr);
+      f.calls |= c.calls, (post ? f.post : f.pre).push_back(c), L = s;
+    }
+    if (f.pre.empty() && f.post.empty()) return;
+    if (cls < 0) fnSpecs.push_back(qn);
+    else classSpec(cls).methods.push_back(m);
+    specFns[qn] = std::move(f);
+  }
+  ClassSpec& classSpec(int cls) {
+    auto [it, fresh] = classSpecs.try_emplace(cls);
+    if (fresh) it->second.at = classAt[cls].first, it->second.name = symName(classAt[cls].second), classOrder.push_back(cls);
+    return it->second;
+  }
   // Token pre-pass: learn every top-level name, arity and fn/method source span, following imports.
   void prescan(const std::string& path, const char* src) {
     std::string savedFile = file;
@@ -1331,10 +1630,15 @@ struct Compiler : Gen {
         int n = sp.arity = params(&sp.retNum);
         open.push_back({qn, p.p, p.line, depth});
         if (!depth) declare(d, 'f', n | (sp.retNum ? 128 : 0));  // callers rely on a `: num` result
+        declScan(L, qn, p, depth ? cls : -1, t.sym);
       } else if (depth == 0 && afterKw && (p.sym == K_class || p.sym == K_var)) {
         Tok d = q(t);
         declare(d, p.sym == K_class ? 'c' : 'v', 0);
-        if (p.sym == K_class) cls = d.sym;
+        if (p.sym == K_class) {
+          cls = d.sym, classAt[cls] = {{t.p, t.line, file, srcStart}, t.sym};
+          Lexer s = L;
+          if (lex(s).t == ':') if (Tok n = lex(s); n.t == T_ID) superAt[cls] = {n.p, n.line, file, srcStart};
+        }
         else if (VarTy& v = varTypes[d.sym] = {}; [&] { Lexer s = L; return lex(s).t == ':'; }()) {  // a typed var
           Lexer s = L;
           lex(s), v.file = path, v.src = src, v.at = s.p, v.line = s.line;
@@ -1346,6 +1650,11 @@ struct Compiler : Gen {
           }
           mixEnv(fnv(s.p, e) ^ uint64_t(d.sym) << 32, -2);  // its stores check it, in importers too
         }
+      } else if (depth == 1 && cls >= 0 && t.t == T_ID && t.sym == S_invariant && (t.nl || p.t == '{') && [&] { Lexer s = L; return !lex(s).nl; }()) {
+        Clause c;
+        const char* from = L.p;
+        clauseScan(L, c, nullptr), classSpec(cls).invariants.push_back(c), invariantsOn = true;
+        mixEnv(fnv(from, L.p) ^ uint64_t(cls) << 32, -1);  // editing one recompiles the class's methods
       } else if (depth == 1 && cls >= 0 && afterKw && p.sym == K_var) {  // a declared field: methods compile against them
         mixEnv(uint64_t(cls) << 32 | uint64_t(t.sym) << 2 | 1, -2);
       } else if (depth == 0 && t.t == T_STR && p.t == T_ID && p.sym == K_import) {
@@ -1445,22 +1754,113 @@ struct Compiler : Gen {
       surfEnv[P] = h;
     }
     for (auto& [P, _] : pkgImports) envOf.try_emplace(P, 1469598103934665603ull);
+    if (invariantsOn)  // every store to a field, in every package, checks them
+      for (auto& [P, h] : envOf) h = (h ^ 0x1a7a) * 1099511628211ull;
     for (auto& [P, h] : envOf) {
       uint64_t e = h;
       for (auto& D : pkgImports[P]) e = (e ^ surfEnv[D]) * 1099511628211ull;
       envFinal[P] = e;
     }
+    invariantClasses();
     file = path, srcStart = src, lx = Lexer{src}, next();
     Fun top;
     top.top = true, top.noRegs = topTry, top.k.name = "<top>", top.k.file = path, F = &top;
     topLevel();
     if (!modulesPending.empty()) compileFail("waiting for the host to load modules", false);
+    if (testing) todosPending(), specProperties();
     checkClasses();
     for (auto& [sym, v] : varTypes) globalType(sym);  // each typed var's type, for commit
     Code chunk = finish();
     return commit(chunk);
   }
 
+  // The classes whose methods check invariants when an outside call ends: each with invariants, its superclasses
+  // (a method they define may run on an instance of it) and its subclasses (they inherit its invariants).
+  void invariantClasses() {
+    std::unordered_map<int, int> sup;
+    for (auto& [c, at] : superAt) detour(at.file, at.src, at.p, at.line, [&] { ident(), sup[c] = topName(prev).sym; });
+    auto up = [&](int k) { auto it = sup.find(k); return it == sup.end() ? -1 : it->second; };
+    auto has = [&](int k) { auto it = classSpecs.find(k); return it != classSpecs.end() && !it->second.invariants.empty(); };
+    for (auto& [d, _] : classAt)
+      for (int k = d, n = 0; k >= 0 && n < 256; k = up(k), n++)
+        if (has(k)) {
+          for (int a = d, m = 0; a >= 0 && m < 256; a = up(a), m++) invClasses.insert(a);
+          break;
+        }
+  }
+  // A function whose body is todo() is a pending test: its signature and contract are written, its code isn't yet.
+  void todosPending() {
+    for (auto& [q, at] : todos) tests.push_back({q + "()", at.file, q + "() is not implemented yet", at.line});
+  }
+  // Under fut test, each function with a contract, and each class with one (its invariants, or methods with
+  // contracts), becomes a property test: the function on random inputs of its parameters' types, or an instance
+  // under random calls of its methods with contracts (all of them, for a class with only invariants). An input that breaks a
+  // requires is thrown away; any other error (an ensures, the invariant, a runtime error) fails the test, with the
+  // input shrunk to a small one that still fails. The test is fut code the compiler writes (on one line, so traces
+  // name the function's or class's line), compiled in its file; prop@ natives (test.cpp) generate, shrink and report.
+  std::deque<std::string> synth;  // the text of those tests (compiled here; nothing keeps pointing into it after)
+  static bool generatable(uint64_t t) { return (t & 15) >= TY_ANY && (t & 15) <= TY_MAP; }
+  bool paramTypes(const std::string& q, std::vector<uint64_t>& out) {  // q's parameter types, if every one can be generated
+    auto it = sigs.find(q);
+    if (!spans.count(q) || it == sigs.end()) return false;
+    out.assign(it->second.types.begin(), it->second.types.end() - 1);  // (the last is the result's)
+    return std::all_of(out.begin(), out.end(), generatable);
+  }
+  static std::string argList(const char* v, size_t n) {
+    std::string a;
+    for (size_t i = 0; i < n; i++) a += (i ? ", " : "") + std::string(v) + "[" + std::to_string(i) + "]";
+    return a;
+  }
+  bool isTodo(const std::string& q) { return std::any_of(todos.begin(), todos.end(), [&](auto& t) { return t.first == q; }); }
+  void specProperties() {
+    struct One { std::string n; At at; bool isFn; const ClassSpec* cs; std::string raw; };
+    std::vector<One> all;
+    for (auto& q : fnSpecs) all.push_back({q, specFns.at(q).fn, true, nullptr, specFns.at(q).name});
+    for (int c : classOrder) all.push_back({symName(c), classSpecs.at(c).at, false, &classSpecs.at(c), classSpecs.at(c).name});
+    for (auto& d : all) {
+      std::string n = d.n, call;
+      PropSite ps;
+      ps.file = d.at.file, ps.cls = !d.isFn, ps.names = {n};
+      if (d.isFn) {
+        std::vector<uint64_t> t;
+        if (isTodo(n) || !paramTypes(n, t)) continue;
+        ps.types.push_back(t), ps.line = d.at.line;
+        ps.text = n + "() to keep its contract on random inputs", ps.discard = "the caller broke " + n + "()'s contract:";
+        call = d.raw + "(" + argList("a@", t.size()) + ")";
+      } else {
+        std::vector<uint64_t> t;
+        if (isTodo(n + ".init") || (spans.count(n + ".init") && !paramTypes(n + ".init", t))) continue;
+        ps.types.push_back(t), ps.line = d.at.line;
+        std::vector<int> ms;  // its methods with contracts, else (only invariants) every method
+        for (int m : d.cs->methods) if (m != S_init) ms.push_back(m);
+        if (ms.empty() && d.cs->methods.empty())
+          for (auto& cd : classes) if (symName(cd.sym) == n) for (auto& [m, f] : cd.methods) if (m != S_init && m != invariantSym()) ms.push_back(m);
+        std::string dispatch;
+        for (int m : ms) {
+          std::vector<uint64_t> mt;
+          if (isTodo(n + "." + symName(m)) || !paramTypes(n + "." + symName(m), mt)) continue;
+          dispatch += std::string(ps.names.size() > 1 ? " else " : "") + "if m@ == " + std::to_string(ps.names.size() - 1) + " { o@." + symName(m) + "(" + argList("x@", mt.size()) + ") }";
+          ps.names.push_back(symName(m)), ps.types.push_back(mt);
+        }
+        if (ps.names.size() == 1 && d.cs->invariants.empty()) continue;
+        ps.text = n + " to keep its contract over random calls", ps.discard = "the caller broke " + n + ".";
+        call = "var x@ = a@[0]; var o@ = " + d.raw + "(" + argList("x@", t.size()) + "); for c@ in a@[1] { var m@ = c@[0]; x@ = c@[1]; try { " +
+               dispatch + " } catch e@ { if !prop@discard(S@, e@) { throw e@ } } }";
+      }
+      // (its own names end in '@', so they can't hide the program's)
+      std::string& src = synth.emplace_back(
+          "test \"contract " + n + (d.isFn ? "() on random inputs" : " on random calls") + "\" { var S@ = " + std::to_string(propSite(ps)) +
+          "; var f@ = fn(a@) { " + call + " }; var ok@ = 0; var n@ = 0; while ok@ < 100 && n@ < 1000 { var in@ = prop@gen(S@, n@); n@ += 1; "
+          "var e@ = nil; try { f@(in@) } catch x@ { e@ = x@ }; if e@ == nil { ok@ += 1 } else if !prop@discard(S@, e@) { var k@ = 0; var steps@ = 0; "
+          "while steps@ < 2000 { var c@ = prop@shrink(S@, in@, k@); if c@ == nil { break }; steps@ += 1; var e2@ = nil; "
+          "try { f@(c@) } catch x@ { e2@ = x@ }; if e2@ != nil && !prop@discard(S@, e2@) { in@ = c@; e@ = e2@; k@ = 0 } else { k@ += 1 } }; "
+          "prop@fail(S@, in@, e@, n@) } }; prop@done(S@, ok@, n@) }");
+      Mark m = mark();
+      file = d.at.file, srcStart = src.c_str(), lx = Lexer{srcStart, ps.line, true}, next(), next();
+      testDecl();
+      rewind(m);
+    }
+  }
   // ---- checks that need every class: overrides, and `self.name` against declared fields ----
   // A class as this compile defines it, else as the running program has it (a class defined at the REPL may
   // extend one from the program).
@@ -1469,14 +1869,14 @@ struct Compiler : Gen {
     for (auto& cd : classes)
       if (cd.sym == sym) {
         v = {cd.super, {}, &cd.fields};
-        for (auto& [m, f] : cd.methods) v.methods.push_back({m, spans.at(symName(sym) + "." + symName(m)).arity});
+        for (auto& [m, f] : cd.methods) if (m != invariantSym()) v.methods.push_back({m, spans.at(symName(sym) + "." + symName(m)).arity});
         return true;
       }
     Global* g = findGlobal(sym);
     if (!g || !g->o || g->o->kind != K::Class) return false;
     Class* c = (Class*)g->o;
     v = {c->super ? (int)c->super->name : -1, {}, &c->fields};
-    for (auto& [m, f] : c->methods) v.methods.push_back({m, f->arity - 1});  // a method's Fn counts self
+    for (auto& [m, f] : c->methods) if (m != invariantSym()) v.methods.push_back({m, f->arity - 1});  // a method's Fn counts self
     return true;
   }
   [[noreturn]] void failHere(const At& a, const char* fmt, const std::string& x, const std::string& y = "", const std::string& z = "", const std::string& w = "") {
@@ -1591,6 +1991,12 @@ struct Compiler : Gen {
         t = std::move(p.tier), t.stub = p.stub, t.body = body;
       }
       if (p.fn) p.fn->arity = p.arity;
+      if (p.lambda && p.owner.ends_with(".inv@")) {  // a class's invariants, compiled every time: the old body goes
+        u32*& old = invBodies[p.owner];
+        if (old) jitRetire(old);
+        old = body;
+        continue;
+      }
       if (p.lambda) { lambdas[p.owner].push_back(body); continue; }
       Span& sp = spans.at(p.owner);
       uint64_t text = fnv(sp.start, sp.end);

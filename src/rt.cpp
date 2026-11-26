@@ -271,11 +271,12 @@ static V rt_closure(V fn, uint64_t n, V* w) {
 static void* identCode;  // constructor of a class without init: returns self
 // Resolve a call. w[0] is the callee or receiver, w[1..n] the args; on return the JIT loads x0..x7 from w (x8 = w).
 // ic: a method call's cache (key: receiver header), or a constructor site's (key: the class value).
+int invariantSym() { static int s = intern("inv@"); return s; }
 static void* rt_prep(V* w, uint64_t n, uint64_t sym, V sup, IC* ic) {
   V r = w[0];
   Fn* f = nullptr;
   IC* ctor = sym ? nullptr : ic;
-  if (sym && is(r, K::Map) && !builtin(K::Map, sym)) {  // m.f(x) calls m["f"]
+  if (sym && is(r, K::Map) && !builtin(K::Map, sym) && (int)sym != invariantSym()) {  // m.f(x) calls m["f"]
     long e = mapFind(as<Map>(r), mapKey(sym));
     if (e < 0) ERR("map has no key '%s' to call", symName(sym).c_str());
     r = w[0] = as<Map>(r)->e[e].second, sym = 0;
@@ -284,6 +285,10 @@ static void* rt_prep(V* w, uint64_t n, uint64_t sym, V sup, IC* ic) {
     if (sup) f = as<Class>(sup)->super ? as<Class>(sup)->super->find(sym) : nullptr;
     else if (is(r, K::Inst)) f = as<Inst>(r)->cls->find(sym);
     else if (isObj(r)) f = builtin(obj(r)->kind, sym);
+    if (!f && (int)sym == invariantSym()) {  // no invariant to check: the receiver is the result
+      if (ic && is(r, K::Inst) && !sup) *ic = {header(obj(r)), (uint64_t)identCode};
+      return identCode;
+    }
     if (!f) ERR("%s has no method '%s'", typeName(r), symName(sym).c_str());
     if (ic && is(r, K::Inst) && f->arity == (int)n + 1) *ic = {header(obj(r)), (uint64_t)f->code};
   } else if (is(r, K::Fn)) {

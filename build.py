@@ -264,7 +264,7 @@ def runner_json(exe):
 
 
 def runner_text(exe):
-    """`fut test` (text) with a filter; a compile error; spec-first: all pending, then all passing."""
+    """`fut test` (text) with a filter; a compile error; tests first: all pending, then all passing; todo() bodies."""
     d = ROOT / "build" / "spec"
     d.mkdir(parents=True, exist_ok=True)
     spec = 'test "doubles" { expect double(2) == 4 }\ntest "halves" { expect half(4) == 2 }\n'
@@ -280,7 +280,13 @@ def runner_text(exe):
           and b.returncode == 0 and b.stdout.startswith("ok      doubles\nok      halves\n2 tests: 2 passed")
           and c.stdout.startswith("ok      doubles\n1 test: 1 passed")
           and e.returncode == 2 and err.get("type") == "compile_error" and err.get("line") == 1 and err.get("message") == "unexpected '}'")
-    return ok, f"pending run: {a.stdout!r}\n  passing run: {b.stdout!r}\n  filtered: {c.stdout!r}\n  compile error: {e.stdout!r}"
+    # a function whose body is todo() is pending: its signature and contract are written, its code isn't yet
+    (d / "s.fut").write_text('class Box {\n  fn open()\n    requires true\n  {\n    todo()\n  }\n}\nfn triple(n)\n  ensures result == n * 3\n{ todo() }\n'
+                             'test "t" { expect throws { triple(1) } == "triple() is not implemented yet" }\n')
+    p = run(str(d / "s.fut"))
+    ok = ok and p.returncode == 1 and p.stdout.startswith(
+        "ok      t\npending Box.open() (s.fut:2): Box.open() is not implemented yet\npending triple() (s.fut:8): triple() is not implemented yet\n")
+    return ok, f"pending run: {a.stdout!r}\n  passing run: {b.stdout!r}\n  filtered: {c.stdout!r}\n  compile error: {e.stdout!r}\n  specs: {p.stdout!r}"
 
 
 def runner_api(exe):
@@ -341,7 +347,7 @@ PKG_TREE = {
 
 def runner_packages(exe):
     """Packages: imports by name, the root file's surface (with re-exports), what a dependency can't see, the
-    boundary and cycle errors, and one .api per package whose breaking changes need a version bump."""
+    boundary and cycle errors, and one .api per package whose breaking changes (contracts too) need a version bump."""
     d = ROOT / "build" / "pkg"
     tree(d, PKG_TREE)
     run = lambda *a: subprocess.run([*runner(exe), *a], capture_output=True, text=True, timeout=60)
@@ -372,12 +378,23 @@ def runner_packages(exe):
     b, held = run("test", main), run("api", main)
     (d / "geom" / "fut.pkg").write_text(PKG_TREE["geom/fut.pkg"].replace("0.3.0", "0.4.0"))
     w = run("api", main)
+    # contracts are part of the interface: adding an ensures is compatible, adding a requires is breaking
+    geom = (d / "geom" / "geom.fut").read_text()
+    (d / "geom" / "geom.fut").write_text(geom.replace("pub fn area(r) {", "pub fn area(r)\n  ensures result >= 0\n{"))
+    ens = run("api", main)
+    ensApi = (d / "geom" / "geom.api").read_text()
+    (d / "geom" / "geom.fut").write_text(geom.replace("pub fn area(r) {", "pub fn area(r)\n  requires r >= 0\n  ensures result >= 0\n{"))
+    req = run("test", main)
     ok = (r.stdout.splitlines() == ["5", "12", "1"] and all(x in y for x, y in zip(want, errs))
           and a.returncode == 0 and "package geom 0.3.0" in api and "pub fn unit()" in api and "pub class Vec {" in api
           and "sq" not in api and "hidden" not in api and not (d / "app" / "main.api").exists() and t.returncode == 0
           and b.returncode == 1 and "set 'version 0.4.0'" in b.stdout and held.returncode == 1 and "not writing" in held.stdout
-          and w.returncode == 0 and "package geom 0.4.0" in (d / "geom" / "geom.api").read_text())
-    return ok, f"run: {r.stdout!r} {r.stderr!r}\n  errors: {errs!r}\n  api: {a.stdout!r} {api!r}\n  breaking: {b.stdout!r} {held.stdout!r}\n  bumped: {w.stdout!r}"
+          and w.returncode == 0 and "package geom 0.4.0" in (d / "geom" / "geom.api").read_text()
+          and ens.returncode == 0 and "+ area() ensures result >= 0" in ens.stdout and "pub fn area(r)\n  ensures result >= 0\n" in ensApi
+          and req.returncode == 1 and "strengthened a contract" in req.stdout and "set 'version 0.5.0'" in req.stdout
+          and "  + area() requires r >= 0" in req.stdout)
+    return ok, (f"run: {r.stdout!r} {r.stderr!r}\n  errors: {errs!r}\n  api: {a.stdout!r} {api!r}\n  breaking: {b.stdout!r} {held.stdout!r}\n  bumped: {w.stdout!r}"
+                f"\n  ensures added: {ens.stdout!r} {ensApi!r}\n  requires added: {req.stdout!r}")
 
 
 def runner_map(exe):
@@ -439,7 +456,7 @@ RUNNER_TESTS = [("fut test --json: statuses, details, output", runner_json),
                 ("packages: names, interfaces, boundaries, versions", runner_packages),
                 ("fut map: packages, files, declarations", runner_map),
                 ("foreign modules: js, wasm, c", runner_modules),
-                ("fut test: spec first, filter, compile error", runner_text),
+                ("fut test: tests first, filter, compile error, todo()", runner_text),
                 ("fut api: interfaces written, checked by fut test", runner_api)]
 
 

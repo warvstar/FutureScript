@@ -137,6 +137,8 @@ inline constexpr u32 sizeClasses[] = {16, 32, 48, 64, 96, 128, 192, 256, 384, 51
 constexpr int NCLS = sizeof sizeClasses / sizeof *sizeClasses;
 constexpr int sizeClass(size_t bytes) { int c = 0; while (c < NCLS && sizeClasses[c] < bytes) c++; return c; }  // NCLS: large
 void* gcAlloc(size_t bytes);
+uint64_t gcAllocations();  // objects the program allocated so far (not counting gcUncounted)
+extern uint64_t gcUncounted;  // objects allocated for contracts' bookkeeping, which `expect allocs` doesn't count
 void gcOwn(Obj*);  // o holds malloc'd memory: finalize it when the GC finds it dead
 template <class T> T* make(size_t extra = 0) {
   T* o = new (gcAlloc(sizeof(T) + extra)) T();
@@ -153,7 +155,7 @@ extern uintptr_t* stackTop;
   X(true) X(false) X(nil) X(self) X(super) X(import) X(extern) X(yield) X(try) X(catch) X(throw)
 #define SYM_ENUM(k) K_##k,
 #define SYM_STR(k) #k,
-#define EXTRA_SYMS(X) X(init) X(main) X(push) X(pop) X(len) X(has) X(remove) X(keys) X(values) X(reload) X(resume) X(send) X(done) X(as) X(test) X(expect) X(throws) X(prints) X(pub) X(override) X(atomic) X(effect) X(handle) X(with)
+#define EXTRA_SYMS(X) X(init) X(main) X(push) X(pop) X(len) X(has) X(remove) X(keys) X(values) X(reload) X(resume) X(send) X(done) X(as) X(test) X(expect) X(throws) X(prints) X(pub) X(override) X(atomic) X(effect) X(handle) X(with) X(requires) X(ensures) X(invariant) X(old) X(result) X(allocs) X(grows) X(like) X(todo)
 #define SYM_S(k) S_##k,
 enum { KEYWORDS(SYM_ENUM) NKW, S_FIRST = NKW - 1, EXTRA_SYMS(SYM_S) };
 int intern(std::string_view);
@@ -282,8 +284,15 @@ extern std::string* outSink;  // when set, print() appends here instead of writi
 extern std::string* errSink;  // when set, an uncaught error's message and trace go here instead of to stderr
 
 // ---- tests (test.cpp): `expect` sites, and the runner behind `fut test` ----
-struct ExpectSite { std::string file, text, left, right; int line = 0, op = -1; bool throws = false; };  // op < 0: truthiness
+struct ExpectSite { std::string file, text, left, right; int line = 0, op = -1; bool throws = false; std::string contract; };  // op < 0: truthiness
+// contract: a spec's clause (requires/ensures/invariant), checked inline; contract@fail(site, left, right) raises naming who broke it
 int expectSite(ExpectSite);  // its number, passed to the expect@ native
+// A spec turned into a property test (fut test): what prop@gen generates and prop@shrink shrinks. A function's
+// arguments: types[0] (names[0]: the function). A class's: [init's arguments (types[0]), calls], each call
+// [method i, its arguments (types[i + 1])] (names[0]: the class, then the methods). discard: how an error that
+// says the generated input broke a requires starts.
+struct PropSite { std::string file, text, discard; int line = 0, expect = -1; bool cls = false; std::vector<std::string> names; std::vector<std::vector<uint64_t>> types; };
+int propSite(PropSite);
 void testInit();
 V binopValue(V a, V b, int op);  // a op b, as the language computes it (raises on bad operands)
 struct TestRun { bool json = false; std::string filter; double timeout = 10; };
@@ -314,6 +323,10 @@ bool txnAtomic();               // is an atomic block open? (io can't be undone 
 void txnMark(void (*mark)(V));  // GC roots: what rollbacks would put back
 extern bool txnPollLater;       // a reload or typed line waits for the transactions to end
 int globalCount();              // global slots in use
+
+// ---- contracts: a class's invariants compile to a hidden method inv@(who); calling it on anything without one
+// returns the receiver (rt_prep) ----
+int invariantSym();
 
 // ---- types (types.cpp): optional annotations, checked at run time where they are written ----
 // A type is a kind, TY_OPT if nil is allowed too (`str?`), and for a class its symbol (bits 8..).
@@ -369,7 +382,7 @@ bool parseVersion(const std::string& v, int out[3]);
 // ---- public interfaces (api.cpp): `pub` declarations, kept in .api files ----
 struct ApiIssue {
   std::string file, api, status;           // status: "missing" (no .api yet), "changed", "stale" (nothing is pub
-                                           // now), "breaking" (declarations went, and the version did not move)
+                                           // now), "breaking" (declarations went or a contract was strengthened, and the version did not move)
   std::vector<std::string> removed, added;  // declarations, one per line
   std::string want;                         // the .api text it should have
   std::string version, needs;               // breaking: the version, and the least it must become

@@ -1,0 +1,32 @@
+// The public interface of package money 0.1.0 (money.fut), written by `fut api`. `fut test` fails while it is out of date.
+
+// Dollars to cents, rounding half up.
+pub fn cents(dollars: num): num
+  ensures result == floor(result)
+
+// "$1234.56", "-$0.05".
+pub fn format(c: num): str
+  requires c == floor(c)
+  ensures result.has("$")
+  ensures result.has(".")
+
+// p percent of c, rounded half up.
+pub fn percent(c: num, p: num): num
+  requires c >= 0
+  requires c == floor(c)
+  requires p >= 0
+  requires p <= 100
+  ensures result >= 0
+  ensures result <= c
+  ensures result == floor(result)
+
+// total split into `ways` parts that differ by at most a cent and add up to it exactly; the bigger parts first.
+pub fn split(total: num, ways: num): list
+  requires total >= 0
+  requires total == floor(total)
+  requires ways >= 1
+  requires ways <= 10000000
+  requires ways == floor(ways)
+  ensures result.len() == ways
+  ensures sum(result) == total
+  ensures largest(result) - smallest(result) <= 1

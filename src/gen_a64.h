@@ -22,7 +22,7 @@ struct Gen : CState {
       if ((p & 0xffc00000) == str(0, 0, 0) && i == (p | ldr(0, 0, 0))) return (int)c.size() - 1;  // str r,[m]; ldr r,[m]
     }
     auto& ln = F->k.lines;
-    if (ln.empty() || ln.back().second != prev.line) ln.push_back({(int)F->k.c.size(), prev.line});
+    if (ln.empty() || ln.back().second != line()) ln.push_back({(int)F->k.c.size(), line()});
     return emitted++, c.push_back(i), (int)c.size() - 1;
   }
   int here() { return labels++, F->label = (int)F->k.c.size(); }  // a branch target: peepholes must not cross it
@@ -124,12 +124,13 @@ struct Gen : CState {
     int end = (int)F->k.c.size();
     if (F->rets.empty() || F->rets.back() != end - 1 || F->label >= end) F->init ? ldl(0, F->selfHome) : (void)E(mov(0, 27));
     else F->k.c.pop_back(), F->rets.pop_back(), emitted++;  // ends in an unbranched-to `return`: fall into the epilogue
+    for (int r : F->rets) patch(r);
+    if (F->retTy) typeCheck(F->retTy, F->retSite, F->retTy == TY_NUM);  // the result, outside every try: see Fun::retTy
+    if (F->exit) F->live = true, F->facts.reset(), F->exit();          // its spec's exit checks (they may use the frame)
     if (F->maxd > 4000) fail("function too large");
     if (F->noRegs) F->maxreg = 7, F->maxfreg = 8;
     int pairs = (F->maxreg + 1) / 2, fpairs = (F->maxfreg + 1) / 2;  // x19.. then d8.. pairs, just below x29
     u32 bytes = ((F->maxd * 8 + 15) & ~15) + 16 * (pairs + fpairs);
-    for (int r : F->rets) patch(r);
-    if (F->retTy) typeCheck(F->retTy, F->retSite, F->retTy == TY_NUM);  // the result, outside every try: see Fun::retTy
     if (F->effHome >= 0) ld(9, F->effHome), E(str(9, 28, EOFF)), ld(9, F->effHome + 1), E(strw(9, 28, EOFF + 16));  // the caller's effects
     for (int k = 0; k < pairs; k++) E(ldp_off(19 + 2 * k, 20 + 2 * k, 29, -16 * (k + 1)));
     for (int k = 0; k < fpairs; k++) E(ldpd(8 + 2 * k, 9 + 2 * k, 29, -16 * (pairs + k + 1)));
