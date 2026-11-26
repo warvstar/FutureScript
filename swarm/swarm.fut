@@ -112,8 +112,10 @@ fn otherSpent() {  // what the other saved runs spent
 fn budgetLeft() { return min2(CAP, GLOBAL_CAP - otherSpent()) - ledger.spent }  // dollars this run may still spend
 fn min2(a, b) { if a < b { return a } return b }
 fn pollControl() {  // the dashboard's changes to this run, read every 10 s
-  if DASH == nil || time() - lastPoll < 10 { return nil }
+  if time() - lastPoll < 10 { return nil }
   lastPoll = time()
+  for r in ["worker", "planner", "approver", "reviewer"] { ROLE[r] = readFile(ROOT + "/swarm/prompts/" + r + ".md") || ROLE[r] }  // edits apply without a restart
+  if DASH == nil { return nil }
   var sc = kvGet("scenarios")
   if sc { scenarios = sc }
   var c = kvGet("control")
