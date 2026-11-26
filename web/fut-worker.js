@@ -26,6 +26,7 @@ function options(cfg, pending) {
     cores: navigator.hardwareConcurrency,
     read,
     write: (fd, b) => postMessage({ write: [fd, b.slice()] }),
+    problem: (text) => postMessage({ problem: text ?? "" }),
     files: (f) => postMessage({ files: f }),
     importModule: (p, stamp) => import(p + "?v=" + stamp),
     stamp: (p) => stamps.get(p) ?? 0,

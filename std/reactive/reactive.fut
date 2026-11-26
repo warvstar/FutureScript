@@ -123,6 +123,44 @@ pub fn cell(v): Signal {  // `state x = e`: e's signal if it is one (computed(),
   if isa(v, Signal) { return v }
   return Signal(v)
 }
+// `state x = e` in a function or view: as cell(e), but after a reload (keepLocals()) the key's states take the values
+// those of the page before had, in the order they were made.
+var localsMade = {}  // key -> [{s, live}], in the order made
+var localsKept = {}  // key -> the values before the reload
+var localsTaken = {}  // key -> how many of them are taken
+pub fn local(key: str, v): Signal {
+  if isa(v, Signal) { return v }
+  var s = Signal(v)
+  if localsKept.has(key) {
+    var i = 0
+    if localsTaken.has(key) { i = localsTaken[key] }
+    if i < localsKept[key].len() { s.value = localsKept[key][i] }
+    localsTaken[key] = i + 1
+  }
+  if !localsMade.has(key) { localsMade[key] = [] }
+  var list = localsMade[key]
+  if list.len() >= 64 && list.len() % 64 == 0 {  // (rows come and go: forget those gone)
+    var live = []
+    for e in list { if e.live { live.push(e) } }
+    list = live
+    localsMade[key] = live
+  }
+  var entry = {s: s, live: true}
+  list.push(entry)
+  onCleanup(fn() { entry.live = false })
+  return s
+}
+// Before a page is shown again (a reload): what its own states hold now, for local() to give the next page's.
+pub fn keepLocals() {
+  localsKept = {}
+  for k in localsMade.keys() {
+    var vals = []
+    for e in localsMade[k] { if e.live { vals.push(e.s.value) } }
+    localsKept[k] = vals
+  }
+  localsMade = {}
+  localsTaken = {}
+}
 pub fn store(old, v) {
   if isa(old, Signal) { old.set(v) return old }
   return v

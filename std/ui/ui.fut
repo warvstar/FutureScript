@@ -1100,7 +1100,7 @@ var themed = false
 var shown = nil
 var shownView = nil
 // Show the page again, built by the code as it is now: after a reload (a file with views does this in its reload()
-// unless it has its own). The state is kept; a view's own state starts again.
+// unless it has its own). The state is kept, a view's own too (by its view and name, in the order made).
 pub fn refresh() {
   if shownView != nil { show(shownView) }
 }
@@ -1108,6 +1108,7 @@ pub fn refresh() {
 // page shown before (as a reload shows it again) is taken down first: its effects and timers stop.
 pub fn show(view: fn): fn {
   if !themed { themed = true base(THEME) }
+  r.keepLocals()  // (before the page goes: its states' values, for the new page's)
   if shown != nil { shown() }
   if sheets.len() > 0 {  // the file's top level ran again (else only functions changed: its sheets stay)
     for s in pageSheets { remove(s) }

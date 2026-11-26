@@ -151,7 +151,12 @@ export async function createFut(opts) {
     if (hi < 128 && e - p < 64) return String.fromCharCode.apply(null, m.subarray(p, e));  // short ASCII: no decoder
     return dec.decode(shared ? m.slice(p, e) : m.subarray(p, e));
   };
-  const write = (fd, s) => opts.write(fd, typeof s == "string" ? enc.encode(s) : s);
+  let caught = null;  // what went to stderr since a reload began (its compile errors), while one is under way
+  const write = (fd, s) => {
+    if (fd == 2 && caught != null) caught += typeof s == "string" ? s : dec.decode(s);
+    opts.write(fd, typeof s == "string" ? enc.encode(s) : s);
+  };
+  const problem = (text) => opts.problem?.(text);  // the page's banner: what's wrong now (null: nothing)
   function withStr(s, f) {  // f(pointer to s as a C string)
     const b = enc.encode(s), p = ex.fut_alloc(b.length + 1);
     u8().set(b, p), (u8()[p + b.length] = 0);
@@ -530,7 +535,7 @@ export async function createFut(opts) {
     } else (msg = describe(e)), opts.verbose && !(e instanceof RangeError) && (t = String(e.stack) + "\n");
     return fiberTraces.clear(), msg + "\n" + t;
   }
-  const report = (e) => write(2, "runtime error: " + errorText(e));
+  const report = (e) => (write(2, "runtime error: " + errorText(e)), problem("runtime error: " + errorText(e)));
 
   // ---- the program's events: changed files and typed lines, handled at the next safepoint ----
   let fileChanged = false, inbox = [], replBuf = "", inMain = false, wake = null, path = "", mainChanged = false;
@@ -593,8 +598,10 @@ export async function createFut(opts) {
     if (ex.fut_isolates() > 1 && !stopping()) return void setTimeout(poke, 50);
     fileChanged = false;
     const stopped = stopping() && !!ex.fut_isolates_stop();
-    const c = await load(true);
-    if (!c) return void (stopped && ex.fut_isolates_verdict(1));  // compile error: keep running the old code
+    caught = "";
+    let c;
+    try { c = await load(true); } finally { var text = caught; caught = null; }
+    if (!c) return void (problem(text.replace(/^\[fut\].*\n/gm, "").trim() || "the file doesn't compile"), stopped && ex.fut_isolates_verdict(1));  // compile error: keep running the old code
     if (stopped) ex.fut_isolates_sync();
     const restart = mainChanged && inMain;
     // The new top level and the reload() hook (which migrates state) run as one transaction. If either fails, the
@@ -607,12 +614,12 @@ export async function createFut(opts) {
       const r = withStr("reload", (p) => ex.fut_fn(p));
       if (r) await call(r);
       const failed = stopped ? cstr(ex.fut_isolates_parts(c, r)) : "";
-      if (failed) return write(2, `[fut] reload failed in ${failed}\n`), undo();
+      if (failed) return write(2, `[fut] reload failed in ${failed}\n`), problem(`reload failed in ${failed}`), undo();
     } catch (e) {
       if (e instanceof Restart || e instanceof Exit) throw e;
       return report(e), undo();
     }
-    ex.fut_retire(c), ex.fut_txn_commit();
+    ex.fut_retire(c), ex.fut_txn_commit(), problem(null);
     if (stopped) ex.fut_isolates_verdict(1);
     if (restart) throw new Restart();
   }

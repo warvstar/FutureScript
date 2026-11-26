@@ -19,6 +19,11 @@
   .e { color: var(--err); }
   #form { display: flex; border-top: 1px solid var(--line); padding-top: 8px; }
   #prompt { color: var(--dim); padding-right: 6px; }
+  #problem { position: fixed; left: 16px; right: 16px; bottom: 16px; max-height: 40vh; overflow: auto; margin: 0; padding: 12px 40px 12px 14px;
+    background: #2a1416; color: #ffd6d6; border: 1px solid #7a2a30; border-radius: 8px; white-space: pre-wrap; z-index: 99;
+    font: 12.5px/1.5 ui-monospace, Menlo, monospace; box-shadow: 0 10px 30px rgb(0 0 0 / .4); }
+  #problem[hidden] { display: none; }
+  #problem button { position: absolute; top: 8px; right: 8px; background: none; border: 0; color: inherit; font: inherit; cursor: pointer; }
   #in { flex: 1; background: none; border: 0; color: var(--fg); font: inherit; outline: none; }
 </style>
 </head>
@@ -33,6 +38,7 @@
     <form id="form"><span id="prompt">&gt;</span><input id="in" autocomplete="off" spellcheck="false" autofocus></form>
   </div>
 </main>
+<pre id="problem" hidden role="alert"></pre>
 <script type="module">
 import { createFut } from "/web/fut.js";
 const $ = (id) => document.getElementById(id);
@@ -58,6 +64,15 @@ const host = {
   verbose: true,
   serve: true,  // a program that builds a page (std/ui, into #ui) keeps handling its events after it finishes
   write,
+  // what's wrong now (a reload that doesn't compile, a runtime error), over the page until the next good reload
+  problem(text) {
+    const p = $("problem");
+    if (!text) return void (p.hidden = true);
+    p.textContent = text;
+    const x = document.createElement("button");
+    x.textContent = "✕", x.title = "Hide", x.onclick = () => (p.hidden = true);
+    p.append(x), (p.hidden = false);
+  },
   files: (f) => (watched = new Set(f)),
   window(w, h) {
     for (const c of [canvas, gpuCanvas]) c.width = w, c.height = h;

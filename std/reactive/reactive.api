@@ -11,6 +11,11 @@ pub fn computed(f: fn): Signal
 // Run f now, and again whenever a signal it read last time changes. dispose() on the result stops it.
 pub fn effect(f: fn)
 
+// Before a page is shown again (a reload): what its own states hold now, for local() to give the next page's.
+pub fn keepLocals()
+
+pub fn local(key: str, v): Signal
+
 // Run f before the running effect reruns or is disposed (to undo what it did outside signals).
 pub fn onCleanup(f: fn)
 

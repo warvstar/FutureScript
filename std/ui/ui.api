@@ -120,7 +120,7 @@ pub fn readText(file): Task
 pub fn readUrl(file): Task
 
 // Show the page again, built by the code as it is now: after a reload (a file with views does this in its reload()
-// unless it has its own). The state is kept; a view's own state starts again.
+// unless it has its own). The state is kept, a view's own too (by its view and name, in the order made).
 pub fn refresh()
 
 // What load() is fetching, and what came back: data() (JSON parsed, else text), error() (nil, or what went wrong) and

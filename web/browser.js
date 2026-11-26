@@ -153,6 +153,7 @@ export async function startFut(o) {
       if (m.hello) threads.get(w).ch = m.hello;
       else if (m.bell) serve(w);
       else if (m.write) o.write(...m.write);
+      else if (m.problem != null) o.problem?.(m.problem || null);
       else if (m.spawn) start({ cfg, thread: m.spawn });
       else if (m.files) o.files?.(m.files);
       else if (m.window) o.window?.(...m.window);
