@@ -1,0 +1,21 @@
+err_recovery_members.fut:2:4: error: 'f' is already defined [duplicate]
+  fn f() { return 1 }
+     ^
+err_recovery_members.fut:4:17: error: a field's default must be a number, string, true, false or nil (set other values in init) [class]
+    var damaged = ]
+                  ^
+err_recovery_members.fut:5:20: error: field 'typed' is str, but its default is not [type]
+    var typed: str = 1
+                     ^
+err_recovery_members.fut:7:13: error: expected a name [syntax]
+    fn broken(,) {}
+              ^
+err_recovery_members.fut:9:13: error: use '==' for equality [syntax]
+      print(1 === 2)
+              ^
+err_recovery_members.fut:10:12: error: undefined name 'unknown' [undefined-name]
+      return unknown
+             ^
+err_recovery_members.fut:13:13: error: 'print' expects at least 1 argument, got 0 [arity]
+  fn last() { print() }
+              ^

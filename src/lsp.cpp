@@ -253,7 +253,7 @@ public:
   }
 };
 
-using Buffers = std::vector<std::pair<std::string, std::string_view>>;
+using Buffers = CompileCheck::Buffers;
 bool source(const std::string& path, const Buffers& buffers, std::string& text) {
   for (auto& [file, contents] : buffers) if (file == path) { text = contents; return true; }
   return readFile(path, text);
@@ -452,10 +452,8 @@ std::optional<std::string> isolated(Work work) {
 
 std::string checkSource(const std::string& path, const Buffers& buffers) {
   rtInit();
-  CompileCheck check{buffers, normalize, {}};
-  std::vector<CompileDiagnostic> diagnostics;
-  try { compile(path, false, false, nullptr, false, &check); }
-  catch (const CompileError& e) { diagnostics.push_back(compileDiagnostic(e.what())); }
+  CompileCheck check{buffers, normalize};
+  auto diagnostics = compileDiagnostics(path, check);
   Rows errors, imports;
   for (auto& d : diagnostics)
     errors.add("{\"file\":" + quoteJson(d.file) + ",\"message\":" + quoteJson(d.message) + ",\"code\":" + quoteJson(d.code) +
@@ -515,12 +513,16 @@ class Server {
       Range range = lines.token(line, column);
       if (seen.emplace(range.start, message, code).second) out.push_back({range, std::move(message), code, related});
     };
-    for (auto& [_, root] : documents) for (const auto& d : root.errors) {
-      if (d.file == doc.path) {
-        add(d.line, d.column, d.message, d.code);
-        continue;
-      }
-      if (&root != &doc) continue;
+    for (auto& [_, root] : documents) for (const auto& d : root.errors)
+      if (d.file == doc.path) add(d.line, d.column, d.message, d.code);
+    if (doc.errors.empty()) return out;
+
+    std::set<std::string_view> projectedFiles;
+    std::set<std::pair<int, int>> projectedSites;
+    std::multimap<std::string_view, std::string_view> parents;
+    for (auto& i : doc.imports) if (!i.to.empty()) parents.emplace(i.to, i.from);
+    for (const auto& d : doc.errors) {
+      if (d.file == doc.path || !projectedFiles.insert(d.file).second) continue;
       std::string message = base(d.file) + ":" + std::to_string(d.line) + ":" + std::to_string(d.column) + ": " + d.message;
       std::string related;
       if (relatedInfo) for (auto& [uri, other] : documents) if (other.path == d.file) {
@@ -529,22 +531,20 @@ class Server {
         break;
       }
       // Walk backwards from the error through the import graph, then mark the root's import site(s).
-      std::set<std::string> reaches{d.file};
-      std::vector<std::string> pending{d.file};
-      std::multimap<std::string_view, std::string_view> parents;
-      for (auto& i : root.imports) if (!i.to.empty()) parents.emplace(i.to, i.from);
+      std::set<std::string_view> reaches{d.file};
+      std::vector<std::string_view> pending{d.file};
       for (size_t i = 0; i < pending.size(); i++) {
-        if (pending[i] == root.path) continue;
+        if (pending[i] == doc.path) continue;
         auto [first, last] = parents.equal_range(pending[i]);
         for (; first != last; ++first) if (reaches.emplace(first->second).second) pending.emplace_back(first->second);
       }
-      bool placed = false;
-      for (auto& i : root.imports)
-        if (i.from == root.path && reaches.contains(i.to)) {
-          add(i.line, i.column, message, d.code, related);
-          placed = true;
+      bool hasSite = false;
+      for (auto& i : doc.imports)
+        if (i.from == doc.path && reaches.contains(i.to)) {
+          if (projectedSites.emplace(i.line, i.column).second) add(i.line, i.column, message, d.code, related);
+          hasSite = true;
         }
-      if (!placed) add(1, 1, std::move(message), d.code, related);
+      if (!hasSite) add(1, 1, std::move(message), d.code, related);
     }
     return out;
   }
@@ -579,18 +579,12 @@ class Server {
     }
     Json report = JsonParser(*result).parse();
     doc.imports.clear();
-    for (auto& i : report.get("imports").list) {
-      std::string to = i.get("to").string;
-      doc.imports.push_back({normalize(i.get("from").string), to.empty() ? "" : normalize(to),
+    for (auto& i : report.get("imports").list)
+      doc.imports.push_back({i.get("from").string, i.get("to").string,
                              i.get("line").integer(1), i.get("column").integer(1)});
-    }
-    for (auto& d : report.get("errors").list) {
-      auto& file = d.get("file").string;
-      CompileDiagnostic result{file.empty() ? doc.path : normalize(file), d.get("message").string, d.get("code").string,
-                               d.get("line").integer(1), d.get("column").integer(1)};
-      if (result.code == "manifest" && !doc.imports.empty() && doc.imports.back().to.empty()) doc.imports.back().to = result.file;
-      doc.errors.push_back(std::move(result));
-    }
+    for (auto& d : report.get("errors").list)
+      doc.errors.push_back({d.get("file").string, d.get("message").string, d.get("code").string,
+                            d.get("line").integer(1), d.get("column").integer(1)});
   }
 
   void changed(const std::string& method, const Json& params) {

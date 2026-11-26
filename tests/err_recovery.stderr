@@ -1,0 +1,15 @@
+err_recovery.fut:3:17: error: unexpected ')' [syntax]
+    var damaged = )
+                  ^
+err_recovery.fut:5:9: error: undefined name 'unknown' [undefined-name]
+    print(unknown + another)
+          ^
+err_recovery.fut:9:11: error: 'valid' expects 0 arguments, got 1 [arity]
+    var x = valid(
+            ^
+err_recovery.fut:11:7: error: undefined name 'missing' [undefined-name]
+    ) + missing
+        ^
+err_recovery.fut:12:10: error: undefined name 'alsoMissing' [undefined-name]
+    return alsoMissing
+           ^

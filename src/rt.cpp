@@ -103,6 +103,11 @@ int newIC(bool set) {
   TSAN_UNSEEN_END();
   return nics++;
 }
+void discardICs(int first) {
+  Locked g(icMu);
+  nics = first;
+  while (!setICs.empty() && setICs.back() >= first) setICs.pop_back();
+}
 // Each isolate's copy of a new global starts nil (a new isolate's: vmNew, which sets only the slots in use, as most
 // of its 64K are never used). Written from the compiling thread, as newIC's.
 static void newGlobalSlot(int slot) {

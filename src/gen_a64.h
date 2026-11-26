@@ -292,7 +292,7 @@ struct Gen : CState {
 
   // ---- inline caches live in the VM block: r = its 4KB page (one instruction), lo = its offset there ----
   u32 icAt(u32 r, bool set = false) {
-    u32 off = IOFF(newIC(set));
+    u32 off = IOFF(cache(set));
     E(addhi(r, 28, off >> 12));
     return off & 0xfff;
   }

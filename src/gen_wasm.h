@@ -391,7 +391,7 @@ struct Gen : CState {
     st(0, slot()), callWindow(base, 1, S_push, false), close();
   }
   void field(int64_t sym, bool store) {  // r0 = object (r2 = value to store); result in r0
-    u32 ic = vo(&vm->ics[newIC(store)]);
+    u32 ic = vo(&vm->ics[cache(store)]);
     open(BLOCK), open(BLOCK);  // $done, $miss
     isPtr(0, false), br(BR_IF, F->blocks, UNLIKELY);
     addr(0), mem(I64_LOAD, 3, 0), vmb(), mem(I64_LOAD, 3, ic), op(I64_NE), br(BR_IF, F->blocks, UNLIKELY);
@@ -460,7 +460,7 @@ struct Gen : CState {
   }
   void callWindow(int base, int n, int sym, bool super) {
     if (sym && !super) {
-      u32 ic = vo(&vm->ics[newIC()]);
+      u32 ic = vo(&vm->ics[cache()]);
       if (n) ld(0, base);  // the receiver (with no arguments, r0 still holds it: see Compiler::call)
       open(BLOCK), open(BLOCK);  // $done, $miss
       isPtr(0, false), br(BR_IF, F->blocks, UNLIKELY);
@@ -473,7 +473,7 @@ struct Gen : CState {
   // C(args) for a top-level class C: allocated inline on an inline-cache hit, as in gen_a64.h.
   void ld32(u32 addr, u32 off = 0) { get(addr), mem(I32_LOAD, 2, off); }
   void constructCall(int base, int n) {
-    u32 ic = vo(&vm->ics[newIC()]);
+    u32 ic = vo(&vm->ics[cache()]);
     open(BLOCK), open(BLOCK);  // $done, $miss
     ld(0, base), get(R0), vmb(), mem(I64_LOAD, 3, ic), op(I64_NE), br(BR_IF, F->blocks, UNLIKELY);
     addr(0), set(T2);                                                                     // T2 = the class
@@ -528,7 +528,7 @@ struct Gen : CState {
     // No declared parameters, nothing to speculate on: tier 2 would only move the body to a module of its own,
     // where V8 can no longer inline it into its callers; and the counter makes it bigger.
     if ((int)homes.size() == first) return;
-    u32 ic = vo(&vm->ics[newIC()]);
+    u32 ic = vo(&vm->ics[cache()]);
     vmb(), vmb(), mem(I64_LOAD, 3, ic + 8), i64c(1), op(I64_ADD), op(LOCAL_TEE), u(R0), mem(I64_STORE, 3, ic + 8);
     get(R0), i64c(HOT), op(I64_EQ), open(IF, VOID, UNLIKELY);
     get(W), i32c(8 * first), op(I32_ADD), op(I64_EXTEND_U), set(R0 + 1);

@@ -93,6 +93,7 @@ def runner(exe):
 
 def test(exe, only=()):
     """Each tests/*.fut lists `// expect: <line>` for stdout and optionally `// error: <text>` lines for stderr.
+    A sibling .stderr file instead matches the complete diagnostic output and requires exit status 1.
     Each tests/specs/*.fut is run with `fut test` and must pass. Everything runs at once, one job per core;
     a hot-reload test that fails under that load (they are timed) is rerun alone before it counts.
     `only` keeps the jobs whose name contains any of its words."""
@@ -105,6 +106,13 @@ def test(exe, only=()):
         want = re.findall(r"// expect: ?(.*)", src)
         err = re.findall(r"// error: ?(.*)", src)
         r = subprocess.run([*runner(exe), str(t)], capture_output=True, text=True, timeout=60)
+        exact = t.with_suffix(".stderr")
+        if exact.exists():
+            want_err = exact.read_text()
+            got_err = r.stderr.replace(str(t), t.name)
+            return t.name, r.stdout.splitlines() == want and r.returncode == 1 and got_err == want_err, (
+                f"want stdout: {want}\n  got: {r.stdout.splitlines()} (exit {r.returncode})\n"
+                f"  want stderr: {want_err}\n  got: {got_err}")
         ok = r.stdout.splitlines() == want and (all(e in r.stderr for e in err) and r.returncode != 0 if err else r.returncode == 0)
         return t.name, ok, f"want: {want}\n  got:  {r.stdout.splitlines()}\n  stderr: {r.stderr.strip()}"
 
@@ -938,6 +946,10 @@ def runner_fmt(exe):
         if again.returncode or again.stdout != r.stdout:
             return False, f"second pass for {src!r}: {again.stdout!r} {again.stderr!r}"
 
+    lexical_errors = {
+        ROOT / "tests" / "err_char.fut": b"line 1: this character can be in a string or a comment, not in code",
+        ROOT / "tests" / "err_recovery_members.fut": b"line 9: use '==' for equality",
+    }
     for path, dirs, files in os.walk(ROOT):
         dirs[:] = [d for d in dirs if d not in {".git", "build", "node_modules"}]
         for name in sorted(files):
@@ -946,8 +958,8 @@ def runner_fmt(exe):
             f = Path(path) / name
             src = f.read_bytes()
             a = run("--stdin", source=src)  # each pass verifies the compiler's tokens, comments and line boundaries
-            if f == ROOT / "tests" / "err_char.fut":
-                if a.returncode != 2 or a.stdout or b"line 1" not in a.stderr:
+            if f in lexical_errors:
+                if a.returncode != 2 or a.stdout or lexical_errors[f] not in a.stderr:
                     return False, f"{f}: expected a lexical error, got {a.stdout!r} {a.stderr!r}"
                 continue
             if a.returncode:
