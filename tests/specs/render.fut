@@ -61,3 +61,10 @@ test "print joins an argument window before invoking one handler" {
   var print = fn(a, b) { return a + b }
   expect print(2, 3) == 5
 }
+
+test "deep nesting is cut off, not a crash, even on a fiber's stack" {
+  var deep = fn(n) { var l = [] var x = l for i in 0..n { var y = [] x.push(y) x = y } return l }
+  expect str(deep(5000)).has("[...]")
+  var f = fiber(fn(x) { yield str(deep(5000)) })
+  expect f.resume().has("[...]")  // where it stops depends on the stack
+}

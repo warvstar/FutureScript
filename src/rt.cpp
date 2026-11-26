@@ -207,6 +207,8 @@ static void render(std::string& out, V v, bool quote, std::unordered_set<Obj*>& 
     case K::List: case K::Map: case K::Inst: break;
     default: out += '?'; return;
   }
+  char here;  // nested too deep for the C stack (a fiber's is small): cut off; natively, where fut code would stop
+  if (active.size() >= 1000 || (!WASM && &here < (char*)vm->limit)) { out += o->kind == K::List ? "[...]" : o->kind == K::Map ? "{...}" : "<...>"; return; }
   if (!active.insert(o).second) { out += "<cycle>"; return; }
   bool first = true;
   auto separator = [&] { if (!std::exchange(first, false)) out += ", "; };

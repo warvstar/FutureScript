@@ -301,8 +301,24 @@ static int workerCommand(int argc, char** argv) {
   return fprintf(stderr, "fut worker: cannot run node (%s): it runs %s\n", strerror(errno), script.c_str()), 2;
 }
 
+// A crash still writes what the program printed (stdout is fully buffered, for speed): flush, unless another thread
+// holds stdout (waiting could hang instead of crashing), then die of the same signal.
+static void flushAndDie(int sig) {
+  if (ftrylockfile(stdout) == 0) fflush(stdout), funlockfile(stdout);
+  signal(sig, SIG_DFL), raise(sig);
+}
+static void onCrash() {
+  static char alt[1 << 16];  // a stack overflow leaves no stack to run the handler on
+  stack_t ss = {};
+  ss.ss_sp = alt, ss.ss_size = sizeof alt;
+  sigaltstack(&ss, nullptr);
+  struct sigaction sa = {};
+  sa.sa_handler = flushAndDie, sa.sa_flags = SA_ONSTACK | SA_RESETHAND;
+  for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) sigaction(sig, &sa, nullptr);
+}
+
 int main(int argc, char** argv) {
-  setvbuf(stdout, nullptr, _IOLBF, 0);  // keep completed lines visible even if the program crashes
+  onCrash();
   findStd();
   if (argc > 1 && std::string(argv[1]) == "explain") return explain(argc > 2 ? argv[2] : nullptr);  // an error code's rule and fix
   if (argc > 1 && std::string(argv[1]) == "worker") return workerCommand(argc, argv);
