@@ -294,6 +294,22 @@ struct Gen : CState {
     br(BR, F->blocks - 1), close();
     helper(store ? H_SETI : H_GETI), close();
   }
+  // x.push(v), x in slot base, v in r0: appended inline when x is a list with spare capacity and no transaction
+  // is open (l_push saves the list first); the result is x. Else the method call.
+  void listPush(int base) {
+    open(BLOCK), open(BLOCK);  // $done, $miss
+    ld(1, base), isPtr(1, false), br(BR_IF, F->blocks, UNLIKELY);
+    addr(1), mem(I32_LOAD8_U, 0, 0), i32c((int)K::List), op(I32_NE), br(BR_IF, F->blocks, UNLIKELY);
+    txnDepth(), br(BR_IF, F->blocks, UNLIKELY);
+    addr(1), mem(I32_LOAD, 2, LIST_V + 4), set(T);  // the end, or the count
+    get(T), addr(1), mem(I32_LOAD, 2, LIST_V + 8), op(I32_GE_U), br(BR_IF, F->blocks, UNLIKELY);  // full
+    if (vecCount) addr(1), mem(I32_LOAD, 2, LIST_V), get(T), i32c(3), op(I32_SHL), op(I32_ADD);
+    else get(T);
+    get(R0), mem(I64_STORE, 3, 0);
+    addr(1), get(T), i32c(vecCount ? 1 : 8), op(I32_ADD), mem(I32_STORE, 2, LIST_V + 4), mv(0, 1);
+    br(BR, F->blocks - 1), close();
+    st(0, slot()), callWindow(base, 1, S_push, false), close();
+  }
   void field(int sym, bool store) {  // r0 = object (r2 = value to store); result in r0
     u32 ic = slotOf(&vm.ics[newIC(store)]);
     open(BLOCK), open(BLOCK);  // $done, $miss

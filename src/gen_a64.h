@@ -259,6 +259,21 @@ struct Gen : CState {
     for (int m : miss) patch(m);
     helper(set ? H_SETI : H_GETI), patch(done);
   }
+  // x.push(v), x in slot base, v in x0: appended inline when x is a list with spare capacity and no transaction
+  // is open (l_push saves the list first); the result is x. Else the method call.
+  void listPush(int base) {
+    Jumps miss;
+    ld(1, base), E(mvn(9, 1)), E(tstptr(9)), miss.push_back(E(bcond(NE))), E(andaddr(9, 1));
+    E(ldrb(10, 9)), E(cmpwi(10, (u32)K::List)), miss.push_back(E(bcond(NE)));
+    E(ldrw(10, 28, 4)), E(cmpwi(10, 0)), miss.push_back(E(bcond(NE)));
+    E(ldr(11, 9, LIST_V + 8)), E(ldr(12, 9, LIST_V + 16)), E(cmp(11, 12)), miss.push_back(E(bcond(HS)));  // full
+    if (vecCount) E(ldr(12, 9, LIST_V)), E(strreg(0, 12, 11)), E(addi(11, 11, 1));
+    else E(strpost(0, 11, 8));
+    E(str(11, 9, LIST_V + 8)), E(mov(0, 1));
+    int done = E(B);
+    for (int m : miss) patch(m);
+    st(0, slot()), callWindow(base, 1, S_push, false), patch(done);
+  }
   void field(int sym, bool set) {  // x0 = object (x2 = value to store); result in x0
     Jumps miss;
     u32 ic = set ? 3 : 2, lo = icAt(ic, set);

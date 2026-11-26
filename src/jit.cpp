@@ -42,6 +42,9 @@ template <class F> static void eachReturnAddress(F f, uintptr_t* fp = (uintptr_t
 // txn: transactions open at its entry; allowed, hstack, who: the effect state at its entry (effects.cpp)
 struct Handler { Handler* prev; void *sp, *fp, *limit, *pc; uint64_t txn, allowed; V hstack; uint64_t who; };
 #if __has_feature(address_sanitizer)
+// JIT code appends to a list's std::vector in place (listPush), inside capacity libc++ has marked unused; ASan's
+// container annotations can't see that, so they would report the vector's next reallocation.
+extern "C" const char* __asan_default_options() { return "detect_container_overflow=0"; }
 extern "C" void __asan_handle_no_return();  // the frames we jump past must not stay poisoned
 #else
 static void __asan_handle_no_return() {}

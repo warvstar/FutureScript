@@ -388,6 +388,14 @@ struct Compiler : Gen {
     }
     return n;
   }
+  void pushCall() {  // x.push(v): appended inline when x is a list with room (listPush), else the method call
+    int base = slot();
+    st(0, base);
+    int n = exprList(')', true);
+    if (n == 1) return listPush(base);
+    if (n) st(0, slot());
+    callWindow(base, n, S_push, false);
+  }
   void call(int sym, bool super) { int base = slot(); st(0, base), callWindow(base, exprList(')'), sym, super); }
   void construct(Global& g) {  // C(args) for a top-level class C
     int base = slot();
@@ -533,7 +541,7 @@ struct Compiler : Gen {
           fieldUses.push_back({F->cls, s, {ft.p, ft.line, file, srcStart}});  // self.name: checked once every class is known
         load(v);
         v = {LV_FIELD, 0, s};
-        if (at('(') && !cur.nl) next(), call(s, false), v = {};
+        if (at('(') && !cur.nl) next(), s == S_push ? pushCall() : call(s, false), v = {};
       } else if (at('[') && !cur.nl) {
         next(), load(v);
         int t = slot();

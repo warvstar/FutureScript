@@ -122,8 +122,10 @@ V fiberResume(V f, V v);
 V rt_yield(V v);
 void sleepFor(double seconds);
 double now();  // seconds, monotonic
-constexpr int LIST_V = offsetof(List, v);  // its std::vector, which JIT code reads: the elements, then the end or the count
-inline bool vecCount;                      // the second word is the element count (wasm's libc++), not an end pointer
+// A list's std::vector, which JIT code reads and appends to: the elements, then the end and the capacity's end as
+// pointers (macOS's libc++) or as counts (wasm's). rtInit checks which.
+constexpr int LIST_V = offsetof(List, v);
+inline bool vecCount;
 constexpr int INST_SLOTS = offsetof(Inst, slots), CLO_ENV = sizeof(Clo), CLS_IHDR = offsetof(Class, ihdr), CLS_IRUN = offsetof(Class, irun);
 
 inline Obj* obj(V v) { return (Obj*)(v & ADDR); }
