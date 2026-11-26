@@ -9,6 +9,7 @@
 //   files: { "/app/path": text }                the sources the compiles read (nothing else is readable)
 //   serve: { main, keys } | null                the program whose fn serve(req) answers requests; keys: its modules
 //   tests: [{ main, keys, names }]              test files: POST or GET /__fut/test runs them (see runTests)
+//   children: { id: { keys } }                  the programs the tests start with run() (see runChild)
 import { createFut, FutError } from "./fut.js";
 
 export const ROOT = "/app";  // where fut sees the bundle's files (the same path at build time)
@@ -20,9 +21,34 @@ export function moduleKey(b) {  // length and FNV-1a: install() is synchronous, 
 const enc = new TextEncoder(), dec = new TextDecoder();
 
 // The options both sides give createFut: whatever could change the heap before or during a compile must match.
-export function futOptions({ wasm, read, module, write, fetch }) {
-  return { wasm, read, module, write, fetch, verbose: false, noTier: true };
+export function futOptions({ wasm, read, module, write, fetch, run }) {
+  return { wasm, read, module, write, fetch, run, verbose: false, noTier: true };
 }
+
+// run(): a child program, in a fresh instance. A Worker has no processes, and can't compile, so the build runs the
+// tests that call run() and compiles each child they start ahead of time, by id: its args, and its file or source.
+// ctx: { wasm, read(path), module(id, path): createFut's module() hook for that child, or null if it has none }.
+const sourceKey = (s) => moduleKey(enc.encode(s));
+export const childId = (args, file, source) => JSON.stringify([args, source != null ? "source " + sourceKey(source) : file]);
+export async function runChild(ctx, args, file, source) {
+  const id = childId(args, file, source), path = source != null ? `/tmp/fut-run-${sourceKey(source)}.fut` : file;
+  const read = (p) => (source != null && p == path ? enc.encode(source) : ctx.read(p)), out = [], err = [];
+  const write = (fd, b) => (fd == 2 ? err : out).push(dec.decode(b));
+  let code = 1;
+  try {
+    if (args.length && args[0] != "test") throw new Error(`run() with args ${JSON.stringify(args)}: a Worker runs a program, or its tests (args: ["test", ...])`);
+    const module = ctx.module(id, path);
+    if (!module) throw new Error(`run(${source != null ? "a source" : file}): not compiled ahead of time. The build runs the tests to find the programs they run(); one that changes from run to run can't be known`);
+    const fut = await createFut(futOptions({ wasm: ctx.wasm, read, module, write, run: (a, f, s) => runChild(ctx, a, f, s) }));
+    const fi = args.indexOf("--filter");
+    code = args[0] == "test" ? await fut.test(path, args.includes("--json"), fi > 0 ? args[fi + 1] : "") : await fut.run(path, false);
+  } catch (e) { err.push(`fut: ${e?.message ?? e}\n`); }
+  return { code, out: out.join(""), err: err.join(""), timedOut: false };
+}
+const bundleCtx = (bundle, read) => ({
+  wasm: bundle.wasm, read,
+  module: (id, path) => (bundle.children?.[id] ? aheadOfTime(bundle.modules, bundle.children[id].keys, path) : null),
+});
 
 // A module() hook that serves a program's compile from the uploaded modules, checking each against keys (in order).
 export function aheadOfTime(modules, keys, what) {
@@ -125,7 +151,8 @@ export async function runTestFile(bundle, t, filter) {
   const errs = [], write = (fd, b) => (fd == 1 ? out.push(dec.decode(b)) : errs.push(dec.decode(b)));
   let status;
   try {
-    const fut = await createFut(futOptions({ wasm: bundle.wasm, read, module: aheadOfTime(bundle.modules, t.keys, t.main), write }));
+    const ctx = bundleCtx(bundle, read), run = (a, f, s) => runChild(ctx, a, f, s);
+    const fut = await createFut(futOptions({ wasm: bundle.wasm, read, module: aheadOfTime(bundle.modules, t.keys, t.main), write, run }));
     status = await fut.test(t.main, true, filter || "");
   } catch (e) {
     out.push(JSON.stringify({ type: "error", file: t.main, message: "internal error: " + (e?.message ?? e), trace: "" }) + "\n"), (status = 1);

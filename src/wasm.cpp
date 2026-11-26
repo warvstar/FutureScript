@@ -30,7 +30,7 @@ HOST(yield) void host_yield(Fiber* f);                         // suspending: ba
 HOST(fiber_gone) void host_fiber_gone(Fiber* f);
 HOST(sleep) void host_sleep(double seconds);                   // suspending
 HOST(poll) void host_poll();                                   // suspending: run typed lines, reload changed files
-HOST(run) int host_run(const char* args, const char* source, double timeout);  // run(): the result's length (in take), -1: none
+HOST(run) int host_run(const char* args, const char* source, double timeout);  // suspending: run(): the result's length (in take), -1: none
 HOST(fetch) int host_fetch(const char* reqs);                  // suspending: HTTP requests (a JSON list), at once; their
                                                                // results' JSON length (in take), -1: the host has no fetch
 }

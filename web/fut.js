@@ -10,7 +10,7 @@
 //   fetch(url, init): the platform's fetch, for fut's fetch() and fetchAll() (default: globalThis.fetch)
 //           read(path): file bytes or null      write(fd, bytes): stdout (1) / stderr (2)
 //   verbose: bool                     getenv(name): string or undefined   window(w, h): bool, present(rgba, w, h): Promise
-//   run(args, file, source, timeout): {code, out, err, timedOut} -- fut in a child process (run()), if possible
+//   run(args, file, source, timeout): {code, out, err, timedOut}, or a Promise of it -- fut in a child process (run()), if possible
 //   save(path, text): bool -- write a file (text null: remove it), for `fut api`
 //   importModule(path, stamp): Promise of a JS module's namespace (stamp: change it to load the file again)
 //   stamp(path): anything that changes when the file does (a modification time), for reloading modules
@@ -368,14 +368,14 @@ export async function createFut(opts) {
     resume: S(resume), yield: S(yieldTo), fiber_gone: (f) => fibers.delete(f),
     sleep: S((s) => new Promise((r) => setTimeout(r, Math.max(0, s * 1000)))),
     poll: S(() => (ffiDepth ? void (pollLater = true) : hostPoll())),  // not inside a callback: after the extern call
-    run(argsP, srcP, timeout) {  // run(): fut in a child process, if the host can (opts.run)
+    run: S(async (argsP, srcP, timeout) => {  // run(): fut in a child process, if the host can (opts.run)
       const args = cstr(argsP).split("\n"), file = args.pop();
-      const r = opts.run?.(args, file, srcP ? cstr(srcP) : null, timeout);
+      const r = await opts.run?.(args, file, srcP ? cstr(srcP) : null, timeout);
       if (!r) return -1;
       const out = enc.encode(r.out), err = enc.encode(r.err), head = enc.encode(`${r.code} ${r.timedOut ? 1 : 0} ${out.length}\n`);
       held = new Uint8Array(head.length + out.length + err.length);
       return held.set(head), held.set(out, head.length), held.set(err, head.length + out.length), held.length;
-    },
+    }),
     fetch: S(async (p) => {  // fetch(), fetchAll(): the requests (checked in wasm.cpp) at once; results in order, as sys.cpp's
       const f = opts.fetch ?? globalThis.fetch;
       if (!f) return -1;
@@ -416,6 +416,7 @@ export async function createFut(opts) {
       const st = await runCode(c);
       return ex.fut_retire(c), st;
     },
+    checkApi: () => withStr(path, (p) => ex.fut_api(1, p)),  // after compile(file, true): report out-of-date interfaces (JSON); how many
     has: (name) => withStr(name, (p) => ex.fut_pin_fn(p)) >= 0,  // a top-level function name?
     tests: () => Array.from({ length: ex.fut_test_count() }, (_, i) => cstr(ex.fut_test_name(i))),  // after compile(file, true)
     // Call the program's top-level function name with args (JSON data): its result. Calls queue, one at a time (each
