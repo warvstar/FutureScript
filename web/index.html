@@ -13,7 +13,7 @@
   #ui { flex: 3; min-width: 280px; overflow: auto; font: 15px/1.5 system-ui, sans-serif; } #ui:empty { display: none; }
   #ui:not(:empty) ~ #side { flex: 0 1 280px; }  /* a page gets the room; the output stays beside it */
   body > main:has(#ui:not(:empty)) { flex-wrap: nowrap; }  /* one line: the page's height is the window's, so it can scroll inside */
-  #screen { image-rendering: pixelated; background: #000; display: none; align-self: flex-start; width: min(640px, 100%); outline: none; }
+  #screen, #gpu { image-rendering: pixelated; background: #000; display: none; align-self: flex-start; width: min(640px, 100%); outline: none; }
   #side { flex: 1; min-width: 280px; display: flex; flex-direction: column; min-height: 0; }
   #out { flex: 1; margin: 0; overflow: auto; white-space: pre-wrap; word-break: break-word; }
   .e { color: var(--err); }
@@ -27,6 +27,7 @@
 <main>
   <div id="ui"></div>
   <canvas id="screen" tabindex="0"></canvas>
+  <canvas id="gpu" tabindex="0"></canvas>
   <div id="side">
     <pre id="out"></pre>
     <form id="form"><span id="prompt">&gt;</span><input id="in" autocomplete="off" spellcheck="false" autofocus></form>
@@ -35,10 +36,11 @@
 <script type="module">
 import { createFut } from "/web/fut.js";
 const $ = (id) => document.getElementById(id);
-const out = $("out"), canvas = $("screen"), ctx = canvas.getContext("2d");
+const out = $("out"), canvas = $("screen"), ctx = canvas.getContext("2d"), gpuCanvas = $("gpu");
 const params = new URLSearchParams(location.search), file = params.get("file");
 // fut-mt.wasm (isolates in parallel, a worker each thread) where the page may share memory (web/serve.mjs's headers);
-// ?threads=0: fut.wasm, on this thread; ?threads=n: at most n threads; ?proxy=all|none: see fut.js's proxy option
+// ?threads=0: fut.wasm, on this thread; ?threads=n: at most n threads; ?proxy=all|none: see fut.js's proxy option;
+// ?test: run the file's tests (fut test) instead
 const threads = self.crossOriginIsolated && params.get("threads") != "0";
 $("file").textContent = file ?? "REPL (add ?file=examples/paddle.fut)";
 const decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
@@ -48,7 +50,8 @@ function write(fd, bytes) {
   if (fd == 2) s.className = "e";
   out.append(s), (out.scrollTop = out.scrollHeight);
 }
-let watched = new Set();
+let watched = new Set(), windowOpen = false;
+let gpuPresent = null;  // while std/gpu draws the window: shows its frame (see screen)
 const stamps = new Map();  // path -> how many times it changed: a package's JS modules load again when it moves
 const host = {
   std: "/std",
@@ -56,11 +59,29 @@ const host = {
   serve: true,  // a program that builds a page (std/ui, into #ui) keeps handling its events after it finishes
   write,
   files: (f) => (watched = new Set(f)),
-  window(w, h) { canvas.width = w, canvas.height = h, (canvas.style.display = "block"), canvas.focus(); return true; },
+  window(w, h) {
+    for (const c of [canvas, gpuCanvas]) c.width = w, c.height = h;
+    const c = gpuPresent ? gpuCanvas : canvas;
+    return (windowOpen = true), (c.style.display = "block"), c.focus(), true;
+  },
   async present(rgba, w, h) {
-    ctx.putImageData(new ImageData(rgba, w, h), 0, 0);
+    if (gpuPresent) gpuPresent();
+    else ctx.putImageData(new ImageData(rgba, w, h), 0, 0);
     await new Promise(requestAnimationFrame);
     return true;
+  },
+  // The window, for a module that draws it with WebGPU (std/gpu): a canvas can't have a 2d context and a webgpu one,
+  // so it gets a canvas of its own in the window's place, with the same size and input
+  screen: {
+    take(present) {
+      if (!windowOpen) return null;
+      (gpuPresent = present), (canvas.style.display = "none"), (gpuCanvas.style.display = "block"), gpuCanvas.focus();
+      return gpuCanvas;
+    },
+    give() {
+      gpuPresent = null, (gpuCanvas.style.display = "none");
+      if (windowOpen) (canvas.style.display = "block"), canvas.focus();
+    },
   },
 };
 let fut;
@@ -72,7 +93,7 @@ if (threads) {
 } else {
   const f = await createFut({ ...host, wasm: await (await fetch("/build/fut.wasm")).arrayBuffer(), read, importModule: (p, stamp) => import(p + "?v=" + stamp), stamp: (p) => stamps.get(p) ?? 0 });
   fut = {
-    run: f.run, line: f.line, type: f.type,
+    run: f.run, line: f.line, type: f.type, test: (file) => f.test(file, false, ""),
     changed: (p) => (stamps.set(p, (stamps.get(p) ?? 0) + 1), f.changed()),
     key: (c, down) => f.exports.fut_key(c, down),
     mouse: (x, y, down) => f.exports.fut_mouse(x, y, down),
@@ -90,15 +111,17 @@ function read(p) {  // fut reads files synchronously
 // keys: the codes key() looks up (arrows as AppKit numbers them)
 const named = { ArrowUp: 0xf700, ArrowDown: 0xf701, ArrowLeft: 0xf702, ArrowRight: 0xf703, Enter: 13, Escape: 27, Tab: 9 };
 const code = (e) => named[e.key] ?? (e.key.length == 1 ? e.key.toLowerCase().charCodeAt(0) : -1);
-for (const [type, down] of [["keydown", 1], ["keyup", 0]])
-  canvas.addEventListener(type, (e) => { const c = code(e); if (c >= 0) fut.key(c, down), e.preventDefault(); });
 let mouseDown = 0;
 const mouse = (e) => {
-  const r = canvas.getBoundingClientRect();
-  fut.mouse((e.clientX - r.left) * canvas.width / r.width, (e.clientY - r.top) * canvas.height / r.height, mouseDown);
+  const c = gpuPresent ? gpuCanvas : canvas, r = c.getBoundingClientRect();
+  fut.mouse((e.clientX - r.left) * c.width / r.width, (e.clientY - r.top) * c.height / r.height, mouseDown);
 };
-canvas.addEventListener("mousemove", mouse);
-canvas.addEventListener("mousedown", (e) => ((mouseDown = 1), mouse(e)));
+for (const c of [canvas, gpuCanvas]) {  // the window: the pixel buffer's canvas, or std/gpu's
+  for (const [type, down] of [["keydown", 1], ["keyup", 0]])
+    c.addEventListener(type, (e) => { const k = code(e); if (k >= 0) fut.key(k, down), e.preventDefault(); });
+  c.addEventListener("mousemove", mouse);
+  c.addEventListener("mousedown", (e) => ((mouseDown = 1), mouse(e)));
+}
 addEventListener("mouseup", (e) => ((mouseDown = 0), mouse(e)));
 
 let running = !!file, prompt = "> ";
@@ -114,7 +137,7 @@ if (missing) write(2, new TextEncoder().encode(`fut: there is no ${file} (the se
 else if (file) {
   const path = "/" + file.replace(/^\/+/, "");
   new EventSource("/events").onmessage = (e) => watched.has(e.data) && fut.changed(e.data);
-  const st = await fut.run(path, true).catch((e) => (write(2, new TextEncoder().encode(`[fut] ${e.message}\n`)), 1));
+  const st = await (params.has("test") ? fut.test(path) : fut.run(path, true)).catch((e) => (write(2, new TextEncoder().encode(`[fut] ${e.message}\n`)), 1));
   running = false, write(2, new TextEncoder().encode(`[fut] exited (${st})\n`));
 }
 </script>

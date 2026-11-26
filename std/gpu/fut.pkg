@@ -1,3 +1,4 @@
 name gpu
 version 0.1.0
 c gpu ../../build/libfutgpu.dylib   // python3 build.py gpu: Dawn, and this library over it
+js gpu ./gpu.js main                 // the browser's WebGPU (wasm build): on the page's thread, which has the window

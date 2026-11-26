@@ -57,6 +57,7 @@ async function handle(m) {
   if (m.presented) return presents.get(m.presented)?.(true), presents.delete(m.presented);
   await started;
   if (m.run) reply(m.rid, fut.run(...m.run));
+  else if (m.test) reply(m.rid, fut.test(m.test, false, ""));
   else if (m.line != null) reply(m.rid, fut.line(m.line));
   else if (m.type != null) fut.type(m.type);
   else if (m.changed) stamps.set(m.changed, (stamps.get(m.changed) ?? 0) + 1), fut.changed();
