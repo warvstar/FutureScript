@@ -76,9 +76,9 @@ u32* jitInstall(Code& k) {
 // fetch and fetchAll, as in sys.cpp, but the host makes the requests (its fetch(), all at once); exec and files:
 // not in this build yet.
 static void checkReq(V v, const char* fn) {
-  auto str = [&](V x, const char* what) { if (!is(x, K::Str)) ERR("%s(): %s must be a string, got %s", fn, what, typeName(x)); };
+  auto str = [&](V x, const char* what) { if (!is(x, K::Str)) ERR("@argument %s(): %s must be a string, got %s", fn, what, typeName(x)); };
   if (is(v, K::Str)) return str(v, "the url");
-  if (!is(v, K::Map)) ERR("%s() expects a url or {url, method, headers, body, timeout}, got %s", fn, typeName(v));
+  if (!is(v, K::Map)) ERR("@argument %s() expects a url or {url, method, headers, body, timeout}, got %s", fn, typeName(v));
   bool url = false;
   for (auto& [k, x] : as<Map>(v)->e) {
     str(k, "an option name");
@@ -86,17 +86,17 @@ static void checkReq(V v, const char* fn) {
     if (key == "url") str(x, "url"), url = as<Str>(x)->sv().size();
     else if (key == "method") str(x, "method");
     else if (key == "body") str(x, "body");
-    else if (key == "timeout") { if (!isNum(x) || num(x) <= 0) ERR("%s(): timeout must be a positive number", fn); }
+    else if (key == "timeout") { if (!isNum(x) || num(x) <= 0) ERR("@argument %s(): timeout must be a positive number", fn); }
     else if (key == "headers") {
-      if (!is(x, K::Map)) ERR("%s(): headers must be a map of strings", fn);
+      if (!is(x, K::Map)) ERR("@argument %s(): headers must be a map of strings", fn);
       for (auto& [hk, hv] : as<Map>(x)->e) str(hk, "a header name"), str(hv, "a header value");
-    } else ERR("%s(): unknown option '%s' (url, method, headers, body, timeout)", fn, std::string(key).c_str());
+    } else ERR("@argument %s(): unknown option '%s' (url, method, headers, body, timeout)", fn, std::string(key).c_str());
   }
-  if (!url) ERR("%s(): no url", fn);
+  if (!url) ERR("@argument %s(): no url", fn);
 }
 static V fetchList(const std::string& json, const char* fn) {  // -> the list of results
   int n = host_fetch(json.c_str());
-  if (n < 0) ERR("%s(): this host cannot make HTTP requests", fn);
+  if (n < 0) ERR("@host %s(): this host cannot make HTTP requests", fn);
   std::string r(n, 0);
   host_take(r.data());
   return fromJs(r);
@@ -106,7 +106,7 @@ static V n_fetch(V req) {
   return as<List>(fetchList("[" + toJs(req) + "]", "fetch"))->v.at(0);
 }
 static V n_fetchAll(V reqs) {
-  if (!is(reqs, K::List)) ERR("fetchAll() expects a list, got %s", typeName(reqs));
+  if (!is(reqs, K::List)) ERR("@argument fetchAll() expects a list, got %s", typeName(reqs));
   for (V v : as<List>(reqs)->v) checkReq(v, "fetchAll");
   return fetchList(toJs(reqs), "fetchAll");
 }

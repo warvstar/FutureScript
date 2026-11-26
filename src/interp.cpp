@@ -442,7 +442,7 @@ void interpSetTryCall(u32 slot) { tryCallSlot = slot; }
 void interpAdd(const std::vector<u32>& slots, std::vector<std::vector<uint8_t>>& bodies, std::vector<int32_t>& ops) {
   auto mod = std::make_shared<std::vector<IFn*>>();
   for (size_t i = 0; i < slots.size(); i++) {
-    if (freeK.empty()) ERR("the interpreter ran out of function slots (%d)", NTRAMP);
+    if (freeK.empty()) ERR("@limit the interpreter ran out of function slots (%d)", NTRAMP);
     int k = freeK.back();
     freeK.pop_back();
     IFn* f = new IFn;
