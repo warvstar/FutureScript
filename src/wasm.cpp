@@ -88,6 +88,7 @@ extern "C" int __cxa_thread_atexit(void (*)(void*), void*, void*) { return 0; }
 extern "C" void exit(int code) {
   fflush(stdout), fflush(stderr);
   if (!isolateMainThread()) {
+    unwindLocks(nullptr);  // the main thread may need one to reach its exit check
     isolatesExit(code);
     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     static pthread_cond_t never = PTHREAD_COND_INITIALIZER;
@@ -186,7 +187,7 @@ static V n_fetchAll(V reqs) {
 }
 void sysInit() { native<n_fetch>("fetch"), native<n_fetchAll>("fetchAll"); }
 void patchStub(u32* stub, void* target) { ops.push_back((int32_t)wa::slotOf(stub)), ops.push_back((int32_t)wa::slotOf(target)); }
-void jitRetire(u32* body) { retired.push_back(wa::slotOf(body)); }
+void jitRetire(u32* body) { Locked code(codeMu); retired.push_back(wa::slotOf(body)); }  // (fut_retire: the host)
 void jitShiftLines(u32* body, int delta) {
   if (auto it = lineTabs.find(wa::slotOf(body)); it != lineTabs.end()) for (auto& l : it->second.lines) l.second += delta;
 }
@@ -492,9 +493,9 @@ extern u32 tryCallSlot;  // interp.cpp
 struct TryBox { int64_t payload; void (*body)(void*); void* ctx; };  // payload first: try_call stores it there
 static int tryTramp(TryBox* b) { return b->body(b->ctx), 0; }
 bool catchFut(void (*body)(void*), void* ctx, V* err, std::string* trace) {
-  if (!tryCallSlot) {
+  if (!__atomic_load_n(&tryCallSlot, __ATOMIC_ACQUIRE)) {
     Locked code(codeMu);
-    if (!tryCallSlot) tryCallSlot = tableTryCall();
+    if (!tryCallSlot) __atomic_store_n(&tryCallSlot, tableTryCall(), __ATOMIC_RELEASE);
   }
   codeSync();  // (another thread may have made it)
   TryBox b{0, body, ctx};
@@ -542,7 +543,7 @@ bool runProcess(const std::vector<std::string>& args, const std::string& file, c
   return true;
 }
 static void safepoint() {  // rt_poll: a collection the allocator asked for, then the host's events
-  u32 p = __atomic_exchange_n(&vm->poll, 0, __ATOMIC_RELAXED);
+  u32 p = __atomic_fetch_and(&vm->poll, ~(1u | 2u | 32u), __ATOMIC_RELAXED);  // (others are set by other threads, for rt_poll)
   codeSync();
   if (gcWanted()) gcCollect();
   if (p & 1) syncDepth ? void(syncPoll = true) : vm->txn ? void(txnPollLater = true) : host_poll();  // reloads and typed lines wait for transactions to end
@@ -581,7 +582,7 @@ EXPORT(fut_isolates) int futIsolates() { return isolates; }  // running now: the
 EXPORT(fut_seed) void futSeed(double seed) { isolateSeed = (uint64_t)seed; }  // --seed n
 EXPORT(fut_threads) void futThreads(int n) { isolateThreads = n; }               // --threads n
 #if !ONE_THREAD
-EXPORT(fut_exit_request) void futExitRequest(int code) { isolatesExit(code); }  // a worker thread's exit
+EXPORT(fut_exit_request) void futExitRequest(int code) { unwindLocks(nullptr), isolatesExit(code); }  // a worker thread's exit (or trap)
 #endif
 EXPORT(fut_heap) void futHeap(u32 mb) { gcRegion(size_t(mb) << 20); }  // before fut_init
 void setUntimed(bool on);  // test.cpp
@@ -666,7 +667,7 @@ EXPORT(fut_map) int futMap(int pub, int json, const char* only, const char* prog
 static std::string applied;
 EXPORT(fut_sync) void futSync(int d) {  // the host calls fut code synchronously (1), and it returned (-1)
   syncDepth += d;
-  if (!syncDepth && syncPoll) syncPoll = false, vm->poll |= 1;
+  if (!syncDepth && syncPoll) syncPoll = false, __atomic_fetch_or(&vm->poll, 1u, __ATOMIC_RELAXED);
 }
 EXPORT(fut_apply) const char* futApply(int id, const char* args) {
   V f = jsPinned(id);

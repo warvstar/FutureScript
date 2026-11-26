@@ -317,8 +317,11 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
   which first replays what it has yet to, and then logged with the module's bytes. Another thread replays the log
   (`codeSync`) before it could reach what was added: when it switches isolates, decodes a message (which may hold a
   function compiled since), adds `try_call`, or reaches a safepoint. Tier 2 code compiled on one thread sets bit 32
-  of every other isolate's `vm->poll`, so each adopts it at its next poll. A thread instantiates each module from the
-  logged bytes itself; the bytes are kept for threads not started yet.
+  of every other isolate's `vm->poll`, so each adopts it at its next poll. Until then the old body is reached directly
+  (a call compiled before), and its replaced cell, in shared memory, sends the call through the stub: so it polls
+  first, or this thread's stub slot could still hold that body, and the call would come straight back to it
+  (`tests/isolates_tierup.fut`). A thread instantiates each module from the logged bytes itself; the bytes are kept
+  for threads not started yet.
 - **The image.** Compiled code's constants, functions and classes now go to the image in wasm too (as natively): a
   tier-2 compile on a spawned isolate had put them in that isolate's heap, which is freed when it ends. A compile
   error longjmps past `ImageScope` and `Locked`, so where it lands puts their state back (`Guard` in wasm.cpp).
@@ -326,11 +329,15 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
   JavaScript) asynchronously; until they hear, the new memory is out of bounds to them, and a block `malloc` handed
   out just after a growth on another thread trapped. fut-mt.wasm starts with 768 MB of memory (reserved; pages are
   touched as used), and replaces the C library's `sbrk` with one that grows 64 MB ahead of use, so what `malloc`
-  hands out was grown long before.
+  hands out was grown long before. Not always: a block larger than 64 MB, or the first block past the initial memory,
+  is new memory, and a thread it is sent to at once can still fault on it.
 - **Ending.** A worker can't end the process (in Node, `process.exit` there ends only the worker), and the C library's
   `exit` runs handlers under locks the main thread may need. So `exit` is replaced too: on a worker it asks the main
   thread to end the process (`isolatesExit`: bit 64 of every `vm->poll`, and a wake of the root's wait) and waits;
-  on the main thread it flushes output and ends.
+  on the main thread it flushes output and ends. A worker that ends this way (or traps) first lets go of the locks it
+  holds, since the main thread may need one on the way to its exit check; the check itself takes none. Only the
+  bits a safepoint handles are cleared there (`fetch_and`), so a stop or an exit another thread asks for meanwhile
+  is not lost.
 - **Limits.**
   - Extern functions (JavaScript's) and JavaScript values are the main thread's: an isolate on a worker that calls
     one gets an error saying so.

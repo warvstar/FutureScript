@@ -706,6 +706,7 @@ void isoRun(void* p) {  // the spawned call: its globals and arguments rebuilt h
   void* code;
   {
     Locked code(codeMu);  // compiled functions and classes, a reload's new ones too (the spawner's copy may predate it)
+    codeSync();           // (threads) their slots, in this thread's table
     for (auto& g : globals) if (g.slot >= 0 && g.o) vm->globals[g.slot] = box(g.o);
   }
   {
@@ -979,7 +980,7 @@ void isolateNudge() {
 
 void isolateExitPoint() {
 #if __wasm__ && !ONE_THREAD
-  if (exitAsked.load() >= 0 && isolateMainThread()) chanMu.lock(), exitNow();
+  if (exitAsked.load() >= 0 && isolateMainThread()) exit(exitAsked.load());  // (no lock: the worker may have died holding one)
 #endif
 }
 #if __wasm__ && !ONE_THREAD
@@ -987,11 +988,12 @@ bool isolateMainThread() { return pthread_equal(pthread_self(), mainThread); }
 void isolatesExit(int code) {
   int none = -1;
   exitAsked.compare_exchange_strong(none, code);
-  bool locked = false;  // (this thread may hold it, failing)
-  for (int i = 0; i < 1000 && !locked; i++) locked = !pthread_mutex_trylock(&chanMu.m) || (sched_yield(), false);
   eachVM([](VM* v, void*) { __atomic_fetch_or(&v->poll, 64u, __ATOMIC_RELAXED); }, nullptr);
+  bool locked = false;  // (a thread that died holding it never lets go: give up after a while)
+  for (int i = 0; i < 2000 && !(locked = !pthread_mutex_trylock(&chanMu.m)); i++) usleep(100);
+  if (!locked) return;
   for (Iso* i : isos) if (i->pinned) pthread_cond_broadcast(&i->cv);
-  if (locked) pthread_mutex_unlock(&chanMu.m);
+  pthread_mutex_unlock(&chanMu.m);
 }
 #endif
 void isolateReloadPoint() {

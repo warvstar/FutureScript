@@ -113,7 +113,7 @@ export async function createFut(opts) {
       return 0;
     },
     clock_time_get(id, _prec, p) {
-      const ns = id == 0 ? Date.now() * 1e6 : performance.now() * 1e6;
+      const ns = id == 0 ? Date.now() * 1e6 : (performance.timeOrigin + performance.now()) * 1e6;  // (one clock on every thread)
       return dv().setBigUint64(p, BigInt(Math.round(ns)), true), 0;
     },
     fd_close: () => 0, fd_seek: () => 70,
@@ -360,7 +360,7 @@ export async function createFut(opts) {
 
   // ---- the program's events: changed files and typed lines, handled at the next safepoint ----
   let fileChanged = false, inbox = [], replBuf = "", inMain = false, wake = null, path = "", mainChanged = false;
-  const poke = () => { if (ex) dv().setUint32(pollAt, dv().getUint32(pollAt, true) | 1, true); wake?.(), (wake = null); };
+  const poke = () => { if (ex) Atomics.or(new Uint32Array(mem.buffer), pollAt >> 2, 1); wake?.(), (wake = null); };  // (threads set bits too)
   let pollAt = 0;
   async function enter(f) {  // Keep the interrupted program's stack, effects, and transactions.
     const sp = spG.value, txn = ex.fut_txn_depth(), eff = ex.fut_eff_enter();
@@ -543,6 +543,7 @@ export async function createFut(opts) {
   fiberStart = WebAssembly.promising(ex.fut_fiber_start), ctxStart = WebAssembly.promising(ex.fut_ctx_start);
   const finishP = WebAssembly.promising(ex.fut_isolates_finish);
   if (opts.thread) {  // one of fut-mt.wasm's threads: it runs (wasi_thread_start) until the process ends
+    if (opts.interp) tryCallSlot();  // the slot the main thread's table grew for it, before anything was logged
     WebAssembly.promising(ex.wasi_thread_start)(opts.thread.tid, opts.thread.arg).catch(hostFailed);
     return null;
   }

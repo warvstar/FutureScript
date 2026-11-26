@@ -169,6 +169,11 @@ struct Gen : CState {
     if (F->stub) {
       op(I32_CONST), rel(F->stub, REL_OWN), mem(I32_LOAD8_U, 0, 0), open(IF, VOID, UNLIKELY);
       get(W), i32c(1), op(I32_AND), open(IF, VOID), get(W), i32c(1), op(I32_XOR), set(W), op(ELSE);
+#if __wasm__ && !ONE_THREAD
+      // (threads) another thread may have replaced it: this thread's table may still have this body in the stub's
+      // slot, until it catches up (a poll does), and the call would come straight back here
+      get(SP), op(GLOBAL_SET), u(0), i32c(slotOf(vm->helpers[H_POLL])), callTable(1 + H_POLL);
+#endif
       for (u32 p = 0; p < A0 + NA; p++) get(p);
       op(I32_CONST), rel(F->stub, REL_SLOT), op(RETURN_CALL_INDIRECT), u(0), u(0), close(), close();
     }
