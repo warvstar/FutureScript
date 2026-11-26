@@ -23,7 +23,7 @@
 #include <utility>
 
 using namespace wa;
-bool interpMode, interpTrace;
+bool interpMode;
 void* interpTop;  // the innermost interpreted frame (a Frame), for stack traces; each fiber keeps its own (wasm.cpp)
 namespace {
 using L = uint64_t;
@@ -94,7 +94,10 @@ void prepare(IFn& f) {  // the locals' count, and where each block ends
     if ((op == LOCAL_SET || op == LOCAL_TEE) && !framed && c[pc] == FP) framed = true, f.frame = prev == I32_SUB ? (u32)lastConst : 0;  // FP = SP - size
     if (op != I32_CONST) prev = op;
     skipImm(c, pc, op);
-    if (op == BLOCK || op == LOOP || op == IF || op == TRY_TABLE) open.push_back(at);
+    if (op == BLOCK || op == LOOP || op == IF || op == TRY_TABLE) {
+      open.push_back(at);
+      if (open.size() >= 90) bad("blocks nested too deeply in one function:", (unsigned)open.size());
+    }
     else if (op == ELSE) f.elseAt[open.back()] = pc, open.push_back(at);  // the else's own entry: its end
     else if (op == ENDOP) {
       if (open.empty()) break;  // the function's end
@@ -136,7 +139,8 @@ void callTypesInit() {
 
 // ---- running a body ----
 struct Ctl { u32 cont; int height; uint8_t arity; bool loop; };
-struct Frame { IFn* f; L* loc; L stk[96]; int s; Ctl ctl[96]; int nctl; L ret; Frame* prev; u32 pc; };
+constexpr int NSTK = 96, NCTL = 96;  // operand stack (shallow: gen_wasm keeps values in locals) and block nesting (prepare checks it)
+struct Frame { IFn* f; L* loc; L stk[NSTK]; int s; Ctl ctl[NCTL]; int nctl; L ret; Frame* prev; u32 pc; };
 struct TryCtx { L payload; Frame* fr; u32 pc; int base; };  // payload first: try_call stores it at the context
 int run(Frame& fr, u32 pc, int base);
 L enter(IFn& f, V* w, L a0, L a1, L a2, L a3);
@@ -173,7 +177,6 @@ int run(Frame& fr, u32 pc, int base) {
   };
   for (;;) {
     uint8_t op = c[pc++];
-    if (interpTrace) fprintf(stderr, "[%p] pc %u op %02x s %d nctl %d top %llx\n", (void*)&f, pc - 1, op, s, fr.nctl, s ? (unsigned long long)stk[s - 1] : 0ull);
     switch (op) {
       case UNREACHABLE: __builtin_trap();
       case NOP: break;

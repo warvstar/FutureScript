@@ -436,8 +436,6 @@ EXPORT(fut_init) void futInit(int flags) {  // installs the natives' adapters
   if (interpMode) interpInit();
   rtInit(), jitCollect(), refRelease = host_ref_gone;
 }
-extern bool interpTrace;
-EXPORT(fut_interp_debug) void futInterpDebug(int on) { interpTrace = on; }
 EXPORT(fut_set_trycall) void futSetTryCall(u32 slot) { interpSetTryCall(slot); }  // the host's try_call (see interp.cpp)
 EXPORT(fut_alloc) char* futAlloc(u32 n) { return (char*)malloc(n); }
 EXPORT(fut_free) void futFree(char* p) { free(p); }
