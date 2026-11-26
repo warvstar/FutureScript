@@ -246,7 +246,13 @@ void typeFail(int site, V v, void* ra, uint64_t t) {
   TypeSite& s = sites[site];
   std::string w = t ? why(t, v, 0, "") : "";
   if (!w.empty()) rtError(ra, "@type %s must be %s: %s", s.what.c_str(), s.type.c_str(), w.c_str());
-  rtError(ra, "@type %s must be %s, got %s", s.what.c_str(), s.type.c_str(), describe(v).c_str());
+  std::string want = s.type;  // a named union of literals: say what they are
+  if (const TypeDesc* d = t && (t & 15) == TY_NAMED ? typeDesc(t) : nullptr; d && d->k == 'u') {
+    bool lits = true;
+    for (uint64_t a : d->alts) lits = lits && typeDesc(a) && typeDesc(a)->k == 'l';
+    if (lits) want += " (" + typeText(typeResolve(t) & ~TY_OPT) + ")";
+  }
+  rtError(ra, "@type %s must be %s, got %s", s.what.c_str(), want.c_str(), describe(v).c_str());
 }
 // A store into a list (key nil) or map that has its element type. The value stored gets tagged as a check would.
 void typeWrite(Obj* o, V key, V v, void* ra) {

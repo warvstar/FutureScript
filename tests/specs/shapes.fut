@@ -32,7 +32,7 @@ fn compileErr(src) { return run({source: src}).err }
 
 test "unions and literals" {
   expect verb("GET") == "GET"
-  expect err(fn() { verb("PUT") }).has("must be Method")
+  expect err(fn() { verb("PUT") }).has("must be Method (\"GET\" | \"POST\"), got the string \"PUT\"")
   expect maybe(1) == 1 && maybe("a") == "a" && maybe(nil) == nil
   expect err(fn() { maybe(true) }).has("must be num | str | nil")
 }
