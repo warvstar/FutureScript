@@ -90,6 +90,10 @@ struct Compiler : Gen {
   bool reload = false, echo = false, tiering = false, topTry = false, testing = false;  // testing: compile `test` blocks
   std::vector<TestCase> tests;
   std::string owner;
+  // fut test --changed: who the code being compiled belongs to, for the top-level names it uses (traceRef): refKey if
+  // set, else owner (a function, a method and their lambdas), else testRefs (a test body; "<top>": top-level code).
+  std::string refKey, testRefs = "<top>";
+  std::vector<std::pair<const char*, const char*>> traceCuts;  // fns, classes, vars and tests: hashed on their own
   struct Source { std::string text; bool compiled = false; };
   std::unordered_map<std::string, Source> sources;  // by path; nodes are stable, so text pointers stay valid
   std::vector<std::string> files, present;
@@ -591,6 +595,7 @@ struct Compiler : Gen {
       return {};
     }
     if (!g) undefined(t);
+    if (traceOn && !tiering) traceRef(!refKey.empty() ? refKey : !owner.empty() ? owner : testRefs, t.sym);
     if (pubContract && g->kind != 'n' && !(t.sym < (int)pubSym.size() && pubSym[t.sym]))  // the .api shows the clause, not the name
       failAt(t.p, t.line, "%s can only use what its readers can see, and '%s' is private: make it pub, or write the condition without it",
              pubContract, name(prev.sym));
@@ -1066,6 +1071,7 @@ struct Compiler : Gen {
     int arity = (int)homes.size();
     if (arity > 64) fail("too many parameters");
     for (int i = 0; i < arity; i++) param(i, homes[i]);
+    if (traceOn && !f.test && !(f.lambda && owner.empty())) traceTouch(traceMark(f.lambda ? owner : nm));  // fut test: it ran
     for (int i = first; i < arity && i < 8; i++)
       if (f.spec >> (i - first) & 1) f.guard.push_back(i), prove(homes[i]);
     for (size_t i = 0; i < ptys.size(); i++) {  // tier 2: a number parameter its entry guard proved needs no check
@@ -1232,12 +1238,15 @@ struct Compiler : Gen {
     f.selfHome = home(), f.locals.push_back({K_self, f.selfHome});
     int who = home();
     param(0, f.selfHome), param(1, who);
+    if (traceOn) traceTouch(traceMark(q));
     bool calls = false;
     for (auto& c : cs.invariants) calls |= c.calls;
     if (calls) imm(0, box((double)effSite("the invariant of " + K, 0, "!"))), callNative("contract@begin", true);
     std::string what = "the invariant of " + K + ", a pub class,";
     if (cd.sym < (int)pubSym.size() && pubSym[cd.sym]) pubContract = what.c_str();
+    refKey = q;
     clauses({{K_self, f.selfHome}}, cs.at.line, [&] { for (auto& c : cs.invariants) check(c.at, "\x01 broke " + K + "'s invariant:", who); });
+    refKey.clear();
     pubContract = nullptr;
     if (calls) callNative("contract@end", false);
     if (cd.super >= 0) {
@@ -1439,6 +1448,7 @@ struct Compiler : Gen {
   // A body naming something not defined yet compiles to nothing and the test is pending (write the spec first).
   void testDecl() {
     int line = prev.line;
+    const char* from = prev.p;  // `test`
     next();
     std::string nm;
     for (const char *p = prev.p, *e = p + prev.len; p < e; p++) nm += *p == '\\' && p + 1 < e ? *++p : *p;
@@ -1448,7 +1458,9 @@ struct Compiler : Gen {
     if (!testing) return;
     Mark after = mark();
     rewind(body);
-    TestCase tc{nm, file, "", line, nullptr};
+    TestCase tc{nm, file, "", line, nullptr, traceHash(from, after.prevEnd)};
+    std::string sr = testRefs;
+    testRefs = traceTestRefs(tc.hash);
     Fun f;
     f.test = true;
     struct Job { Compiler* c; Fun* f; std::string name; u32* stub; } job{this, &f, "test \"" + nm + "\"", newStub()};
@@ -1466,7 +1478,7 @@ struct Compiler : Gen {
       F = outer, pend.resize(np), hasLit = false, rewind(after);
       tc.pending = msg + (loc.empty() ? "" : " at " + loc.substr(loc.rfind('/') + 1));
     }
-    owner = so;
+    owner = so, testRefs = sr;
     tests.push_back(std::move(tc));
   }
   void declare(const Tok& t, char kind, int arity) {
@@ -1706,12 +1718,14 @@ struct Compiler : Gen {
   }
   void topLevel() {
     while (!at(T_EOF)) {
+      const char* item = cur.p;  // where the declaration starts, `pub` included (fut test --changed hashes it)
+      bool trace = traceOn && testing;
       if (atPub()) next();
-      if (atKw(K_fn)) { next(), fnDecl(); continue; }
-      if (atKw(K_class)) { next(), classDecl(); continue; }
+      if (atKw(K_fn)) { next(), fnDecl(); if (trace) traceFn(item); continue; }
+      if (atKw(K_class)) { next(), classDecl(); if (trace) traceClassDecl(item); continue; }
       if (atKw(K_extern)) { next(), externDecl(); continue; }
       if (atKw(S_effect) && peek().t == T_ID && !peek().nl && peek().sym >= NKW) { next(), effectDecl(); continue; }
-      if (atKw(S_test) && peekIs(T_STR)) { next(), testDecl(); continue; }
+      if (atKw(S_test) && peekIs(T_STR)) { next(), testDecl(); if (trace) traceCuts.push_back({item, prevEnd}); continue; }
       if (atKw(K_import)) {
         next();
         if (!at(T_STR)) fail("expected a file or package name");
@@ -1736,6 +1750,7 @@ struct Compiler : Gen {
         uint64_t& h = varText[v], t = fnv(start, end);
         if (reload && h && h != t) keep = true, add(reset, symName(v));
         h = t;
+        if (trace) traceCuts.push_back({item, end}), traceDefine("v:" + symName(v), traceHash(item, end));
       }
       if (!keep) F->k.c.resize(c), F->k.rel.resize(r), F->k.lines.resize(l);
     }
@@ -1778,10 +1793,71 @@ struct Compiler : Gen {
     topLevel();
     if (!modulesPending.empty()) compileFail("waiting for the host to load modules", false);
     if (testing) todosPending(), specProperties();
+    if (testing && traceOn) traceFiles();
     checkClasses();
     for (auto& [sym, v] : varTypes) globalType(sym);  // each typed var's type, for commit
     Code chunk = finish();
     return commit(chunk);
+  }
+
+  // ---- fut test --changed: the hashes a test's trace is checked against (testcache.cpp) ----
+  // The tokens of [a, b) outside the ranges in skip (sorted), and not `override`, with the line breaks between them
+  // (they can end a statement): comments and other spacing don't count, nor where in its file the text is. Mixed in:
+  // every top-level declaration of each name the text mentions, wherever it is, so a new declaration that a name now
+  // resolves to (a file's private `helper` hiding the global one) changes the hash of the code that names it.
+  std::unordered_map<std::string, uint64_t> declsNamed;  // a name as written -> its declarations (qualified, kind, pub)
+  uint64_t traceHash(const char* a, const char* b, const std::vector<std::pair<const char*, const char*>>& skip = {}) {
+    if (declsNamed.empty())
+      for (size_t s = 0; s < declKind.size(); s++)
+        if (char k = declKind[s]) {
+          const std::string& q = symName((int)s);
+          std::string e = q + ' ' + k + (s < pubSym.size() && pubSym[s] ? " pub" : "");
+          declsNamed[q.substr(q.rfind('.') + 1)] += fnv(e.data(), e.data() + e.size());  // (order-free)
+        }
+    uint64_t h = 1469598103934665603ull, names = 0;
+    std::unordered_set<int> seen;
+    size_t i = 0;
+    Lexer L{a};
+    for (Tok k = L.next(); k.t != T_EOF && k.t != T_ERR && k.p < b; k = L.next()) {
+      while (i < skip.size() && skip[i].second <= k.p) i++;
+      if ((i < skip.size() && skip[i].first <= k.p) || (k.t == T_ID && k.sym == S_override)) continue;
+      h = (h ^ (uint64_t)k.t ^ (uint64_t)k.nl << 32) * 1099511628211ull;
+      for (const char* c = k.p; c < L.p; c++) h = (h ^ (uint8_t)*c) * 1099511628211ull;
+      if (k.t == T_ID && k.sym >= NKW && seen.insert(k.sym).second)
+        if (auto it = declsNamed.find(symName(k.sym)); it != declsNamed.end()) names += it->second;
+    }
+    return (h ^ names) * 1099511628211ull;
+  }
+  void traceFn(const char* item) {
+    traceCuts.push_back({item, prevEnd});
+    traceDefine("f:" + symName(fnDefs.back().first), traceHash(item, prevEnd));
+  }
+  // A class: each method's text, and its shape (the rest: its superclass, fields, invariants), which its methods and
+  // lookups on its instances depend on, with its superclasses' (testcache.cpp chains them).
+  void traceClassDecl(const char* item) {
+    traceCuts.push_back({item, prevEnd});
+    ClassDef& cd = classes.back();
+    std::string K = symName(cd.sym);
+    std::vector<std::pair<const char*, const char*>> bodies;
+    for (auto& [m, f] : cd.methods) {
+      std::string q = K + "." + symName(m);
+      traceMethod(q, K);
+      if (m == invariantSym()) { traceDefine("f:" + q, 1); continue; }  // (its clauses are in the shape)
+      Span& sp = spans.at(q);
+      bodies.push_back({sp.start, sp.end}), traceDefine("f:" + q, traceHash(sp.start, sp.end));
+    }
+    std::sort(bodies.begin(), bodies.end());
+    traceClass(K, cd.super >= 0 ? symName(cd.super) : "", traceHash(item, prevEnd, bodies));
+  }
+  void traceFiles() {  // each file's top-level code other than its fns, classes, vars and tests
+    std::sort(traceCuts.begin(), traceCuts.end());
+    for (auto& f : files) {
+      const std::string& text = sources.at(f).text;
+      const char *a = text.c_str(), *b = a + text.size();
+      std::vector<std::pair<const char*, const char*>> cuts;
+      for (auto& c : traceCuts) if (c.first >= a && c.first < b) cuts.push_back(c);
+      traceDefine("t:" + canonicalPath(f), traceHash(a, b, cuts));
+    }
   }
 
   // The classes whose methods check invariants when an outside call ends: each with invariants, its superclasses

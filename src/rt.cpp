@@ -347,6 +347,7 @@ static void* rt_prep(V* w, uint64_t n, uint64_t sym, V sup, IC* ic) {
     r = w[0] = as<Map>(r)->e[e].second, sym = 0;
   }
   if (sym) {  // method call (sym 0 is the keyword 'var', never a method name)
+    if (Class* c = sup ? as<Class>(sup)->super : is(r, K::Inst) ? as<Inst>(r)->cls : nullptr; c && traceOn) traceLookup(c->name, (int)sym);
     if (sup) f = as<Class>(sup)->super ? as<Class>(sup)->super->find(sym) : nullptr;
     else if (is(r, K::Inst)) f = as<Inst>(r)->cls->find(sym);
     else if (isObj(r)) f = builtin(obj(r)->kind, sym);
@@ -365,6 +366,7 @@ static void* rt_prep(V* w, uint64_t n, uint64_t sym, V sup, IC* ic) {
   } else if (is(r, K::Clo)) f = as<Clo>(r)->fn;
   else if (is(r, K::Class)) {
     Class* c = as<Class>(r);
+    if (traceOn) traceLookup(c->name, S_init);
     if (!__atomic_load_n(&c->ihdr, __ATOMIC_ACQUIRE)) {  // its first construction: what JIT constructors read
       Locked g(layoutMu);
       reshape(c);

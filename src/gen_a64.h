@@ -441,6 +441,8 @@ struct Gen : CState {
     imm(0, box(fn)), imm(1, n), addsp(2, base), helper(H_CLOSURE), F->depth = base;
     if (done >= 0) patch(done);
   }
+  // fut test --changed: a body sets its owner's mark (any nonzero word: here, the mark's own address) on entry.
+  void traceTouch(uint64_t* mark) { imm(16, (V)(uintptr_t)mark), E(str(16, 16, 0)); }
   // Each function counts its calls; at HOT, rt_hot sees which arguments are numbers and calls tierUp.
   void hotCounter(void* tier, int first, const std::vector<int>& homes) {
     u32 lo = icAt(16);

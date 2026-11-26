@@ -453,6 +453,7 @@ struct Gen : CState {
     karg(0, (int64_t)box(fn)), karg(1, n), warg(2, base), helper(H_CLOSURE), F->depth = base;
     if (inl) close();
   }
+  void traceTouch(uint64_t*) {}  // fut test --changed records traces natively only
   // Each function counts its calls; at HOT, rt_hot(tier, its arguments, how many) sees which are numbers and calls tierUp.
   void hotCounter(void* tier, int first, const std::vector<int>& homes) {
     // No declared parameters, nothing to speculate on: tier 2 would only move the body to a module of its own,

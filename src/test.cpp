@@ -181,6 +181,7 @@ static V growsAt(V site, V clo, V growth, V byAllocs) {
       pts.push_back({n, (double)(gcAllocations() - a0)});
     }
   else {
+    traceImpure();  // timed: not a result fut test --changed can reuse
     auto measure = [&](double n) {
       double best = 1e30;
       for (int k = 0; k < 3; k++)
@@ -498,7 +499,8 @@ void testInit() {
 
 // ---------------- the runner ----------------
 static TestRun opts;
-static int passed, failed, errored, pending;
+static int passed, failed, errored, pending, cachedPasses;
+static std::string later;  // --changed, text: failures and pending tests, shown after the summary line
 static std::string out;  // the running test's print() output
 static double t0, tAll;
 static std::string json(const std::string& s) {
@@ -523,18 +525,25 @@ static std::string indent(const std::string& s, const char* pre) {
 }
 static std::string where(const TestCase& t) { return t.file.substr(t.file.rfind('/') + 1) + ":" + std::to_string(t.line); }
 static void emit(const std::string& s) { fflush(stdout), fwrite(s.data(), 1, s.size(), stdout), fflush(stdout); }
+// --changed is terse: passes are counted, not listed; in text, what failed follows the summary line.
+static void say(const std::string& s, bool pass) {
+  if (!opts.changed) emit(s);
+  else if (!pass) opts.json ? emit(s) : (void)(later += s);
+}
 
-void testsBegin(const TestRun& o) { opts = o, passed = failed = errored = pending = 0, tAll = now(); }
+void testsBegin(const TestRun& o) { opts = o, passed = failed = errored = pending = cachedPasses = 0, later.clear(), tAll = now(), traceBegin(o); }
 
 void* testStart(const TestCase& t) {
   if (!opts.filter.empty() && t.name.find(opts.filter) == std::string::npos) return nullptr;
   if (!t.pending.empty()) {
     pending++;
-    if (opts.json) emit("{\"type\":\"test\",\"name\":" + json(t.name) + ",\"file\":" + json(t.file) + ",\"line\":" + std::to_string(t.line) +
-                        ",\"status\":\"pending\",\"reason\":" + json(t.pending) + "}\n");
-    else emit("pending " + t.name + " (" + where(t) + "): " + t.pending + "\n");
+    if (opts.json) say("{\"type\":\"test\",\"name\":" + json(t.name) + ",\"file\":" + json(t.file) + ",\"line\":" + std::to_string(t.line) +
+                       ",\"status\":\"pending\",\"reason\":" + json(t.pending) + "}\n", false);
+    else say("pending " + t.name + " (" + where(t) + "): " + t.pending + "\n", false);
     return nullptr;
   }
+  if (traceCached(t)) return cachedPasses++, nullptr;
+  traceStart(t);
   failure = {}, out.clear(), endCaptures(), outSink = &out;
   t0 = now();
   return t.code;
@@ -562,7 +571,7 @@ std::string testReport(const TestCase& t, bool err, const std::string& e, char& 
       size_t nl = e.find('\n');
       j += ",\"message\":" + json(e.substr(0, nl)) + ",\"trace\":" + json(nl == std::string::npos ? "" : e.substr(nl + 1));
     }
-    return j + ",\"output\":" + json(out) + "}\n";
+    return j + ",\"output\":" + json(out) + "}\n" + traceReport(t);
   }
   std::string s = std::string(failure.set ? "FAIL    " : err ? "ERROR   " : "ok      ") + t.name;
   if (failure.set) {
@@ -572,9 +581,13 @@ std::string testReport(const TestCase& t, bool err, const std::string& e, char& 
   } else if (err) s += " (" + where(t) + ")\n" + indent("runtime error: " + e.substr(0, e.find_last_not_of('\n') + 1), "  ");
   else s += "\n";
   if ((failure.set || err) && !out.empty()) s += "  output:\n" + indent(out.substr(0, out.size() - (out.back() == '\n')), "    ");
-  return s;
+  return s + traceReport(t);
 }
-void testRecord(char code, const std::string& text) { outSink = nullptr, (code == 'f' ? failed : code == 'e' ? errored : passed)++, emit(text); }
+void testRecord(char code, const std::string& text) {
+  size_t z = text.find('\0');  // the test's trace follows its report (fut test --changed)
+  traceResult(code, z == std::string::npos ? "" : text.substr(z + 1));
+  outSink = nullptr, (code == 'f' ? failed : code == 'e' ? errored : passed)++, say(text.substr(0, z), code == 'p');
+}
 void testFinish(const TestCase& t, bool err, const std::string& e) {
   char code;
   std::string text = testReport(t, err, e, code);
@@ -584,6 +597,16 @@ void testFinish(const TestCase& t, bool err, const std::string& e) {
 int testsEnd() {
   double ms = (now() - tAll) * 1e3;
   char b[256];
+  traceEnd();
+  if (opts.changed) {  // "12 run, 340 cached, 0 failed", then what failed
+    int ran = passed + failed + errored;
+    if (opts.json) snprintf(b, sizeof b, "{\"type\":\"summary\",\"run\":%d,\"cached\":%d,\"passed\":%d,\"failed\":%d,\"errors\":%d,\"pending\":%d,\"ms\":%.3f}\n",
+                            ran, cachedPasses, passed, failed, errored, pending, ms);
+    else snprintf(b, sizeof b, "%d run, %d cached, %d failed%s (%.1f ms)\n", ran, cachedPasses, failed + errored,
+                  pending ? (", " + std::to_string(pending) + " pending").c_str() : "", ms);
+    emit(b + later);
+    return failed || errored || pending ? 1 : 0;
+  }
   if (opts.json) snprintf(b, sizeof b, "{\"type\":\"summary\",\"passed\":%d,\"failed\":%d,\"errors\":%d,\"pending\":%d,\"ms\":%.3f}\n",
                           passed, failed, errored, pending, ms);
   else {

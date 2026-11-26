@@ -303,7 +303,8 @@ V vmCall(void* code, std::initializer_list<V> args = {});
 V vmEnter(void* code, V* args);  // args: 8 values
 extern std::string* asmListing;
 
-struct TestCase { std::string name, file, pending; int line = 0; void* code = nullptr; };  // a `test "name" { }` block
+struct TestCase { std::string name, file, pending; int line = 0; void* code = nullptr; uint64_t hash = 0; };  // a `test "name" { }` block
+// (hash: of its source, name included: fut test --changed)
 // An interface file: the `pub` declarations of a file outside any package, or a package's surface (its root file's,
 // and those it re-exports), with the package's name and version.
 struct ApiUnit { std::string file, api, label; std::vector<std::string> parts; std::string pkg, version; };
@@ -371,7 +372,7 @@ int propSite(PropSite);
 void testInit();
 void sysInit();  // fetch, exec, files, env, time, JSON (native; the wasm build has none yet)
 V binopValue(V a, V b, int op);  // a op b, as the language computes it (raises on bad operands)
-struct TestRun { bool json = false; std::string filter; double timeout = 10; int isolates = 0; };
+struct TestRun { bool json = false; std::string filter; double timeout = 10; int isolates = 0; bool changed = false; };
 extern std::string mainFile;  // the program's file: run() finds relative files next to it
 void mapPut(Map*, std::string_view key, V v);
 struct ProcResult { int code = 0; std::string out, err; bool timedOut = false; };
@@ -386,6 +387,27 @@ void testRecord(char code, const std::string& text);                            
 int testsEnd();
 void reportCompileError(const std::string& msg);          // fut test: in the chosen format
 void reportTopError(const std::string& msg);
+// ---- fut test --changed (testcache.cpp): what each test used, so one whose inputs are unchanged need not run ----
+// While tracing (fut test, natively), each function body's entry sets its owner's mark (lambdas set their enclosing
+// function's), rt_prep records the method lookups it resolves, and effPrep notes io, clock and random. The compiler
+// defines the hashes a trace is checked against: "f:" functions and methods, "v:" top-level vars, "t:" each file's
+// other top-level code, and classes (their fields, superclass and invariants).
+inline bool traceOn;
+uint64_t* traceMark(const std::string& owner);        // the word a body of owner sets on entry (stable)
+void traceRef(const std::string& owner, int sym);     // owner's code names top-level sym ("<top>": top-level code)
+void traceLookup(int64_t cls, int sym);               // a call resolved method sym on an instance of class cls
+void traceImpure();                                   // something ran whose result the world can change
+void traceDefine(const std::string& item, uint64_t hash);
+void traceClass(const std::string& cls, const std::string& super, uint64_t shape);
+void traceMethod(const std::string& q, const std::string& cls);
+std::string traceTestRefs(uint64_t testHash);         // the owner a test body's references are recorded under
+void traceBegin(const TestRun&);                      // testsBegin
+int testsToRun(const std::vector<TestCase>&);         // after compiling: how many tests run (--changed: 0 skips the top level)
+bool traceCached(const TestCase&);                    // testStart: its cached pass still holds (--changed)
+void traceStart(const TestCase&);                     // testStart: it is about to run
+std::string traceReport(const TestCase&);             // its process's trace, for the report (empty elsewhere)
+void traceResult(char code, const std::string& trace);  // the report came back
+void traceEnd();                                      // testsEnd: write the cache
 // ---- transactions (txn.cpp): atomic { } and hot reloads ----
 void txnInit();
 void txnBegin();

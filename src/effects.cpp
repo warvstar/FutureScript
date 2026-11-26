@@ -40,6 +40,7 @@ std::unordered_map<int, uint64_t> userBits;  // user effect symbol -> its bit
 std::string effName[EFF_LEVEL];
 std::vector<int> effOps[EFF_LEVEL];          // each effect's operations (a handle that answers all of them allows it)
 int nextBit = 4;
+int printOp;  // print(): deterministic where tests run (their output is captured), so it leaves a test cacheable
 TLS std::vector<EffState> saved;    // effEnter (per isolate)
 struct Pending { V clo = 0, rec = 0; int op = 0; uint64_t n = 0; };
 TLS Pending pending;  // effPrep -> invokeHandler
@@ -184,6 +185,7 @@ void* effPrep(Fn* f, V* w, uint64_t n) {
     return invokeCode;
   }
   if (!(vm->allowed & o.effect) || (o.effect == EFF_IO && txnAtomic())) forbidden(what, o.effect, RA());
+  if (traceOn && op != printOp && (o.effect & (EFF_IO | EFF_CLOCK | EFF_RANDOM))) traceImpure();  // (print: captured under fut test)
   if (o.user) rtError(RA(), "%s was performed, but nothing handles it (handle { ... } with %s { ... })", what.c_str(), o.name.substr(0, o.name.size() - 1).append("...)").c_str());
   memmove(w, w + 1, n * 8);
   return f->code;
@@ -270,5 +272,6 @@ void effectsInit() {
     f->op = (int)ops.size(), builtinOps[sym] = f->op;
     ops.push_back({std::string(name) + "()", e, f->arity, false, {}, {}, 0, -1, f});
     effOps[bitIndex(e)].push_back(f->op);
+    if (!strcmp(name, "print")) printOp = f->op;
   }
 }

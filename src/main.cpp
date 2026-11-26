@@ -209,7 +209,7 @@ static int runTests(const TestRun& o) {
   }
   std::string err;
   errSink = &err;
-  int st = run(c.chunk);
+  int st = testsToRun(c.tests) ? run(c.chunk) : 0;  // --changed with every test cached: nothing runs, not even the top level
   jitRetire((u32*)c.chunk);
   // A public interface out of date fails the run too, reported last so it is what the reader sees with the status.
   auto api = [&](int st) { return reportInterfaces(checkInterfaces(c), o.json, path) ? std::max(st, 1) : st; };
@@ -265,7 +265,7 @@ int main(int argc, char** argv) {
   std::string mapOnly;
   TestRun topts;
   const char* usage = "usage: fut [-w | -v | --asm | --isolates n] [file.fut]   (no file: REPL)\n"
-                      "       fut test [--json] [--filter text] [--timeout s] [--isolates n] file.fut\n"
+                      "       fut test [--changed] [--json] [--filter text] [--timeout s] [--isolates n] file.fut\n"
                       "       fut api [--check] file.fut\n       fut map [--pub] [--json] file.fut [package | file]\n";
   for (int i = 1 + (testMode || apiMode || mapMode); i < argc; i++) {
     std::string a = argv[i];
@@ -281,6 +281,7 @@ int main(int argc, char** argv) {
     } else if (a == "--isolates" && i + 1 < argc && atoi(argv[i + 1]) > 0 && !WASM) topts.isolates = atoi(argv[++i]);
     else if (testMode && a == "--json") topts.json = true;
     else if (testMode && a == "--filter" && i + 1 < argc) topts.filter = argv[++i];
+    else if (testMode && a == "--changed") topts.changed = true;
     else if (testMode && a == "--timeout" && i + 1 < argc && atof(argv[i + 1]) > 0) topts.timeout = atof(argv[++i]);
     else if (a == "-w" && !testMode) watch = verbose = true;
     else if (a == "-v") verbose = true;
