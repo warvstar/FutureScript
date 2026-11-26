@@ -33,7 +33,8 @@ static bool same(V a, V b, std::string& at, std::string& what, Compared& active)
   };
   bool lists = is(a, K::List) && is(b, K::List);
   bool maps = is(a, K::Map) && is(b, K::Map);
-  if (!lists && !maps) return a == b;
+  bool sums = is(a, K::Inst) && is(b, K::Inst) && as<Inst>(a)->cls == as<Inst>(b)->cls && as<Inst>(a)->cls->sum == 2;  // an enum's values
+  if (!lists && !maps && !sums) return a == b;
   std::pair pair{a, b};
   for (auto p : active) if (p == pair) return true;
   active.push_back(pair);
@@ -43,6 +44,12 @@ static bool same(V a, V b, std::string& at, std::string& what, Compared& active)
     for (size_t i = 0; i < x.size() && i < y.size(); i++)
       if (!same(x[i], y[i], at, what, active)) return differ("[" + std::to_string(i) + "]", x[i], y[i]);
     if (x.size() != y.size()) return what = "length " + std::to_string(x.size()) + " vs " + std::to_string(y.size()), false;
+    return true;
+  }
+  if (sums) {
+    Inst *x = as<Inst>(a), *y = as<Inst>(b);
+    for (auto& [f, d] : x->cls->fields)
+      if (V u = variantField(x, f), w = variantField(y, f); !same(u, w, at, what, active)) return differ("." + symName(f), u, w);
     return true;
   }
   auto &x = as<Map>(a)->e, &y = as<Map>(b)->e;

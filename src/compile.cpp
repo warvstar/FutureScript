@@ -29,7 +29,14 @@ struct ClassDef {
   std::vector<Member> written;
   std::vector<std::pair<int, V>> fields;  // declared: `var name [: type] [= constant]`
   std::vector<Class::FieldType> ftypes;   // those with a type
+  uint8_t sum = 0;                        // Class::sum: 1 an enum, 2 a variant
 };
+// enum Shape { Circle(r: num) Rect(w, h) Empty }: a closed class Shape with no instances, and a closed subclass of it
+// per variant, named Shape.Circle, whose declared fields are the variant's. Shape.Circle(2) makes one; match takes
+// them apart. Kept across compiles (the REPL), by the enum's symbol.
+struct VariantDef { int raw, sym; std::vector<int> fields; };
+struct EnumDef { int raw; std::vector<VariantDef> vs; };
+static std::unordered_map<int, EnumDef> enumDefs;
 struct FieldUse { int cls, sym; At at; };  // `self.name` in a method: checked against declared fields
 // `x.name` where x is a variable with a declared type (a shape, or a class): checked against that type's fields once
 // every type is known. Stores to x are checked, so x has its type wherever it is used.
@@ -358,6 +365,7 @@ struct Compiler : Gen {
         Global* g = findGlobal(n.sym);
         if (!g || (g->kind != 'c' && g->kind != 't'))
           failAt(t.p, t.line, "@unknown-type unknown type '%s' (num, str, bool, list, map, fn, any, a class, or a named type)", std::string(t.p, prevEnd).c_str());
+        if (auto it = enumDefs.find(n.sym); g->kind == 'c' && it != enumDefs.end() && at('.') && !cur.nl) next(), n.sym = variantNamed(it->first, cur)->sym, next();  // Shape.Circle
         ty.code = g->kind == 'c' ? tyClass(n.sym) : TY_NAMED | uint64_t(n.sym) << 8;
       }
     }
@@ -783,6 +791,160 @@ struct Compiler : Gen {
     gmem(0, findGlobal(intern("spawn@"))->slot), st(0, base), callWindow(base, 2, 0, false);
   }
 
+  // ---- enums ----
+  int enumOf(int cls) {  // the enum cls is or is a variant of, else -1
+    if (enumDefs.count(cls)) return cls;
+    for (auto& [s, e] : enumDefs) for (auto& v : e.vs) if (v.sym == cls) return s;
+    return -1;
+  }
+  const VariantDef* variantNamed(int esym, const Tok& t) {  // t: a variant's name, as written after Shape.
+    EnumDef& e = enumDefs.at(esym);
+    if (t.t == T_ID) for (auto& v : e.vs) if (v.raw == t.sym) return &v;
+    std::string all;
+    for (auto& v : e.vs) add(all, symName(v.raw));
+    failAt(t.p, t.line, "@undefined-name enum %s has no variant '%s' (it has %s)", name(esym), std::string(t.p, t.t == T_ID ? symName(t.sym).size() : 1).c_str(), all.c_str());
+  }
+  // Shape.Circle(args), after `Shape.`: a new instance whose fields are the arguments, set in order. A variant with
+  // no fields is one value (Shape.Empty), made on first use and kept in a hidden global.
+  void variantValue(const Tok& et) {
+    const VariantDef& vd = *variantNamed(et.sym, cur);
+    Tok vt = cur;
+    next();
+    Global& g = global(vd.sym);
+    int n = (int)vd.fields.size();
+    if (!n) {
+      if (at('(') && !cur.nl) failAt(vt.p, vt.line, "@arity %s has no fields: write it without parentheses", name(vd.sym));
+      Global& one = global(intern(symName(vd.sym) + "@one"));
+      gmem(0, one.slot);
+      Cond no = truthyCond();
+      thenBegin(no);
+      int e = elseBegin(no, true);
+      int base = slot();
+      gmem(0, g.slot), st(0, base), constructCall(base, 0), gmem(0, one.slot, true);
+      ifEnd(e);
+      gmem(0, one.slot);
+      return;
+    }
+    std::string fs;
+    for (int f : vd.fields) add(fs, symName(f));
+    if (!at('(') || cur.nl) failAt(vt.p, vt.line, "@arity %s has fields: make one with %s(%s)", name(vd.sym), name(vd.sym), fs.c_str());
+    next();
+    int base = slot();
+    gmem(0, g.slot), st(0, base), constructCall(base, 0);
+    int o = slot(), k = 0;
+    st(0, o);
+    if (!accept(')')) {
+      do {
+        expr();
+        if (k < n) mv(2, 0), ld(0, o), field(vd.fields[k], true);
+        k++;
+      } while (accept(','));
+      expect(')');
+    }
+    if (k != n) failAt(vt.p, vt.line, "@arity %s expects %d arguments (%s), got %d", name(vd.sym), n, fs.c_str(), k);
+    ld(0, o), F->depth = base;
+  }
+  // match value { Circle(r) { ... } Rect(w, _) { ... } Empty { ... } else { ... } }: each arm tests the value's
+  // variant (is@) and binds its fields in order (_ skips one); arms nest like else-if. Without else, the arms must
+  // cover every variant of the enum (a compile error names those missing), and a value that is not one of them raises.
+  bool isMatch() {
+    if (resolve(F, S_match).k != LV_NONE || findGlobal(globalSym(S_match))) return false;
+    Tok n = peek();
+    return !n.nl && n.t != '=' && n.t != '.' && n.t != T_EOF && n.t != '{' && !(n.t >= T_ADDEQ && n.t <= T_DIVEQ);
+  }
+  struct MatchAt { Tok at; int subject, esym = -1; std::vector<bool> seen; };
+  void callRt2(const char* nm, int subject, int cls) {  // nm(subject, the class cls)
+    int base = slot();
+    ldl(0, subject), st(0, slot()), gmem(0, global(cls).slot), st(0, slot());
+    gmem(0, findGlobal(intern(nm))->slot), st(0, base), callWindow(base, 2, 0, false);
+  }
+  void matchStmt() {
+    MatchAt m{prev, 0};
+    expr();
+    scope([&] {
+      m.subject = home();
+      stl(0, m.subject), F->locals.push_back({-1, m.subject});
+      expect('{');
+      matchArms(m);
+    });
+  }
+  void matchArms(MatchAt& m) {
+    if (bool end = accept('}'); end || (atKw(K_else) && m.esym >= 0)) {
+      if (!end) {
+        next(), block();
+        if (!accept('}')) fail("@syntax the else arm is the last arm of a match: expected '}'");
+        return;
+      }
+      if (m.esym < 0) failAt(m.at.p, m.at.line, "@syntax a match needs arms: Variant(fields) { ... }");
+      std::string miss;
+      for (size_t i = 0; i < m.seen.size(); i++) if (!m.seen[i]) add(miss, symName(enumDefs[m.esym].vs[i].raw));
+      if (!miss.empty()) failAt(m.at.p, m.at.line, "@match match on %s misses %s: add an arm for each, or else { }", name(m.esym), miss.c_str());
+      callRt2("match@fail", m.subject, m.esym), F->live = false;
+      return;
+    }
+    Tok pt = cur;
+    int esym = -1;
+    if (at(T_ID) && peekIs('.')) {  // Shape.Circle, geom.Shape.Circle
+      next();
+      Tok e = topName(prev);
+      if (!enumDefs.count(e.sym)) failAt(pt.p, pt.line, "@match '%s' is not an enum", std::string(pt.p, prevEnd).c_str());
+      esym = e.sym, expect('.');
+    } else if (at(T_ID) && cur.sym >= NKW) {
+      if (m.esym >= 0) esym = m.esym;
+      else {
+        std::string all;
+        for (auto& [s, e] : enumDefs)
+          if (globalSym(e.raw) == s || (s < (int)pubSym.size() && pubSym[s]))
+            for (auto& v : e.vs) if (v.raw == cur.sym) esym = s, add(all, symName(s));
+        if (esym < 0) fail("@match '%s' is not a variant of any enum here", name(cur.sym));
+        if (all.find(',') != std::string::npos) fail("@match '%s' is a variant of several enums (%s): write which, Enum.%s", name(cur.sym), all.c_str(), name(cur.sym));
+      }
+    } else fail("@syntax expected an arm: a variant (with names for its fields), or else");
+    if (m.esym >= 0 && esym != m.esym) failAt(pt.p, pt.line, "@match this match is on %s, and '%s' is not one of its variants", name(m.esym), std::string(pt.p, cur.p + symName(cur.sym).size()).c_str());
+    if (m.esym < 0) m.esym = esym, m.seen.assign(enumDefs[esym].vs.size(), false);
+    if (traceOn && !tiering) traceRef(!refKey.empty() ? refKey : !owner.empty() ? owner : testRefs, esym);  // the arms depend on its variants
+    const VariantDef& vd = *variantNamed(esym, cur);
+    size_t vi = &vd - enumDefs[esym].vs.data();
+    if (m.seen[vi]) failAt(pt.p, pt.line, "@duplicate this match already has an arm for %s", name(vd.raw));
+    m.seen[vi] = true;
+    next();
+    std::vector<int> binds;
+    if (at('(') && !cur.nl) {
+      for (next(); !accept(')');) {
+        binds.push_back(ident());
+        if (!at(')')) expect(',');
+      }
+      if (binds.size() != vd.fields.size()) {
+        std::string fs;
+        for (int f : vd.fields) add(fs, symName(f));
+        failAt(pt.p, pt.line, "@arity %s has %d fields (%s), and the arm names %d", name(vd.sym), (int)vd.fields.size(), fs.c_str(), (int)binds.size());
+      }
+    }
+    callRt2("is@", m.subject, vd.sym);
+    Cond no = truthyCond();
+    thenBegin(no);
+    auto f0 = F->facts;
+    scope([&] {
+      static const int skip = intern("_");
+      for (size_t i = 0; i < binds.size(); i++) {
+        if (binds[i] == skip) continue;
+        ldl(0, m.subject), field(vd.fields[i], false);
+        int h = home();
+        stl(0, h), F->locals.push_back({binds[i], h});
+      }
+      block();
+    });
+    auto f1 = F->facts;
+    bool l1 = F->live;
+    int e = elseBegin(no, true);
+    F->facts = f0, F->live = true;
+    matchArms(m);
+    ifEnd(e);
+    if (!l1) return;
+    if (!F->live) return (void)(F->facts = f1, F->live = true);
+    F->facts &= f1;
+  }
+
   // ---- expressions: result in x0 ----
   LV primary() {
     next();
@@ -794,7 +956,7 @@ struct Compiler : Gen {
       case '{': return mapLit(), LV{};
       case '[': { int base = F->depth, n = exprList(']'); return collect(base, n, H_LIST), LV{}; }
       case T_ID: break;
-      default: failAt(t.p, t.line, t.t == T_EOF ? "@syntax unexpected end of file" : "unexpected '%c'", t.t);
+      default: failAt(t.p, t.line, t.t == T_EOF ? "@syntax unexpected end of file" : "@syntax unexpected '%c'", t.t);
     }
     switch (t.sym) {
       case K_true: return imm(0, TRUE_), LV{};
@@ -843,6 +1005,10 @@ struct Compiler : Gen {
              pubContract, name(prev.sym));
     if (g->kind == 'n' && at('(') && !cur.nl && symName(t.sym) == "print") return next(), printCall(t, *g), LV{};
     if (g->kind == 'f' && at('(') && !cur.nl) return next(), directCall(t, *g), t.sym == F->self || returnsNum(t.sym) ? NUM : LV{};
+    if (g->kind == 'c' && enumDefs.count(t.sym)) {
+      if (at('.') && !cur.nl) return next(), variantValue(t), LV{};
+      if (at('(') && !cur.nl) failAt(t.p, t.line, "@class %s is an enum: make one of its variants, %s.%s", name(t.sym), name(t.sym), name(enumDefs[t.sym].vs.empty() ? t.sym : enumDefs[t.sym].vs[0].raw));
+    }
     if (g->kind == 'c' && at('(') && !cur.nl) return next(), construct(*g), LV{};
     if (g->kind == 'e') return perform(t), LV{};
     if (g->kind == 't') failAt(t.p, t.line, "@not-a-value '%s' is a type: use it after ':' (x: %s)", name(t.sym), name(t.sym));
@@ -1073,6 +1239,7 @@ struct Compiler : Gen {
         case S_expect: if (isExpect()) return expectStmt(), false; break;
         case S_atomic: if (peekIs('{') && !peek().nl) return next(), atomicStmt(), false; break;
         case S_handle: if (peekIs('{') && !peek().nl) return next(), handleStmt(), false; break;
+        case S_match: if (isMatch()) return next(), matchStmt(), false; break;
       }
     LV v = unary();
     int t = cur.t;
@@ -1628,6 +1795,7 @@ struct Compiler : Gen {
       ident();
       Global* g = findGlobal(cd.super = topName(prev).sym);
       if (!g || g->kind != 'c' || cd.super == cd.sym) failAt(prev.p, prev.line, "@class bad superclass '%s'", name(cd.super));
+      if (enumOf(cd.super) >= 0) failAt(prev.p, prev.line, "@class '%s' belongs to an enum: its variants are its only classes (add one to the enum)", name(cd.super));
     }
     expect('{');
     while (!accept('}')) {
@@ -1673,6 +1841,28 @@ struct Compiler : Gen {
     }
     if (auto it = classSpecs.find(cd.sym); it != classSpecs.end() && !it->second.invariants.empty()) invariantMethod(cd, it->second);
     classes.push_back(std::move(cd));
+  }
+  void enumDecl() {
+    int s = qualify(ident());
+    EnumDef& e = enumDefs.at(s);  // the prescan's
+    expect('{');
+    ClassDef base{s, -1, {}};
+    base.sum = 1, classes.push_back(std::move(base));
+    for (size_t i = 0; !accept('}');) {
+      if (accept(',')) continue;
+      ident();
+      ClassDef cd{e.vs[i++].sym, s, {}};
+      cd.sum = 2;
+      if (at('(') && !cur.nl)
+        for (next(); !accept(')');) {
+          int f = ident();
+          Ty ty = accept(':') ? type() : Ty{};
+          if (ty.code && ty.code != TY_ANY) cd.ftypes.push_back({f, ty.code, typeSite("field '" + symName(f) + "' of " + symName(cd.sym), ty.text)});
+          cd.fields.push_back({f, NIL});
+          if (!at(')')) expect(',');
+        }
+      classes.push_back(std::move(cd));
+    }
   }
   // extern ["library"] fn name(type, ...) [: type] -- a C function (a host function in wasm); types: num int long ptr str (and void)
   // extern [lib] fn name(types): result. lib: a C library ("libm.dylib"; none: the program's own symbols, or on
@@ -1938,6 +2128,41 @@ struct Compiler : Gen {
     else classSpec(cls).methods.push_back(m);
     specFns[qn] = std::move(f);
   }
+  // An enum's body, from its '{' (L) to past its '}': declares the enum and each variant (a class, its arity) and
+  // notes their fields, which construction and match compile against.
+  void enumScan(Lexer& L, Tok d) {
+    int raw = pubRaw;
+    bool pub = d.sym < (int)pubSym.size() && pubSym[d.sym];
+    declare(d, 'c', 0);
+    EnumDef& e = enumDefs[d.sym] = {d.sym, {}};
+    e.raw = intern(symName(d.sym).substr(symName(d.sym).rfind('.') + 1));
+    lex(L);  // {
+    for (Tok v = lex(L); v.t != '}'; v = lex(L)) {
+      if (v.t == ',') continue;
+      if (v.t == T_EOF) failAt(v.p, v.line, "@syntax expected '}' to end the enum");
+      if (v.t != T_ID || v.sym < NKW) failAt(v.p, v.line, "@syntax expected a variant: a name, with its fields in parentheses if it has any (Circle(r: num))");
+      for (auto& o : e.vs) if (o.raw == v.sym) failAt(v.p, v.line, "@duplicate duplicate variant '%s'", name(v.sym));
+      VariantDef vd{v.sym, intern(symName(d.sym) + "." + symName(v.sym)), {}};
+      if (Lexer r = L; lex(r).t == '(') {
+        L = r;
+        for (Tok a = lex(L); a.t != ')';) {
+          if (a.t != T_ID || a.sym < NKW) failAt(a.p, a.line, "@syntax expected a field name");
+          for (int f : vd.fields) if (f == a.sym) failAt(a.p, a.line, "@duplicate duplicate field '%s'", name(a.sym));
+          vd.fields.push_back(a.sym);
+          for (int d = 0; a = lex(L), a.t != T_EOF && (d > 0 || (a.t != ',' && a.t != ')'));)  // its type: map<str, num>, {x: num, y: num}
+            d += (a.t == '(' || a.t == '{' || a.t == '[' || a.t == '<') - (a.t == ')' || a.t == '}' || a.t == ']' || a.t == '>') - 2 * (a.t == T_SHR);
+          if (a.t == ',') a = lex(L);
+          else if (a.t != ')') failAt(a.p, a.line, "@syntax expected ')' after the variant's fields");
+        }
+      }
+      Tok vt = v;
+      vt.sym = vd.sym, pubRaw = raw;
+      declare(vt, 'c', (int)vd.fields.size());
+      if (pub) growAt(pubSym, vd.sym) = true;
+      for (int f : vd.fields) mixEnv(uint64_t(vd.sym) << 32 | uint64_t(f) << 2 | 1, raw);
+      e.vs.push_back(std::move(vd));
+    }
+  }
   ClassSpec& classSpec(int cls) {
     auto [it, fresh] = classSpecs.try_emplace(cls);
     if (fresh) it->second.at = classAt[cls].first, it->second.name = symName(classAt[cls].second), classOrder.push_back(cls);
@@ -2002,6 +2227,8 @@ struct Compiler : Gen {
         int n = params();
         effOps[eff].push_back({t.sym, n});
         mixEnv(uint64_t(eff) << 40 | uint64_t(t.sym) << 8 | uint64_t(n), -2);
+      } else if (depth == 0 && afterKw && p.sym == S_enum && !t.nl && t.sym >= NKW && [&] { Lexer s = L; return lex(s).t == '{'; }()) {
+        enumScan(L, q(t));
       } else if (depth == 0 && afterKw && p.sym == S_effect && !t.nl && [&] { Lexer s = L; return lex(s).t == '{'; }()) {
         Tok d = q(t);
         declare(d, 'e', 0);
@@ -2032,6 +2259,7 @@ struct Compiler : Gen {
         Tok d = q(t);
         declare(d, p.sym == K_class ? 'c' : 'v', 0);
         if (p.sym == K_class) {
+          enumDefs.erase(d.sym);  // (an enum by this name before a reload)
           cls = d.sym, classAt[cls] = {{t.p, t.line, file, srcStart}, t.sym};
           Lexer s = L;
           if (lex(s).t == ':') if (Tok n = lex(s); n.t == T_ID) superAt[cls] = {n.p, n.line, file, srcStart};
@@ -2087,7 +2315,7 @@ struct Compiler : Gen {
   bool atPub() {  // `pub` before a top-level declaration (the prescan noted it); elsewhere `pub` is an ordinary name
     if (!atKw(S_pub)) return false;
     Tok n = peek();
-    return n.t == T_ID && !n.nl && (n.sym == K_fn || n.sym == K_class || n.sym == K_var || n.sym == K_extern || n.sym == S_effect || n.sym == K_import || n.sym == S_type);
+    return pubDecl(n);
   }
   void topLevel() {
     while (!at(T_EOF)) {
@@ -2098,6 +2326,7 @@ struct Compiler : Gen {
       if (atKw(K_class)) { next(), classDecl(); if (trace) traceClassDecl(item); continue; }
       if (atKw(K_extern)) { next(), externDecl(); continue; }
       if (atKw(S_effect) && peek().t == T_ID && !peek().nl && peek().sym >= NKW) { next(), effectDecl(); continue; }
+      if (atKw(S_enum) && peek().t == T_ID && !peek().nl && peek().sym >= NKW) { next(), enumDecl(); if (trace) traceEnum(item); continue; }
       if (atKw(S_test) && peekIs(T_STR)) { next(), testDecl(); if (trace) traceCuts.push_back({item, prevEnd}); continue; }
       if (atKw(S_type) && isTypeDecl(lx)) {  // type Name = <type>: checked where it is used, by name
         next();
@@ -2240,6 +2469,13 @@ struct Compiler : Gen {
     }
     std::sort(bodies.begin(), bodies.end());
     traceClass(K, cd.super >= 0 ? symName(cd.super) : "", traceHash(item, prevEnd, bodies));
+  }
+  void traceEnum(const char* item) {  // an enum and its variants: classes whose shape is the enum's text
+    traceCuts.push_back({item, prevEnd});
+    uint64_t h = traceHash(item, prevEnd);
+    int e = -1;
+    for (auto it = classes.rbegin(); it != classes.rend() && e < 0; ++it) if (it->sum == 1) e = it->sym;
+    for (auto& cd : classes) if (cd.sum && (cd.sym == e || cd.super == e)) traceClass(symName(cd.sym), cd.super >= 0 ? symName(cd.super) : "", h);
   }
   void traceFiles() {  // each file's top-level code other than its fns, classes, vars and tests
     std::sort(traceCuts.begin(), traceCuts.end());
@@ -2540,7 +2776,7 @@ struct Compiler : Gen {
     for (auto& cd : classes) {
       Class* c = globalObj<Class>(cd.sym);
       c->super = cd.super >= 0 ? (Class*)global(cd.super).o : nullptr;
-      c->methods = cd.methods, c->fields = cd.fields, c->ftypes = cd.ftypes;
+      c->methods = cd.methods, c->fields = cd.fields, c->ftypes = cd.ftypes, c->sum = cd.sum;
       Locked g(layoutMu);
       size_t n = c->layout.size();
       for (auto& [f, d] : cd.fields) c->layout.add(f);

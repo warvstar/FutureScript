@@ -209,6 +209,25 @@ static std::vector<Decl> declsOf(const std::string& text) {
         out.push_back({eff ? "op" : "method", symName(nm.sym), squash(first.p, e), owner, "", pub, first.line, end, md, cl});
       }
       out[at].end = L.line;
+    } else if (isKw(k, S_enum)) {  // its variants, in order, each with its fields
+      Lexer save = L;
+      Tok n = S.next(), b = S.next();
+      if (n.t != T_ID || b.t != '{') { L = save; continue; }
+      size_t at = out.size();
+      std::string owner = symName(n.sym);
+      out.push_back({"enum", owner, squash(from, b.p), "", "", pub, k.line, k.line, doc, {}});
+      for (Tok v = S.next(); v.t != '}' && v.t != T_EOF; v = S.next()) {
+        if (v.t != T_ID) continue;
+        const char* e = v.p + symName(v.sym).size();
+        if (Lexer r = L; r.next().t == '(') {
+          for (int d = 0;;) {
+            Tok t = S.next();
+            if (t.t == T_EOF || (d += (t.t == '(') - (t.t == ')')) == 0) { e = L.p; break; }
+          }
+        }
+        out.push_back({"variant", symName(v.sym), squash(v.p, e), owner, "", pub, v.line, v.line, docs(src, v.p, ""), {}});
+      }
+      out[at].end = L.line;
     } else if (isKw(k, S_test) && !pub) {
       Lexer save = L;
       Tok n = S.next();
@@ -245,6 +264,10 @@ static void itemsOf(const std::string& text, std::vector<Item>& items) {
     if (d.kind == "fn" && !d.clauses.empty()) {
       std::string c = contract(d.clauses, "  ");
       it.text += "\n" + c.substr(0, c.size() - 1);
+    } else if (d.kind == "enum") {  // its variants, as declared (their order is the enum's)
+      it.text += " {\n";
+      for (size_t j = i + 1; j < ds.size() && ds[j].owner == d.name; j++) it.text += indented(ds[j].doc, "  ") + "  " + ds[j].sig + "\n";
+      it.text += "}";
     } else if (d.kind == "class" || d.kind == "effect") {  // its invariants as written, then fields and methods, each sorted
       std::string invariants;
       std::vector<std::pair<std::string, std::string>> fields, methods;
@@ -296,7 +319,8 @@ static std::string versionIn(const std::string& api) {  // what an interface fil
 // compares. Comments are left out (a change to them alone is reported as such).
 static std::vector<std::string> entries(const std::string& text) {
   std::vector<std::string> e;
-  std::string cls, fn;  // the class (or effect) and the function the lines are in
+  std::string cls, fn;  // the class (or effect, or enum) and the function the lines are in
+  bool variants = false;  // cls is an enum: its lines are variants
   for (size_t i = 0; i < text.size();) {
     size_t j = text.find('\n', i);
     if (j == std::string::npos) j = text.size();
@@ -304,8 +328,10 @@ static std::vector<std::string> entries(const std::string& text) {
     i = j + 1;
     if (l.empty() || l.starts_with("//")) continue;
     if (l.starts_with("pub ")) l = l.substr(4);
-    if (l == "}") cls.clear(), fn.clear();
-    else if ((l.starts_with("class ") || l.starts_with("effect ")) && l.ends_with("{")) {
+    if (l == "}") cls.clear(), fn.clear(), variants = false;
+    else if (variants) e.push_back(cls + " variant " + l);
+    else if ((l.starts_with("class ") || l.starts_with("effect ") || l.starts_with("enum ")) && l.ends_with("{")) {
+      variants = l.starts_with("enum ");
       l = squash(l.data(), l.data() + l.size() - 1), e.push_back(l);
       size_t at = l.find(' ') + 1;
       cls = l.substr(at, l.find(' ', at) - at), fn.clear();
@@ -319,13 +345,14 @@ static std::vector<std::string> entries(const std::string& text) {
   }
   return std::sort(e.begin(), e.end()), e;
 }
-// A change callers may notice: a declaration gone (or changed), a requires added (callers must now meet it), or an
-// ensures or invariant gone (they may have relied on it). An edited clause is one gone and one added. Adding an
-// ensures or invariant, or dropping a requires, is compatible.
+// A change callers may notice: a declaration gone (or changed), a requires added (callers must now meet it), an
+// ensures or invariant gone (they may have relied on it), or a variant added (a match without else no longer covers
+// the enum). An edited clause is one gone and one added. Adding an ensures or invariant, or dropping a requires, is
+// compatible.
 static bool breaks(const std::vector<std::string>& removed, const std::vector<std::string>& added) {
   auto has = [](const std::string& e, const char* w) { return e.find(w) != std::string::npos; };
   for (auto& r : removed) if (!has(r, "() requires ")) return true;  // a declaration, an ensures or an invariant
-  for (auto& a : added) if (has(a, "() requires ")) return true;
+  for (auto& a : added) if (has(a, "() requires ") || has(a, " variant ")) return true;
   return false;
 }
 
@@ -401,7 +428,7 @@ int reportInterfaces(const std::vector<ApiIssue>& issues, bool asJson, const std
       s = "API     " + shown(is.file, program) + ": " +
           (is.status == "missing" ? "has pub declarations but no " + api + " yet; " + fix + "writes it\n"
            : is.status == "stale" ? "has no pub declarations, but " + api + " exists; " + fix + "removes it\n"
-           : is.status == "breaking" ? "its package's interface lost declarations or strengthened a contract, a breaking change, but its version is still " + is.version +
+           : is.status == "breaking" ? "its package's interface lost declarations, strengthened a contract or added a variant, a breaking change, but its version is still " + is.version +
                                            ": set 'version " + is.needs + "' (or later) in its fut.pkg, then " + fix + "updates " + api + "\n"
                                   : "its public interface changed; " + fix + "updates " + api + "\n");
       if (is.status != "missing") {
@@ -418,7 +445,7 @@ int writeInterfaces(const Compiled& c, const std::string& program) {  // fut api
   int n = 0, held = 0;
   for (auto& is : checkInterfaces(c)) {
     if (is.status == "breaking") {
-      printf("not writing %s: its package's interface lost declarations or strengthened a contract, so its version must become at least %s (it is %s)\n", shown(is.api, program).c_str(), is.needs.c_str(), is.version.c_str());
+      printf("not writing %s: its package's interface lost declarations, strengthened a contract or added a variant, so its version must become at least %s (it is %s)\n", shown(is.api, program).c_str(), is.needs.c_str(), is.version.c_str());
       for (auto& r : is.removed) printf("  - %s\n", r.c_str());
       for (auto& a : is.added) printf("  + %s\n", a.c_str());
       held++;

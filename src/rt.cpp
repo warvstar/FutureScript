@@ -235,8 +235,17 @@ static void render(std::string& out, V v, bool quote, std::unordered_set<Obj*>& 
       render(out, x, true, active);
     }
     out += '}';
+  } else if (Inst* in = as<Inst>(v); in->cls->sum == 2) {  // an enum's variant: as constructed, Shape.Circle(2)
+    out += symName(in->cls->name);
+    if (!in->cls->fields.empty()) {
+      out += '(';
+      for (auto& [f, _] : in->cls->fields) {
+        separator();
+        render(out, variantField(in, f), true, active);
+      }
+      out += ')';
+    }
   } else {
-    Inst* in = as<Inst>(v);
     out += symName(in->cls->name);
     out += '{';
     // Declared fields first, the base class's before the subclass's (one never assigned shows its default), then
@@ -271,6 +280,20 @@ std::string toStr(V v, bool quote) {
 static bool equal(V a, V b) {
   if (isNum(a) && isNum(b)) return num(a) == num(b);
   return a == b || (is(a, K::Str) && is(b, K::Str) && as<Str>(a)->sv() == as<Str>(b)->sv());
+}
+V variantField(Inst* in, int s) {
+  int i = in->cls->layout.find(s);
+  V v = i >= 0 && i < in->nslots ? in->slots[i] : ABSENT;
+  return v == ABSENT ? NIL : v;
+}
+// ==: equal, and two values of one enum variant when their fields are (an enum's values are data, compared by value)
+static bool sameValue(V a, V b, int depth = 0) {
+  if (equal(a, b)) return true;
+  if (!is(a, K::Inst) || !is(b, K::Inst) || depth > 200) return false;
+  Inst *x = as<Inst>(a), *y = as<Inst>(b);
+  if (x->cls != y->cls || x->cls->sum != 2) return false;
+  for (auto& [f, d] : x->cls->fields) if (!sameValue(variantField(x, f), variantField(y, f), depth + 1)) return false;
+  return true;
 }
 static std::string_view text(V v, std::string& tmp) { return is(v, K::Str) ? as<Str>(v)->sv() : std::string_view(tmp = toStr(v)); }
 static u32* mapSlot(Map* m, V k) {  // k's index slot, else the slot to insert it at
@@ -367,7 +390,7 @@ static V rt_binop(V a, V b, uint64_t op) {
                        : op == O_SHL ? (in ? int64_t(uint64_t(x) << y) : 0) : x >> (in ? y : 63)));
   }
   if (isNum(a) && isNum(b) && op == O_MOD) return box(num(a) - num(b) * std::floor(num(a) / num(b)));  // the rest ran inline
-  if (op == O_EQ || op == O_NE) return boxb(equal(a, b) == (op == O_EQ));
+  if (op == O_EQ || op == O_NE) return boxb(sameValue(a, b) == (op == O_EQ));
   if (op == O_ADD && (is(a, K::Str) || is(b, K::Str))) {
     std::string x, y;
     volatile V keep[] = {a, b};  // on the stack, so the GC sees the operands while newStr allocates
@@ -958,6 +981,12 @@ void rtInit() {
   method<s_slice>(K::Str, intern("slice")), method<s_find>(K::Str, intern("find")), method<s_split>(K::Str, intern("split"));
   method<s_trim>(K::Str, intern("trim")), method<l_join>(K::List, intern("join")), method<l_slice>(K::List, intern("slice"));
   native<n_parseNum>("parseNum");
+  // match: is@(value, variant class) tests an arm; match@fail(value, enum) is reached when no arm takes the value
+  native<+[](V v, V c) { return boxb(is(v, K::Inst) && is(c, K::Class) && as<Inst>(v)->cls->name == as<Class>(c)->name); }>("is@");
+  native<+[](V v, V e) {
+    ERR("@match match on %s got %s, which is not one of its variants", symName(as<Class>(e)->name).c_str(), toStr(v, true).c_str());
+    return NIL;
+  }>("match@fail");
   method<+[](V m) { return mapList(m, true); }>(K::Map, S_keys);
   method<+[](V m) { return mapList(m, false); }>(K::Map, S_values);
   testInit();

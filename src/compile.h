@@ -95,7 +95,7 @@ template <class Next> void skipType(Lexer& L, Next next) {
 
 inline bool pubDecl(const Tok& t) {
   return t.t == T_ID && !t.nl && (t.sym == K_fn || t.sym == K_class || t.sym == K_var || t.sym == K_extern ||
-                                 t.sym == S_effect || t.sym == K_import || t.sym == S_type);
+                                 t.sym == S_effect || t.sym == S_enum || t.sym == K_import || t.sym == S_type);
 }
 inline bool clauseEnds(int depth, const Tok& prev, const Tok& t) {
   return depth == 0 && prev.t && (t.t == '{' || t.t == '}' || t.nl || t.t == T_EOF);

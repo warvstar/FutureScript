@@ -150,6 +150,7 @@ struct Class : Obj {
   std::vector<std::pair<int, V>> fields;      // fields declared in the class body (`var hp = 10`) and their defaults
   struct FieldType { int sym; uint64_t type; int site; };
   std::vector<FieldType> ftypes;              // declared fields with a type (`var hp: num = 10`): checked on every store
+  uint8_t sum = 0;  // 1: an enum (`enum Shape { ... }`), 2: one of its variants (Shape.Circle): closed, compared by value
   Fn* find(int s) {
     for (Class* c = this; c; c = c->super)
       for (auto [m, f] : c->methods) if (m == s) return f;
@@ -157,7 +158,7 @@ struct Class : Obj {
   }
   // A class that declares fields, or inherits declared ones, is closed: it has exactly those fields. A field
   // never assigned reads as its default. Open classes (no declarations) get fields by assignment.
-  bool closed() { for (Class* c = this; c; c = c->super) if (!c->fields.empty()) return true; return false; }
+  bool closed() { for (Class* c = this; c; c = c->super) if (!c->fields.empty() || c->sum) return true; return false; }
   const FieldType* typed(int s) {
     for (Class* c = this; c; c = c->super)
       for (auto& t : c->ftypes) if (t.sym == s) return &t;
@@ -268,7 +269,7 @@ inline TLS uintptr_t* stackTop;
   X(true) X(false) X(nil) X(self) X(super) X(import) X(extern) X(yield) X(try) X(catch) X(throw)
 #define SYM_ENUM(k) K_##k,
 #define SYM_STR(k) #k,
-#define EXTRA_SYMS(X) X(init) X(main) X(push) X(pop) X(len) X(has) X(remove) X(keys) X(values) X(reload) X(resume) X(send) X(done) X(as) X(test) X(expect) X(throws) X(prints) X(pub) X(override) X(atomic) X(effect) X(handle) X(with) X(requires) X(ensures) X(invariant) X(old) X(result) X(allocs) X(grows) X(like) X(todo) X(spawn) X(type)
+#define EXTRA_SYMS(X) X(init) X(main) X(push) X(pop) X(len) X(has) X(remove) X(keys) X(values) X(reload) X(resume) X(send) X(done) X(as) X(test) X(expect) X(throws) X(prints) X(pub) X(override) X(atomic) X(effect) X(handle) X(with) X(requires) X(ensures) X(invariant) X(old) X(result) X(allocs) X(grows) X(like) X(todo) X(spawn) X(type) X(enum) X(match)
 #define SYM_S(k) S_##k,
 enum { KEYWORDS(SYM_ENUM) NKW, S_FIRST = NKW - 1, EXTRA_SYMS(SYM_S) };
 int intern(std::string_view);
@@ -420,6 +421,7 @@ template <auto f> void native(const char* name) { native(name, callable<f>(), na
 template <auto f> void method(K k, int sym) { method(k, sym, callable<f>(), nargs(f)); }
 void gfxInit(), gfxPump();  // window, drawing, input (gfx.cpp)
 std::string toStr(V, bool quote = false);
+V variantField(Inst* in, int sym);  // an enum variant's field (nil if unset)
 const char* typeName(V);
 extern void (*pollHook)();
 inline TLS jmp_buf* errJmp;

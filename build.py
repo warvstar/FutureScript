@@ -285,7 +285,25 @@ def hot_isolates(exe):
     return ok, f"stdout: {out!r}\n  stderr: {err!r}"
 
 
-HOT_TESTS = [("methods, errors, main restart", hot_methods_and_main),
+def hot_enum(exe):
+    """A variant added while running: the reload fails while a match without else misses it, and patches in once
+    the match has its arm."""
+    prog = ("enum Op { Inc Dec@EXTRA }\n"
+            "fn step(o, n) { match o { Inc { return n + 1 } Dec { return n - 1 }@ARM } }\n"
+            "fn main() { var last = 0\n"
+            "  while true { var v = step(@OP, 5)\n"
+            "    if v != last { print(v) last = v }\n"
+            "    if v == 10 { return }\n"
+            "    sleep(0.01) } }\n")
+    def v(extra, arm, op): return prog.replace("@EXTRA", extra).replace("@ARM", arm).replace("@OP", op)
+    out, err = live(exe, {"a.fut": v("", "", "Op.Inc")},
+                    [("a.fut", v(" Twice", "", "Op.Inc")), ("a.fut", v(" Twice", " Twice { return n * 2 }", "Op.Twice"))])
+    ok = out.split() == ["6", "10"] and "match on Op misses Twice" in err
+    return ok, f"stdout: {out!r}\n  stderr: {err!r}"
+
+
+HOT_TESTS = [("an enum's new variant and an exhaustive match", hot_enum),
+             ("methods, errors, main restart", hot_methods_and_main),
              ("packages: per-package recompiles, JS modules", hot_packages),
              ("a changed effect declaration takes effect", hot_effects),
              ("a changed result type recompiles callers", hot_result_type),
@@ -378,6 +396,13 @@ def runner_api(exe):
     fx = run("test", main)
     ok = ok and fx.returncode == 1 and "  - fn sq(x: num): num\n  + fn sq(x: num): num ! io\n" in fx.stdout
     t = fx
+    enum = lib + "pub enum Op {\n  Add(x: num)\n  Neg\n}\n"  # an enum lists its variants; a new one is a change
+    (d / "lib.fut").write_text(enum), run("api", main)
+    api = (d / "lib.api").read_text()
+    (d / "lib.fut").write_text(enum.replace("  Neg\n", "  Neg\n  Mul(x, y)\n"))
+    en = run("test", main)
+    ok = ok and "pub enum Op {\n  Add(x: num)\n  Neg\n}" in api and en.returncode == 1 and "  + Op variant Mul(x, y)\n" in en.stdout
+    t = en
     return ok, f"missing: {a.stdout!r}\n  api: {w.stdout!r} -> {api!r}\n  after: {b.stdout!r}\n  private edit: {c.stdout!r}\n  changed: {e.stdout!r}\n  json: {j.stdout!r}\n  check: {k.stdout!r}\n  typed: {t.stdout!r}"
 
 

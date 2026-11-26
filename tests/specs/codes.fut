@@ -15,6 +15,7 @@ test "compile errors" {
   expect err("fn f() \{ }\nfn f() \{ }").has(" [duplicate]\n")
   expect err("class A \{ var x = [] }").has(" [class]\n")
   expect err("class A \{ fn m() \{ } }\nclass B : A \{ fn m() \{ } }").has(" [override]\n")
+  expect err("enum E \{ A B }\nfn f(e) \{ match e \{ A \{ } } }").has(" [match]\n")
   expect err("import \"nope.fut\"").has(" [import]\n")
   expect err("extern fn no_such_fn_xyz(): num").has(" [extern]\n")
   var ps = "p0"

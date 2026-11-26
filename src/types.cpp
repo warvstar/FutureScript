@@ -149,6 +149,10 @@ static std::string describe(V v) {  // the value a check rejected, for its messa
     std::string s = toStr(v, true);
     return "the string " + (s.size() > 40 ? s.substr(0, 37) + "...\"" : s);
   }
+  if (is(v, K::Inst) && as<Inst>(v)->cls->sum == 2) {  // an enum's value: as made (Shape.Rect(3, 4))
+    std::string s = toStr(v);
+    return s.size() > 40 ? s.substr(0, 37) + "..." : s;
+  }
   if (is(v, K::Inst)) return "an instance of " + symName((int)as<Inst>(v)->cls->name);
   if (is(v, K::Class)) return "the class " + symName((int)as<Class>(v)->name);
   return std::string("a ") + typeName(v);

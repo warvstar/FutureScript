@@ -89,7 +89,30 @@ expect Sq(3).area() == 9
 expect throws { Sq(1).sid = 2 }
 ```
 
-`class` declarations are top level only. A nested `fn g(x) { ... }` declares a local closure that can call itself by name. `main()` runs after top level; `reload()` after each hot reload. Arity is checked. Overrides keep param count and types.
+## Enums, match
+
+```fut
+enum Expr {
+  Num(v: num)
+  Add(a: Expr, b: Expr)
+  Zero
+}
+fn eval(e: Expr): num {
+  match e {                        // no else: an arm per variant, or a compile error [match]
+    Num(v) { return v }
+    Add(a, b) { return eval(a) + eval(b) }
+    Zero { return 0 }
+  }
+}
+expect eval(Expr.Add(Expr.Num(2), Expr.Zero)) == 2
+expect Expr.Num(1) == Expr.Num(1)  // by value; prints as made: Expr.Num(1)
+var e: Expr.Num = Expr.Num(3)      // Expr and Expr.Num are types; e.v reads a field
+match e { Expr.Num(_) { } else { } }   // _ skips a field; Num alone binds none; else takes the rest
+```
+
+`match` is a statement. A value that is no variant of the enum raises [match]. Variants with no fields are single values. Adding a variant to a pub enum is a breaking change.
+
+`class` and `enum` declarations are top level only. A nested `fn g(x) { ... }` declares a local closure that can call itself by name. `main()` runs after top level; `reload()` after each hot reload. Arity is checked. Overrides keep param count and types.
 
 ## Types, effects
 

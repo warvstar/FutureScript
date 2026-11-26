@@ -31,6 +31,7 @@ const ErrCode codes[] = {
     {"atomic", "Something that can't be undone (io, yield) happens inside atomic { }.", "Do it after the block, or handle the io inside the block."},
     {"effect", "A function performs or calls something its declared effects don't allow.", "Add the effect to the declaration (and its callers'), or handle it."},
     {"unhandled", "An operation of a declared effect is performed with no handler for it.", "Wrap the call in handle { } with Effect.op(...) { }."},
+    {"match", "A match leaves out variants of its enum with no else arm, or its value is not one of the enum's variants.", "Add an arm for each variant the message lists (or else { }), and match only values of that enum."},
     {"no-field", "A field is read or written that the object doesn't have (or, in a closed class, didn't declare).", "Declare it in the class (var name) or the shape, or fix the spelling."},
     // run time
     {"operand", "An operator got operand types it doesn't take.", "Convert first: str(x) for text, int(x) for whole numbers; check for nil."},

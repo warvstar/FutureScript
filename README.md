@@ -103,6 +103,29 @@ class Mage : Unit {
 - **Fields** are created by assignment (`self.w = w`) unless the class declares them. A class that declares a field, or inherits one, is **closed**: it has exactly the declared fields. A typo such as `self.hpp = 3` is a compile error inside the class's own methods and a runtime error elsewhere, instead of silently creating a field that nothing reads. A field never assigned reads as its default. Instances that already exist get the default when hot reload adds a declared field.
 - **`override`** is required on a method that replaces a superclass's method, and is an error on one that doesn't. A subclass method can't silently replace a base method that is added later, and renaming or removing a base method can't leave subclass methods quietly orphaned. An overriding method must take as many parameters as the method it replaces. `init` is exempt.
 
+## Enums and match
+
+```
+enum Shape {
+  Circle(r: num)
+  Rect(w: num, h: num)
+  Empty
+}
+fn area(s: Shape): num {
+  match s {
+    Circle(r) { return 3.14159 * r * r }
+    Rect(w, h) { return w * h }
+    Empty { return 0 }
+  }
+}
+print(area(Shape.Rect(3, 4)))   // 12
+print(Shape.Circle(2))          // Shape.Circle(2)
+```
+
+- **Variants** are made by name, `Shape.Circle(2)`, with their fields in order; a variant with no fields (`Shape.Empty`) is a single value. Each variant is a closed class (`Shape.Circle`) under a closed class `Shape` that nothing else can extend, so both are types (`fn f(s: Shape)`, `var c: Shape.Circle`), field types are checked like a class's, and `s.r` reads a field. Variants compare by value with `==` and `expect`, and print as they are made.
+- **`match`** takes a value apart: an arm per variant, `Circle(r)` binding its fields in order (`_` skips one), `Circle` binding none, `Shape.Circle(r)` when the name is ambiguous, and `else { }` last for the rest. A match without `else` must cover every variant: a missing one is a compile error naming it, so adding a variant points at every match that needs an arm (a hot reload that adds one waits for them). A value that is not one of the enum's variants raises `[match]`.
+- In a package, adding a variant to a pub enum is a breaking change, like removing a declaration: matches without `else` in its users stop compiling.
+
 ## Types
 
 Types are optional. Code without them is as dynamic as ever. Where one is written, on a parameter, a result, a declared field or a var, it is checked at run time at that boundary.
