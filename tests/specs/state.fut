@@ -57,3 +57,15 @@ test "a field named like a state field, on a record or another class, is plain" 
   expect p.stage == "sowned"
   expect "{p.stage} and {rec.stage}" == "sowned and label!"
 }
+fn counter() {
+  state n = 10
+  n += 1
+  return fn() { n += 1 return "n is {n}" }
+}
+test "state in a function: its own signal, per call" {
+  var a = counter()
+  var b = counter()
+  expect a() == "n is 12"
+  expect a() == "n is 13"
+  expect b() == "n is 12"
+}

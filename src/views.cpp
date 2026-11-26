@@ -166,8 +166,8 @@ struct Views {
       Tok n2 = peek(t.e);
       if (word == "if") { ifBlock(n); continue; }
       if (word == "for") { forBlock(n); continue; }
-      if (word == "var") {  // a local: var x = e
-        take(), out += "var";
+      if (word == "var" || (word == "state" && n2.k == 'i')) {  // a local: var x = e, state x = e
+        take(), out += word;
         Tok name = take();
         out += s.substr(name.tb, name.e - name.tb);
         expect("=");
@@ -181,7 +181,8 @@ struct Views {
         continue;
       }
       if (t.k == 'i' && !assignOp(s, n2) && !((is(s, n2, "(") || is(s, n2, ".")) && !n2.sp())) { element(n); continue; }
-      out += expr(false);  // a statement: x = 1, f(x)
+      if (!assignOp(s, peek(exprEnd(i, false)))) { out += k + ".push(" + live(expr(false)) + ")"; continue; }  // a call: its result, kept current
+      out += expr(false);  // an assignment: x = 1, t.done = true
       if (Tok a = peek(); assignOp(s, a)) { take(), out += s.substr(a.tb, a.e - a.tb) + expr(false); }
     }
   }
@@ -319,6 +320,9 @@ struct State {
   std::vector<Tok> t;
   std::vector<size_t> match;  // each bracket's partner
   std::vector<bool> quiet;    // a fn's parameters, and names a local or parameter shadows: not the state
+  std::vector<size_t> encl;   // each token's innermost enclosing `{`
+  struct Local { std::string name; size_t from, to; };
+  std::vector<Local> locals;  // state in a function or view: its name, to its block's end
   std::string out;
   struct ClassBody { std::vector<std::pair<std::string, std::string>> fields; bool hasInit = false; };
   std::map<size_t, ClassBody> classes;  // by the index of its `{`
@@ -335,7 +339,7 @@ struct State {
       if (opener(s, t[j])) open.push_back(j);
       else if (closer(s, t[j]) && !open.empty()) match[open.back()] = j, match[j] = open.back(), open.pop_back();
     }
-    std::vector<size_t> encl(t.size(), SIZE_MAX);  // each token's innermost enclosing `{`
+    encl.assign(t.size(), SIZE_MAX);
     for (size_t j = 0, cur = SIZE_MAX; j < t.size(); j++) {
       encl[j] = cur;
       if (is(s, t[j], "{")) cur = j;
@@ -381,7 +385,9 @@ struct State {
       else if (closer(s, t[j])) depth--;
       if (!is(s, t[j], "state") || t[j + 1].k != 'i' || t[j + 1].nl) continue;
       if (depth == 0) tops.insert(textOf(s, t[j + 1]));
-      else if (depth == 1 && !body.empty() && j > body.back() && j < match[body.back()]) {
+      else if (!(depth == 1 && !body.empty() && j > body.back() && j < match[body.back()])) {
+        if (encl[j] != SIZE_MAX) locals.push_back({textOf(s, t[j + 1]), j + 1, match[encl[j]]});
+      } else {
         std::string def = "nil";
         if (is(s, t[j + 2], "=")) def = textOf(s, t[j + 3]);
         classes[body.back()].fields.push_back({textOf(s, t[j + 1]), def});
@@ -407,13 +413,17 @@ struct State {
       value = depth == 0 && operandEnd(s, k);
     }
   }
+  bool localAt(const std::string& name, size_t j) const {
+    for (auto& l : locals) if (l.name == name && j >= l.from && j < l.to) return true;
+    return false;
+  }
   const ClassBody* inClass(size_t j) const {
     for (auto& [b, c] : classes) if (j > b && j < match[b]) return &c;
     return nullptr;
   }
   std::string inits(const ClassBody& c) {
     std::string r;
-    for (auto& [f, d] : c.fields) r += " self." + f + " = _state.signal(" + d + ")";
+    for (auto& [f, d] : c.fields) r += " self." + f + " = _state.cell(" + d + ")";
     return r;
   }
   // The first token of the value `.name` at j is read from: `a`, `a.b`, `f(x)[i]`, `(e)`.
@@ -453,7 +463,7 @@ struct State {
       if (is(s, k, "state") && j + 1 < t.size() && t[j + 1].k == 'i' && !t[j + 1].nl) {
         std::string name = textOf(s, t[j + 1]);
         const ClassBody* in = inClass(j);
-        if (in && fields.count(name)) {  // a field: made in init
+        if (in && fields.count(name) && !localAt(name, j + 1)) {  // a field: made in init
           size_t e = j + 2 + (is(s, t[j + 2], "=") ? 2 : 0);
           std::string gone;
           for (size_t q = j + 1; q < e; q++) gone += s.substr(t[q].tb, t[q].b - t[q].tb);
@@ -461,8 +471,8 @@ struct State {
           j = e - 1;
           continue;
         }
-        if (!in && tops.count(name)) {
-          out += pre + "var " + name + " = _state.signal(";
+        if ((!in && tops.count(name)) || localAt(name, j + 1)) {
+          out += pre + "var " + name + " = _state.cell(";
           size_t e = j + 2;
           if (is(s, t[e], "=")) { size_t x = exprEnd(e + 1); out += s.substr(t[e].tb, t[e].b - t[e].tb); emit(e + 1, x), e = x; }
           else out += "nil";
@@ -515,7 +525,7 @@ struct State {
             continue;
           }
         }
-        if (((member && fields.count(name)) || (!member && tops.count(name))) && !key && !decl) {
+        if (((member && fields.count(name)) || (!member && (tops.count(name) || localAt(name, j)))) && !key && !decl) {
           out += pre + name;
           const Tok& op = t[j + 1];
           if (assignOp(s, op)) {
@@ -530,11 +540,11 @@ struct State {
           continue;
         }
       }
-      if (k.k == 's') { out += pre + interpolate(textOf(s, k)); continue; }
+      if (k.k == 's') { out += pre + interpolate(textOf(s, k), j); continue; }
       out += pre + textOf(s, k);
     }
   }
-  std::string interpolate(const std::string& str) {  // state read in a string's {holes}
+  std::string interpolate(const std::string& str, size_t at) {  // state read in a string's {holes}
     std::string r;
     for (size_t j = 0; j < str.size(); j++) {
       if (str[j] == '\\') { r += str.substr(j, 2), j++; continue; }
@@ -544,6 +554,7 @@ struct State {
       std::string inner = str.substr(j + 1, e - j - 2);
       State in(inner);
       in.tops = tops, in.fields = fields;
+      for (auto& l : locals) if (at >= l.from && at < l.to) in.tops.insert(l.name);
       in.emit(0, in.t.size());
       r += "{" + in.out + "}";
       j = e - 1;

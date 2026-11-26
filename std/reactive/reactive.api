@@ -3,6 +3,8 @@
 // f(), with the effects that its changes rerun run once, after it.
 pub fn batch(f: fn)
 
+pub fn cell(v): Signal
+
 // A signal that holds f(), recomputed when what f read changes.
 pub fn computed(f: fn): Signal
 

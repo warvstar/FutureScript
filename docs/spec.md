@@ -213,7 +213,7 @@ the isolates to end.
 - `std/math`: pow exp log log2 log10 cbrt hypot sin cos tan asin acos atan atan2 ceil trunc abs min max clamp sign round isNaN pi e
 - `std/reactive`: signal(v) (.get .set .update .peek) effect computed batch untrack onCleanup root — effects rerun when a signal read on their last run changes
 - `std/ui` (wasm): el(tag, props, kids) mount(sel|node, view) each(items, key, view) field(sig, props) check(sig, label, props) button(label, f) style(css) find htmlOf trigger; a fn child/prop stays current; `on<event>` props: handlers given {type, value, checked, key}; write `"class"`
-- `state x = v` (top level) / `state f` (class field): a signal read as `x`, set by `x = v`/`x += v`. `view V(a) { ... }`: fn returning nodes; body: `row .c .on: cond attr: v { text "x{y}" button "b" on click { ... } check "l" bind: s  if c { } else { }  for t in ts key t.id { Row(t) } }`; holes stay current. `mount(V)`: into #ui or body, with the theme. Tags: any HTML, row column text field check
+- `state x = v` (top level) / `state f` (class field): a signal read as `x`, set by `x = v`/`x += v`. `view V(a) { ... }`: fn returning nodes; body: `row .c .on: cond attr: v { text "x{y}" button "b" on click { ... } check "l" bind: s  if c { } else { }  for t in ts key t.id { Row(t) } }`; holes stay current. `mount(V)`: into #ui or body, with the theme. Tags: any HTML or SVG, row column text field check link (`link to: "/p" "Text"`). A call on its own line is a child; `state` in a view or fn is its own; `state x = e` uses e if it's a signal. std/ui: `load(url|fn)` -> data() error() loading() reload(); every(s, f) after(s, f); path() go(p) at("/x/:id"); persist(key, v); lineChart barChart sparkline svg
 
 ```fut
 import "std/lists"

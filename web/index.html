@@ -7,17 +7,17 @@
 <style>
   :root { color-scheme: dark; --bg: #14141c; --fg: #d8d8e0; --dim: #7a7a8c; --err: #ff7a7a; --line: #2a2a38; }
   body { margin: 0; background: var(--bg); color: var(--fg); font: 13px/1.45 ui-monospace, Menlo, monospace; display: flex; flex-direction: column; height: 100vh; }
-  header { padding: 8px 16px; border-bottom: 1px solid var(--line); color: var(--dim); }
-  header b { color: var(--fg); }
-  main { flex: 1; display: flex; gap: 16px; padding: 16px; min-height: 0; flex-wrap: wrap; }
+  body > header { padding: 8px 16px; border-bottom: 1px solid var(--line); color: var(--dim); }
+  body > header b { color: var(--fg); }
+  body > main { flex: 1; display: flex; gap: 16px; padding: 16px; min-height: 0; flex-wrap: wrap; }
   #ui { flex: 3; min-width: 280px; overflow: auto; font: 15px/1.5 system-ui, sans-serif; } #ui:empty { display: none; }
   #ui:not(:empty) ~ #side { flex: 0 1 280px; }  /* a page gets the room; the output stays beside it */
-  main:has(#ui:not(:empty)) { flex-wrap: nowrap; }  /* one line: the page's height is the window's, so it can scroll inside */
-  canvas { image-rendering: pixelated; background: #000; display: none; align-self: flex-start; width: min(640px, 100%); outline: none; }
+  body > main:has(#ui:not(:empty)) { flex-wrap: nowrap; }  /* one line: the page's height is the window's, so it can scroll inside */
+  #screen { image-rendering: pixelated; background: #000; display: none; align-self: flex-start; width: min(640px, 100%); outline: none; }
   #side { flex: 1; min-width: 280px; display: flex; flex-direction: column; min-height: 0; }
   #out { flex: 1; margin: 0; overflow: auto; white-space: pre-wrap; word-break: break-word; }
   .e { color: var(--err); }
-  form { display: flex; border-top: 1px solid var(--line); padding-top: 8px; }
+  #form { display: flex; border-top: 1px solid var(--line); padding-top: 8px; }
   #prompt { color: var(--dim); padding-right: 6px; }
   #in { flex: 1; background: none; border: 0; color: var(--fg); font: inherit; outline: none; }
 </style>

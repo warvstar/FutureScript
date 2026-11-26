@@ -119,6 +119,10 @@ pub fn val(x) {
   if isa(x, Signal) { return x.get() }
   return x
 }
+pub fn cell(v): Signal {  // `state x = e`: e's signal if it is one (computed(), ui.persist()), else a new one
+  if isa(v, Signal) { return v }
+  return Signal(v)
+}
 pub fn store(old, v) {
   if isa(old, Signal) { old.set(v) return old }
   return v

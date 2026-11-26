@@ -49,6 +49,36 @@ export function fire(n, type, data) {  // as a user would: set what they typed o
   n.dispatchEvent(globalThis.document ? new KeyboardEvent(type, { bubbles: true, key: data?.key ?? "" }) : { type, target: n, key: data?.key });
 }
 
+// ---- data, timers, the address, storage, SVG ----
+const fakes = new Map();  // url -> response, for tests and demos without a server
+export const fake = (url, res) => void fakes.set(url, typeof res == "string" ? { status: 200, body: res, headers: {} } : res);
+const later = (f, ...a) => { const p = f(...a); if (p && typeof p.catch == "function") p.catch(() => {}); };
+export function request(req, f) {  // fetch, then f({status, body, headers}), or f({status: 0, error}): fut goes on meanwhile
+  const url = typeof req == "string" ? req : req.url;
+  if (fakes.has(url)) return void Promise.resolve().then(() => later(f, fakes.get(url)));
+  const init = typeof req == "string" ? {} : { method: req.method ?? "GET", headers: req.headers ?? undefined, body: req.body ?? undefined };
+  fetch(url, init).then(async (x) => later(f, { status: x.status, body: await x.text(), headers: Object.fromEntries(x.headers) }),
+    (e) => later(f, { status: 0, error: String(e?.message ?? e) }));
+}
+export function timer(ms, repeat, f) {  // an id for stopTimer; under Node it doesn't keep the process alive
+  const t = (repeat ? setInterval : setTimeout)(() => later(f), ms);
+  t?.unref?.();
+  return t;
+}
+export const stopTimer = (t) => void (clearInterval(t), clearTimeout(t));
+let fakeHash = "";
+const hashFns = [];
+export const hash = () => decodeURIComponent(globalThis.location ? location.hash.slice(1) : fakeHash);
+export function setHash(h) {
+  if (globalThis.location) location.hash = h;
+  else if (h != fakeHash) { fakeHash = h; for (const f of hashFns) later(f); }
+}
+export function onHash(f) { globalThis.location ? addEventListener("hashchange", () => later(f)) : hashFns.push(f); }
+const mem = new Map();
+export function stored(k) { try { return globalThis.document && globalThis.localStorage ? localStorage.getItem(k) : mem.get(k) ?? null; } catch { return null; } }
+export function store(k, v) { try { globalThis.document && globalThis.localStorage ? localStorage.setItem(k, v) : mem.set(k, v); } catch {} }
+export const createSvg = (tag) => doc.createElementNS ? doc.createElementNS("http://www.w3.org/2000/svg", tag) : doc.createElement(tag);
+
 // ---- a document for Node: elements, text, comments and fragments; attributes; listeners; outerHTML ----
 function fakeDocument() {
   const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");

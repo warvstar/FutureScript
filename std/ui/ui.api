@@ -1,5 +1,16 @@
 // The public interface of package ui 0.1.0 (ui.fut), written by `fut api`. `fut test` fails while it is out of date.
 
+// f() once, after so many seconds (unless stopped first).
+pub fn after(seconds: num, f: fn): fn
+
+// The path's parts if it matches pattern, else nil: "/hosts/:id" matches "/hosts/web-1" as {id: "web-1"}; a last "*"
+// matches the rest. Followed as a signal is, so a view's `if ui.at("/x") { }` follows the address.
+pub fn at(pattern: str)
+
+// A bar per item, across, each with its label and value: items is a list (or a function of one) of {label, value}.
+// opts: nil, or {unit} (shown after each value).
+pub fn barChart(items, opts): any
+
 // A button that calls onclick.
 pub fn button(label, onclick: fn): any
 
@@ -16,10 +27,16 @@ pub fn each(items: fn, key: fn, view: fn): fn
 // An element: its tag, its props (a map, or nil), and its children (one child or a list).
 pub fn el(tag: str, props, kids): any
 
+// f() every so many seconds, from now until the returned function is called or the view that made it goes away.
+pub fn every(seconds: num, f: fn): fn
+
 // A text field showing s (a signal), which typing sets.
 pub fn field(s: r.Signal, props): any
 
 pub fn find(selector: str): any
+
+// Go to path p (the address becomes #p).
+pub fn go(p: str)
 
 // The HTML a node is now, and an event on it as a user would cause it ({value} typed, {checked} ticked): for tests.
 pub fn htmlOf(n): str
@@ -27,18 +44,54 @@ pub fn htmlOf(n): str
 // The list f fills: a view's block of children.
 pub fn kids(f: fn): any
 
-// An element of a view: an HTML tag, or one of fut's own (row, column, text, field, check), with props (bind: a
-// signal the element shows and sets) and children.
+// Lines over shared x labels: series is a list (or a function of one) of {label, values} (values: numbers, one per x
+// label); opts: {labels: [...x labels], height} (labels may be a function too). A legend, a y axis from 0, and
+// gridlines come with it; colors come from --c1..--c6.
+pub fn lineChart(series, opts): any
+
+// A Resource for source(): a URL, a request ({url, method, headers, body}), or nil (nothing yet). It fetches again when
+// what source read changes. source may be a URL as it is.
+pub fn load(source): Resource
+
+// An element of a view: an HTML or SVG tag, or one of fut's own (row, column, text, field, check, link), with props
+// (bind: a signal the element shows and sets) and children.
 pub fn make(tag: str, props, kids): any
 
 // Show view() in target (a selector or a node), replacing what was there. The returned function takes it down: its
 // effects stop.
 pub fn mount(target, view: fn): fn
 
-// Show view() on the page (web/index.html's #ui, else the body), with fut's theme under the page's own styles.
+// The page's path (the address after #, "/" if none), followed as a signal is.
+pub fn path(): str
+
+// A signal that starts as what was saved under key (else v), and saves each new value: `state theme = ui.persist(...)`.
+pub fn persist(key: str, v): r.Signal
+
+// What load() is fetching, and what came back: data() (JSON parsed, else text), error() (nil, or what went wrong) and
+// loading(), each followed as a signal is. The last data stays while a new request runs.
+pub class Resource {
+  fn data()
+  fn error()
+  fn init(source)
+  fn loading()
+  fn reload()
+  fn send(req)
+}
+
+// What load() gets for url from now on (text, or {status, body}), instead of the network: for tests and demos.
+pub fn respond(url: str, res)
+
+// Show view() on the page (web/index.html's #ui, else the body), with fut's theme under the page's own styles. The
+// page shown before (as a reload shows it again) is taken down first: its effects and timers stop.
 pub fn show(view: fn): fn
+
+// A small line of values, no axes: the trend beside a number. values: a list, or a function of one.
+pub fn sparkline(values, props): any
 
 // A style sheet for the page.
 pub fn style(sheet: str)
+
+// An SVG element (tag, props, kids), as el() makes HTML ones. "label" makes SVG's <text>.
+pub fn svg(tag: str, props, kids): any
 
 pub fn trigger(n, event: str, data)

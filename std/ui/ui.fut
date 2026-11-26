@@ -27,6 +27,16 @@ extern dom fn css(str): void
 extern dom fn base(str): void
 extern dom fn html(any): str
 extern dom fn fire(any, str, any): void
+extern dom fn fake(str, any): void
+extern dom fn request(any, fn): void
+extern dom fn timer(num, any, fn): any
+extern dom fn stopTimer(any): void
+extern dom fn hash(): str
+extern dom fn setHash(str): void
+extern dom fn onHash(fn): void
+extern dom fn stored(str): any
+extern dom fn store(str, str): void
+extern dom fn createSvg(str): any
 
 // What kind of child v is: "none" (nil, false, true), "text" (a string or number), "fn", "list" or "node".
 fn kindOf(v) {
@@ -173,6 +183,271 @@ pub fn htmlOf(n): str { return html(n) }
 pub fn find(selector: str): any { return query(selector) }
 pub fn trigger(n, event: str, data) { fire(n, event, data) }
 
+// ---- data ----
+
+// What load() is fetching, and what came back: data() (JSON parsed, else text), error() (nil, or what went wrong) and
+// loading(), each followed as a signal is. The last data stays while a new request runs.
+pub class Resource {
+  fn init(source) {
+    self.value = r.signal(nil)
+    self.err = r.signal(nil)
+    self.busy = r.signal(false)
+    self.seq = 0
+    self.source = source
+    var me = self
+    r.effect(fn() { me.send(source()) })
+  }
+  fn send(req) {
+    if req == nil { return }
+    self.seq += 1
+    var mine = self.seq
+    var me = self
+    self.busy.set(true)
+    request(req, fn(res) {
+      if mine != me.seq { return }  // a newer request is on its way
+      r.batch(fn() {
+        me.busy.set(false)
+        if res.status >= 200 && res.status < 300 { me.err.set(nil) me.value.set(decode(res.body)) }
+        else if res.status == 0 { me.err.set(res.error) }
+        else { me.err.set("the server answered {res.status}") }
+      })
+    })
+  }
+  fn data() { return self.value.get() }
+  fn error() { return self.err.get() }
+  fn loading() { return self.busy.get() }
+  fn reload() { self.send(r.untrack(self.source)) }  // again, as it is now
+}
+fn decode(body) {
+  var b = body.trim()
+  if b.slice(0, 1) == "\{" || b.slice(0, 1) == "[" {
+    try { return parseJson(b) } catch e { return body }
+  }
+  return body
+}
+
+// A Resource for source(): a URL, a request ({url, method, headers, body}), or nil (nothing yet). It fetches again when
+// what source read changes. source may be a URL as it is.
+pub fn load(source): Resource {
+  if kindOf(source) == "fn" { return Resource(source) }
+  return Resource(fn() { return source })
+}
+
+// What load() gets for url from now on (text, or {status, body}), instead of the network: for tests and demos.
+pub fn respond(url: str, res) { fake(url, res) }
+
+// ---- time ----
+
+// f() every so many seconds, from now until the returned function is called or the view that made it goes away.
+pub fn every(seconds: num, f: fn): fn { return ticker(seconds, true, f) }
+// f() once, after so many seconds (unless stopped first).
+pub fn after(seconds: num, f: fn): fn { return ticker(seconds, false, f) }
+fn ticker(seconds, repeat, f) {
+  var t = timer(seconds * 1000, repeat, fn() { r.batch(f) })
+  var stop = fn() { stopTimer(t) }
+  r.onCleanup(stop)
+  return stop
+}
+
+// ---- the address: #/path ----
+
+var route = nil
+fn routeSignal() {
+  if route == nil {
+    route = r.signal(pathOf(hash()))
+    onHash(fn() { route.set(pathOf(hash())) })
+  }
+  return route
+}
+fn pathOf(h) {
+  if h == "" { return "/" }
+  return h
+}
+// The page's path (the address after #, "/" if none), followed as a signal is.
+pub fn path(): str { return routeSignal().get() }
+// Go to path p (the address becomes #p).
+pub fn go(p: str) { setHash(p) }
+// The path's parts if it matches pattern, else nil: "/hosts/:id" matches "/hosts/web-1" as {id: "web-1"}; a last "*"
+// matches the rest. Followed as a signal is, so a view's `if ui.at("/x") { }` follows the address.
+pub fn at(pattern: str) {
+  var want = parts(pattern)
+  var got = parts(path())
+  var found = {}
+  var i = 0
+  while i < want.len() {
+    var w = want[i]
+    if w == "*" { found["*"] = got.slice(i, got.len()).join("/") return found }
+    if i >= got.len() { return nil }
+    if w.slice(0, 1) == ":" { found[w.slice(1, w.len())] = got[i] }
+    else if w != got[i] { return nil }
+    i += 1
+  }
+  if i != got.len() { return nil }
+  return found
+}
+fn parts(p) {
+  var out = []
+  for x in p.split("/") { if x != "" { out.push(x) } }
+  return out
+}
+
+// ---- storage ----
+
+// A signal that starts as what was saved under key (else v), and saves each new value: `state theme = ui.persist(...)`.
+pub fn persist(key: str, v): r.Signal {
+  var saved = stored(key)
+  var s = r.signal(v)
+  if saved != nil {
+    try { s.set(parseJson(saved)) } catch e { }
+  }
+  r.root(fn() { r.effect(fn() { store(key, json(s.get())) }) })
+  return s
+}
+
+// ---- SVG and charts ----
+
+var SVG_TAGS = {svg: true, g: true, path: true, line: true, polyline: true, polygon: true, rect: true, circle: true,
+  ellipse: true, defs: true, linearGradient: true, stop: true, title: true}
+
+// An SVG element (tag, props, kids), as el() makes HTML ones. "label" makes SVG's <text>.
+pub fn svg(tag: str, props, kids): any {
+  var t = tag
+  if t == "label" { t = "text" }
+  var n = createSvg(t)
+  if props != nil { for k in props { prop(n, k, props[k]) } }
+  add(n, kids)
+  return n
+}
+
+fn now(v) {
+  if kindOf(v) == "fn" { return v() }
+  return v
+}
+fn fmt(v) {  // short numbers for axes: 1200 -> 1.2k
+  var a = v
+  if a < 0 { a = -a }
+  if a >= 1000000 { return "{floor(v / 100000) / 10}M" }
+  if a >= 1000 { return "{floor(v / 100) / 10}k" }
+  if a == floor(a) { return "{v}" }
+  return "{floor(v * 10) / 10}"
+}
+fn niceMax(m) {  // a round number at or above m, for an axis's top
+  if m <= 0 { return 1 }
+  var step = 1
+  while step * 10 <= m { step *= 10 }
+  while step > m { step /= 10 }
+  for k in [1, 2, 2.5, 5, 10] { if step * k >= m { return step * k } }
+  return step * 10
+}
+
+// A small line of values, no axes: the trend beside a number. values: a list, or a function of one.
+pub fn sparkline(values, props): any {
+  return el("span", withClass(orEmpty(props), "spark"), fn() {
+    var vs = now(values)
+    if vs.len() < 2 { return nil }
+    var lo = vs[0]
+    var hi = vs[0]
+    for v in vs { if v < lo { lo = v } if v > hi { hi = v } }
+    if hi == lo { hi = lo + 1 }
+    var pts = ""
+    var i = 0
+    for v in vs {
+      pts += "{floor(i * 1000 / (vs.len() - 1)) / 10},{floor((28 - (v - lo) * 26 / (hi - lo)) * 10) / 10} "
+      i += 1
+    }
+    return svg("svg", {viewBox: "0 0 100 30", preserveAspectRatio: "none"}, [svg("polyline", {points: pts}, nil)])
+  })
+}
+fn orEmpty(props) {
+  if props == nil { return {} }
+  return props
+}
+
+// Lines over shared x labels: series is a list (or a function of one) of {label, values} (values: numbers, one per x
+// label); opts: {labels: [...x labels], height} (labels may be a function too). A legend, a y axis from 0, and
+// gridlines come with it; colors come from --c1..--c6.
+pub fn lineChart(series, opts): any {
+  return el("div", {"class": "chart"}, fn() { return plot(now(series), now(opts.labels), opts) })
+}
+// A bar per item, across, each with its label and value: items is a list (or a function of one) of {label, value}.
+// opts: nil, or {unit} (shown after each value).
+pub fn barChart(items, opts): any {
+  return el("div", {"class": "chart bars"}, fn() {
+    var list = now(items)
+    var hi = 0
+    for it in list { if it.value > hi { hi = it.value } }
+    if hi == 0 { hi = 1 }
+    var unit = ""
+    if opts != nil && opts.has("unit") { unit = opts.unit }
+    var rows = []
+    for it in list {
+      rows.push(el("div", {"class": "bar-row", title: "{it.label}: {it.value}{unit}"}, [
+        el("span", {"class": "bar-name"}, it.label),
+        el("span", {"class": "bar-track"}, el("i", {style: "width: {floor(it.value * 1000 / hi) / 10}%"}, nil)),
+        el("span", {"class": "bar-value"}, "{fmt(it.value)}{unit}")]))
+    }
+    return rows
+  })
+}
+
+fn plot(series, labels, opts) {
+  var w = 600
+  var h = 220
+  if opts != nil && opts.has("height") { h = opts.height }
+  var left = 40
+  var bottom = 22
+  var top = 8
+  var ph = h - bottom - top
+  var pw = w - left - 8
+  var hi = 0
+  var n = 0
+  for s in series { for v in s.values { if v > hi { hi = v } } if s.values.len() > n { n = s.values.len() } }
+  hi = niceMax(hi)
+  var kids = []
+  for k in [0, 1, 2, 3, 4] {  // gridlines and the y axis
+    var y = top + ph - ph * k / 4
+    kids.push(svg("line", {x1: left, x2: w - 8, y1: y, y2: y, "class": "grid"}, nil))
+    kids.push(svg("label", {x: left - 6, y: y + 4, "class": "tick", "text-anchor": "end"}, fmt(hi * k / 4)))
+  }
+  var skip = 1
+  while n / skip > 8 { skip += 1 }
+  var slot = pw
+  if n > 1 { slot = pw / (n - 1) }
+  var i = 0
+  for l in labels {  // x labels, thinned to fit
+    if i % skip == 0 {
+      var x = left + i * slot
+      kids.push(svg("label", {x: x, y: h - 6, "class": "tick", "text-anchor": "middle"}, l))
+    }
+    i += 1
+  }
+  var c = 1
+  for s in series {
+    var pts = ""
+    var j = 0
+    for v in s.values {
+      pts += "{left + j * slot},{top + ph - ph * v / hi} "
+      j += 1
+    }
+    kids.push(svg("polyline", {points: pts, "class": "line", style: "stroke: var(--c{c})"}, nil))
+    if s.values.len() > 0 {  // the latest value, marked
+      var last = s.values[s.values.len() - 1]
+      kids.push(svg("circle", {cx: left + (s.values.len() - 1) * slot, cy: top + ph - ph * last / hi, r: 3.5,
+                               style: "fill: var(--c{c})"}, nil))
+    }
+    c = c % 6 + 1
+  }
+  var chart = svg("svg", {viewBox: "0 0 {w} {h}", "class": "plot"}, kids)
+  if series.len() < 2 { return chart }
+  var legend = []
+  c = 1
+  for s in series {
+    legend.push(el("span", {"class": "key"}, [el("i", {style: "background: var(--c{c})"}, nil), s.label]))
+    c = c % 6 + 1
+  }
+  return [el("div", {"class": "legend"}, legend), chart]
+}
+
 // ---- for views (src/views.cpp rewrites `view` and `state` into these) ----
 
 // The list f fills: a view's block of children.
@@ -204,8 +479,8 @@ fn withClass(props, base: str) {
   return props
 }
 
-// An element of a view: an HTML tag, or one of fut's own (row, column, text, field, check), with props (bind: a
-// signal the element shows and sets) and children.
+// An element of a view: an HTML or SVG tag, or one of fut's own (row, column, text, field, check, link), with props
+// (bind: a signal the element shows and sets) and children.
 pub fn make(tag: str, props, kids): any {
   var bound = nil
   if props.has("bind") { bound = props.remove("bind") }
@@ -225,6 +500,19 @@ pub fn make(tag: str, props, kids): any {
     return el("label", withClass(props, "check"), [box, el("span", nil, kids)])
   }
   if bound != nil && (tag == "input" || tag == "textarea") { return bindText(tag, bound, props) }
+  if tag == "link" {  // link to: "/path" "Text": an <a> to #/path, class "active" while the page is there
+    var to = props.remove("to")
+    var given = props["class"]
+    props["href"] = fn() { return "#" + now(to) }
+    props["class"] = fn() {
+      var c = now(given)
+      if c == nil { c = "" }
+      if path() == now(to) { return (c + " active").trim() }
+      return c
+    }
+    return el("a", props, kids)
+  }
+  if SVG_TAGS.has(tag) { return svg(tag, props, kids) }
   var n = el(tag, props, kids)
   if bound != nil && tag == "select" {
     r.effect(fn() { setProp(n, "value", bound.get()) })
@@ -234,12 +522,16 @@ pub fn make(tag: str, props, kids): any {
 }
 
 var themed = false
-// Show view() on the page (web/index.html's #ui, else the body), with fut's theme under the page's own styles.
+var shown = nil
+// Show view() on the page (web/index.html's #ui, else the body), with fut's theme under the page's own styles. The
+// page shown before (as a reload shows it again) is taken down first: its effects and timers stop.
 pub fn show(view: fn): fn {
   if !themed { themed = true base(THEME) }
+  if shown != nil { shown() }
   var target = query("#ui")
   if target == nil { target = "body" }
-  return mount(target, view)
+  shown = mount(target, view)
+  return shown
 }
 
 var THEME = "
@@ -258,11 +550,30 @@ button \{ font: inherit; padding: 6px 14px; border-radius: var(--radius); border
 button:hover \{ border-color: var(--accent); }
 button:active \{ background: var(--line); }
 button.primary \{ background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
-input:not([type]), input[type=text], textarea, select \{ font: inherit; color: inherit; background: var(--field);
+input:not([type]), input[type=text], input[type=search], textarea, select \{ font: inherit; color: inherit; background: var(--field);
   padding: 6px 10px; border: 1px solid var(--line); border-radius: var(--radius); outline: none; }
 input:focus-visible, textarea:focus-visible, button:focus-visible \{ outline: 2px solid var(--accent); outline-offset: 1px; }
 .field \{ display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
 .field input \{ font-size: 15px; color: var(--fg); }
 .check \{ display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
 input[type=checkbox] \{ accent-color: var(--accent); width: 16px; height: 16px; margin: 0; }
+:root \{ --c1: #3a5bd9; --c2: #d9773a; --c3: #2f9e74; --c4: #a64fc4; --c5: #c9a227; --c6: #d94a6a; }
+.chart \{ display: flex; flex-direction: column; gap: 6px; }
+.plot \{ width: 100%; height: auto; overflow: visible; }
+.plot .grid \{ stroke: var(--line); stroke-width: 1; }
+.plot .tick \{ fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.plot .line \{ fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.bars \{ gap: 8px; }
+.bar-row \{ display: grid; grid-template-columns: minmax(0, 9em) 1fr 4.5em; align-items: center; gap: 10px; font-size: 13px; }
+.bar-name \{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar-track \{ height: 10px; border-radius: 5px; background: color-mix(in srgb, var(--line) 70%, transparent); overflow: hidden; }
+.bar-track i \{ display: block; height: 100%; border-radius: 5px; background: var(--accent); }
+.bar-value \{ color: var(--muted); font-variant-numeric: tabular-nums; text-align: right; }
+.legend \{ display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--muted); }
+.legend .key \{ display: inline-flex; align-items: center; gap: 6px; }
+.legend i \{ width: 10px; height: 3px; border-radius: 2px; }
+.spark \{ display: inline-block; width: 96px; height: 28px; }
+.spark svg \{ width: 100%; height: 100%; display: block; overflow: visible; }
+.spark polyline \{ fill: none; stroke: currentColor; stroke-width: 1.6; vector-effect: non-scaling-stroke; }
+a.active \{ color: var(--accent); }
 "
