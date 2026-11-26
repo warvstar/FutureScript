@@ -95,14 +95,13 @@ function target(c, w, h) {  // the texture frames are drawn into: headless, the 
   c.depth = c.dev.createTexture({ size: [w, h], format: "depth24plus", usage: RENDER_ATTACHMENT });  // pipelines made with depth test it
   c.depthView = c.depth.createView();
 }
-function pass(c, pipe, bind, vbuf, count) {  // one render pass, submitted: the frame's first clears it
+function pass(c, draws, load) {  // one render pass of draws ([pipeline, bind, vertices, count]), submitted
   const enc = c.dev.createCommandEncoder();
-  const load = c.cleared ? "load" : "clear";
   const p = enc.beginRenderPass({
     colorAttachments: [{ view: c.view, loadOp: load, storeOp: "store", clearValue: c.clear }],
     depthStencilAttachment: { view: c.depthView, depthLoadOp: load, depthStoreOp: "store", depthClearValue: 1 },
   });
-  if (pipe) {
+  for (const [pipe, bind, vbuf, count] of draws) {
     p.setPipeline(pipe);
     if (bind) p.setBindGroup(0, bind);
     if (vbuf) p.setVertexBuffer(0, vbuf);
@@ -110,9 +109,20 @@ function pass(c, pipe, bind, vbuf, count) {  // one render pass, submitted: the 
   }
   p.end(), submit(c, enc);
 }
-function clearFrame(c) {  // a frame with no draws still clears; a Promise of its error, if it did
-  if (!c.frame || c.cleared) return null;
-  const p = later(c, () => pass(c, null, null, null, 0));
+// A frame's draws wait in c.batch and go as one render pass (the frame's first clears it) when something that must
+// follow them comes: a write, a dispatch, a read, a release, the frame's end. A pass for each draw, each with its own
+// error scopes, costs a phone much of its frame.
+function flush(c) {  // a Promise of the pass's error, or null if no draws were waiting
+  if (!c?.batch?.length) return null;
+  const draws = c.batch, first = !c.cleared;
+  c.batch = [], (c.cleared = true);
+  return later(c, () => pass(c, draws, first ? "clear" : "load"), () => first && c.frame && (c.cleared = false));  // (it didn't clear)
+}
+function clearFrame(c) {  // the frame's waiting draws; a frame with none still clears. A Promise of the error, if it drew
+  if (!c.frame) return null;
+  if (c.batch?.length) return flush(c);
+  if (c.cleared) return null;
+  const p = later(c, () => pass(c, [], "clear"));
   return (c.cleared = true), p;
 }
 function endFrame(c) {  // a window's: the frame to its canvas, which the page shows at its next rendering
@@ -164,8 +174,11 @@ async function openDevice(c) {
   });
 }
 
-export function fg_error() {  // once the calls still in flight have settled: a Promise of it then
-  if (inflight.size) return Promise.all(inflight).then(fg_error);
+// The first error since the last call. Headless, once the calls still in flight have settled (a Promise of it then);
+// with a window open, at once: waiting on the GPU after each call would stall every frame, so an error a frame's
+// calls make is reported by the first check after the next fg_frame, which waits for them.
+export function fg_error() {
+  if (inflight.size && !windowCtx) return Promise.all(inflight).then(fg_error);
   let shown = err;
   err = "";
   if (notes) shown += (shown ? "\n" : "") + notes, (notes = "");
@@ -190,7 +203,7 @@ export function fg_release(hd) {
   const o = objs.get(hd);
   if (!o) return void fail(hd > 0 && hd < nextId ? "already released" : "not a GPU handle");
   objs.delete(hd);
-  if (o.kind != CTX) return releaseObj(o);
+  if (o.kind != CTX) return flush(objs.get(o.g)?.p), releaseObj(o);  // (draws waiting may use it)
   for (const [h, x] of objs) if (x.g == hd) releaseObj(x), objs.delete(h);  // everything it made goes with it
   if (hd == windowCtx) windowCtx = 0;
   closeCtx(o.p);
@@ -221,6 +234,7 @@ export function fg_write(g, buf, data, bytes) {
   if (!b || bytes <= 0) return;
   if (!data) return void fail("fg_write: no data");
   if (bytes > b.size) return void fail(`fg_write: ${bytes} bytes into a buffer of ${b.size}`);
+  flush(c);  // the frame's draws so far see the buffer as it was
   later(c, () => {
     let src = bytesAt(data, bytes, "fg_write");
     if (bytes % 4) {  // writes are whole words: the last one's tail is zeroed
@@ -237,6 +251,7 @@ export async function fg_read(g, buf, out, bytes) {
   if (bytes < 0 || bytes > b.size) return fail(`fg_read: ${bytes} bytes from a buffer of ${b.size}`), -1;
   if (bytes == 0) return 0;
   if (!out) return fail("fg_read: nowhere to read into"), -1;
+  flush(c);
   const size = Math.ceil(bytes / 4) * 4;
   let st = null;
   let ok = await scoped(c, () => {
@@ -328,6 +343,7 @@ export function fg_dispatch(g, pipeline, bind, x, y, z) {
   const c = ctx(g), p = c ? get(g, pipeline, COMPUTE) : null, b = p && bind ? get(g, bind, BIND) : null;
   if (!p || (bind && !b)) return;
   if (x < 0 || y < 0 || z < 0) return void fail("fg_dispatch: negative workgroup counts");
+  flush(c);
   later(c, () => {
     const enc = c.dev.createCommandEncoder(), pass = enc.beginComputePass();
     pass.setPipeline(p.p);
@@ -339,13 +355,15 @@ export function fg_dispatch(g, pipeline, bind, x, y, z) {
 export function fg_frame(g, rgb) {
   const c = ctx(g);
   if (!c) return 0;
+  if (!c.headless && inflight.size) return Promise.all(inflight).then(() => fg_frame(g, rgb));  // (see fg_error)
   c.clear = { r: ((rgb >> 16) & 255) / 255, g: ((rgb >> 8) & 255) / 255, b: (rgb & 255) / 255, a: 1 };
   if (!c.headless) {
     endFrame(c);  // a frame left open is shown first
     try { target(c, Math.max(1, c.canvas.width), Math.max(1, c.canvas.height)); }  // the window was resized
     catch (e) { return fail("fg_frame: " + message(e)), 0; }
   }
-  c.frame = true, (c.cleared = false);
+  flush(c);  // (headless: a frame left open)
+  c.frame = true, (c.cleared = false), (c.batch = []);
   return 1;
 }
 
@@ -355,9 +373,7 @@ export function fg_draw(g, pipeline, bind, vbuf, count) {
   if (!p || (bind && !b) || (vbuf && !v)) return;
   if (!c.frame) return void fail("fg_draw: no frame (call fg_frame first)");
   if (count < 0) return void fail("fg_draw: a negative vertex count");
-  const first = !c.cleared;
-  later(c, () => pass(c, p.p, b?.p, v?.p, count), () => first && c.frame && (c.cleared = false));  // (it didn't clear)
-  c.cleared = true;
+  (c.batch ??= []).push([p.p, b?.p, v?.p, count]);  // (sent by flush)
 }
 
 export function fg_present(g) {
