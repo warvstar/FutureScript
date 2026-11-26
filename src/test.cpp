@@ -131,6 +131,8 @@ static V allocsEnd(V start) { return box((double)gcAllocations() - num(start)); 
 // and the check fits how its cost grows on a log-log scale: it fails if, divided by the growth, the cost still grows
 // (slope over tolerance). Time is the best of 3 runs of a batch lasting 2 ms or more, from the n at which one call
 // takes 50 us, measured afresh up to twice before it fails; allocations are counted for n = 64..2048 (exact, so their tolerance is tight).
+// With FUT_UNTIMED set (build.py tsan, where the sanitizer and N isolates per core bend every timing), time isn't
+// measured: those checks pass, and the summary says they weren't measured. Allocation checks still run.
 namespace {
 struct Growth { double k = 0; bool lg = false; };
 bool parseGrowth(std::string_view m, Growth& g) {
@@ -163,6 +165,11 @@ double slope(const std::vector<std::pair<double, double>>& p, Growth g) {  // of
   return (n * sxy - sx * sy) / (n * sxx - sx * sx);
 }
 }  // namespace
+#if __wasm__
+static bool untimed() { return false; }  // no environment there (the host gives the module none)
+#else
+static bool untimed() { static bool u = getenv("FUT_UNTIMED"); return u; }
+#endif
 static V growsAt(V site, V clo, V growth, V byAllocs) {
   const ExpectSite& s = sites.at((size_t)num(site));
   Growth want;
@@ -173,6 +180,7 @@ static V growsAt(V site, V clo, V growth, V byAllocs) {
   Fn* f = as<Clo>(clo)->fn;
   auto call = [&](double n) { V a[8] = {clo, box(n)}; vmEnter(f->code, a); };
   bool allocs = byAllocs == TRUE_;
+  if (!allocs && untimed()) return NIL;
   std::vector<std::pair<double, double>> pts;
   if (allocs)
     for (double n = 64; n <= 2048; n *= 2) {
@@ -615,7 +623,8 @@ int testsEnd() {
     for (auto [n, w] : {std::pair{failed, "failed"}, {errored, errored == 1 ? "error" : "errors"}, {pending, "pending"}})
       if (n) parts += ", " + std::to_string(n) + " " + w;
     int total = passed + failed + errored + pending;
-    snprintf(b, sizeof b, "%d test%s: %d passed%s (%.1f ms)\n", total, total == 1 ? "" : "s", passed, parts.c_str(), ms);
+    snprintf(b, sizeof b, "%d test%s: %d passed%s (%.1f ms%s)\n", total, total == 1 ? "" : "s", passed, parts.c_str(), ms,
+             untimed() ? "; FUT_UNTIMED: expect grows by time not measured" : "");
   }
   emit(b);
   return failed || errored || pending ? 1 : 0;

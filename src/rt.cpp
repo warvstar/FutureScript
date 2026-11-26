@@ -67,11 +67,28 @@ static constexpr uint64_t EMPTY = ~0ull;  // matches no header
 static std::vector<int> setICs;
 static Mutex icMu;  // nics, setICs, vms
 static std::vector<VM*> vms;
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+extern "C" void AnnotateIgnoreWritesBegin(const char*, int), AnnotateIgnoreWritesEnd(const char*, int);
+#define TSAN_UNSEEN_BEGIN() AnnotateIgnoreWritesBegin(__FILE__, __LINE__)
+#define TSAN_UNSEEN_END() AnnotateIgnoreWritesEnd(__FILE__, __LINE__)
+#endif
+#endif
+#ifndef TSAN_UNSEEN_BEGIN
+#define TSAN_UNSEEN_BEGIN()
+#define TSAN_UNSEEN_END()
+#endif
 int newIC(bool set) {
   Locked g(icMu);
   if (nics == MAXIC) compileFail("too many inline caches", false);
   if (set) setICs.push_back(nics);
+  // Each isolate's slot for the new cache, written from the compiling thread. The isolate's own writes to it (rt_setf)
+  // come after: only code compiled from here names the slot, and that code reaches the isolate published under codeMu.
+  // TSan doesn't see that ordering, since what carries it is JIT code, which it doesn't instrument, so these writes
+  // are hidden from it (and only these).
+  TSAN_UNSEEN_BEGIN();
   for (VM* v : vms) v->ics[nics].key = EMPTY;
+  TSAN_UNSEEN_END();
   return nics++;
 }
 void clearSetICs() { Locked g(icMu); for (int i : setICs) vm->ics[i].key = EMPTY; }

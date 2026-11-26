@@ -630,9 +630,10 @@ def fuzz(exe, n=300, seed=None):
 
 def isolated(exe, t, n):
     """A spec run in n isolates at once in one process: it must pass in every one, and under `tsan` the sanitizer must
-    report nothing."""
+    report nothing; time isn't measured there (FUT_UNTIMED), since TSan and N isolates per core bend it."""
     r = subprocess.run([str(exe), "test", "--isolates", str(n), str(t)], capture_output=True, text=True, timeout=600,
-                       env={**os.environ, "TSAN_OPTIONS": "halt_on_error=1 second_deadlock_stack=1"})
+                       env={**os.environ, "TSAN_OPTIONS": "halt_on_error=1 second_deadlock_stack=1",
+                            **({"FUT_UNTIMED": "1"} if "tsan" in exe.name else {})})
     ok = r.returncode == 0 and "WARNING: ThreadSanitizer" not in r.stderr
     return f"isolates: specs/{t.name}", ok, (r.stdout[-2000:] + r.stderr[-6000:]).strip().replace("\n", "\n  ")
 
