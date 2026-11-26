@@ -11,7 +11,7 @@
 # With SWARM_DASH_URL, a run that ends waits for the dashboard to start the next one; swarm/supervise.sh starts it.
 set -e
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-[ -n "$1" ] || { sed -n '2,10p' "$0"; exit 2; }
+[ -n "$1" ] || { sed -n '2,11p' "$0"; exit 2; }
 export SWARM_SCENARIO="$1"
 KEYFILE="${2:-$ROOT/build/swarm/.key}"
 [ -f "$ROOT/swarm/scenarios/$1.json" ] || [ -n "$SWARM_DASH_URL" ] || { echo "no scenario swarm/scenarios/$1.json"; exit 2; }
