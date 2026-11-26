@@ -492,6 +492,88 @@ static V n_len(V v) {
 }
 double now() { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static V n_clock() { return box(now()); }
+// Strings and lists: slice, find, split, trim, join, and parseNum. Indexes count bytes, as len() and s[i] do.
+static std::string_view svArg(V v, const char* fn) {
+  if (!is(v, K::Str)) ERR("%s expects a string, got %s", fn, typeName(v));
+  return as<Str>(v)->sv();
+}
+static size_t clampIx(V v, size_t n, const char* fn) {
+  if (!isNum(v)) ERR("%s expects numbers, got %s", fn, typeName(v));
+  double d = num(v);
+  if (d != std::trunc(d)) ERR("%s: an index must be a whole number, got %g", fn, d);
+  return d < 0 ? 0 : d > (double)n ? n : (size_t)d;
+}
+static V s_slice(V s, V a, V b) {  // s.slice(from, to): from..to exclusive, clamped to the string
+  volatile V held = s;  // on the stack while newStr allocates: v points into it
+  (void)held;
+  std::string_view v = as<Str>(s)->sv();
+  size_t i = clampIx(a, v.size(), "slice()"), j = clampIx(b, v.size(), "slice()");
+  return box(newStr(i < j ? v.substr(i, j - i) : std::string_view{}));
+}
+static V s_find(V s, V sub) {  // the index of the first sub, or -1
+  size_t i = as<Str>(s)->sv().find(svArg(sub, "find()"));
+  return box(i == std::string_view::npos ? -1.0 : (double)i);
+}
+static V s_split(V s, V sep) {
+  volatile V held = s;  // on the stack while newStr allocates: v points into it
+  (void)held;
+  std::string_view v = as<Str>(s)->sv(), d = svArg(sep, "split()");
+  if (d.empty()) ERR("split() needs a separator that isn't empty");
+  List* l = make<List>();
+  volatile V keep = box(l);
+  (void)keep;
+  for (size_t i = 0;;) {
+    size_t j = v.find(d, i);
+    V part = box(newStr(v.substr(i, j == std::string_view::npos ? std::string_view::npos : j - i)));
+    l->v.push_back(part);
+    if (j == std::string_view::npos) break;
+    i = j + d.size();
+  }
+  return box(l);
+}
+static V s_trim(V s) {
+  volatile V held = s;  // on the stack while newStr allocates: v points into it
+  (void)held;
+  std::string_view v = as<Str>(s)->sv();
+  auto ws = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
+  while (!v.empty() && ws(v.front())) v.remove_prefix(1);
+  while (!v.empty() && ws(v.back())) v.remove_suffix(1);
+  return box(newStr(v));
+}
+static V l_join(V l, V sep) {  // strings as they are, other values as str() shows them
+  volatile V held = l;
+  (void)held;
+  std::string_view d = svArg(sep, "join()");
+  std::string o;
+  bool first = true;
+  for (V x : as<List>(l)->v) {
+    if (!first) o += d;
+    first = false;
+    if (is(x, K::Str)) o += as<Str>(x)->sv();
+    else o += toStr(x);
+  }
+  return box(newStr(o));
+}
+static V l_slice(V l, V a, V b) {
+  volatile V held = l;
+  (void)held;
+  auto& v = as<List>(l)->v;
+  size_t i = clampIx(a, v.size(), "slice()"), j = clampIx(b, v.size(), "slice()");
+  List* r = make<List>();
+  if (i < j) r->v.assign(as<List>(l)->v.begin() + i, as<List>(l)->v.begin() + j);
+  return box(r);
+}
+static V n_parseNum(V s) {  // the number a string spells (surrounding spaces allowed), or nil
+  std::string t(svArg(s, "parseNum()"));
+  const char* p = t.c_str();
+  while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+  if (!*p) return NIL;
+  char* end;
+  double d = strtod(p, &end);
+  if (end == p) return NIL;
+  while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r') end++;
+  return *end ? NIL : box(d);
+}
 static V n_time() {  // seconds since 1970
   timespec t;
   clock_gettime(CLOCK_REALTIME, &t);
@@ -580,6 +662,9 @@ void rtInit() {
     if (!is(sub, K::Str)) ERR("has() on a string expects a string, got %s", typeName(sub));
     return boxb(as<Str>(s)->sv().find(as<Str>(sub)->sv()) != std::string_view::npos);
   }>(K::Str, S_has);
+  method<s_slice>(K::Str, intern("slice")), method<s_find>(K::Str, intern("find")), method<s_split>(K::Str, intern("split"));
+  method<s_trim>(K::Str, intern("trim")), method<l_join>(K::List, intern("join")), method<l_slice>(K::List, intern("slice"));
+  native<n_parseNum>("parseNum");
   method<+[](V m) { return mapList(m, true); }>(K::Map, S_keys);
   method<+[](V m) { return mapList(m, false); }>(K::Map, S_values);
   testInit();

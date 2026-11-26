@@ -49,9 +49,10 @@ exec([argv...])  exec({cmd: [argv...], cwd, input, timeout}) -> {code, out, err,
 fetch(url)  fetch({url, method, headers, body, timeout}) -> {status, body, headers}; failure: {status: 0, error}, no throw
 execAll([cmd, ...])  fetchAll([req, ...])   run at once, results in order
                          time/json/parseJson also in wasm; the other host builtins are native only
-l.push(v) -> l   l.pop() -> v   l.len()
+l.push(v) -> l   l.pop() -> v   l.len()   l.slice(a, b)   l.join(sep) -> str
 m.has(k)   m.remove(k) -> v   m.keys()   m.values()   m.len()
-s.len()    s.has(sub)   s[i] -> 1-char str
+s.len()    s.has(sub)   s[i] -> 1-char str   s.find(sub) -> i | -1   s.slice(a, b)   s.split(sep)   s.trim()
+parseNum(s) -> num | nil   (indexes count bytes; slice excludes b, clamps)
 window(w, h)   present() -> false once closed (once per frame, waits 1/60 s)
 clear(rgb)   rect(x, y, w, h, rgb)   circle(x, y, r, rgb)     rgb = 0xRRGGBB, origin top-left
 key(name) -> bool   "a".."z" "0".."9" space enter escape tab up down left right
