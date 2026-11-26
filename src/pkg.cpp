@@ -96,6 +96,8 @@ const Package* packageOf(const std::string& file) {
   }
 }
 const Package* packageAt(const std::string& dir) { return load(dir); }
+std::string stdRoot;
+bool inStd(const std::string& path) { return !stdRoot.empty() && path.starts_with(stdRoot + "/"); }
 const ForeignMod* Package::module(const std::string& n, bool native) const {
   const ForeignMod* any = nullptr;
   for (auto& m : mods)

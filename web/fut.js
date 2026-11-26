@@ -9,6 +9,7 @@
 //   save(path, text): bool -- write a file (text null: remove it), for `fut api`
 //   importModule(path, stamp): Promise of a JS module's namespace (stamp: change it to load the file again)
 //   stamp(path): anything that changes when the file does (a modification time), for reloading modules
+//   std: the directory of the standard library's packages (import "std/strings")
 export class Restart extends Error {}  // unwinds to the driver, which reruns main()
 export class Exit extends Error { constructor(code) { super("exit " + code), (this.code = code); } }
 
@@ -372,6 +373,7 @@ export async function createFut(opts) {
   const callP = WebAssembly.promising(ex.fut_call), applyP = WebAssembly.promising(ex.fut_apply);
   fiberStart = WebAssembly.promising(ex.fut_fiber_start);
   ex._initialize(), ex.fut_init(opts.verbose ? 1 : 0), (pollAt = ex.fut_poll());
+  if (opts.std) withStr(opts.std, (p) => ex.fut_std(p));  // where the standard library's packages are
 
   return {
     exports: ex,

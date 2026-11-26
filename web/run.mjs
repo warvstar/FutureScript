@@ -34,6 +34,7 @@ function writeAll(fd, b) {  // stdout may be a non-blocking pipe
 let watched = [file], rewatch = () => {}, runs = 0;
 const fut = await createFut({
   wasm: readFileSync(new URL("../build/fut.wasm", import.meta.url)),
+  std: process.env.FUT_STD || fileURLToPath(new URL("../std", import.meta.url)),
   verbose,
   read(p) { try { return readFileSync(p); } catch { return null; } },
   save(p, text) { try { return text == null ? rmSync(p) : writeFileSync(p, text), true; } catch { return false; } },

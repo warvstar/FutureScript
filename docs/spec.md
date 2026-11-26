@@ -1,14 +1,24 @@
 # fut spec
 
-Terse; README has the rest. ```fut blocks run as tests (top-level `expect` asserts).
+Everything needed to write fut. ```fut blocks run as tests (a top-level `expect` asserts).
 
-`fut f.fut` | `fut test f.fut [--json --filter s]` (exit 0 pass, 1 fail/pending, 2 compile error) | `fut api f.fut` (write .api) | `fut map f.fut [--pub --json]` | `fut -w f.fut` (hot reload + REPL) | `node web/run.mjs` (wasm)
+```
+fut f.fut                      run: top level, then main() if defined
+fut test f.fut                 test blocks + contract property tests + .api check. exit 0 pass, 1 fail/pending, 2 compile error
+  --json                       one object per line: {type: "test", name, file, line, status: ok|FAIL|ERROR|pending, ms,
+                               output, expect?: {expr, left, right, diff}, message?, trace?}, then {type: "summary", ...}
+  --filter text  --changed     only tests named text / only tests whose inputs changed since the last run
+fut map f.fut [--pub] [pkg]    where everything is: packages, files, declarations, line ranges
+fut api f.fut                  rewrite the .api files after an interface change
+fut -w f.fut                   run, hot-reload on save; stdin lines run inside the program
+node web/run.mjs ...           the same CLI on WebAssembly
+```
 
 ## Core
 
 ```fut
 var a = 1; var b = 2               // ; optional. A line starting ( [ - begins a new statement
-expect "{a + b}\{\n" == "3\{\n"     // interpolation; escapes \n \t \0 \" \\ \{
+expect "{a + b}\{\n" == "3\{\n"     // "{expr}" interpolates, so a literal { is \{ (JSON: "\{\"k\": 1}"); escapes \n \t \0 \" \\
 expect 0 && ""                     // only nil, false are falsy
 expect (nil || 2) == 2             // && || return an operand
 expect -7 % 3 == 2 && 7 / 2 == 3.5 // all numbers f64
@@ -137,5 +147,27 @@ expect fb.send(1) == 1 && fb.send(2) == 3 && !fb.done()  // send(v): v is yield'
 - `import "x.fut"` (pub names global) or `as x` (`x.f`). Non-`pub` = file-private, free to change.
 - `fut.pkg`: `name`, `version`, `root`, `dep <name> <dir>`, `js|wasm|c <name> <path>`. `import "<name>"`. Outside sees only root's `pub` + `pub import` re-exports. No cycles, no paths across packages.
 - `.api` = public signatures, types, effects, contracts. Stale `.api` fails `fut test`. Editing one means you changed an interface: run `fut api`, commit it; breaking change needs a version bump.
-- `extern fn hypot(num, num): num`, `extern mod fn f(any, fn): str` (types `num int long ptr str any fn`).
+- `extern fn hypot(num, num): num` (C natively, JS under wasm; performs io), `extern fn sin(num): num !` (bare `!`: pure), `extern mod fn f(any, fn): str` (a module in fut.pkg). Types `num int long ptr str`, and for JS `any fn`.
 - Hot reload keeps globals; a var reinitializes only if its line changed.
+
+## Std
+
+`import "std/<name>"` (no dep line; `as` to rename). Signatures, docs and contracts: `std/<name>/<name>.api`.
+
+- `std/strings`: replace startsWith endsWith count repeat padStart padEnd upper lower lines words reverse
+- `std/lists`: sort sortable sortBy map filter reduce find any all count indexOf contains reverse unique flatten range sum min max
+- `std/math`: pow exp log log2 log10 cbrt hypot sin cos tan asin acos atan atan2 ceil trunc abs min max clamp sign round isNaN pi e
+
+```fut
+import "std/lists"
+import "std/strings"
+expect lists.sort([3, 1, 2]) == [1, 2, 3]
+expect strings.replace("a-b", "-", "+") == "a+b"
+```
+
+## Working on fut code
+
+- Find code with `fut map --pub`; read a package's `.api`, not its source, to use it.
+- Type and declare effects on `pub` functions; keep `pub` small (private code is free to change).
+- Contract first: signature, `requires`/`ensures` (one per line), `todo()` body; then tests; then the body.
+- Before finishing: `fut test` passes. If an `.api` changed, you changed an interface: `fut api`, commit the `.api`, bump the version if something was removed or changed.

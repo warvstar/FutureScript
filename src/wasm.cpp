@@ -363,6 +363,7 @@ void platformInit() {
 // ---------------- the host's entry points ----------------
 static std::string text;  // what the last string-returning export returned
 static Compiled last;
+EXPORT(fut_std) void futStd(const char* dir) { stdRoot = canonicalPath(dir); }  // the host says where std/ is
 EXPORT(fut_init) void futInit(int v) { verbose = v, rtInit(), jitCollect(), refRelease = host_ref_gone; }  // installs the natives' adapters
 EXPORT(fut_alloc) char* futAlloc(u32 n) { return (char*)malloc(n); }
 EXPORT(fut_free) void futFree(char* p) { free(p); }

@@ -123,7 +123,7 @@ struct Compiler : Gen {
   std::vector<FieldUse> fieldUses;
   std::vector<std::pair<int, int>> fnDefs;  // (sym, arity)
   std::vector<int> inits;                   // top-level vars initialised by this chunk
-  struct Extern { int sym; void* fn; std::string sig; char ret; };
+  struct Extern { int sym; void* fn; std::string sig; char ret; bool pure; };  // pure: declared `!`, performs nothing
   std::vector<Extern> externs;
   std::string patched, added, removed, reset;  // for the reload log
   std::unordered_map<std::string, std::vector<int>> pubs;  // file -> its top-level names marked `pub`
@@ -1394,7 +1394,12 @@ struct Compiler : Gen {
       expect(')');
     }
     if (sig.size() > 7) failAt(t.p, t.line, "extern functions take at most 7 parameters");
-    externs.push_back({qualify(s), fn, sig, accept(':') ? type(true) : 'v'});
+    char ret = accept(':') ? type(true) : 'v';
+    // A bare `!` declares that the function performs nothing (sin, strlen): the caller's promise, as its types are.
+    // Without it, a call performs io.
+    bool pure = at('!') && !cur.nl;
+    if (pure && (next(), at(T_ID) && !cur.nl)) fail("an extern fn performs io, or with a bare '!' nothing: it can't declare other effects");
+    externs.push_back({qualify(s), fn, sig, ret, pure});
   }
   // effect Name { fn op(params) [: type] ... }: operations with no body. Code performs one as Name.op(args); the
   // nearest handler for it answers (handle { } with Name.op(params) { }).
@@ -1502,6 +1507,12 @@ struct Compiler : Gen {
     std::string s(t.p, (size_t)t.len);
     const Package* here = pkgOf(file);
     if (s.empty()) failAt(t.p, t.line, "expected a file or package name");
+    if (s.starts_with("std/") && !s.ends_with(".fut")) {  // a standard library package: no dep line needed
+      std::string n = s.substr(4);
+      const Package* p = n.empty() || n.find('/') != std::string::npos || stdRoot.empty() ? nullptr : packageAt(stdRoot + "/" + n);
+      if (!p || p->name != n) failAt(t.p, t.line, "no standard library package '%s'%s", s.c_str(), stdRoot.empty() ? " (the standard library was not found: set FUT_STD to its directory)" : "");
+      return linkPackage(t, p, here);
+    }
     if (s.find('/') == std::string::npos && !s.ends_with(".fut")) {  // a package
       if (!here) failAt(t.p, t.line, "'%s' is a package name, and %s is in no package: put a fut.pkg next to it (name app, then dep %s <its directory>), or import a file by path (\"./%s.fut\")", s.c_str(), ::base(file).c_str(), s.c_str(), s.c_str());
       if (s == here->name) failAt(t.p, t.line, "this file is in package %s: import its files by path (\"./file.fut\")", s.c_str());
@@ -1512,7 +1523,20 @@ struct Compiler : Gen {
       std::string at = here->manifest + ":" + std::to_string(d->line);
       if (!p) failAt(t.p, t.line, "%s has no fut.pkg (dep %s, %s)", d->dir.c_str(), s.c_str(), at.c_str());
       if (p->name != s) failAt(t.p, t.line, "the package in %s is named '%s', not '%s' (%s)", d->dir.c_str(), p->name.c_str(), s.c_str(), at.c_str());
-      std::vector<std::string> chain{here->name};  // packages depend on each other in one direction only
+      return linkPackage(t, p, here);
+    }
+    std::string ip = resolvePath(s);
+    if (const Package* there = pkgOf(ip); there != here) {
+      if (there) failAt(t.p, t.line, "'%s' is in package %s: import it by name (import \"%s\")%s", s.c_str(), there->name.c_str(), inStd(there->dir) ? ("std/" + there->name).c_str() : there->name.c_str(), here || inStd(there->dir) ? "" : ", from a package that lists it with dep");
+      failAt(t.p, t.line, "'%s' is outside package %s: a package's files are the ones below its fut.pkg (%s)", s.c_str(), here->name.c_str(), here->dir.c_str());
+    }
+    return {ip, ""};
+  }
+  // An import of package p (by name, or from the standard library) from a file of package here (null: none).
+  Target linkPackage(const Tok& t, const Package* p, const Package* here) {
+    std::string s = p->name;
+    {
+      std::vector<std::string> chain{here ? here->name : ""};  // packages depend on each other in one direction only
       std::unordered_set<std::string> seen;
       std::function<bool(const Package*)> reaches = [&](const Package* q) {
         chain.push_back(q->name);
@@ -1521,12 +1545,12 @@ struct Compiler : Gen {
           for (auto& e : q->deps) if (const Package* r = packageAt(e.dir); r && reaches(r)) return true;
         return chain.pop_back(), false;
       };
-      if (reaches(p)) {
+      if (here && reaches(p)) {
         std::string c;
         for (auto& n : chain) c += (c.empty() ? "" : " -> ") + n;
         failAt(t.p, t.line, "packages can't depend on each other in a cycle: %s (move what both need into a package of its own)", c.c_str());
       }
-      if (std::string& o = pkgNamed[p->name]; o.empty()) o = p->dir;
+      if (std::string& o = pkgNamed[(inStd(p->dir) ? "std/" : "") + p->name]; o.empty()) o = p->dir;  // std/x and x may both exist
       else if (o != p->dir) failAt(t.p, t.line, "two packages are named '%s': %s and %s", s.c_str(), o.c_str(), p->dir.c_str());
       pkgOf(p->root);
       std::string& pre = pkgPreOf[p->dir];
@@ -1534,12 +1558,6 @@ struct Compiler : Gen {
       pkgRootOf[pre] = p->root, pkgImports[pkgPrefix(file)].insert(pre);
       return {p->root, pre};
     }
-    std::string ip = resolvePath(s);
-    if (const Package* there = pkgOf(ip); there != here) {
-      if (there) failAt(t.p, t.line, "'%s' is in package %s: import it by name (import \"%s\")%s", s.c_str(), there->name.c_str(), there->name.c_str(), here ? "" : ", from a package that lists it with dep");
-      failAt(t.p, t.line, "'%s' is outside package %s: a package's files are the ones below its fut.pkg (%s)", s.c_str(), here->name.c_str(), here->dir.c_str());
-    }
-    return {ip, ""};
   }
   // A clause's condition: from L (after its keyword) to the end of its line, or to a '{' or '}' there (a function's
   // body, the class's end). Notes its calls and (in ensures: olds) each old(...). Leaves L before what ends it.
@@ -1692,7 +1710,7 @@ struct Compiler : Gen {
         if (re && !tg.pkg.empty()) failAt(t.p, t.line, "'pub import' re-exports a file of this package; a package's dependencies are not part of its interface");
         if (re && n.t == T_ID) failAt(n.p, n.line, "'pub import' re-exports the file's pub names as they are: leave out 'as'");
         if (re) reexports[path].push_back(ip);
-        if (!tg.pkg.empty()) aliases[path][n.t == T_ID ? n.sym : intern({t.p, (size_t)t.len})] = tg.pkg;  // the package's name
+        if (!tg.pkg.empty()) aliases[path][n.t == T_ID ? n.sym : intern(::base(std::string(t.p, (size_t)t.len)))] = tg.pkg;  // the package's name
         if (sources.count(ip) && !nsOf.count(ip)) continue;  // the program's own file: already here, with global names
         std::string& pre = nsOf[ip];
         if (pre.empty()) {  // the file's stem (after its package's prefix), made unique
@@ -1913,6 +1931,7 @@ struct Compiler : Gen {
     for (auto& q : fnSpecs) all.push_back({q, specFns.at(q).fn, true, nullptr, specFns.at(q).name});
     for (int c : classOrder) all.push_back({symName(c), classSpecs.at(c).at, false, &classSpecs.at(c), classSpecs.at(c).name});
     for (auto& d : all) {
+      if (inStd(d.at.file) && !inStd(canonicalPath(mainFile))) continue;  // the standard library's are tested by its own tests
       std::string n = d.n, call;
       PropSite ps;
       ps.file = d.at.file, ps.cls = !d.isFn, ps.names = {n};
@@ -2117,7 +2136,7 @@ struct Compiler : Gen {
     }
     for (auto& e : externs) {
       Fn* f = globalObj<Fn>(e.sym);
-      f->code = ffiThunk(e.fn, e.sig, e.ret, e.sym), f->arity = (int)e.sig.size(), f->op = OP_EXTERN;  // performs io
+      f->code = ffiThunk(e.fn, e.sig, e.ret, e.sym), f->arity = (int)e.sig.size(), f->op = e.pure ? 0 : OP_EXTERN;  // performs io
     }
     for (auto& d : effDefs) effDefine(d.sym, symName(d.sym), d.ops);
     for (auto& [s, l] : effOps) effectOps[s] = l;

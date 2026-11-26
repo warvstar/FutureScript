@@ -45,6 +45,7 @@ let watched = new Set();
 const stamps = new Map();  // path -> how many times it changed: a package's JS modules load again when it moves
 const fut = await createFut({
   wasm: await (await fetch("/build/fut.wasm")).arrayBuffer(),
+  std: "/std",
   verbose: true,
   read(p) {  // fut reads files synchronously
     const x = new XMLHttpRequest();

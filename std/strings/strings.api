@@ -1,0 +1,51 @@
+// The public interface of package strings 0.1.0 (strings.fut), written by `fut api`. `fut test` fails while it is out of date.
+
+// How many times part occurs in s, not overlapping.
+pub fn count(s: str, part: str): num !
+  requires part.len() > 0
+  ensures result >= 0
+
+// Does s end with part?
+pub fn endsWith(s: str, part: str): bool !
+  ensures !result || s.len() >= part.len()
+
+// The lines of s, without their "\n" (or "\r\n"). A final newline doesn't start another line.
+pub fn lines(s: str): list !
+
+// s with A-Z made a-z; other bytes unchanged.
+pub fn lower(s: str): str !
+  ensures result.len() == s.len()
+
+// s padded on the right with fill (one character) to at least n bytes.
+pub fn padEnd(s: str, n: num, fill: str): str !
+  requires fill.len() == 1
+  ensures result.len() >= s.len()
+
+// s padded on the left with fill (one character) to at least n bytes.
+pub fn padStart(s: str, n: num, fill: str): str !
+  requires fill.len() == 1
+  ensures result.len() >= s.len()
+
+// s, n times over.
+pub fn repeat(s: str, n: num): str !
+  requires n >= 0
+  ensures result.len() == s.len() * int(n)
+
+// s with every occurrence of part replaced by with.
+pub fn replace(s: str, part: str, with: str): str !
+  requires part.len() > 0
+
+// s backwards (by bytes).
+pub fn reverse(s: str): str !
+  ensures result.len() == s.len()
+
+// Does s begin with part?
+pub fn startsWith(s: str, part: str): bool !
+  ensures !result || s.len() >= part.len()
+
+// s with a-z made A-Z; other bytes unchanged.
+pub fn upper(s: str): str !
+  ensures result.len() == s.len()
+
+// The words of s: its runs of characters other than spaces, tabs and newlines.
+pub fn words(s: str): list !

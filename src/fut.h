@@ -478,6 +478,9 @@ const Package* packageOf(const std::string& file);  // the nearest fut.pkg at or
 const Package* packageAt(const std::string& dir);   // dir's own fut.pkg, or null
 void packagesReset();                               // each compile reads the manifests again
 bool parseVersion(const std::string& v, int out[3]);
+// The standard library: packages in stdRoot (std/ beside build/, or $FUT_STD), imported as "std/<name>" with no dep.
+extern std::string stdRoot;
+bool inStd(const std::string& path);
 
 // ---- public interfaces (api.cpp): `pub` declarations, kept in .api files ----
 struct ApiIssue {

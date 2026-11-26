@@ -389,6 +389,16 @@ The rest follows from that:
 
 **Reloads stop at package boundaries.** A function body is reused when its text and its environment are unchanged. Its environment is its own package's declarations plus the interfaces of the packages it imports. So a new private function in `geom` recompiles only `geom`, an addition to `geom`'s interface also recompiles the packages that import it, and an edit in the program recompiles no dependency. Manifests are watched too.
 
+### The standard library
+
+`std/` holds packages written in fut, imported as `import "std/strings"` (then `strings.upper(s)`) from any file, with no `dep` line. Each is an ordinary package with an `.api`, which is the place to read what it offers: `std/strings/strings.api`, `std/lists/lists.api`, `std/math/math.api`. A builtin is something only the runtime or the host can do; everything else belongs in a std package, where it is readable fut, its contracts are tested, and it reloads like other code.
+
+- **`strings`:** replace, startsWith, endsWith, count, repeat, padStart, padEnd, upper, lower, lines, words, reverse.
+- **`lists`:** sort (stable, of numbers or of strings), sortBy, map, filter, reduce, find, any, all, count, indexOf, contains, reverse, unique, flatten, range, sum, min, max. None changes the list it is given.
+- **`math`:** libm natively and JavaScript's `Math` under wasm (pow, exp, log, log2, log10, cbrt, hypot, the trigonometric functions, ceil, trunc), all declared pure; abs, min, max, clamp, sign, round, isNaN, pi and e in fut.
+
+The binary finds `std/` next to the directory it is in (`build/fut` uses `std/`), or at `$FUT_STD`; the WebAssembly hosts pass its location. `std/x` and a program's own package `x` can both be used. `fut test` checks the contracts of std functions only when the test file is itself in `std/`, so a program's tests don't rerun the library's. `python3 build.py test` runs `std/*/*_test.fut`.
+
 ### fut map
 
 `fut map main.fut` prints the layout of a program: each package, the files of it the program uses, and every top-level declaration, with line ranges, in fut syntax. It is generated from the sources each time, so it is never stale and never committed. It is for readers who want to know where things are before reading any code, such as an agent picking where to work.
@@ -441,6 +451,8 @@ print(hypot(3, 4))
 ```
 
 Types: `num` (double), `int` (32-bit), `long` (64-bit), `ptr` (a pointer, as a number), `str` (a `const char*`; a returned one is copied, NULL becomes nil). The return type defaults to `void` (nil). Up to 7 parameters; variadic C functions such as `printf` are not supported. A call is a thunk that branches to one generic marshaller: integer and floating-point arguments travel in separate registers (`x0`–`x7` and `d0`–`d7`), so passing all of them suits every signature. Arguments are type-checked, but what the C function does with them is not.
+
+A call performs `io` (see [Effects](#effects)). A bare `!` after the signature declares that the function performs nothing, so code that may not perform `io` can call it: `extern fn sin(num): num !`. Like the types, this is the declaration's promise, not something fut can check.
 
 ## Foreign modules
 
@@ -545,7 +557,7 @@ Other differences from arm64: file changes and typed lines are delivered only wh
 | `types.cpp` | Optional types: what each check names, the check compiled code calls, and the one field stores make |
 | `effects.cpp` | Effects: declared sets and their checks (entry, perform site), operations and their ids, handler records, `handle`, `random()`; the frame records that tell an outside call for invariants |
 | `api.cpp` | Public interfaces: a file's or a package's `pub` declarations as `.api` text, the version check, the check `fut test` runs, `fut api`, `fut map` |
-| `pkg.cpp` | Packages: reading `fut.pkg` manifests, finding a file's package |
+| `pkg.cpp` | Packages: reading `fut.pkg` manifests, finding a file's package, where the standard library is |
 | `jsval.cpp` | Values crossing into JavaScript: JSON both ways, pinned fut functions, handles (`Ref`) for JS objects |
 | `testcache.cpp` | `fut test --changed`: each test's trace (functions entered, method lookups, names used) with the hashes the compiler gives, checked against the program as compiled now, and the cache file |
 | `test.cpp` | `expect`'s check (deep equality, failure details), `allocs` and `grows` (sizes, timing, the log-log fit), property tests from contracts (generation, shrinking), a failed contract's message, and the test runner's reporting, text and JSON; shared by both platforms |

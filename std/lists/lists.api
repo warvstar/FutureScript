@@ -1,0 +1,64 @@
+// The public interface of package lists 0.1.0 (lists.fut), written by `fut api`. `fut test` fails while it is out of date.
+
+// Is f(x) truthy for every x in l?
+pub fn all(l: list, f: fn): bool
+
+// Is f(x) truthy for some x in l?
+pub fn any(l: list, f: fn): bool
+
+// Is v in l (by ==)?
+pub fn contains(l: list, v: any): bool !
+
+// How many x in l have f(x) truthy.
+pub fn count(l: list, f: fn): num
+
+// The items x of l for which f(x) is truthy, in order.
+pub fn filter(l: list, f: fn): list
+
+// The first x in l for which f(x) is truthy, or nil.
+pub fn find(l: list, f: fn): any
+
+// The items of l's items, one level down: [[1, 2], [3]] -> [1, 2, 3].
+pub fn flatten(l: list): list !
+
+// The first index of v in l (by ==), or -1.
+pub fn indexOf(l: list, v: any): num !
+  ensures result >= -1 && result < l.len()
+
+// [f(x) for each x in l].
+pub fn map(l: list, f: fn): list
+
+// The largest item of l by <, or nil when empty.
+pub fn max(l: list): any !
+
+// The smallest item of l by <, or nil when empty.
+pub fn min(l: list): any !
+
+// [a, a + 1, ..., b - 1].
+pub fn range(a: num, b: num): list !
+  requires b - a < 1e7
+
+// f(...f(f(start, l[0]), l[1])..., l[n-1]).
+pub fn reduce(l: list, start: any, f: fn): any
+
+// A reversed copy of l.
+pub fn reverse(l: list): list !
+  ensures result.len() == l.len()
+
+// A sorted copy of l, smallest first, by <. Stable.
+pub fn sort(l: list): list !
+  requires sortable(l)
+  ensures result.len() == l.len()
+
+// Can sort() take l: are its items all numbers, or all strings?
+pub fn sortable(l: list): bool !
+
+// A copy of l sorted by key(item), smallest first. Stable.
+pub fn sortBy(l: list, key: fn): list
+
+// The sum of l's numbers (0 when empty).
+pub fn sum(l: list): num !
+
+// The items of l without repeats (by ==), first occurrences in order.
+pub fn unique(l: list): list !
+  ensures result.len() <= l.len()

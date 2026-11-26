@@ -69,10 +69,10 @@ def test(exe, only=()):
         ok = r.stdout.splitlines() == want and (all(e in r.stderr for e in err) and r.returncode != 0 if err else r.returncode == 0)
         return t.name, ok, f"want: {want}\n  got:  {r.stdout.splitlines()}\n  stderr: {r.stderr.strip()}"
 
-    def spec(t):  # specs written with test blocks
+    def spec(t, where="specs"):  # specs written with test blocks (and the standard library's tests)
         r = subprocess.run([*runner(exe), "test", str(t)], capture_output=True, text=True, timeout=60)
         last = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else "no output"
-        return f"specs/{t.name} ({last})", r.returncode == 0, (r.stdout + r.stderr).strip().replace("\n", "\n  ")
+        return f"{where}/{t.name} ({last})", r.returncode == 0, (r.stdout + r.stderr).strip().replace("\n", "\n  ")
 
     def check(name, fn):
         ok, detail = fn(exe)
@@ -81,6 +81,7 @@ def test(exe, only=()):
     jobs = ([("hot reload: " + n, lambda n=n, f=f: check("hot reload: " + n, f)) for n, f in HOT_TESTS]  # the slowest (they sleep) start first
             + [(t.name, lambda t=t: program(t)) for t in sorted((ROOT / "tests").glob("*.fut"))]
             + [("specs/" + t.name, lambda t=t: spec(t)) for t in sorted((ROOT / "tests" / "specs").glob("*.fut"))]
+            + [("std/" + t.name, lambda t=t: spec(t, "std")) for t in sorted((ROOT / "std").glob("*/*_test.fut"))]
             + [(n, lambda n=n, f=f: check(n, f)) for n, f in RUNNER_TESTS]
             + (isolateJobs(exe, 4) if exe == OUT else []))  # the plain native build: wasm runs one isolate (docs/isolates.md,
     # phase 5), and the sanitizer builds are slow enough that more load makes timed tests (expect grows) flaky
@@ -482,6 +483,27 @@ def runner_modules(exe):
     return r.stdout.splitlines() == want, f"got: {r.stdout!r}\n  stderr: {r.stderr!r}"
 
 
+def runner_std(exe):
+    """import "std/x" needs no dep line, from a package or not; std/x and a package x of the program's own coexist;
+    std's contracts aren't property-tested in programs that use it; an extern declared ! performs nothing."""
+    d = ROOT / "build" / "stdcase"
+    tree(d, {
+        "loose.fut": 'import "std/strings"\nimport "std/math" as m\nprint(strings.upper("ok"))\nfn f(): num ! { return m.pow(2, 3) }\nprint(f())\n',
+        "app/fut.pkg": "name app\ndep strings ../strings\n",
+        "app/main.fut": 'import "strings"\nimport "std/strings" as s\nprint(strings.mine() + s.upper("x"))\n',
+        "strings/fut.pkg": "name strings\n",
+        "strings/strings.fut": 'pub fn mine() { return "mine" }\n',
+        "t.fut": 'import "std/lists"\ntest "t" { expect lists.sort([2, 1]) == [1, 2] }\n',
+        "bad.fut": 'import "std/nope"\n',
+        "io.fut": 'extern fn hypot(num, num): num\nfn f(): num ! { return hypot(3, 4) }\nprint(f())\n',
+    })
+    run = lambda *a: subprocess.run([*runner(exe), *a], capture_output=True, text=True, timeout=60)
+    a, b, t, bad, io = run(str(d / "loose.fut")), run(str(d / "app" / "main.fut")), run("test", str(d / "t.fut")), run(str(d / "bad.fut")), run(str(d / "io.fut"))
+    ok = (a.stdout == "OK\n8\n" and b.stdout == "mineX\n" and t.returncode == 0 and "1 test: 1 passed" in t.stdout
+          and "no standard library package 'std/nope'" in bad.stderr and "performs io" in io.stderr)
+    return ok, f"loose: {a.stdout!r} {a.stderr!r}\n  app: {b.stdout!r} {b.stderr!r}\n  test: {t.stdout!r}\n  bad: {bad.stderr!r}\n  io: {io.stderr!r}"
+
+
 def runner_spec(exe):
     """docs/spec.md is executable: each ```fut block must pass `fut test` (its top-level expects are assertions)."""
     bad, d = [], ROOT / "build" / "specdoc"  # (runner_text has build/spec; they run at once)
@@ -557,7 +579,8 @@ RUNNER_TESTS = [("fut test --json: statuses, details, output", runner_json),
                 ("fut test: tests first, filter, compile error, todo()", runner_text),
                 ("fut api: interfaces written, checked by fut test", runner_api),
                 ("docs/spec.md: every fut block passes", runner_spec),
-                ("fut test --changed: reruns what an edit affects", runner_changed)]
+                ("fut test --changed: reruns what an edit affects", runner_changed),
+                ("std: imports without dep, names, property tests, pure externs", runner_std)]
 
 
 def fuzz(exe, n=300, seed=None):

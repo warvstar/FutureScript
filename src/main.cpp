@@ -7,6 +7,22 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <mach-o/dyld.h>
+
+// The standard library: $FUT_STD, else std/ beside the directory holding this binary (build/fut -> std/).
+static void findStd() {
+  if (const char* e = getenv("FUT_STD"); e && *e) return void(stdRoot = canonicalPath(e));
+  char b[4096];
+  uint32_t n = sizeof b;
+  if (_NSGetExecutablePath(b, &n)) return;
+  char real[PATH_MAX];
+  if (!realpath(b, real)) return;
+  std::string d = real;
+  d = d.substr(0, d.rfind('/'));
+  d = d.substr(0, d.rfind('/')) + "/std";
+  struct stat st;
+  if (!stat(d.c_str(), &st) && S_ISDIR(st.st_mode)) stdRoot = d;
+}
 
 static std::string path;
 static pthread_mutex_t watchMu = PTHREAD_MUTEX_INITIALIZER;
@@ -259,6 +275,7 @@ static int dumpAsm() {  // assemble the emitted words with clang and disassemble
 }
 
 int main(int argc, char** argv) {
+  findStd();
   bool watch = false, asmMode = false, testMode = argc > 1 && std::string(argv[1]) == "test";
   bool apiMode = argc > 1 && std::string(argv[1]) == "api", apiCheck = false;
   bool mapMode = argc > 1 && std::string(argv[1]) == "map", mapPub = false, mapJson = false;
