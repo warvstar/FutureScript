@@ -358,7 +358,7 @@ fn workerRound(w, msg) {  // the reply to a worker's request
 fn onMain(w) {  // an empty submission: show what main has in the task's files
   var out = "(none)\n\nThe worker changed nothing and says main already does the task. Approve only if the files below show that it does.\n"
   for f in w.task.files { out += "\n--- " + f + " ---\n" + clip(readFile(w.wt + "/" + f) || "(missing)", 20000) }
-  return out
+  return out + "\n--- files tracked on main (git ls-files) ---\n" + clip(sh("git ls-files", w.wt).out, 8000)
 }
 fn reviewRequest(w) {
   var diff = sh("git diff main...HEAD", w.wt).out
