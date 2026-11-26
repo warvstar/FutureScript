@@ -457,6 +457,7 @@ EXPORT(fut_live) u32 futLive() { return (u32)jitLive(); }
 // fut test: the host calls the top level, then each test's code, catching errors (see test.cpp for the rest)
 EXPORT(fut_tests_begin) void futTestsBegin(int json, const char* filter) { testsBegin({json != 0, filter}); }
 EXPORT(fut_test_count) int futTestCount() { return (int)last.tests.size(); }
+EXPORT(fut_test_name) const char* futTestName(int i) { return last.tests[i].name.c_str(); }
 EXPORT(fut_test_start) int futTestStart(int i) { return (int)wa::slotOf(testStart(last.tests[i])); }
 EXPORT(fut_test_finish) void futTestFinish(int i, int errored, const char* err) { testFinish(last.tests[i], errored, err); }
 EXPORT(fut_test_top_error) void futTestTopError(const char* err) { reportTopError(err); }

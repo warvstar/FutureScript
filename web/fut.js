@@ -137,7 +137,7 @@ export async function createFut(opts) {
   const refs = new Map(), refIds = new Map();  // id -> value, value -> id: one id per value while fut holds it
   let refNext = 1;  // never reused, so an id names one value
   const refOf = (v) => { let id = refIds.get(v); if (id == null) refIds.set(v, (id = refNext++)), refs.set(id, v); return id; };
-  const unpin = new FinalizationRegistry((id) => ex.fut_unpin(id));
+  const unpin = globalThis.FinalizationRegistry ? new FinalizationRegistry((id) => ex.fut_unpin(id)) : { register() {} };  // (older Workers lack it)
   function futFn(id) {
     const f = (...args) => callFut(id, args);
     return (f[FUT] = id), unpin.register(f, id), f;
@@ -404,7 +404,11 @@ export async function createFut(opts) {
 
   return {
     exports: ex,
-    async compile(file) { return (path = file), !!(await load(false)); },  // compile only (errors printed): did it compile?
+    async compile(file, tests) {  // compile only (errors printed), as test() would if tests: did it compile?
+      if (!tests) return (path = file), !!(await load(false));
+      withStr("", (p) => ex.fut_tests_begin(1, p));
+      return !!(await compileWith(() => withStr((path = file), (p) => ex.fut_compile(p, 0, 0, 0, 1))));
+    },
     async start(file) {  // compile, then run the top level (not main()): 0 ok, 1 runtime error, 2 compile error
       path = file;
       const c = await load(false);
@@ -412,6 +416,8 @@ export async function createFut(opts) {
       const st = await runCode(c);
       return ex.fut_retire(c), st;
     },
+    has: (name) => withStr(name, (p) => ex.fut_pin_fn(p)) >= 0,  // a top-level function name?
+    tests: () => Array.from({ length: ex.fut_test_count() }, (_, i) => cstr(ex.fut_test_name(i))),  // after compile(file, true)
     // Call the program's top-level function name with args (JSON data): its result. Calls queue, one at a time (each
     // may wait on fetch() meanwhile). A fut error rejects with a FutError (its text: the message and trace).
     apply(name, args) {
@@ -453,9 +459,12 @@ export async function createFut(opts) {
         }
       };
       try {
-        withStr(filter ?? "", (p) => ex.fut_tests_begin(json ? 1 : 0, p));
+        // The filter is set after the compile: nothing before it may depend on the filter, so the code a test file
+        // compiles to doesn't either (a Cloudflare Worker runs it as compiled ahead of time, whatever the filter).
+        withStr("", (p) => ex.fut_tests_begin(json ? 1 : 0, p));
         const c = await compileWith(() => withStr(path, (p) => ex.fut_compile(p, 0, 0, 0, 1)));
         if (!c) return 2;
+        if (filter) withStr(filter, (p) => ex.fut_tests_begin(json ? 1 : 0, p));
         const top = await errorOf(c);
         ex.fut_retire(c);
         // a public interface out of date fails the run too (reported last, by the status)
