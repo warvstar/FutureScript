@@ -369,6 +369,7 @@ int expectSite(ExpectSite);  // its number, passed to the expect@ native
 struct PropSite { std::string file, text, discard; int line = 0, expect = -1; bool cls = false; std::vector<std::string> names; std::vector<std::vector<uint64_t>> types; };
 int propSite(PropSite);
 void testInit();
+void sysInit();  // fetch, exec, files, env, time, JSON (native; the wasm build has none yet)
 V binopValue(V a, V b, int op);  // a op b, as the language computes it (raises on bad operands)
 struct TestRun { bool json = false; std::string filter; double timeout = 10; int isolates = 0; };
 extern std::string mainFile;  // the program's file: run() finds relative files next to it

@@ -105,7 +105,7 @@ test "a handler outside a function that does not declare the effect does not mak
 fn napper() ! clock { sleep(100) return clock() }
 fn faked() ! {
   var t = 0
-  handle { t = napper() } with clock() { return 7 } with sleep(s) { }
+  handle { t = napper() } with clock() { return 7 } with sleep(s) { } with time() { return 0 }
   return t
 }
 test "a handle that answers every operation of an effect allows that effect inside it" {

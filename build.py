@@ -15,7 +15,7 @@ WASM_FLAGS = ["--target=wasm32-wasip1", "--sysroot=/opt/homebrew/share/wasi-sysr
               "-mllvm", "-wasm-enable-sjlj"]
 WASM_LINK = ["-mexec-model=reactor", "-lsetjmp", "-Wl,--export=__stack_pointer", "-Wl,--export-table", "-Wl,--growable-table",
              "-Wl,-z,stack-size=8388608", "-Wl,--stack-first"]
-NATIVE_ONLY, WASM_ONLY = {"main.cpp", "jit.cpp"}, {"wasm.cpp"}
+NATIVE_ONLY, WASM_ONLY = {"main.cpp", "jit.cpp", "sys.cpp"}, {"wasm.cpp"}
 
 
 def build(debug=False, wasm=False, tsan=False):
@@ -42,7 +42,7 @@ def build(debug=False, wasm=False, tsan=False):
             sys.exit(1)
     stamp.write_text(flags)
     if stale or not out.exists():
-        link = WASM_LINK if wasm else ["-lobjc"]
+        link = WASM_LINK if wasm else ["-lobjc", "-lcurl"]
         subprocess.run([cxx, *(o for o in opt if o not in ("-mllvm", "-wasm-enable-sjlj")), *(str(o) for _, o in objs), *link, "-o", str(out)], check=True)
     return out
 
@@ -61,6 +61,8 @@ def test(exe, only=()):
 
     def program(t):
         src = t.read_text()
+        if exe.suffix == ".wasm" and "// native only" in src:  # e.g. the host builtins (exec, files), which wasm lacks yet
+            return t.name + " (native only)", True, ""
         want = re.findall(r"// expect: ?(.*)", src)
         err = re.findall(r"// error: ?(.*)", src)
         r = subprocess.run([*runner(exe), str(t)], capture_output=True, text=True, timeout=60)
@@ -508,7 +510,7 @@ def fuzz(exe, n=300, seed=None):
     rng = random.Random(seed if seed is not None else time.time_ns())
     corpus = [p.read_text() for p in sorted((ROOT / "tests").glob("*.fut")) + sorted((ROOT / "tests" / "specs").rglob("*.fut"))
               + sorted((ROOT / "examples").glob("*.fut"))]
-    corpus = [c for c in corpus if "window(" not in c and "extern" not in c and "run(" not in c]  # no windows; C calls are unchecked; no child processes
+    corpus = [c for c in corpus if not any(w in c for w in ("window(", "extern", "run(", "exec", "writeFile", "fetch"))]  # no windows; C calls are unchecked; no child processes, files or network
     toks = ["(", ")", "{", "}", "[", "]", ",", ".", ":", "=", "+=", "-", "*", "/", "%", "==", "<", "&&", "!", "..", "\"",
             "\"{x}\"", "fn", "var", "class", "if", "else", "while", "for", "in", "return", "break", "self", "super", "nil",
             "1", "0", "-1", "x", "f", "fn(a) { return a }", "{a: 1}", "\n"]

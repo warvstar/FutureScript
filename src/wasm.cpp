@@ -62,6 +62,7 @@ u32* jitInstall(Code& k) {
   batch.push_back({std::move(k), s});
   return (u32*)(uintptr_t)s;
 }
+void sysInit() {}  // fetch, exec and files: not in the browser build yet
 void patchStub(u32* stub, void* target) { ops.push_back((int32_t)wa::slotOf(stub)), ops.push_back((int32_t)wa::slotOf(target)); }
 void jitRetire(u32* body) { retired.push_back(wa::slotOf(body)); }
 void jitShiftLines(u32* body, int delta) {

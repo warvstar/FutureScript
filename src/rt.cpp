@@ -492,6 +492,16 @@ static V n_len(V v) {
 }
 double now() { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static V n_clock() { return box(now()); }
+static V n_time() {  // seconds since 1970
+  timespec t;
+  clock_gettime(CLOCK_REALTIME, &t);
+  return box(t.tv_sec + t.tv_nsec / 1e9);
+}
+static V n_json(V v) { return box(newStr(toJs(v))); }  // JSON text, as for JavaScript
+static V n_parseJson(V s) {
+  if (!is(s, K::Str)) ERR("parseJson() expects a string, got %s", typeName(s));
+  return fromJs(std::string(as<Str>(s)->sv()));
+}
 static V n_sleep(V v) { return sleepFor(NUMARG(v, "sleep")), NIL; }
 static V n_floor(V v) { return box(std::floor(NUMARG(v, "floor"))); }
 static V n_sqrt(V v) { return box(std::sqrt(NUMARG(v, "sqrt"))); }
@@ -559,6 +569,7 @@ void rtInit() {
   native<n_print>("print"), native<n_str>("str"), native<n_len>("len"), native<n_clock>("clock"), native<n_sleep>("sleep");
   native<+[](V v) { return box(std::trunc(NUMARG(v, "int"))); }>("int");
   native<n_floor>("floor"), native<n_sqrt>("sqrt"), native<newFiber>("fiber");
+  native<n_time>("time"), native<n_json>("json"), native<n_parseJson>("parseJson");
   method<+[](V f) { return fiberResume(f, NIL); }>(K::Fiber, S_resume), method<fiberResume>(K::Fiber, S_send);
   method<+[](V f) { return boxb(as<Fiber>(f)->state == FIB_DONE); }>(K::Fiber, S_done);
   method<l_push>(K::List, S_push), method<l_pop>(K::List, S_pop), method<n_len>(K::List, S_len);
@@ -572,5 +583,6 @@ void rtInit() {
   method<+[](V m) { return mapList(m, true); }>(K::Map, S_keys);
   method<+[](V m) { return mapList(m, false); }>(K::Map, S_values);
   testInit();
+  sysInit();
   effectsInit();  // after the natives it marks as operations
 }
