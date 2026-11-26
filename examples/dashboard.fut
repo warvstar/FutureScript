@@ -182,8 +182,7 @@ fn requestLog() {
 fn pad(n) { return n < 10 ? "0{n}" : "{n}" }
 fn commas(n) {  // 20000 -> "20,000"
   if n < 1000 { return "{n}" }
-  var rest = strings.padStart("{n % 1000}", 3, "0")
-  return "{commas(floor(n / 1000))},{rest}"
+  return "{commas(floor(n / 1000))},{strings.padStart("{n % 1000}", 3, "0")}"
 }
 fn filteredLog(only, who) {
   return lists.filter(requestLog(), fn(e) { return (only == "all" || e.code >= 500) && (who == "" || e.service == who) })

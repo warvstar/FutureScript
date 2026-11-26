@@ -69,3 +69,7 @@ test "state in a function: its own signal, per call" {
   expect a() == "n is 13"
   expect b() == "n is 12"
 }
+test "state read in a string inside an interpolation" {
+  items = ["x", "y"]
+  expect "{items.join(", ")} and {"{items.len()} {"of {n > 0 ? "them" : "none"}"}"}" == "x, y and 2 of them"
+}

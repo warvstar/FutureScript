@@ -14,3 +14,10 @@ test "an escaped brace is not interpolated" {
   expect "escaped \{x}".len() == 11   // "escaped {x}", not "escaped 3"
   expect prints { print("escaped \{x}") } == "escaped \{x}\n"
 }
+test "strings inside an interpolation" {
+  var xs = ["a", "b"]
+  expect "{xs.join(", ")}!" == "a, b!"
+  expect "{"in {"deep"}"} end" == "in deep end"
+  expect "{x > 2 ? "big" : "small"} {"\{"}" == "big \{"
+  expect "{"\"quoted\""}".len() == 8
+}

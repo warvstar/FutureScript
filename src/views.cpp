@@ -25,6 +25,32 @@ struct Tok {
   bool sp() const { return tb != b; }
 };
 
+// From a string's opening quote to just past its closing one, as compile.h's skipString: a quote inside an
+// interpolation's braces starts a string of its own, which ends on its line; braces that don't pair up end the string
+// at its next quote. npos: no closing quote.
+size_t nestedEnd(const std::string& s, size_t i, bool inner) {
+  int depth = 0;
+  for (i++; i < s.size(); i++) {
+    if (inner && s[i] == '\n') return std::string::npos;
+    if (s[i] == '\\') { i++; continue; }
+    if (s[i] == '{') depth++;
+    else if (s[i] == '}' && depth) depth--;
+    else if (s[i] == '"') {
+      if (!depth) return i + 1;
+      size_t e = nestedEnd(s, i, true);
+      if (e == std::string::npos) return e;
+      i = e - 1;
+    }
+  }
+  return std::string::npos;
+}
+size_t stringEnd(const std::string& s, size_t i) {
+  size_t e = nestedEnd(s, i, false);
+  if (e != std::string::npos) return e;
+  for (i++; i < s.size() && s[i] != '"'; i++) if (s[i] == '\\') i++;
+  return std::min(i + 1, s.size());
+}
+
 Tok lexAt(const std::string& s, size_t i) {
   Tok t;
   t.tb = i;
@@ -42,10 +68,7 @@ Tok lexAt(const std::string& s, size_t i) {
     while (i < s.size() && (idChar(s[i]) || (s[i] == '.' && i + 1 < s.size() && s[i + 1] >= '0' && s[i + 1] <= '9'))) i++;
     return t.k = 'n', t.e = i, t;
   }
-  if (c == '"') {
-    for (i++; i < s.size() && s[i] != '"'; i++) if (s[i] == '\\') i++;
-    return t.k = 's', t.e = std::min(i + 1, s.size()), t;
-  }
+  if (c == '"') return t.k = 's', t.e = stringEnd(s, i), t;
   static const char* const two[] = {"==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=", "%=", "**", "?.", ".."};
   for (const char* o : two) if (s.compare(i, 2, o) == 0) return t.k = 'p', t.e = i + 2, t;
   return t.k = 'p', t.e = i + 1, t;
@@ -567,7 +590,10 @@ struct State {
       if (str[j] == '\\') { r += str.substr(j, 2), j++; continue; }
       if (str[j] != '{') { r += str[j]; continue; }
       size_t e = j + 1;
-      for (int depth = 1; e < str.size() && depth; e++) depth += str[e] == '{' ? 1 : str[e] == '}' ? -1 : 0;
+      for (int depth = 1; e < str.size() && depth; e++) {
+        if (str[e] == '"') { e = stringEnd(str, e) - 1; continue; }  // a string in the hole: its braces are its own
+        depth += str[e] == '{' ? 1 : str[e] == '}' ? -1 : 0;
+      }
       std::string inner = str.substr(j + 1, e - j - 2);
       State in(inner);
       in.tops = tops, in.fields = fields;

@@ -736,16 +736,16 @@ struct Compiler : Gen {
         suffix++;
         while (suffix < end && strchr(" \t\r\n", *suffix)) suffix++;
       }
-      if (suffix == end) failAt(s - 1, line, "@syntax unclosed '{' in string");
+      if (suffix == end) failAt(s - 1, line, "@syntax this '{' starts code that never ends: close it with '}', or write \\{ for a brace");
       FormatSpec spec;
       bool formatted = *suffix == ':';
       if (formatted) {
         const char* start = suffix + 1;
         suffix = std::find(start, end, '}');
-        if (suffix == end) failAt(s - 1, line, "@syntax unclosed '{' in string");
+        if (suffix == end) failAt(s - 1, line, "@syntax this '{' starts code that never ends: close it with '}', or write \\{ for a brace");
         spec = formatSpec(start, suffix, cur.line + (int)std::count(marker, start, '\n'));
       }
-      if (*suffix != '}') failAt(suffix, cur.line, "@syntax expected '}' to end the interpolation");
+      if (*suffix != '}') failAt(suffix, cur.line, "@syntax expected '}' to end the code in this string, or write \\{ for a brace");
       if (debug || formatted) {
         imm(1, std::bit_cast<V>(spec));
         if (debug) konst(std::string(s, marker) + " = ", 2);

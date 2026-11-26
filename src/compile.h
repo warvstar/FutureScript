@@ -16,6 +16,24 @@ struct Tok { int t = 0, line = 0, sym = -1, len = 0; bool nl = false; double n =
 inline bool idc(char c) { return ((c | 32) >= 'a' && (c | 32) <= 'z') || c == '_'; }
 inline bool dig(char c) { return c >= '0' && c <= '9'; }
 
+// From a string's opening quote to just past its closing one (false: it has none). An interpolation's code may hold
+// strings of its own ("{join(xs, ", ")}"): a quote inside braces starts one, which ends on its line.
+inline bool skipString(const char*& p, int& line, bool inner = false) {
+  int depth = 0;
+  for (p++;; p++) {
+    if (!*p || (inner && *p == '\n')) return false;
+    if (*p == '\\' && p[1]) { if (*++p == '\n') line++; continue; }
+    if (*p == '\n') line++;
+    else if (*p == '{') depth++;
+    else if (*p == '}' && depth) depth--;
+    else if (*p == '"') {
+      if (!depth) return p++, true;
+      if (!skipString(p, line, true)) return false;
+      p--;
+    }
+  }
+}
+
 struct Lexer {
   const char* p = "";
   int line = 1;
@@ -44,12 +62,17 @@ struct Lexer {
       return k.t = T_ID, k.sym = intern({k.p, size_t(p - k.p)}), k;
     }
     if (*p == '"') {
-      for (p++; *p != '"'; p++) {
+      int at = line;
+      if (!skipString(p, line)) {  // braces that don't pair up: the string ends at its next quote, and its holes report
+        p = k.p, line = at;
+        for (p++; *p && *p != '"'; p++) {
+          if (*p == '\\' && p[1]) p++;
+          if (*p == '\n') line++;
+        }
         if (!*p) return err = "unterminated string", k.t = T_ERR, k;
-        if (*p == '\\' && p[1]) p++;
-        if (*p == '\n') line++;
+        p++;
       }
-      k.p++, k.len = int(p++ - k.p);
+      k.p++, k.len = int(p - 1 - k.p);
       return k.t = T_STR, k;
     }
     if ((*p == '=' || *p == '!') && p[1] == '=' && p[2] == '=') {
