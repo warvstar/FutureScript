@@ -1823,8 +1823,17 @@ struct Compiler : Gen {
       if ((i < skip.size() && skip[i].first <= k.p) || (k.t == T_ID && k.sym == S_override)) continue;
       h = (h ^ (uint64_t)k.t ^ (uint64_t)k.nl << 32) * 1099511628211ull;
       for (const char* c = k.p; c < L.p; c++) h = (h ^ (uint8_t)*c) * 1099511628211ull;
-      if (k.t == T_ID && k.sym >= NKW && seen.insert(k.sym).second)
-        if (auto it = declsNamed.find(symName(k.sym)); it != declsNamed.end()) names += it->second;
+      auto named = [&](const std::string& n) {
+        if (auto it = declsNamed.find(n); it != declsNamed.end()) names += it->second;
+      };
+      if (k.t == T_ID && k.sym >= NKW && seen.insert(k.sym).second) named(symName(k.sym));
+      if (k.t == T_STR && memchr(k.p, '{', k.len))  // "{name}" interpolates: every word in it (a few more is harmless)
+        for (const char *c = k.p, *e = k.p + k.len; c < e;) {
+          if (!idc(*c)) { c++; continue; }
+          const char* w = c;
+          while (c < e && (idc(*c) || dig(*c))) c++;
+          if (int sym = intern({w, size_t(c - w)}); sym >= NKW && seen.insert(sym).second) named(symName(sym));
+        }
     }
     return (h ^ names) * 1099511628211ull;
   }

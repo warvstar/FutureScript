@@ -360,7 +360,10 @@ static void* rt_prep(V* w, uint64_t n, uint64_t sym, V sup, IC* ic) {
   } else if (is(r, K::Fn)) {
     f = as<Fn>(r);
     if (f->op) return effPrep(f, w, n);  // an effect's operation: a handler, the builtin, or an error
-    if (f->arity != (int)n) ERR("%s expects %d arguments, got %d", symName(f->name).c_str(), f->arity, (int)n);
+    if (f->arity != (int)n) {
+      if (traceOn) traceCalled(f->name);
+      ERR("%s expects %d arguments, got %d", symName(f->name).c_str(), f->arity, (int)n);
+    }
     memmove(w, w + 1, n * 8);
     return f->code;
   } else if (is(r, K::Clo)) f = as<Clo>(r)->fn;

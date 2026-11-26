@@ -77,7 +77,8 @@ bool itemHash(const std::string& item, uint64_t& h) {
       std::string owner;
       for (Class* k = c; k && owner.empty(); k = k->super)
         for (auto& [s, f] : k->methods) if (s == m) { owner = symName((int)k->name) + "." + symName(m); break; }
-      h = mix(fnvStr(owner), chain(n.substr(0, sp)));
+      auto body = defs.find("f:" + owner);  // its parameters: a call it rejected never entered it
+      h = mix(mix(fnvStr(owner), body == defs.end() ? 0 : body->second), chain(n.substr(0, sp)));
       return true;
     }
   }
@@ -164,6 +165,9 @@ uint64_t* traceMark(const std::string& owner) {
 }
 void traceRef(const std::string& owner, int sym) { refs[owner].insert(sym); }
 void traceLookup(int64_t cls, int sym) { Locked l(lookMu); lookups.insert({cls, sym}); }
+void traceCalled(int fn) {  // a call to function fn was rejected (its parameters) without entering it
+  if (std::string q = symName(fn); defs.count("f:" + q)) *traceMark(q) = 1;
+}
 void traceImpure() { impure.store(true, std::memory_order_relaxed); }
 void traceDefine(const std::string& item, uint64_t hash) { defs[item] = hash; }
 void traceClass(const std::string& cls, const std::string& super, uint64_t shape) { classes[cls] = {super, shape}; }

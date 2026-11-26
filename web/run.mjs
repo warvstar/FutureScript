@@ -20,6 +20,7 @@ for (let i = testing || api || map ? 1 : 0; i < argv.length; i++) {
   else if (testing && a == "--json") json = true;
   else if (testing && a == "--filter" && i + 1 < argv.length) filter = argv[++i];
   else if (testing && a == "--timeout" && i + 1 < argv.length) i++;  // tests share one process here: no per-test timeout
+  else if (testing && a == "--changed") {}  // ... and no traces: every test runs
   else if (a == "-w" && !testing) watch = verbose = true;
   else if (a == "-v") verbose = true;
   else if (a[0] == "-") process.stderr.write(usage), process.exit(2);

@@ -484,7 +484,7 @@ def runner_modules(exe):
 
 def runner_spec(exe):
     """docs/spec.md is executable: each ```fut block must pass `fut test` (its top-level expects are assertions)."""
-    bad, d = [], ROOT / "build" / "spec"
+    bad, d = [], ROOT / "build" / "specdoc"  # (runner_text has build/spec; they run at once)
     d.mkdir(parents=True, exist_ok=True)
     blocks = re.findall(r"```fut\n(.*?)```", (ROOT / "docs" / "spec.md").read_text(), re.S)
     for i, b in enumerate(blocks):
@@ -496,13 +496,68 @@ def runner_spec(exe):
     return not bad and len(blocks) > 5, "\n  ".join(bad) or f"only {len(blocks)} blocks"
 
 
+CHANGED_SRC = """var rate = 2
+var unused = 1
+class Shape {
+  fn area() { return 0 }
+  fn name() { return "shape" }
+}
+class Square : Shape {
+  fn init(s) { self.s = s }
+}
+fn scale(x) { return x * rate }
+fn add(a, b) { return a + b }
+fn mul(a, b) { return a * b }
+test "add" { expect add(1, 2) == 3 }
+test "mul" { expect mul(2, 3) == 6 }
+test "area" { expect Square(2).area() == 0 }
+test "name" { expect Shape().name() == "shape" }
+test "scale" { expect scale(3) == 6 }
+test "clock" { expect clock() >= 0 }
+"""
+
+
+def runner_changed(exe):
+    """`fut test --changed` reruns only what an edit can affect: a function's callers, a base method's callers on a
+    subclass that now overrides it, a var's readers; effectful tests always; a save with no code change, nothing.
+    Each edit makes the tests it affects fail, so the failures listed are exactly the tests that ran again."""
+    if exe.suffix == ".wasm":  # one process runs every test there: nothing to trace, so --changed runs them all
+        return True, "native only"
+    d = ROOT / "build" / "changed"
+    tree(d, {"main.fut": CHANGED_SRC})
+    main = d / "main.fut"
+    def step(old="", new=""):
+        main.write_text(main.read_text().replace(old, new))
+        r = subprocess.run([*runner(exe), "test", "--changed", str(main)], capture_output=True, text=True, timeout=60)
+        lines = r.stdout.splitlines()
+        return (lines[0].split(" (")[0] if lines else "", sorted(l.split()[1] for l in lines if l.startswith("FAIL")))
+    got = [step(),                                                        # no cache yet: everything runs
+           step(),                                                        # a save with no change: only the clock test
+           step("var unused = 1", "var unused = 1  // never read"),       # a comment, and a var nothing reads
+           step("return a * b", "return a * b + 1"),                      # one function: only its test
+           step("return a * b + 1", "return a * b"),
+           step("self.s = s }", "self.s = s }\n  override fn area() { return self.s * self.s }"),  # an override
+           step("var rate = 2", "var rate = 5"),                          # a var's initializer: its reader
+           step("var rate = 5", "var rate = 2")]
+    want = [("6 run, 0 cached, 0 failed", []), ("1 run, 5 cached, 0 failed", []), ("1 run, 5 cached, 0 failed", []),
+            ("2 run, 4 cached, 1 failed", ["mul"]), ("2 run, 4 cached, 0 failed", []),
+            ("2 run, 4 cached, 1 failed", ["area"]), ("3 run, 3 cached, 2 failed", ["area", "scale"]),
+            ("3 run, 3 cached, 1 failed", ["area"])]
+    j = subprocess.run([*runner(exe), "test", "--changed", "--json", str(main)], capture_output=True, text=True, timeout=60)
+    summary = json.loads(j.stdout.splitlines()[-1]) if j.stdout.strip() else {}
+    tests = [json.loads(l)["name"] for l in j.stdout.splitlines()[:-1]]
+    ok = got == want and tests == ["area"] and summary.get("run") == 2 and summary.get("cached") == 4 and summary.get("failed") == 1
+    return ok, f"got:  {got}\n  want: {want}\n  json: {j.stdout!r}"
+
+
 RUNNER_TESTS = [("fut test --json: statuses, details, output", runner_json),
                 ("packages: names, interfaces, boundaries, versions", runner_packages),
                 ("fut map: packages, files, declarations", runner_map),
                 ("foreign modules: js, wasm, c", runner_modules),
                 ("fut test: tests first, filter, compile error, todo()", runner_text),
                 ("fut api: interfaces written, checked by fut test", runner_api),
-                ("docs/spec.md: every fut block passes", runner_spec)]
+                ("docs/spec.md: every fut block passes", runner_spec),
+                ("fut test --changed: reruns what an edit affects", runner_changed)]
 
 
 def fuzz(exe, n=300, seed=None):

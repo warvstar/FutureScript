@@ -397,6 +397,7 @@ uint64_t* traceMark(const std::string& owner);        // the word a body of owne
 void traceRef(const std::string& owner, int sym);     // owner's code names top-level sym ("<top>": top-level code)
 void traceLookup(int64_t cls, int sym);               // a call resolved method sym on an instance of class cls
 void traceImpure();                                   // something ran whose result the world can change
+void traceCalled(int fn);                             // a call to top-level function fn failed before entering it
 void traceDefine(const std::string& item, uint64_t hash);
 void traceClass(const std::string& cls, const std::string& super, uint64_t shape);
 void traceMethod(const std::string& q, const std::string& cls);
