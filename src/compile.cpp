@@ -107,9 +107,12 @@ using Sources = std::vector<std::pair<std::string, std::string>>;
 static Sources installed, replaced;
 static const Sources* overlay;
 void viewsRewrite(std::string& src, const std::string& path);  // views.cpp
-static bool readSource(const std::string& path, std::string& out) {
+static bool readSource(const std::string& path, std::string& out, const CompileCheck* check) {
   if (!overlay) {
-    if (!readFile(path, out)) return false;
+    bool inMemory = false;
+    if (check) for (auto& [file, text] : check->buffers)
+      if (file == path) { out = text; inMemory = true; break; }
+    if (!inMemory && !readFile(path, out)) return false;
     viewsRewrite(out, path);
     return true;
   }
@@ -119,6 +122,7 @@ static bool readSource(const std::string& path, std::string& out) {
 
 struct Compiler : Gen {
   bool reload = false, echo = false, tiering = false, topTry = false, testing = false;  // testing: compile `test` blocks
+  CompileCheck* editorCheck = nullptr;
   std::vector<TestCase> tests;
   std::string owner;
   // fut test --changed: who the code being compiled belongs to, for the top-level names it uses (traceRef): refKey if
@@ -2063,7 +2067,8 @@ struct Compiler : Gen {
     // extern "fut": a function of the runtime's own (fmath.cpp: math with the same results on every platform)
     Global* rtg = lib == "fut" ? findGlobal(intern("fut@" + symName(s))) : nullptr;
     if (lib == "fut" && !rtg) failAt(t.p, t.line, "@extern the runtime has no function '%s'", name(s));
-    void* fn = rtg ? (void*)rtg->o : !stub.empty() ? (void*)1 : externLookup(lib, symName(s), &err);
+    // An editor check never loads a project's shared libraries: even dlopen can run their code.
+    void* fn = rtg ? (void*)rtg->o : editorCheck || !stub.empty() ? (void*)1 : externLookup(lib, symName(s), &err);
     if (err && !strcmp(err, "pending")) {  // the host loads it, then compiles again
       if (std::find(modulesPending.begin(), modulesPending.end(), lib) == modulesPending.end()) modulesPending.push_back(lib);
       fn = (void*)1;
@@ -2199,7 +2204,7 @@ struct Compiler : Gen {
   std::string resolvePath(std::string_view rel) {
     std::string p(rel);
     if (size_t d = file.rfind('/'); p[0] != '/' && d != std::string::npos) p = file.substr(0, d + 1) + p;
-    return canonicalPath(p);
+    return editorCheck ? editorCheck->normalize(p) : canonicalPath(p);
   }
   // What `import "x"` names: a file of this package, by path; or another package, by name (one its manifest lists
   // with `dep`), meaning that package's root file. pkg: the package's prefix (its alias), when imported by name.
@@ -2470,8 +2475,16 @@ struct Compiler : Gen {
       } else if (depth == 0 && t.t == T_STR && p.t == T_ID && p.sym == K_import) {
         bool re = pubNext;
         pubNext = false;
+        size_t site = 0;
+        if (editorCheck) {
+          const char* start = p.p;
+          while (start > src && start[-1] != '\n') start--;
+          site = editorCheck->imports.size();
+          editorCheck->imports.push_back({path, "", p.line, int(p.p - start + 1)});
+        }
         Target tg = importTarget(t);
         std::string ip = tg.path;
+        if (editorCheck) editorCheck->imports[site].to = ip;
         Lexer s = L;
         Tok a = lex(s), n = a.t == T_ID && a.sym == S_as ? lex(s) : Tok{};
         if (a.t == T_ID && a.sym == S_as && (n.t != T_ID || n.sym < NKW)) failAt(n.p, n.line, "@syntax expected a %s name after 'as'", tg.pkg.empty() ? "module" : "package");
@@ -2497,7 +2510,7 @@ struct Compiler : Gen {
         } else if (tg.pkg.empty() && isModule[ip]) plainModules[path].push_back(ip);
         if (sources.count(ip)) continue;
         std::string& text = sources[ip].text;
-        if (!readSource(ip, text)) failAt(t.p, t.line, "@import cannot read '%s'", ip.c_str());
+        if (!readSource(ip, text, editorCheck)) failAt(t.p, t.line, "@import cannot read '%s'", ip.c_str());
         files.push_back(ip), prescan(ip, text.c_str());
       }
     }
@@ -2635,6 +2648,7 @@ struct Compiler : Gen {
     checkGpu();
     for (auto& [sym, v] : varTypes) globalType(sym);  // each typed var's type, for commit
     Code chunk = finish();
+    if (editorCheck) return {};  // leave code uninstalled for editor checks
     return commit(chunk);
   }
 
@@ -3044,13 +3058,13 @@ void tierUp(void* p, u32 numArgs) {
 // The compile in progress lives on the heap: a compile error unwinds past compile() (wasm: by longjmp, which runs
 // no destructors), and the next compile frees what it left.
 static Compiler* active;
-Compiled compile(const std::string& path, bool reload, bool echo, const std::string* text, bool tests) {
+Compiled compile(const std::string& path, bool reload, bool echo, const std::string* text, bool tests, CompileCheck* check) {
   Locked code(codeMu);  // one compile at a time, whichever isolate asks (tierUp too)
   ImageScope image;     // what it makes, compiled code points at, in every isolate
   JitBatch writable;    // nothing JIT-compiled runs during a compile
   delete active;
   Compiler& c = *(active = new Compiler);
-  c.reload = reload, c.echo = echo, c.testing = tests;
+  c.reload = reload, c.echo = echo, c.testing = tests, c.editorCheck = check;
   packagesReset(), modulesPending.clear();
   if (!echo) {
     mainFile = path;
@@ -3061,7 +3075,7 @@ Compiled compile(const std::string& path, bool reload, bool echo, const std::str
   if (text) {
     src = *text;
     viewsRewrite(src, path);
-  } else if (!readSource(path, src)) compileFail("cannot read " + path, false);
+  } else if (!readSource(path, src, check)) compileFail("cannot read " + path, false);
   Compiled out = c.run(path, src.c_str());
   delete active, active = nullptr;
   return out;

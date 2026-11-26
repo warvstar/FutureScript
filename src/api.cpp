@@ -47,7 +47,11 @@ std::string apiPath(const std::string& file) {
 // Reading declarations from tokens, without compiling.
 struct Scan {
   Lexer L;
-  Tok next() { Tok t = L.next(); return t.t == T_ERR ? Tok{T_EOF} : t; }
+  Tok next() {
+    Tok t = L.next();
+    if (t.t == T_ERR) t.t = T_EOF;
+    return t;
+  }
   static bool isKw(const Tok& t, int k) { return t.t == T_ID && t.sym == k; }
   const char* params(Tok& t) {  // t is '(': through the matching ')'; returns just past it
     for (int d = 0; t.t != T_EOF; t = next()) if ((d += (t.t == '(') - (t.t == ')')) == 0) return t.p + 1;
@@ -109,14 +113,7 @@ struct Scan {
 // Every declaration in a file, read from tokens without compiling: what interfaces and `fut map` both show, so the
 // two can't disagree. A top-level declaration, then its members (owner: the class or effect they are in), each with
 // the // comments right above it and, for a function or method, its contract (an invariant is a member of its own).
-struct Decl {
-  std::string kind, name, sig, owner, mod;  // owner: the class or effect a member is in; mod: an extern's module
-  bool pub;
-  int line, end;
-  std::string doc;                   // the // lines right above it
-  std::vector<std::string> clauses;  // its requires and ensures, as written (on one line each)
-};
-static std::vector<Decl> declsOf(const std::string& text) {
+std::vector<Decl> declsOf(const std::string& text) {
   std::vector<Decl> out;
   const char* src = text.c_str();
   Scan S{Lexer{src}};
@@ -125,6 +122,10 @@ static std::vector<Decl> declsOf(const std::string& text) {
   int depth = 0;
   static const int gpuSym = intern("gpu");
   auto isGpu = [](const Tok& t) { return t.t == T_ID && t.sym == gpuSym; };
+  auto add = [&](Decl d, const char* start, const char* name) {
+    d.start = start - src, d.stop = L.p - src, d.nameAt = name - src;
+    out.push_back(std::move(d));
+  };
   for (Tok t = S.next(); t.t != T_EOF; t = S.next()) {
     if (t.t == '{') depth++;
     if (t.t == '}') depth--;
@@ -151,35 +152,38 @@ static std::vector<Decl> declsOf(const std::string& text) {
       const char* e = S.effects(S.typed(S.params(p)));
       auto cl = S.clauses();
       int end = S.bodyEnd();
-      out.push_back({"fn", symName(n.sym), squash(from, e), "", "", pub, k.line, end, doc, cl});
+      add({"fn", symName(n.sym), squash(from, e), "", "", pub, k.line, end, doc, cl}, from, n.p);
     } else if (isKw(k, S_type)) {  // type Name = <type>
       Lexer save = L;
       Tok n = S.next(), eq = S.next();
       if (n.t != T_ID || n.nl || eq.t != '=') { L = save; continue; }
-      out.push_back({"type", symName(n.sym), squash(from, S.type()), "", "", pub, k.line, L.line, doc, {}});
+      add({"type", symName(n.sym), squash(from, S.type()), "", "", pub, k.line, L.line, doc, {}}, from, n.p);
     } else if (isKw(k, K_var)) {
       Tok n = S.next();
       if (n.t != T_ID) continue;
-      out.push_back({"var", symName(n.sym), squash(from, S.typed(L.p)), "", "", pub, k.line, k.line, doc, {}});
+      add({"var", symName(n.sym), squash(from, S.typed(L.p)), "", "", pub, k.line, k.line, doc, {}}, from, n.p);
     } else if (isKw(k, K_import)) {
       Tok f = S.next();
       if (f.t != T_STR) continue;
       const char* e = f.p + f.len + 1;
       Lexer s = L;
-      if (Tok a = s.next(); isKw(a, S_as)) if (Tok n = s.next(); n.t == T_ID) L = s, e = s.p;
-      out.push_back({"import", std::string(f.p, f.len), squash(from, e), "", "", pub, k.line, k.line, doc, {}});
+      std::string alias;
+      if (Tok a = s.next(); isKw(a, S_as)) if (Tok n = s.next(); n.t == T_ID) L = s, e = s.p, alias = symName(n.sym);
+      add({"import", std::string(f.p, f.len), squash(from, e), "", "", pub, k.line, k.line, doc, {}}, from, f.p);
+      out.back().alias = std::move(alias);
     } else if (isKw(k, K_extern)) {
       Tok n = S.next();
       std::string mod = n.t == T_ID && !isKw(n, K_fn) ? symName(n.sym) : n.t == T_STR ? std::string(n.p, n.len) : "";
       while (n.t != T_EOF && !isKw(n, K_fn)) n = S.next();
       Tok nm = S.next(), p = S.next();
+      if (nm.t != T_ID || p.t != '(') continue;
       const char* e = S.params(p);
       if (Lexer s = L; s.next().t == ':') s.next(), e = s.p, L = s;  // its result type
       Lexer s = L;
       if (Tok b = s.next(); b.t == '!' && !b.nl) e = s.p, L = s;  // pure: a bare ! on its line
       std::string sig = squash(from, e);
-      if (mod == "fut") sig.erase(sig.find(" \"fut\""), 6);  // the runtime's own: where it is implemented is not its interface
-      out.push_back({"extern", symName(nm.sym), sig, "", mod, pub, k.line, k.line, doc, {}});
+      if (mod == "fut") if (size_t at = sig.find(" \"fut\""); at != std::string::npos) sig.erase(at, 6);
+      add({"extern", symName(nm.sym), sig, "", mod, pub, k.line, k.line, doc, {}}, from, nm.p);
     } else if (isKw(k, S_effect) || isKw(k, K_class)) {
       bool eff = isKw(k, S_effect);
       Lexer save = L;
@@ -188,27 +192,29 @@ static std::vector<Decl> declsOf(const std::string& text) {
       while (b.t != '{' && b.t != T_EOF) b = S.next();
       size_t at = out.size();
       std::string owner = symName(n.sym);
-      out.push_back({eff ? "effect" : "class", owner, squash(from, b.p), "", "", pub, k.line, k.line, doc, {}});
+      add({eff ? "effect" : "class", owner, squash(from, b.p), "", "", pub, k.line, k.line, doc, {}}, from, n.p);
       for (Tok m = S.next(); m.t != '}' && m.t != T_EOF; m = S.next()) {
         std::string md = docs(src, m.p, "");
         if (isKw(m, K_var) && !eff) {
           Tok f = S.next();
+          if (f.t != T_ID) continue;
           S.typed(f.p);
           if (Lexer s = L; s.next().t == '=') {  // its default, a constant: one token, maybe negated
             L = s;
             if (S.next().t == '-') S.next();
           }
-          out.push_back({"field", symName(f.sym), squash(m.p, L.p), owner, "", pub, m.line, m.line, md, {}});
+          add({"field", symName(f.sym), squash(m.p, L.p), owner, "", pub, m.line, m.line, md, {}}, m.p, f.p);
           continue;
         }
         if (isKw(m, S_invariant) && !eff) {
-          out.push_back({"invariant", "", squash(m.p, S.clauseEnd()), owner, "", pub, m.line, m.line, md, {}});
+          add({"invariant", "", squash(m.p, S.clauseEnd()), owner, "", pub, m.line, m.line, md, {}}, m.p, m.p);
           continue;
         }
         Tok first = m;
         if (isKw(m, S_override)) m = S.next();
         if (!isKw(m, K_fn)) continue;
         Tok nm = S.next(), p = S.next();
+        if (nm.t != T_ID || p.t != '(') continue;
         const char* e = S.effects(S.typed(S.params(p)));
         std::vector<std::string> cl;
         int end = m.line;
@@ -216,16 +222,16 @@ static std::vector<Decl> declsOf(const std::string& text) {
           cl = S.clauses();
           end = S.bodyEnd();
         }
-        out.push_back({eff ? "op" : "method", symName(nm.sym), squash(first.p, e), owner, "", pub, first.line, end, md, cl});
+        add({eff ? "op" : "method", symName(nm.sym), squash(first.p, e), owner, "", pub, first.line, end, md, cl}, first.p, nm.p);
       }
-      out[at].end = L.line;
+      out[at].end = L.line, out[at].stop = L.p - src;
     } else if (isKw(k, S_enum)) {  // its variants, in order, each with its fields
       Lexer save = L;
       Tok n = S.next(), b = S.next();
       if (n.t != T_ID || b.t != '{') { L = save; continue; }
       size_t at = out.size();
       std::string owner = symName(n.sym);
-      out.push_back({"enum", owner, squash(from, b.p), "", "", pub, k.line, k.line, doc, {}});
+      add({"enum", owner, squash(from, b.p), "", "", pub, k.line, k.line, doc, {}}, from, n.p);
       for (Tok v = S.next(); v.t != '}' && v.t != T_EOF; v = S.next()) {
         if (v.t != T_ID) continue;
         const char* e = v.p + symName(v.sym).size();
@@ -235,15 +241,15 @@ static std::vector<Decl> declsOf(const std::string& text) {
             if (t.t == T_EOF || (d += (t.t == '(') - (t.t == ')')) == 0) { e = L.p; break; }
           }
         }
-        out.push_back({"variant", symName(v.sym), squash(v.p, e), owner, "", pub, v.line, v.line, docs(src, v.p, ""), {}});
+        add({"variant", symName(v.sym), squash(v.p, e), owner, "", pub, v.line, v.line, docs(src, v.p, ""), {}}, v.p, v.p);
       }
-      out[at].end = L.line;
+      out[at].end = L.line, out[at].stop = L.p - src;
     } else if (isKw(k, S_test) && !pub) {
       Lexer save = L;
       Tok n = S.next();
       if (n.t != T_STR) { L = save; continue; }
       int end = S.bodyEnd();
-      out.push_back({"test", std::string(n.p, n.len), squash(k.p, n.p + n.len + 1), "", "", false, k.line, end, doc, {}});
+      add({"test", std::string(n.p, n.len), squash(k.p, n.p + n.len + 1), "", "", false, k.line, end, doc, {}}, k.p, n.p);
     }
   }
   return out;

@@ -4,6 +4,7 @@
 // code with a leading "@code " (fail("@syntax expected '%c'", c), ERR("@index index %s out of range")), which
 // takeCode strips. tests/specs/codes.fut raises each code at least once.
 #include "fut.h"
+#include <charconv>
 #include <cstring>
 
 namespace {
@@ -98,6 +99,33 @@ std::string splitCode(std::string& line) {
   if (b == std::string::npos || !find(std::string_view(line).substr(b + 2, e - b - 3))) return "";
   std::string c = line.substr(b + 2, e - b - 3);
   return line.resize(b), c;
+}
+CompileDiagnostic compileDiagnostic(std::string_view text) {
+  CompileDiagnostic d;
+  std::string_view head = text.substr(0, text.find('\n'));
+  constexpr std::string_view marker = ": error: ";
+  auto number = [](std::string_view s, int& n) {
+    auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), n);
+    return ec == std::errc{} && p == s.data() + s.size() && n > 0;
+  };
+  for (size_t e = head.find(marker); e != std::string_view::npos; e = head.find(marker, e + marker.size())) {
+    size_t c = head.substr(0, e).rfind(':');
+    int n;
+    if (c == std::string_view::npos || !number(head.substr(c + 1, e - c - 1), n)) continue;
+    size_t l = head.substr(0, c).rfind(':');
+    if (l != std::string_view::npos && number(head.substr(l + 1, c - l - 1), d.line))
+      d.column = n, d.file = head.substr(0, l);
+    else d.line = n, d.file = head.substr(0, c);  // a package manifest has a line only
+    head.remove_prefix(e + marker.size());
+    break;
+  }
+  d.message = head;
+  d.code = splitCode(d.message);
+  return d;
+}
+std::string errorExplanation(std::string_view code) {
+  const ErrCode* k = find(code);
+  return k ? std::string(k->rule) + "\n\nFix: " + k->fix : "";
 }
 int explain(const char* code) {
   if (!code) {

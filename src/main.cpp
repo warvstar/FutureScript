@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <spawn.h>
 extern char** environ;
+int lspCommand();
 
 // The standard library: $FUT_STD, else std/ beside the directory holding this binary (build/fut -> std/).
 static void findStd() {
@@ -443,8 +444,9 @@ int main(int argc, char** argv) {
                       "       fut test [--changed] [--json] [--filter text] [--timeout s] [--isolates n] [--seed n] file.fut...\n"
                       "       fut init [dir]   (a new package)\n       fut api [--check] file.fut\n       fut map [--pub] [--json] file.fut [package | file]\n       fut explain [code]\n"
                       "       fut fmt [--check] [--stdin] [file.fut | dir ...]\n"
-                      "       fut worker build ...   (Cloudflare Workers: node web/worker.mjs)\n";
+                      "       fut lsp   (language server over stdio)\n       fut worker build ...   (Cloudflare Workers: node web/worker.mjs)\n";
   if (argc > 1 && std::string_view(argv[1]) == "fmt") return fmtCommand(argc - 2, argv + 2);
+  if (argc > 1 && std::string_view(argv[1]) == "lsp") return argc == 2 ? lspCommand() : (fputs(usage, stderr), 2);
   for (int i = 1 + (testMode || apiMode || mapMode); i < argc; i++) {
     std::string a = argv[i];
     if (mapMode) {

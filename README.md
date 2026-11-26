@@ -20,6 +20,7 @@ build/fut init [dir]           # a new package: fut.pkg, <dir>.fut (main and a t
 build/fut api file.fut         # write each imported file's .api (its pub declarations); `fut test` checks them
 build/fut map file.fut         # every package, file and declaration the program uses, with line ranges
 build/fut fmt file.fut         # format files in place (directories recurse); --check lists files that need formatting
+build/fut lsp                  # language server for editors, over stdio
 build/fut explain [code]       # an error code's rule and fix ([index], [requires], ...; no code: all of them)
 build/fut --record log f.fut   # run, writing down what clock, random, input, files... returned; --replay log: run it again from that
 build/fut --asm file.fut       # disassemble the generated code (uses clang + otool)
@@ -36,6 +37,12 @@ Requires macOS on Apple silicon (arm64, `MAP_JIT`).
 The formatter normalizes spacing and two-space indentation while preserving line breaks between tokens, comments, and string literals.
 
 Agents: [docs/spec.md](docs/spec.md) is the whole language in about 6 KB; every example in it runs as a test.
+
+## Editor support
+
+Configure Zed or another LSP client to launch `fut lsp` over stdio for `.fut` files. Use the absolute path to `build/fut` if `fut` is outside the editor's PATH.
+
+The server checks open buffers as you edit and save, resolves imports against unsaved buffers and disk, and shows an imported file's errors at the import site. Hover over an error for its `fut explain` rule and fix, or over a declaration name for its signature. The outline uses the same declarations as `fut map`. Completion offers keywords, local declarations, public imports including `std/` packages, and members of recognizable receivers after `.`.
 
 ## Language
 
