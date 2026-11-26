@@ -236,14 +236,27 @@ fn startTask(w, t) {
   w.reviews = 0
   w.phase = "work"
   var more = ""
-  if resume { more = progress(w) }
+  if resume { sync(w) more = progress(w) }
   w.messages = [{role: "user", content: intro(t) + more}]
   var how = " starts #"
   if resume { how = " resumes #" }
   log("w" + str(w.i) + how + str(t.id) + " " + t.title)
 }
+fn sync(w) {  // bring the worktree up to main, keeping the worker's changes; false if they conflict
+  if sh("git rev-parse HEAD", w.wt).out == sh("git rev-parse main", w.wt).out { return true }
+  if sh("git status --porcelain", w.wt).out.trim() == "" && sh("git rev-list --count main..HEAD", w.wt).out.trim() == "0" {
+    sh("git reset -q --hard main", w.wt)
+    return true
+  }
+  var wip = sh("git add -A", w.wt).code == 0 && sh("git commit -q -m wip", w.wt).code == 0  // nothing staged: no commit
+  var ok = sh("git rebase -q main", w.wt).code == 0
+  if !ok { sh("git rebase --abort", w.wt) }
+  if wip { sh("git reset -q HEAD~1", w.wt) }  // the changes go back to being uncommitted
+  return ok
+}
 fn refresh(w) {  // the conversation grew too long: start it over, keeping the files
   w.refreshes += 1
+  sync(w)
   w.messages = [{role: "user", content: intro(w.task) + progress(w) + "\n\n(Your earlier conversation was cleared to save space.)"}]
   log("w" + str(w.i) + " starts its conversation over on #" + str(w.task.id) + " (" + str(w.refreshes) + ")")
 }
@@ -316,6 +329,9 @@ fn submit(w, summary) {
   return {text: "submitted; tests: " + r.summary + ". Waiting for review."}
 }
 fn workerRound(w, msg) {  // the reply to a worker's request
+  if w.phase == "work" && sh("git status --porcelain", w.wt).out.trim() == "" && sh("git rev-list --count main..HEAD", w.wt).out.trim() == "0" {
+    sh("git reset -q --hard main", w.wt)  // nothing written yet: follow main, so new modules are there to use
+  }
   w.messages.push({role: "assistant", content: msg.content})
   w.steps += 1
   var uses = toolUses(msg)
