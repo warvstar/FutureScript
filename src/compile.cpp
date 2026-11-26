@@ -251,7 +251,35 @@ struct Compiler : Gen {
     return ty;
   }
   void checkType(const Ty& ty, const std::string& what, bool known = false) {  // x0 must have type ty (known: it is a number)
-    if (ty.code && !(known && ty.code == TY_NUM)) typeCheck(ty.code, typeSite(what, ty.text), ty.code == TY_NUM);
+    if (ty.code && !(known && (ty.code & 15) == TY_NUM)) typeCheck(ty.code, typeSite(what, ty.text), ty.code == TY_NUM);
+  }
+  // A var's declared type, checked at every store to it (from closures too). A top-level var's comes from this
+  // compile's declaration, parsed on first use (a function above the declaration may store to it), else from the
+  // last compile that declared it (the REPL, another module).
+  struct VarTy { std::string file; const char *src = nullptr, *at = nullptr; int line = 0; bool done = false; uint64_t code = 0; int site = -1; };
+  std::unordered_map<int, VarTy> varTypes;  // the top-level vars this compile declares; at: their type's text
+  std::pair<uint64_t, int> globalType(int sym) {
+    auto it = varTypes.find(sym);
+    if (it == varTypes.end()) return {global(sym).type, global(sym).typeSite};
+    VarTy& v = it->second;
+    if (v.at && !v.done) {
+      v.done = true;
+      detour(v.file, v.src, v.at, v.line, [&] {
+        Ty t = type();
+        if (t.code != TY_ANY) v.code = t.code, v.site = typeSite("var '" + symName(sym) + "'", t.text);
+      });
+    }
+    return {v.code, v.site};
+  }
+  std::pair<uint64_t, int> varType(Fun* f, const LV& v) {  // its declared type (0: none) and its check's site
+    if (v.k == LV_GLOBAL) return globalType(v.b);
+    if (v.k == LV_CAP) return varType(f->parent, f->caps[v.a].second);
+    if (v.k == LV_LOCAL)
+      for (auto i = f->locals.rbegin(); i != f->locals.rend(); ++i) if (i->home == v.a) return {i->ty, i->site};
+    return {0, -1};
+  }
+  void storeCheck(std::pair<uint64_t, int> t, bool num) {  // x0, about to be stored to a var of type t
+    if (t.first && !(num && (t.first & 15) == TY_NUM)) typeCheck(t.first, t.second, t.first == TY_NUM);
   }
 
   // ---- effects: io clock random yield, or an `effect` (geom.Log for a module's) ----
@@ -550,7 +578,7 @@ struct Compiler : Gen {
     if (g->kind == 'f' && at('(') && !cur.nl) return next(), directCall(t, *g), t.sym == F->self || returnsNum(t.sym) ? NUM : LV{};
     if (g->kind == 'c' && at('(') && !cur.nl) return next(), construct(*g), LV{};
     if (g->kind == 'e') return perform(t), LV{};
-    return {LV_GLOBAL, g->slot, 0, g->kind != 'v'};
+    return {LV_GLOBAL, g->slot, t.sym, g->kind != 'v'};  // b: its symbol, for its type
   }
   LV postfix() {
     LV v = primary();
@@ -655,14 +683,28 @@ struct Compiler : Gen {
     if (at(T_ID)) switch (cur.sym) {
         case K_var: {
           next();
+          Tok n = cur;
           int s = ident();
-          bool num = accept('=') ? expr() : (imm(0, NIL), false);
-          if (F->top && F->scope == 0) return gmem(0, global(qualify(s)).slot, true), false;
+          Ty ty = accept(':') ? type() : Ty{};
+          if (ty.code == TY_ANY) ty = {};
+          bool top = F->top && F->scope == 0, init = accept('=');
+          std::string what = "var '" + symName(top ? qualify(s) : s) + "'";
+          if (ty.code && !init && !(ty.code & TY_OPT)) failAt(n.p, n.line, "%s is %s, so it needs an initial value", what.c_str(), ty.text.c_str());
+          Tok v = cur;
+          bool num = init ? expr() : (imm(0, NIL), false);
+          if (ty.code && num && (ty.code & 15) != TY_NUM) failAt(v.p, v.line, "%s is %s, but its initial value is a number", what.c_str(), ty.text.c_str());
+          checkType(ty, what, num);
+          if (top) return gmem(0, global(qualify(s)).slot, true), false;
+          int site = ty.code ? typeSite(what, ty.text) : -1;
+          bool isNum = ty.code == TY_NUM;  // every store checks it, so it stays a number
           auto it = std::find_if(F->locals.begin() + F->scopeAt, F->locals.end(), [&](auto& l) { return l.sym == s; });
-          if (it != F->locals.end()) return stl(0, it->home), false;  // redeclared in the same block: reuse
-          int h = num ? fhome() : home();
+          if (it != F->locals.end()) {  // redeclared in the same block: reuse
+            it->ty = ty.code, it->site = site, it->num = isNum;
+            return stl(0, it->home), false;
+          }
+          int h = num || isNum ? fhome() : home();
           if (stl(0, h), num) prove(h);
-          return F->locals.push_back({s, h}), false;
+          return F->locals.push_back({s, h, isNum, ty.code, site}), false;
         }
         case K_if: return next(), ifStmt(), false;
         case K_while: {
@@ -881,16 +923,21 @@ struct Compiler : Gen {
     });
   }
   void assign(LV v, int op) {  // op < 0: plain '=', else compound
+    auto ty = varType(F, v);
     if (v.k == LV_LOCAL && isFReg(v.a) && op >= 0 && op <= O_DIV) {
       unprove(v.a);
       bool rnum = right(0, false);  // the left side is the local itself
-      return fpAssign(v.a, op, rnum);
+      if (!ty.first || rnum) return fpAssign(v.a, op, rnum);  // a number op= a number: a number
+      ldl(0, v.a), binop(op, v.num, false), storeCheck(ty, false), stl(0, v.a);
+      if (v.num) prove(v.a);
+      return;
     }
     auto value = [&](bool lnum = false) { return op < 0 ? expr() : rhs(op, 0, lnum, v.k == LV_LOCAL ? v.a : NOH); };
     if (v.k == LV_LOCAL || v.k == LV_GLOBAL || v.k == LV_CAP) {
       LV t = v;
       if (op >= 0) load(t);
       bool num = value(t.num);
+      storeCheck(ty, num);
       if (v.k == LV_LOCAL) {
         stl(0, v.a);
         if (num) prove(v.a);
@@ -933,6 +980,8 @@ struct Compiler : Gen {
           int s = ident(), h = home();  // not d8..: arguments arrive, and calls pass them, in x registers
           f.locals.push_back({s, h}), homes.push_back(h);
           ptys.push_back({s, accept(':') ? type() : Ty{}});
+          if (Ty& t = ptys.back().second; t.code && t.code != TY_ANY)  // stores to it are checked too
+            f.locals.back().ty = t.code, f.locals.back().num = t.code == TY_NUM, f.locals.back().site = typeSite("argument '" + symName(s) + "' of " + display(nm), t.text);
         } while (accept(','));
         expect(')');
       }
@@ -1369,6 +1418,17 @@ struct Compiler : Gen {
         Tok d = q(t);
         declare(d, p.sym == K_class ? 'c' : 'v', 0);
         if (p.sym == K_class) cls = d.sym;
+        else if (VarTy& v = varTypes[d.sym] = {}; [&] { Lexer s = L; return lex(s).t == ':'; }()) {  // a typed var
+          Lexer s = L;
+          lex(s), v.file = path, v.src = src, v.at = s.p, v.line = s.line;
+          const char* e = s.p;
+          for (Lexer r = s;;) {
+            Tok k = lex(r);
+            if (k.t == '=' || k.t == ';' || k.t == T_EOF || k.nl) break;
+            e = r.p;
+          }
+          mixEnv(fnv(s.p, e) ^ uint64_t(d.sym) << 32, -2);  // its stores check it, in importers too
+        }
       } else if (depth == 1 && cls >= 0 && t.t == T_ID && t.sym == S_invariant && [&] { Lexer s = L; return !lex(s).nl; }()) {
         invariantsOn = true;
       } else if (depth == 1 && cls >= 0 && afterKw && p.sym == K_var) {  // a declared field: methods compile against them
@@ -1483,6 +1543,7 @@ struct Compiler : Gen {
     topLevel();
     if (!modulesPending.empty()) compileFail("waiting for the host to load modules", false);
     checkClasses();
+    for (auto& [sym, v] : varTypes) globalType(sym);  // each typed var's type, for commit
     Code chunk = finish();
     return commit(chunk);
   }
@@ -1662,6 +1723,7 @@ struct Compiler : Gen {
       if (c->layout.size() != n) reshape(c);  // new instances get room for every declared field
     }
     for (int s : inits) if (!global(s).inited) global(s).inited = true, out.newVars.push_back(s);
+    for (auto& [sym, v] : varTypes) global(sym).type = v.code, global(sym).typeSite = v.site;
     clearICs();  // method tables or arities may have changed
     fix(chunk);
     out.chunk = jitInstall(chunk);

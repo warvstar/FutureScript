@@ -84,7 +84,7 @@ constexpr int HOT = 1000;  // calls before a function is compiled again (tier 2)
 struct TryAt { int r = 0, pc = 0, done = 0; };  // a try being compiled: its record's first slot, branches to patch
 struct Fun {  // per-function emission state
   Code k;
-  struct Local { int sym, home; bool num = false; };  // home >= 0 is a frame slot, < 0 a register (arm64)
+  struct Local { int sym, home; bool num = false; uint64_t ty = 0; int site = -1; };  // ty: its declared type (0: none), checked at every store  // home >= 0 is a frame slot, < 0 a register (arm64)
   std::vector<Local> locals;                          // num: always holds a number (a range loop variable)
   std::vector<std::pair<int, LV>> caps;     // lambda captures: (sym, where it lives in the parent)
   Fun* parent = nullptr;

@@ -187,6 +187,16 @@ def hot_result_type(exe):
     return ok, f"stdout: {out!r}\n  stderr: {err!r}"
 
 
+def hot_var_type(exe):
+    """A top-level var's type is checked at stores from the REPL too; changing it recompiles the functions that store."""
+    prog = ("var level{sig}\nfn set(v) {{ level = v }}\n"
+            "fn main() {{ while true {{ try {{ set(\"s\") print(\"ok {{level}}\") return }} catch e {{ }} sleep(0.01) }} }}\n")
+    out, err = live(exe, {"v.fut": prog.format(sig=": num = 0")},
+                    [("<stdin>", "level = \"x\"\nlevel\n"), ("v.fut", prog.format(sig=": str = \"a\""))])
+    ok = out.split() == ["0", "ok", "s"] and "var 'level' must be num, got the string \"x\"" in err
+    return ok, f"stdout: {out!r}\n  stderr: {err!r}"
+
+
 def hot_effects(exe):
     """Changing a function's declared effects takes effect at the next call, like a changed result type: a call that
     its old declaration forbade succeeds once the new one allows it."""
@@ -240,6 +250,7 @@ HOT_TESTS = [("methods, errors, main restart", hot_methods_and_main),
              ("an invariant added by a reload", hot_invariant),
              ("a changed effect declaration takes effect", hot_effects),
              ("a changed result type recompiles callers", hot_result_type),
+             ("a var's type, from the REPL and changed", hot_var_type),
              ("a failed reload rolls back", hot_reload_rollback),
              ("imports, no-op, hook, stale arity", hot_imports_stale_hook),
              ("live REPL, var reset", hot_repl_and_reset),
