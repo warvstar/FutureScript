@@ -594,6 +594,28 @@ fn main() {
 - **Hot reload.** Under `-w`, a reload stops every isolate at a safe point (a loop iteration or call, or where it waits), patches the code once, then has each run the new top level and `reload()` in its own transaction. If any of them fails, every isolate rolls back and the old code returns, as for a failed reload with one isolate. `main()` reloads even while it waits on a channel or a task.
 - **In wasm** fut.wasm (Node, a browser, a Cloudflare Worker) runs a program's isolates on its one thread, taking turns, seeded as `fut test` runs them natively (by 1, or `--seed n`): the same program interleaves the same way every run. Each isolate is a wasm stack of its own, switched with JSPI. **fut-mt.wasm**, the threads build (`python3 build.py wasm --threads`; `FUT_WASM=build/fut-mt.wasm node web/run.mjs prog.fut`), runs them in parallel as natively: a pool of up to `cores()` threads (`--threads n`), each a Node worker, over one shared memory; `fut test` is seeded there too. It needs shared memory: Node, or a cross-origin isolated page (`web/serve.mjs` sends the headers, and the page then runs fut-mt.wasm, every thread a worker, the main isolate's too; `?threads=0` runs fut.wasm), not a Cloudflare Worker. In fut-mt.wasm a reload under `-w` stops the isolates and reloads each, as natively; in fut.wasm it waits until the isolates `main()` started have ended. See phase 5 in `docs/isolates.md`.
 
+### Buffers
+
+```
+var px = u8buffer(w * h * 4)        // bytes; also i32buffer(n), and buffer(n) for f64
+var xs = buffer([0.5, 1, 2])        // from a list of numbers
+xs[1] = 3   px[0] = 255   print(xs.len(), xs.type())
+for x in xs { }   xs.toList()   xs.slice(a, b)   xs.fill(0)
+var t = spawn work(xs)              // moves xs: using it here raises until it comes back
+xs = t.join()
+```
+
+- **A buffer is a fixed run of numbers outside every heap.** The collector never scans it, and compiled code
+  indexes it as it does a list (an f64 buffer holds a number's own bits). `buffer(n)` holds doubles; `i32buffer(n)`
+  and `u8buffer(n)` hold 32-bit integers and bytes, and a store there takes a whole number in the type's range and
+  raises otherwise. Each starts as zeros, or as the list of numbers it is given.
+- **Sending moves it.** A buffer sent over a channel, passed to `spawn` or returned to `join()` is not copied: the
+  receiver gets the same memory, and the sender's handle is dead (using it raises "was sent to another isolate").
+  So one isolate at a time uses a buffer, and none can race on it. A spawned isolate's copy of the globals doesn't
+  take their buffers (pass one as an argument). A buffer can't be sent inside `atomic { }`, since a move can't be
+  undone; a write to one there is undone like any other.
+- `==` is identity (two handles on one buffer are equal); `expect a == b` compares what they hold, as for lists.
+
 ## C functions
 
 ```

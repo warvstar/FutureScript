@@ -100,6 +100,12 @@ static void enc(V v, std::string& o, int depth) {
     }
     case K::Fn: case K::Clo: o += "{\"\\u0000\":\"fn\",\"id\":" + std::to_string(pin(v)) + "}"; return;
     case K::Ref: o += "{\"\\u0000\":\"js\",\"id\":" + std::to_string(((Ref*)x)->id) + "}"; return;
+    case K::Buf: case K::BufI32: case K::BufU8: {  // as a list of its numbers
+      o += '[';
+      for (size_t i = 0, n = bufLen((Buf*)x); i < n; i++) { if (i) o += ','; enc(box(bufAt((Buf*)x, i)), o, depth + 1); }
+      o += ']';
+      return;
+    }
     case K::Inst: ERR("@js an instance of %s can't pass to JavaScript (pass a map of what it needs)", symName(((Inst*)x)->cls->name).c_str());
     default: ERR("@js a %s can't pass to JavaScript", typeName(v));
   }

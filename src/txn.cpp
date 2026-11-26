@@ -39,6 +39,7 @@ static Saved save(Obj* o) {
     }
     case K::Inst: s.v.assign(((Inst*)o)->slots, ((Inst*)o)->slots + o->nslots); break;
     case K::Clo: s.v.assign(((Clo*)o)->env(), ((Clo*)o)->env() + ((Clo*)o)->n); break;
+    case K::Buf: case K::BufI32: case K::BufU8: bufSave(o, s.v); break;
     default: break;
   }
   return s;
@@ -59,6 +60,7 @@ static void restore(Saved& s) {
       break;
     }
     case K::Clo: std::copy(s.v.begin(), s.v.end(), ((Clo*)s.o)->env()); break;
+    case K::Buf: case K::BufI32: case K::BufU8: bufRestore(s.o, s.v); break;
     default: break;
   }
 }

@@ -178,11 +178,13 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
    - Step three: the browser (every thread a worker, as Emscripten's PROXY_TO_PTHREAD; COOP/COEP; opt-in proxying).
    - Step four: reloads with isolates running, in fut-mt.wasm (Node and the browser), as phase 4 does natively.
 6. **Shared buffers and `parallel for`, for C-like throughput.**
-   - Work: typed buffers (`f64buffer(n)` and the like) live outside every heap, so all isolates read and write them
-     directly. Sending a buffer moves its ownership instead of copying it.
-   - Work: `parallel for i in a..b { }` splits the range over the pool. The compiler checks that the body writes
-     shared buffers only at index `i`, and writes no globals. Any other write is a compile error, so the loop is
-     race-free by construction.
+   - Step one, done: typed buffers (`buffer(n)` f64, `i32buffer(n)`, `u8buffer(n)`) live outside every heap, and
+     compiled code indexes them inline. Sending a buffer moves its ownership instead of copying it.
+   - Step two: `parallel for i in a..b { }` splits the range over the pool. Its result is the same as a plain `for`'s
+     on every run, machine and core count: the body can't assign variables from outside it (a compile error); a
+     buffer it writes it may reach only at index `i` (checked through the handle, so also in functions it calls),
+     and the others only read; values it captures arrive as frozen copies, so changing one raises; and it runs with
+     no effects (no print, random, sleep or channels).
 7. **Frozen values and shared state.**
    - Work: `freeze(v)` makes a deep-immutable value that is sent as a pointer, not copied.
    - Work: `shared` objects that can be changed only inside `atomic`, which becomes cross-isolate software
@@ -412,3 +414,25 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
   only and rolls back everywhere, then one that gives each its own new var and `reload()` run, with main waiting in
   `recv()` all along. Checked by hand: isolates that never wait, reloaded three times in a row
   (Node and Chrome), and a REPL line redefining a function they call.
+
+## Phase 6, step one as built: buffers
+
+- **The object.** A buffer is a handle (`Buf`, in an isolate's heap; its kind is its element type: `K::Buf` f64,
+  `K::BufI32`, `K::BufU8`) on refcounted memory (`BufData`, malloc'd: in fut-mt.wasm, the shared memory). The
+  collector finalizes a dead handle, which releases its reference (`src/buffer.cpp`).
+- **Compiled code.** An f64 buffer's handle is laid out as a list's `std::vector` (the elements, then their end or
+  count), and a fut number is a double's bits, so the inline `b[i]` of both code generators (`index()` in
+  `gen_a64.h` and `gen_wasm.h`) is a list's, with one more kind compare; a store checks the value is a number. i32
+  and u8 buffers have an inline path of their own: a load widens to a double, a store converts and checks the
+  conversion was exact and in range (else the helper raises). Inside a transaction a store goes through the helper,
+  which saves the buffer's bytes on its first write (`txn.cpp`).
+- **Moving.** A message takes a reference on each buffer it carries (`Msg::bufs`); once the whole message is made,
+  each sending handle goes dead (`bufSent`), so a failed encode leaves the sender as it was. `BufData::holder` names
+  the isolate whose handles may use it (null while a message carries it): a task's result read by a second isolate
+  raises rather than giving two isolates one buffer. A spawned isolate's copy of the globals gets dead handles for
+  their buffers (`Writer::moving`). A send inside `atomic` raises: a rolled-back send would drop the buffer, its
+  sender's handle already dead.
+- **Speed.** Filling a million-element buffer and summing it 20 times, in a function: f64 42 ms, i32 51 ms, u8
+  62 ms, a list 47 ms; C (clang -O2) 20 ms. (On a loaded machine: rough.)
+- **Not yet.** Type annotations (`b: buffer`), and passing buffers to JavaScript as typed arrays.
+

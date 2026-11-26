@@ -315,15 +315,41 @@ struct Gen : CState {
   }
 
   // ---- fields: an inline cache per site, in the VM block: key = the instance header, val = the slot ----
-  // list[i] (r0 = the list, r1 = the index; r2 = the value to store): inline when r0 is a list and 0 <= i < len,
-  // which a NaN (any non-number) fails; a fraction truncates, as in rt_geti. Else, and for stores inside a
-  // transaction (which save the list first), the helper.
+  // list[i] or buffer[i] (r0 = the list, r1 = the index; r2 = the value to store): inline when r0 is a list or a
+  // buffer and 0 <= i < len, which a NaN (any non-number) fails; a fraction truncates, as in rt_geti. A buffer is
+  // laid out as a list (see Buf), and holds a number's bits, so only a store differs: the value must be a number.
+  // Else, and for stores inside a transaction (which save the list first), the helper.
   void index(bool store) {
     auto idx = [&] { get(R0 + 1), op(F64_REINTERPRET); };
     open(BLOCK), open(BLOCK);  // $done, $miss
     isPtr(0, false), br(BR_IF, F->blocks, UNLIKELY);
-    addr(0), mem(store ? I32_LOAD16_U : I32_LOAD8_U, 0, 0), i32c((int)K::List), op(I32_NE), br(BR_IF, F->blocks, UNLIKELY);  // a store: not typed
     if (store) txnDepth(), br(BR_IF, F->blocks, UNLIKELY);
+    addr(0), mem(store ? I32_LOAD16_U : I32_LOAD8_U, 0, 0), set(T);  // a store: not typed
+    int miss = F->blocks, done = miss - 1;
+    get(T), i32c((int)K::List), op(I32_NE);
+    open(IF, VOID);  // not a list: a buffer, and a store's value a number
+    get(T), i32c((int)K::Buf), op(I32_NE);
+    open(IF, VOID);  // an i32 or u8 buffer: its elements widen to a double; a store takes a number that converts exactly
+    for (bool i32 : {true, false}) {
+      auto val = [&] { get(R0 + 2), op(F64_REINTERPRET); };
+      get(T), i32c((int)(i32 ? K::BufI32 : K::BufU8)), op(I32_EQ), open(IF, VOID);
+      idx(), op(F64_CONST), f64(0), op(F64_GE), op(I32_EQZ), br(BR_IF, miss, UNLIKELY);
+      idx(), addr(0), mem(I32_LOAD, 2, BUF_N), op(F64_CONVERT_I32_U), op(F64_LT), op(I32_EQZ), br(BR_IF, miss, UNLIKELY);
+      addr(0), mem(I32_LOAD, 2, LIST_V), idx(), op(I32_TRUNC_F64_U);
+      if (i32) i32c(2), op(I32_SHL);
+      op(I32_ADD), set(T2);
+      if (store) {
+        isNumber(2), op(I32_EQZ), br(BR_IF, miss, UNLIKELY);
+        val(), val(), op(F64_TRUNC), op(F64_NE), br(BR_IF, miss, UNLIKELY);  // a fraction (or NaN)
+        val(), op(F64_CONST), f64(i32 ? -2147483648.0 : 0), op(F64_LT), br(BR_IF, miss, UNLIKELY);
+        val(), op(F64_CONST), f64(i32 ? 2147483647.0 : 255), op(F64_GT), br(BR_IF, miss, UNLIKELY);
+        get(T2), val(), op(i32 ? I32_TRUNC_F64_S : I32_TRUNC_F64_U), mem(i32 ? I32_STORE : I32_STORE8, i32 ? 2 : 0, 0), mv(0, 2);
+      } else get(T2), mem(i32 ? I32_LOAD : I32_LOAD8_U, i32 ? 2 : 0, 0), op(F64_CONVERT_I32_S), op(I64_REINTERPRET), set(R0);
+      br(BR, done), close();
+    }
+    br(BR, miss, UNLIKELY), close();
+    if (store) isNumber(2), op(I32_EQZ), br(BR_IF, miss, UNLIKELY);
+    close();
     idx(), op(F64_CONST), f64(0), op(F64_GE), op(I32_EQZ), br(BR_IF, F->blocks, UNLIKELY);
     addr(0), mem(I32_LOAD, 2, LIST_V), set(T2);  // T2 = begin
     idx(), addr(0), mem(I32_LOAD, 2, LIST_V + 4);  // the end or the length

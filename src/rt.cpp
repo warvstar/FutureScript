@@ -140,7 +140,7 @@ static uint64_t header(Obj* o) { uint64_t h; memcpy(&h, o, 8); return h; }
 const char* typeName(V v) {
   if (isNum(v)) return "number";
   if (!isObj(v)) return v == NIL ? "nil" : "bool";
-  static const char* n[] = {"string", "list", "function", "class", "instance", "map", "function", "fiber", "js value", "channel", "task"};
+  static const char* n[] = {"string", "list", "function", "class", "instance", "map", "function", "fiber", "js value", "channel", "task", "buffer", "buffer", "buffer"};
   return n[(int)obj(v)->kind];
 }
 static std::string numberText(double d) {
@@ -211,6 +211,14 @@ static void render(std::string& out, V v, bool quote, std::unordered_set<Obj*>& 
     case K::Ref: out += "<js value>"; return;
     case K::Chan: out += "<channel>"; return;
     case K::Task: out += "<task>"; return;
+    case K::Buf: case K::BufI32: case K::BufU8: {
+      Buf* b = as<Buf>(v);
+      size_t n = bufLen(b);
+      out += o->kind == K::BufI32 ? "i32buffer([" : o->kind == K::BufU8 ? "u8buffer([" : "buffer([";
+      for (size_t i = 0; i < n && i < 1000; i++) out += (i ? ", " : "") + numberText(bufAt(b, i));
+      out += n > 1000 ? ", ...])" : "])";
+      return;
+    }
     case K::List: case K::Map: case K::Inst: break;
     default: out += '?'; return;
   }
@@ -280,7 +288,8 @@ std::string toStr(V v, bool quote) {
 }
 static bool equal(V a, V b) {
   if (isNum(a) && isNum(b)) return num(a) == num(b);
-  return a == b || (is(a, K::Str) && is(b, K::Str) && as<Str>(a)->sv() == as<Str>(b)->sv());
+  return a == b || (is(a, K::Str) && is(b, K::Str) && as<Str>(a)->sv() == as<Str>(b)->sv()) ||
+         (isObj(a) && isObj(b) && isBuf(obj(a)->kind) && as<Buf>(a)->s && as<Buf>(a)->s == as<Buf>(b)->s);  // handles on one buffer
 }
 V variantField(Inst* in, int s) {
   int i = in->cls->layout.find(s);
@@ -517,6 +526,7 @@ static V rt_geti(V a, V i) {
     long e = mapFind(as<Map>(a), i);
     return e < 0 ? NIL : as<Map>(a)->e[e].second;
   }
+  if (isObj(a) && isBuf(obj(a)->kind)) return bufGet(a, i);
   if (!is(a, K::List) && !is(a, K::Str)) ERR("@index cannot index %s", typeName(a));
   if (is(a, K::List)) return as<List>(a)->v[INDEX(i, as<List>(a)->v.size())];
   return char1(a, INDEX(i, as<Str>(a)->len));
@@ -526,6 +536,7 @@ static V rt_seti(V a, V i, V v) {
     if (obj(a)->typed) typeWrite(obj(a), i, v, RA());
     return touch(obj(a)), mapSet(as<Map>(a), i, v), v;
   }
+  if (isObj(a) && isBuf(obj(a)->kind)) return touch(obj(a)), bufSet(a, i, v);
   if (!is(a, K::List)) ERR("@index cannot assign into %s", typeName(a));
   auto& l = as<List>(a)->v;
   size_t at = INDEX(i, l.size());
@@ -535,6 +546,7 @@ static V rt_seti(V a, V i, V v) {
 static V rt_iter(V c, uint64_t i) {
   if (is(c, K::List)) return i < as<List>(c)->v.size() ? as<List>(c)->v[i] : END;
   if (is(c, K::Map)) return i < as<Map>(c)->e.size() ? as<Map>(c)->e[i].first : END;
+  if (isObj(c) && isBuf(obj(c)->kind)) return i < bufLen(as<Buf>(c)) ? box(bufAt(as<Buf>(c), i)) : END;
   if (is(c, K::Chan)) return chanNext(c, RA());  // each value received, until it is closed and drained
   if (is(c, K::Fiber)) {  // each yielded value; the fiber's return value ends the loop
     V r = as<Fiber>(c)->state == FIB_DONE ? END : fiberResume(c, NIL);
@@ -759,6 +771,7 @@ static V n_len(V v) {
   if (is(v, K::Str)) return box((double)as<Str>(v)->len);
   if (is(v, K::List)) return box((double)as<List>(v)->v.size());
   if (is(v, K::Map)) return box((double)as<Map>(v)->e.size());
+  if (isObj(v) && isBuf(obj(v)->kind)) return box((double)bufLength(v));
   ERR("@argument len() of %s", typeName(v));
 }
 double now() { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
@@ -977,6 +990,7 @@ void rtInit() {
   method<+[](V f) { return boxb(as<Fiber>(f)->state == FIB_DONE); }>(K::Fiber, S_done);
   method<l_push>(K::List, S_push), method<l_pop>(K::List, S_pop), method<n_len>(K::List, S_len);
   method<n_len>(K::Str, S_len), method<n_len>(K::Map, S_len);
+  for (K k : {K::Buf, K::BufI32, K::BufU8}) method<n_len>(k, S_len);
   gfxInit();
   method<m_has>(K::Map, S_has), method<m_remove>(K::Map, S_remove);
   method<+[](V s, V sub) {  // str.has(part): does it contain part?
@@ -1003,5 +1017,6 @@ void rtInit() {
   testInit();
   sysInit();
   isolatesInit();
+  bufInit();
   effectsInit();  // after the natives it marks as operations
 }

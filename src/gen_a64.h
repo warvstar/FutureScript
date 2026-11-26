@@ -296,14 +296,20 @@ struct Gen : CState {
     return off & 0xfff;
   }
   void isObject(Jumps& miss) { E(mvn(9, 0)), E(tstptr(9)), miss.push_back(E(bcond(NE))), E(andaddr(9, 0)); }  // x9 = address
-  // list[i] (x0 = the list, x1 = the index; x2 = the value to store): inline when x0 is a list and 0 <= i < len,
-  // which a NaN (any non-number) fails; a fraction truncates, as in rt_geti. Else, and for stores inside a
-  // transaction (which save the list first), the helper.
+  // list[i] or buffer[i] (x0 = the list, x1 = the index; x2 = the value to store): inline when x0 is a list or a
+  // buffer and 0 <= i < len, which a NaN (any non-number) fails; a fraction truncates, as in rt_geti. A buffer is
+  // laid out as a list (see Buf), and holds a number's bits, so only a store differs: the value must be a number.
+  // Else, and for stores inside a transaction (which save the list first), the helper.
   void index(bool set) {
     Jumps miss;
     isObject(miss);
-    E(set ? ldrh(10, 9) : ldrb(10, 9)), E(cmpwi(10, (u32)K::List)), miss.push_back(E(bcond(NE)));  // a store: not typed
     if (set) E(ldrw(10, 28, 4)), E(cmpwi(10, 0)), miss.push_back(E(bcond(NE)));
+    E(set ? ldrh(10, 9) : ldrb(10, 9)), E(cmpwi(10, (u32)K::List));  // a store: not typed
+    int list = E(bcond(EQ));
+    E(cmpwi(10, (u32)K::Buf));
+    int narrow = E(bcond(NE));
+    if (set) E(mvn(12, 2)), E(tstq(12)), miss.push_back(E(bcond(EQ)));  // a buffer holds numbers
+    patch(list);
     E(fmovdx(16, 1)), E(fcmpz(16)), miss.push_back(E(bcond(LT)));
     E(ldr(11, 9, LIST_V)), E(ldr(12, 9, LIST_V + 8));  // the elements; the end or the length
     if (!vecCount) E(sub(12, 12, 11)), E(lsri(12, 12, 3));
@@ -313,8 +319,33 @@ struct Gen : CState {
     if (set) E(strreg(2, 11, 10)), E(mov(0, 2));
     else E(ldrreg(0, 11, 10));
     int done = E(B);
+    // An i32 or u8 buffer: its elements widen to a double; a store takes a number that converts to one exactly.
+    patch(narrow);
+    Jumps narrowMiss[2];
+    int narrowDone[2];
+    for (int w = 0; w < 2; w++) {
+      Jumps& m = narrowMiss[w];
+      bool i32 = w == 0;
+      E(cmpwi(10, (u32)(i32 ? K::BufI32 : K::BufU8)));
+      int next = E(bcond(NE));
+      E(fmovdx(16, 1)), E(fcmpz(16)), m.push_back(E(bcond(LT)));
+      E(ldr(11, 9, LIST_V)), E(ldr(12, 9, BUF_N));
+      E(ucvtf(17, 12)), E(fcmp(16, 17)), m.push_back(E(bcond(PL)));
+      E(fcvtzu(10, 16));
+      if (set) {
+        E(mvn(12, 2)), E(tstq(12)), m.push_back(E(bcond(EQ)));
+        E(fmovdx(18, 2)), E(fcvtzs(13, 18));
+        if (i32) E(cmpsxtw(13, 13)), m.push_back(E(bcond(NE)));
+        else E(cmpi(13, 255)), m.push_back(E(bcond(HI)));
+        E(scvtf(17, 13)), E(fcmp(18, 17)), m.push_back(E(bcond(NE)));  // a fraction, or out of range
+        E(i32 ? strwreg(13, 11, 10) : strbreg(13, 11, 10)), E(mov(0, 2));
+      } else E(i32 ? ldrswreg(13, 11, 10) : ldrbreg(13, 11, 10)), E(scvtf(17, 13)), E(fmovxd(0, 17));
+      narrowDone[w] = E(B);
+      patch(next);
+    }
     for (int m : miss) patch(m);
-    helper(set ? H_SETI : H_GETI), patch(done);
+    for (auto& nm : narrowMiss) for (int m : nm) patch(m);
+    helper(set ? H_SETI : H_GETI), patch(done), patch(narrowDone[0]), patch(narrowDone[1]);
   }
   // x.push(v), x in slot base, v in x0: appended inline when x is an untyped list with spare capacity and no transaction
   // is open (l_push saves the list first); the result is x. Else the method call.

@@ -72,6 +72,8 @@ l.push(v) -> l   l.pop() -> v   l.len()   l.slice(a, b)   l.join(sep) -> str
 m.has(k)   m.remove(k) -> v   m.keys()   m.values()   m.len()
 s.len()    s.has(sub)   s[i] -> 1-char str   s.find(sub) -> i | -1   s.slice(a, b)   s.split(sep)   s.trim()
 parseNum(s) -> num | nil   (indexes count bytes; slice excludes b, clamps)
+buffer(n | list)  i32buffer(..)  u8buffer(..)   numbers outside the heap: b[i]  b.len()  b.fill(x)  b.slice(a, b)  b.toList()  b.type()
+                         i32/u8 stores take whole numbers in range, else raise; sending a buffer moves it (the sender's handle dies)
 window(w, h)   present() -> false once closed (once per frame, waits 1/60 s)
 clear(rgb)   rect(x, y, w, h, rgb)   circle(x, y, r, rgb)     rgb = 0xRRGGBB, origin top-left
 key(name) -> bool   "a".."z" "0".."9" space enter escape tab up down left right

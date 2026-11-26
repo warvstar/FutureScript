@@ -121,7 +121,7 @@ inline V box(double d) { return std::bit_cast<V>(d); }
 inline V boxb(bool b) { return b ? TRUE_ : FALSE_; }
 
 // ---- heap objects (no vtables: JIT code reads Inst fields at fixed offsets) ----
-enum class K : uint8_t { Str, List, Fn, Class, Inst, Map, Clo, Fiber, Ref, Chan, Task, Free = 0xff };
+enum class K : uint8_t { Str, List, Fn, Class, Inst, Map, Clo, Fiber, Ref, Chan, Task, Buf, BufI32, BufU8, Free = 0xff };
 // For an Inst, `nslots` and `cid` (its class id) are in the header and are zero for every other kind, so one
 // 64-bit compare of the header checks kind, class and slot count together (the field inline cache).
 // `zero` stays 0 for that compare (mark bits live in the GC's side bitmap, not here).
@@ -219,6 +219,30 @@ struct Shared;
 struct Chan : Obj { static constexpr K KIND = K::Chan; Shared* s; };
 struct Task : Obj { static constexpr K KIND = K::Task; Shared* s; };
 void sharedFree(Obj*);  // the GC found a channel or task handle dead
+// A buffer (buffer.cpp): numbers in memory outside every heap, which an isolate reaches through a handle. Its kind
+// is its element type: K::Buf f64, K::BufI32, K::BufU8. An f64 buffer's handle is laid out as a list's std::vector
+// (the elements, then their end or count: see LIST_V), and a number's bits are the double's, so JIT code indexes
+// either the same way.
+struct BufData;
+struct Buf : Obj { static constexpr K KIND = K::Buf; void* d; uintptr_t endOrCount; size_t n; BufData* s; int gone; };
+inline bool isBuf(K k) { return k == K::Buf || k == K::BufI32 || k == K::BufU8; }
+inline size_t bufLen(Buf* b) { return b->n; }
+size_t bufLength(V b);  // len(): raises if it was sent
+double bufAt(Buf*, size_t i);  // (i < len)
+V bufGet(V b, V i);
+V bufSet(V b, V i, V v);
+void bufFree(Obj*);  // the GC found a buffer handle dead
+// Sending one moves it: the message takes a reference (bufTake), and once the whole message is made the sender's
+// handle goes dead (bufSent); the receiver gets a handle on the same memory (bufGive). A buffer a spawned isolate's
+// copy of the globals holds is not sent: its copy is a dead handle (bufElsewhere).
+BufData* bufTake(Obj*);
+void bufSent(Obj*);
+V bufGive(BufData*);
+V bufElsewhere();
+void bufRelease(BufData*);
+const void* isolateId();  // the running isolate's identity (isolate.cpp)
+void bufSave(Obj*, std::vector<V>&);  // a transaction's copy of its numbers (txn.cpp), and putting them back
+void bufRestore(Obj*, const std::vector<V>&);
 struct Clo : Obj { static constexpr K KIND = K::Clo; Fn* fn; u32 n; V* env() { return (V*)(this + 1); } };
 // A fiber runs a function on a stack of its own; `yield` switches back to whoever resumed it.
 struct Fiber : Obj {
@@ -255,6 +279,8 @@ double now();  // seconds, monotonic
 // A list's std::vector, which JIT code reads and appends to: the elements, then the end and the capacity's end as
 // pointers (macOS's libc++) or as counts (wasm's). rtInit checks which.
 constexpr int LIST_V = offsetof(List, v);
+static_assert(offsetof(Buf, d) == offsetof(List, v));
+constexpr int BUF_N = offsetof(Buf, n);  // (an i32 or u8 buffer's length, for JIT code)
 inline bool vecCount;
 constexpr int INST_SLOTS = offsetof(Inst, slots), CLO_ENV = sizeof(Clo), CLS_IHDR = offsetof(Class, ihdr), CLS_IRUN = offsetof(Class, irun);
 
@@ -287,7 +313,7 @@ template <class T> T* make(size_t extra = 0) {
   T* o = new (gcAlloc(sizeof(T) + extra)) T();
   o->kind = T::KIND;
   if constexpr (T::KIND == K::List || T::KIND == K::Map || T::KIND == K::Class || T::KIND == K::Fiber || T::KIND == K::Ref ||
-                T::KIND == K::Chan || T::KIND == K::Task) gcOwn(o);
+                T::KIND == K::Chan || T::KIND == K::Task || T::KIND == K::Buf) gcOwn(o);
   return o;
 }
 Str* newStr(std::string_view, std::string_view = {});
@@ -484,6 +510,7 @@ void emitOut(std::string_view line);  // print(): to outSink (locked: an isolate
 
 // ---- isolates and channels (isolate.cpp): spawn, join, channel(n), copying sends ----
 void isolatesInit();
+void bufInit();  // buffer() and its methods (buffer.cpp)
 void isolateRoot();          // this thread runs a program (main, a test run, one of --isolates N): its isolates' root
 std::string isolatesFinish(bool failed);  // the root's program ended: wait for the isolates it started (stopping them
                                           // if it failed); what went wrong among them (a deadlock, an unjoined failure)
@@ -764,6 +791,13 @@ constexpr u32 fcmp(u32 n, u32 m) { return 0x1e602000 | m << 16 | n << 5; }
 constexpr u32 fcmpz(u32 n) { return 0x1e602008 | n << 5; }                            // fcmp d, #0.0
 constexpr u32 fcvtzu(u32 d, u32 n) { return 0x9e790000 | n << 5 | d; }                // x = (uint64) d, truncating
 constexpr u32 ucvtf(u32 d, u32 n) { return 0x9e630000 | n << 5 | d; }                 // d = (double) x, unsigned
+constexpr u32 scvtf(u32 d, u32 n) { return 0x9e620000 | n << 5 | d; }                 // d = (double) x, signed
+constexpr u32 fcvtzs(u32 d, u32 n) { return 0x9e780000 | n << 5 | d; }                // x = (int64) d, truncating
+constexpr u32 ldrswreg(u32 t, u32 n, u32 m) { return 0xb8a07800 | m << 16 | n << 5 | t; }  // ldrsw t, [n, m, lsl #2]
+constexpr u32 ldrbreg(u32 t, u32 n, u32 m) { return 0x38606800 | m << 16 | n << 5 | t; }   // ldrb t, [n, m]
+constexpr u32 strwreg(u32 t, u32 n, u32 m) { return 0xb8207800 | m << 16 | n << 5 | t; }   // str w(t), [n, m, lsl #2]
+constexpr u32 strbreg(u32 t, u32 n, u32 m) { return 0x38206800 | m << 16 | n << 5 | t; }   // strb w(t), [n, m]
+constexpr u32 cmpsxtw(u32 n, u32 m) { return 0xeb20c01f | m << 16 | n << 5; }            // cmp n, w(m), sxtw
 constexpr u32 sub(u32 d, u32 n, u32 m) { return 0xcb000000 | m << 16 | n << 5 | d; }
 constexpr u32 ldar(u32 t, u32 n) { return 0xc8dffc00 | n << 5 | t; }  // load-acquire
 constexpr u32 fneg(u32 d, u32 n) { return 0x1e614000 | n << 5 | d; }
