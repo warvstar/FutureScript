@@ -167,8 +167,8 @@ u32* jitInstall(Code& k) {
   batch.push_back({std::move(k), s});
   return (u32*)(uintptr_t)s;
 }
-// fetch and fetchAll, as in sys.cpp, but the host makes the requests (its fetch(), all at once); exec and files:
-// not in this build yet.
+// fetch and fetchAll, as in sys.cpp, but the host makes the requests (its fetch(), all at once); readFile and
+// writeFile go to the host's read and save (a page: its files, or browser storage). exec: not in this build yet.
 static V fetchList(const std::string& json, const char* fn) {  // -> the list of results
   int n = host_fetch(json.c_str());
   if (n < 0) ERR("@host %s(): this host cannot make HTTP requests", fn);
@@ -185,7 +185,19 @@ static V n_fetchAll(V reqs) {
   for (V v : as<List>(reqs)->v) fetchRequest(v, "fetchAll");
   return fetchList(toJs(reqs), "fetchAll");
 }
-void sysInit() { native<n_fetch>("fetch"), native<n_fetchAll>("fetchAll"); }
+static V n_readFile(V path) {
+  std::string s;
+  return readFile(std::string(strViewArg(path, "readFile", "the path")), s) ? box(newStr(s)) : NIL;
+}
+static V n_writeFile(V path, V text) {
+  std::string p(strViewArg(path, "writeFile", "the path")), s(strViewArg(text, "writeFile", "the text"));
+  if (!saveFile(p, &s)) ERR("@host writeFile(): could not write '%s'", p.c_str());
+  return NIL;
+}
+void sysInit() {
+  native<n_fetch>("fetch"), native<n_fetchAll>("fetchAll");
+  native<n_readFile>("readFile"), native<n_writeFile>("writeFile");
+}
 void patchStub(u32* stub, void* target) { ops.push_back((int32_t)wa::slotOf(stub)), ops.push_back((int32_t)wa::slotOf(target)); }
 void jitRetire(u32* body) { Locked code(codeMu); retired.push_back(wa::slotOf(body)); }  // (fut_retire: the host)
 void jitShiftLines(u32* body, int delta) {

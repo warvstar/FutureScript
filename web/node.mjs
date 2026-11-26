@@ -2,9 +2,9 @@
 // build) gives it too, on a worker of its own (web/thread.mjs): the same files, output and child processes. cfg is
 // plain data (it crosses to workers): {verbose, seed, threads, interp, std}.
 import { spawnSync } from "node:child_process";
-import { readFileSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { availableParallelism, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Worker, threadId } from "node:worker_threads";
 
@@ -24,7 +24,7 @@ export function nodeOptions(cfg) {
     interp: cfg.interp,
     cores: availableParallelism(),
     read(p) { try { return readFileSync(p); } catch { return null; } },
-    save(p, text) { try { return text == null ? rmSync(p) : writeFileSync(p, text), true; } catch { return false; } },
+    save(p, text) { try { return text == null ? rmSync(p) : (mkdirSync(dirname(p), { recursive: true }), writeFileSync(p, text)), true; } catch { return false; } },
     write: writeAll,
     getenv: (n) => process.env[n],
     importModule: (p, stamp) => import(pathToFileURL(p).href + "?v=" + (stamp ?? 0)),  // a new URL loads it again
