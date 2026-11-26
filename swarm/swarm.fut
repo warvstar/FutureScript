@@ -500,7 +500,9 @@ fn progress(w) {  // what the worktree already has, for a conversation that star
 }
 fn startTask(w, t) {
   var resume = t.worker == w.i   // the harness restarted mid-task: this worktree still has the work
-  if !resume { sh("git checkout -q -B w" + str(w.i) + " main && git reset -q --hard main && git clean -qfd", w.wt) }
+  if !resume {  // a fresh copy of main: drop what an earlier task left (first, or checkout refuses over local changes)
+    sh("git rebase --abort; git merge --abort; git reset -q --hard && git clean -qfd; git checkout -q -B w" + str(w.i) + " main && git reset -q --hard main && git clean -qfd", w.wt)
+  }
   t.status = "active"
   if !resume { t.attempts = (t.attempts || 0) + 1 }
   t.worker = w.i
