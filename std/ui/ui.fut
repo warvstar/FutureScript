@@ -24,6 +24,7 @@ extern dom fn setProp(any, str, any): void
 extern dom fn listen(any, str, fn): void
 extern dom fn query(str): any
 extern dom fn css(str): void
+extern dom fn base(str): void
 extern dom fn html(any): str
 extern dom fn fire(any, str, any): void
 
@@ -142,8 +143,9 @@ fn place(list, key, view, shown, end) {
 }
 
 // A text field showing s (a signal), which typing sets.
-pub fn field(s: r.Signal, props): any {
-  var n = el("input", props, nil)
+pub fn field(s: r.Signal, props): any { return bindText("input", s, props) }
+fn bindText(tag, s, props) {
+  var n = el(tag, props, nil)
   r.effect(fn() { setProp(n, "value", s.get()) })
   listen(n, "input", fn(e) { s.set(e.value) })
   return n
@@ -222,14 +224,19 @@ pub fn make(tag: str, props, kids): any {
     listen(box, "change", fn(e) { bound.set(e.checked) })
     return el("label", withClass(props, "check"), [box, el("span", nil, kids)])
   }
-  if tag == "input" && bound != nil { return field(bound, props) }
-  return el(tag, props, kids)
+  if bound != nil && (tag == "input" || tag == "textarea") { return bindText(tag, bound, props) }
+  var n = el(tag, props, kids)
+  if bound != nil && tag == "select" {
+    r.effect(fn() { setProp(n, "value", bound.get()) })
+    listen(n, "change", fn(e) { bound.set(e.value) })
+  }
+  return n
 }
 
 var themed = false
 // Show view() on the page (web/index.html's #ui, else the body), with fut's theme under the page's own styles.
 pub fn show(view: fn): fn {
-  if !themed { themed = true css(THEME) }
+  if !themed { themed = true base(THEME) }
   var target = query("#ui")
   if target == nil { target = "body" }
   return mount(target, view)

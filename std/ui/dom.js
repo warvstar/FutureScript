@@ -20,7 +20,10 @@ export function removeRange(a, b) {
   for (let n = a, next; n; n = next) { next = n === b ? null : n.nextSibling; n.parentNode.removeChild(n); }
 }
 export function setProp(n, k, v) {
-  if (k === "value") n.value = v == null ? "" : String(v);
+  if (k === "value") {
+    n.value = v == null ? "" : String(v);
+    if (n.tagName === "SELECT" && typeof queueMicrotask === "function") queueMicrotask(() => (n.value = v == null ? "" : String(v)));  // its options may come after
+  }
   else if (k === "checked" || k === "disabled") n[k] = !!v;
   else if (v == null || v === false) n.removeAttribute(k);
   else n.setAttribute(k, v === true ? "" : String(v));
@@ -34,6 +37,11 @@ export function listen(n, type, f) {
 }
 export const query = (sel) => (sel === "body" ? doc.body : doc.querySelector(sel));
 export function css(s) { const e = doc.createElement("style"); e.textContent = s; (doc.head ?? doc.body).appendChild(e); }
+export function base(s) {  // a style sheet under the page's own: first in the head
+  const e = doc.createElement("style"), h = doc.head ?? doc.body;
+  e.textContent = s;
+  h.insertBefore ? h.insertBefore(e, h.firstChild ?? null) : h.appendChild(e);
+}
 export const html = (n) => n.outerHTML ?? n.textContent;
 export function fire(n, type, data) {  // as a user would: set what they typed or ticked, then the event
   if (data && "value" in data) n.value = data.value;

@@ -147,7 +147,7 @@ struct Views {
     for (auto& c : fixed) names += (names.empty() ? "" : " ") + c;
     if (when.empty()) return "\"class\": " + quote(names);
     std::string l = "[" + quote(names) + ", true";
-    for (auto& [c, e] : when) l += ", " + quote(c) + ", " + e;
+    for (auto& [c, e] : when) l += ", " + (c[0] == '=' ? c.substr(1) : quote(c)) + ", " + e;
     return "\"class\": fn() { return ui.classes(" + l + "]) }";
   }
   static std::string join(const std::vector<std::string>& v) {
@@ -240,14 +240,15 @@ struct Views {
       if (!t.k || t.nl || is(s, t, "}")) break;
       Tok n2 = peek(t.e);
       if (is(s, t, ".") && n2.k == 'i' && !n2.sp()) {
-        take(), take();
-        Tok c = peek();
-        if (is(s, c, ":") && !c.sp()) take(), when.push_back({textOf(s, n2), expr()});
-        else fixed.push_back(textOf(s, n2));
+        i = n2.b;
+        std::string c = markName();  // a class: dashes allowed (.bed-title)
+        if (Tok col = peek(); is(s, col, ":") && !col.sp()) take(), when.push_back({c, expr()});
+        else fixed.push_back(c);
       } else if (t.k == 'i' && is(s, n2, ":") && !n2.sp()) {
         take(), take();
         std::string a = textOf(s, t);
-        if (a == "bind") props.push_back("\"bind\": \x01" + expr());
+        if (a == "class") when.push_back({"=" + expr(), "true"});  // class names from an expression
+        else if (a == "bind") props.push_back("\"bind\": \x01" + expr());
         else props.push_back(quote(a) + ": " + live(expr()));
       } else if (is(s, t, "on") && n2.k == 'i' && is(s, peek(n2.e), "{")) {
         take(), take(), take();
@@ -307,6 +308,7 @@ struct Views {
       if (s[i] == '"') { Tok t = lexAt(s, i); v = textOf(s, t), i = t.e; }
       else v = braced(debt);
       if (view) named[a] = v;
+      else if (a == "class") when.push_back({"=" + v, "true"});
       else if (a == "bind") props.push_back("\"bind\": \x01" + v);
       else if (a.compare(0, 2, "on") == 0 && a.size() > 2) props.push_back(quote(a) + ": fn(e) { " + v + " }");
       else props.push_back(quote(a) + ": " + live(v));
@@ -518,7 +520,8 @@ struct State {
       else if (is(s, t[j], "}") && match[j] < j) cur = encl[match[j]];
     }
     auto shade = [&](const std::string& name, size_t from, size_t to) {
-      for (size_t q = from; q < to && q < t.size(); q++) if (t[q].k == 'i' && textOf(s, t[q]) == name) quiet[q] = true;
+      for (size_t q = from; q < to && q < t.size(); q++)  // the name itself, not a field of that name (self.name)
+        if (t[q].k == 'i' && textOf(s, t[q]) == name && !(q && (is(s, t[q - 1], ".") || is(s, t[q - 1], "?.")))) quiet[q] = true;
     };
     for (size_t j = 0; j + 1 < t.size(); j++) {
       if (is(s, t[j], "fn")) {  // parameters: within the parameter list and the body

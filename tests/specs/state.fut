@@ -28,3 +28,13 @@ test "locals shadow state" {
   expect g() == 3
   expect h() == 7
 }
+class Pt {
+  state x
+  fn init(x) { self.x = x }
+}
+test "a parameter named like a field still sets the field" {
+  var p = Pt(4)
+  expect p.x == 4
+  p.x += 1
+  expect p.x == 5
+}
