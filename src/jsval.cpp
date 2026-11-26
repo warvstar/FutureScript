@@ -9,21 +9,30 @@
 #include <cmath>
 #include <unordered_map>
 
-static std::vector<V> pins;          // by id; NIL: free
+// Pinned functions are the process's (any thread's host may call or drop one; a collection marks only its own
+// heap's). A JavaScript value's id is its thread's host's (each thread of fut-mt.wasm has its own JavaScript), and
+// an isolate never changes threads: refs is the thread's.
+static Mutex jsMu;
+static std::vector<V> pins;          // by id; NIL: free  (under jsMu)
 static std::vector<int> freePins;
-static std::unordered_map<u32, Ref*> refs;  // id -> its Ref, while one is alive
-static std::vector<V> building;      // what fromJs made so far: roots until it returns
+static TLS std::unordered_map<u32, Ref*> refs;  // id -> its Ref, while one is alive
+static TLS std::vector<V> building;  // what fromJs made so far: roots until it returns
 void (*refRelease)(u32 id);
 
 void jsMark(void (*mark)(V)) {
-  for (V v : pins) mark(v);
+  {
+    Locked l(jsMu);
+    for (V v : pins) mark(v);
+  }
   for (V v : building) mark(v);
 }
-V jsPinned(int id) { return id >= 0 && (size_t)id < pins.size() ? pins[id] : NIL; }
+V jsPinned(int id) { Locked l(jsMu); return id >= 0 && (size_t)id < pins.size() ? pins[id] : NIL; }
 void jsUnpin(int id) {
+  Locked l(jsMu);
   if (id >= 0 && (size_t)id < pins.size() && pins[id] != NIL) pins[id] = NIL, freePins.push_back(id);
 }
 static int pin(V f) {
+  Locked l(jsMu);
   int id;
   if (!freePins.empty()) id = freePins.back(), freePins.pop_back(), pins[id] = f;
   else id = (int)pins.size(), pins.push_back(f);
@@ -31,7 +40,9 @@ static int pin(V f) {
 }
 int jsPin(V f) { return pin(f); }
 void refFree(Ref* r) {
-  if (auto it = refs.find(r->id); it != refs.end() && it->second == r) refs.erase(it);
+  auto it = refs.find(r->id);
+  if (it == refs.end() || it->second != r) return;  // (another Ref has the id now, or another thread's host made it)
+  refs.erase(it);
   if (refRelease) refRelease(r->id);
 }
 
@@ -218,7 +229,7 @@ struct Parser {
       r = box(v == "NaN" ? NAN : v == "Infinity" ? INFINITY : -INFINITY);
     } else {
       char* end;
-      long id = strtol(p, &end, 10);
+      long long id = strtoll(p, &end, 10);  // (long is 32 bits in wasm; ids reach 2^32)
       p = end;
       if (kind == "fn") r = jsPinned((int)id);
       else {

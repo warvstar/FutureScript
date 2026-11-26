@@ -23,7 +23,7 @@
 </style>
 </head>
 <body>
-<header><b>fut</b> on WebAssembly · <span id="file"></span> · edits to the file hot-reload · type to poke the running program</header>
+<header><b>fut</b> on WebAssembly<span id="mode"></span> · <span id="file"></span> · edits to the file hot-reload · type to poke the running program</header>
 <main>
   <div id="ui"></div>
   <canvas id="screen" tabindex="0"></canvas>
@@ -36,7 +36,10 @@
 import { createFut } from "/web/fut.js";
 const $ = (id) => document.getElementById(id);
 const out = $("out"), canvas = $("screen"), ctx = canvas.getContext("2d");
-const file = new URLSearchParams(location.search).get("file");
+const params = new URLSearchParams(location.search), file = params.get("file");
+// fut-mt.wasm (isolates in parallel, a worker each thread) where the page may share memory (web/serve.mjs's headers);
+// ?threads=0: fut.wasm, on this thread; ?threads=n: at most n threads; ?proxy=all|none: see fut.js's proxy option
+const threads = self.crossOriginIsolated && params.get("threads") != "0";
 $("file").textContent = file ?? "REPL (add ?file=examples/paddle.fut)";
 const decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
 function write(fd, bytes) {
@@ -47,40 +50,52 @@ function write(fd, bytes) {
 }
 let watched = new Set();
 const stamps = new Map();  // path -> how many times it changed: a package's JS modules load again when it moves
-const fut = await createFut({
-  wasm: await (await fetch("/build/fut.wasm")).arrayBuffer(),
+const host = {
   std: "/std",
   verbose: true,
   serve: true,  // a program that builds a page (std/ui, into #ui) keeps handling its events after it finishes
-  read(p) {  // fut reads files synchronously
-    const x = new XMLHttpRequest();
-    p = p.replace(/^\/+/, "/");  // "//fut.pkg" (the root's) would name a host
-    try { x.open("GET", p, false), x.overrideMimeType("text/plain; charset=x-user-defined"), x.send(); } catch { return null; }
-    if (x.status != 200) return null;
-    const b = new Uint8Array(x.responseText.length);
-    for (let i = 0; i < b.length; i++) b[i] = x.responseText.charCodeAt(i) & 0xff;
-    return b;
-  },
   write,
   files: (f) => (watched = new Set(f)),
-  importModule: (p, stamp) => import(p + "?v=" + stamp),
-  stamp: (p) => stamps.get(p) ?? 0,
   window(w, h) { canvas.width = w, canvas.height = h, (canvas.style.display = "block"), canvas.focus(); return true; },
   async present(rgba, w, h) {
     ctx.putImageData(new ImageData(rgba, w, h), 0, 0);
     await new Promise(requestAnimationFrame);
     return true;
   },
-});
+};
+let fut;
+if (threads) {
+  const { startFut } = await import("/web/browser.js");
+  const wasm = new Uint8Array(await (await fetch("/build/fut-mt.wasm")).arrayBuffer());
+  fut = await startFut({ ...host, wasm, poolSize: +params.get("threads") || undefined, proxy: params.get("proxy") ?? undefined });
+  $("mode").textContent = ` (threads: ${+params.get("threads") || navigator.hardwareConcurrency})`;
+} else {
+  const f = await createFut({ ...host, wasm: await (await fetch("/build/fut.wasm")).arrayBuffer(), read, importModule: (p, stamp) => import(p + "?v=" + stamp), stamp: (p) => stamps.get(p) ?? 0 });
+  fut = {
+    run: f.run, line: f.line, type: f.type,
+    changed: (p) => (stamps.set(p, (stamps.get(p) ?? 0) + 1), f.changed()),
+    key: (c, down) => f.exports.fut_key(c, down),
+    mouse: (x, y, down) => f.exports.fut_mouse(x, y, down),
+  };
+}
+function read(p) {  // fut reads files synchronously
+  const x = new XMLHttpRequest();
+  x.open("GET", p.replace(/^\/+/, "/"), false), x.overrideMimeType("text/plain; charset=x-user-defined");  // ("//x": another host)
+  try { x.send(); } catch { return null; }
+  if (x.status != 200) return null;
+  const b = new Uint8Array(x.responseText.length);
+  for (let i = 0; i < b.length; i++) b[i] = x.responseText.charCodeAt(i) & 0xff;
+  return b;
+}
 // keys: the codes key() looks up (arrows as AppKit numbers them)
 const named = { ArrowUp: 0xf700, ArrowDown: 0xf701, ArrowLeft: 0xf702, ArrowRight: 0xf703, Enter: 13, Escape: 27, Tab: 9 };
 const code = (e) => named[e.key] ?? (e.key.length == 1 ? e.key.toLowerCase().charCodeAt(0) : -1);
 for (const [type, down] of [["keydown", 1], ["keyup", 0]])
-  canvas.addEventListener(type, (e) => { const c = code(e); if (c >= 0) fut.exports.fut_key(c, down), e.preventDefault(); });
+  canvas.addEventListener(type, (e) => { const c = code(e); if (c >= 0) fut.key(c, down), e.preventDefault(); });
 let mouseDown = 0;
 const mouse = (e) => {
   const r = canvas.getBoundingClientRect();
-  fut.exports.fut_mouse((e.clientX - r.left) * canvas.width / r.width, (e.clientY - r.top) * canvas.height / r.height, mouseDown);
+  fut.mouse((e.clientX - r.left) * canvas.width / r.width, (e.clientY - r.top) * canvas.height / r.height, mouseDown);
 };
 canvas.addEventListener("mousemove", mouse);
 canvas.addEventListener("mousedown", (e) => ((mouseDown = 1), mouse(e)));
@@ -98,8 +113,8 @@ const missing = file && !(await fetch("/" + file.replace(/^\/+/, ""), { method: 
 if (missing) write(2, new TextEncoder().encode(`fut: there is no ${file} (the server serves files from its own checkout)\n`)), (running = false);
 else if (file) {
   const path = "/" + file.replace(/^\/+/, "");
-  new EventSource("/events").onmessage = (e) => watched.has(e.data) && (stamps.set(e.data, (stamps.get(e.data) ?? 0) + 1), fut.changed());
-  const st = await fut.run(path, true);
+  new EventSource("/events").onmessage = (e) => watched.has(e.data) && fut.changed(e.data);
+  const st = await fut.run(path, true).catch((e) => (write(2, new TextEncoder().encode(`[fut] ${e.message}\n`)), 1));
   running = false, write(2, new TextEncoder().encode(`[fut] exited (${st})\n`));
 }
 </script>

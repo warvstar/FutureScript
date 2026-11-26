@@ -517,8 +517,9 @@ def runner_map(exe):
 
 def runner_modules(exe):
     """Foreign modules in a package: on wasm, a JS module (data copied, functions as callbacks, JS objects as
-    handles, Promises suspending the caller, exceptions as fut errors) and a wasm module; natively, a C library,
-    and a clear error for a JS-only module."""
+    handles, Promises suspending the caller, exceptions as fut errors) and a wasm module, called from spawned
+    isolates too (in fut-mt.wasm, on other threads, each with the module loaded itself); a module declared main
+    (fut.pkg), which Node runs where it is called; natively, a C library, and a clear error for a JS-only module."""
     d = ROOT / "build" / "mods"
     wasmb = bytes.fromhex("0061736d01000000011203" "60027f7f017f60027c7c017c60017e017e" "030403000102" "071303036164640000036d756c00010364626c0002"
                           "0a1903" "0700200020016a0b070020002001a20b0700200020007c0b")
@@ -528,7 +529,8 @@ def runner_modules(exe):
           "export const boom = () => { throw new Error('kaboom'); };\n"
           "class Counter { n = 0; inc() { return ++this.n; } }\n"
           "export const counter = () => new Counter();\nexport const bump = (c) => c.inc();\n")
-    tree(d, {"app/fut.pkg": "name app\njs util ./util.js\nwasm m ./m.wasm\nc libm libm.dylib\n", "app/util.js": js})
+    tree(d, {"app/fut.pkg": "name app\njs util ./util.js\njs page ./page.js main\nwasm m ./m.wasm\nc libm libm.dylib\n", "app/util.js": js,
+             "app/page.js": "export const where = () => 'here';\n", "bad/fut.pkg": "name bad\njs x ./x.js page\n", "bad/bad.fut": "print(1)\n"})
     (d / "app" / "m.wasm").write_bytes(wasmb)
     run = lambda f: subprocess.run([*runner(exe), str(d / "app" / f)], capture_output=True, text=True, timeout=60)
     if exe.suffix != ".wasm":
@@ -544,10 +546,18 @@ def runner_modules(exe):
         'print(info({"n": 21, "s": "x"}))\nprint(mapWith([1, 2], fn(x) { return x * 10 }))\nprint(later([true, nil]))\n'
         'try { boom() } catch e { print(e) }\nvar c = counter()\nbump(c)\nprint(bump(c))\nprint(c)\n'
         "print(add(2, 3))\nprint(dbl(4000000000))\n")
-    r = run("main.fut")
+    (d / "app" / "iso.fut").write_text(
+        "extern util fn info(any): any\nextern util fn mapWith(any, fn): any\nextern util fn later(any): any\n"
+        "extern util fn counter(): any\nextern util fn bump(any): num\nextern page fn where(): str\nextern m fn add(int, int): int\n"
+        "fn work(k) {\n  var c = counter()\n  bump(c)\n"
+        '  return [info({"n": k})["n"], mapWith([k], fn(x) { return x + 1 }), later(k), bump(c), where(), add(k, 1)]\n}\n'
+        "fn main() {\n  var ts = []\n  for k in 0..4 { ts.push(spawn work(k)) }\n  for t in ts { print(t.join()) }\n}\n")
+    r, i, bad = run("main.fut"), run("iso.fut"), subprocess.run([*runner(exe), str(d / "bad" / "bad.fut")], capture_output=True, text=True, timeout=60)
     want = ['{keys: ["n", "s"], n: 42, list: [1, [2]], ok: true, none: nil}', "[10, 20]", "[true, nil]",
             "boom(): kaboom", "2", "<js value>", "5", "8000000000"]
-    return r.stdout.splitlines() == want, f"got: {r.stdout!r}\n  stderr: {r.stderr!r}"
+    iwant = [f'[{2 * k}, [{k + 1}], {k}, 2, "here", {k + 1}]' for k in range(4)]
+    ok = r.stdout.splitlines() == want and i.stdout.splitlines() == iwant and "js <name> <file> [main]" in bad.stderr
+    return ok, f"got: {r.stdout!r}\n  stderr: {r.stderr!r}\n  isolates: {i.stdout!r} {i.stderr!r}\n  bad: {bad.stderr!r}"
 
 
 def runner_std(exe):

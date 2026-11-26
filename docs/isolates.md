@@ -1,6 +1,6 @@
 # Isolates and channels
 
-Status: phases 1 (the runtime split per isolate), 2 (spawn, join, channels), 3 (the scheduler: isolate stacks, a thread pool with preemption, seeded runs) and 4 (hot reload across isolates) are done, and so is 5 in Node (isolates in wasm: on one thread in fut.wasm, in parallel on workers in fut-mt.wasm). The README has the language as built; `src/isolate.cpp` has the runtime. What remains of 5 is the browser (a page's main thread can't block, and needs COOP/COEP headers). This is how fut gets parallelism: many isolates run at once, each owning its own heap,
+Status: phases 1 (the runtime split per isolate), 2 (spawn, join, channels), 3 (the scheduler: isolate stacks, a thread pool with preemption, seeded runs) and 4 (hot reload across isolates) are done, and so is 5 (isolates in wasm: on one thread in fut.wasm, in parallel on workers in fut-mt.wasm). The README has the language as built; `src/isolate.cpp` has the runtime. and in a browser page (every thread a worker, the main isolate's too; JavaScript a module declares `main` runs on the page's thread). This is how fut gets parallelism: many isolates run at once, each owning its own heap,
 and they share data only by sending it over channels. There is no shared mutable memory, so there are no locks,
 no memory orderings and no data races to write. Read this before you add any global state to the runtime.
 
@@ -144,9 +144,9 @@ Code is shared, so a reload must reach every isolate at once:
   frame, into a local, and reaches its fields as offsets from it.
 - **JIT modules.** Each one is instantiated in every worker, because each worker has its own function table
   (shared tables aren't standardized). Done in step two: a log of every table change, which each thread replays.
-- **Blocking.** `Atomics.wait` works in workers and in Node, but not on a browser's main thread. There, the main
-  isolate's `recv` suspends through JSPI, as fibers already do.
-- **Headers.** Shared memory requires a cross-origin-isolated page (COOP/COEP). `web/serve.mjs` will send them.
+- **Blocking.** `Atomics.wait` works in workers and in Node, but not on a browser's main thread. Done in step three
+  as Emscripten's PROXY_TO_PTHREAD does it: the main isolate runs on a worker too, and the page only serves them.
+- **Headers.** Shared memory requires a cross-origin-isolated page (COOP/COEP). `web/serve.mjs` sends them.
 
 ## Phases
 
@@ -339,8 +339,8 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
   bits a safepoint handles are cleared there (`fetch_and`), so a stop or an exit another thread asks for meanwhile
   is not lost.
 - **Limits.**
-  - Extern functions (JavaScript's) and JavaScript values are the main thread's: an isolate on a worker that calls
-    one gets an error saying so.
+  - Extern functions (JavaScript's) and JavaScript values were the main thread's: an isolate on a worker that called
+    one got an error saying so. Step three runs them where they are called.
   - A host call that waits (`sleep`, `fetch`) holds up the other isolates of its thread, as it does on one thread.
   - Deep recursion runs out of V8's stack (984 KB for a JSPI stack) before fut's own check, so it ends the program
     rather than failing the isolate. The same holds on fut.wasm's main isolate.
@@ -349,3 +349,40 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
 - **Speed.** Eight isolates each summing 10^8 numbers: 0.95 s on 8 threads, 2.1 s on 2, and 3.3 s in fut.wasm on one
   thread (natively: 0.26 s). `tests/isolates_busy.fut` (12 isolates collecting, compiling tier 2 and sending closures
   at once) runs in every build's suite.
+
+## Phase 5, step three as built: the browser
+
+- **Every thread a worker.** A page's own thread can't wait (`Atomics.wait` throws there, and so does wasm's
+  `memory.atomic.wait32`), and fut's threads wait: on locks, channels, `join`. So, as Emscripten's PROXY_TO_PTHREAD
+  does, the program's root (its main isolate, the REPL, reloads) runs on a worker too (`web/fut-worker.js`), and the
+  page (`web/browser.js`) serves the workers: it shows their output, draws what they `present()`, sends keys, mouse,
+  typed lines and changed files to the root, and starts the threads they ask for. It must start them: a browser
+  starts a worker only once the thread that made it is free, and a thread asking for one may then wait on it.
+  `web/index.html` runs fut-mt.wasm this way when the page is cross-origin isolated (`web/serve.mjs` sends COOP and
+  COEP), fut.wasm on its own thread otherwise or with `?threads=0`.
+- **JavaScript runs where it is called** (Emscripten's default too). Each thread loads a package's modules itself
+  when its isolates first call them: fut.wasm binds an extern to an index on the thread that compiled it, and
+  another thread looks the index up (`fut_extern_name`) and binds it the same. Handles (`Ref`) are the thread's:
+  `jsval.cpp`'s `refs` is thread-local, and pinned fut functions are the process's, under a lock. A fut function
+  JavaScript calls later (not during an extern call) runs on the main isolate, so on a pool thread that's an error.
+- **Proxying, opt-in.** A module declared `main` in `fut.pkg` (`js dom ./dom.js main`, as std/ui's is), and a global
+  this thread doesn't have but the page does (`document`, `alert`), run on the page's thread. The calling thread
+  writes the call (its arguments as text, `any` and `fn` as their JSON) to a channel it shares with the page, rings
+  it (a message), and waits on the channel's state word. The page runs it and writes the result back. If the page's
+  JavaScript calls a fut function meanwhile (as `Array.map` does), the page writes that call to the channel and
+  spins until the worker, still waiting there, has run it (as a callback during an extern call) and written its
+  result; a call to the page from inside it is served during the spin. One the page calls later (a click's
+  handler) goes to the root as a message, which also sets the root's poll bit in the shared memory, so a busy root
+  reads its messages at its next safepoint. The page's own values cross as handles with ids from 2^31; it frees
+  one when every thread that held it has let it go. `fut.js`'s `proxy` option (`?proxy=` on the page) picks what is
+  proxied: `declared` (the default), `all` (every module and global function but the small libc and Math), `none`.
+- **Order.** Events the page sends while a callback runs wait until it returns: a host poll reads the page's
+  messages only when it isn't inside one. std/ui's `field` doesn't write back the value its box last reported, since
+  events are handled after the typing that follows them.
+- **Limits.**
+  - The main isolate can't run on the page's own thread (spinning instead of waiting, suspending through JSPI for
+    long waits): the C library's locks (malloc's) wait too, and Emscripten patches its C library for that.
+  - A module's state is per thread; a module that keeps state across isolates must be declared `main`.
+  - Keys and the mouse reach a busy root when it next yields to the page (`present()`), as on one thread.
+- **Speed.** Eight isolates each looping 2*10^7 times: 120 to 250 ms in Chrome on 12 threads, 710 to 780 ms in
+  fut.wasm on the page's thread (natively: 75 ms).

@@ -199,7 +199,7 @@ the isolates to end.
 ## Modules, packages
 
 - `import "x.fut"` (pub names global) or `as x` (`x.f`). Non-`pub` = file-private, free to change.
-- `fut.pkg`: `name`, `version`, `root`, `dep <name> <dir>`, `js|wasm|c <name> <path>`. `import "<name>"`. Outside sees only root's `pub` + `pub import` re-exports. No cycles, no paths across packages.
+- `fut.pkg`: `name`, `version`, `root`, `dep <name> <dir>`, `js|wasm|c <name> <path>`, `js <name> <path> main` (in a browser it runs on the page's thread; other JS runs on the thread calling it). `import "<name>"`. Outside sees only root's `pub` + `pub import` re-exports. No cycles, no paths across packages.
 - `.api` = public signatures, types, effects, contracts. Stale `.api` fails `fut test`. Editing one means you changed an interface: run `fut api`, commit it; breaking change needs a version bump.
 - `extern fn hypot(num, num): num` (C natively, JS under wasm; performs io), `extern fn sin(num): num !` (bare `!`: pure), `extern mod fn f(any, fn): str` (a module in fut.pkg). Types `num int long ptr str`, and for JS `any fn`.
 - Hot reload keeps globals; a var reinitializes only if its line changed.

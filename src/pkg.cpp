@@ -72,14 +72,15 @@ static Package* load(const std::string& dir) {
       for (auto& d : p->deps) if (d.name == w[1]) bad(ln, "'" + w[1] + "' is already a dependency");
       p->deps.push_back({w[1], canonicalPath(w[2][0] == '/' ? w[2] : dir + "/" + w[2]), ln});
     } else if (k == "js" || k == "wasm" || k == "c") {
-      want(3, (k + " <name> <" + (k == "c" ? "library" : "file") + ">").c_str());
+      bool main = k == "js" && w.size() == 4 && w[3] == "main";  // js dom ./dom.js main: it needs the page's thread
+      if (!main) want(3, (k + " <name> <" + (k == "c" ? "library" : "file") + ">" + (k == "js" ? " [main]" : "")).c_str());
       if (!isName(w[1])) bad(ln, "a module name is an identifier: letters, digits and _");
       for (auto& m : p->mods)
         if (m.name == w[1] && (m.kind == k || (m.kind != "c") == (k != "c")))
           bad(ln, "'" + w[1] + "' is already a module" + (m.kind == k ? "" : " (one name can have a js or wasm version and a c version)"));
       std::string t = w[2];
       if (k != "c" || t.find('/') != std::string::npos) t = canonicalPath(t[0] == '/' ? t : dir + "/" + t);
-      p->mods.push_back({k, w[1], t, ln});
+      p->mods.push_back({k, w[1], t, ln, main});
     } else bad(ln, "unknown setting '" + k + "' (name, version, root, dep, js, wasm, c)");
   }
   if (p->name.empty()) bad(1, "a package needs a name: name <identifier>");

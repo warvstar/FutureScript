@@ -646,7 +646,8 @@ void effRequire(uint64_t effect, const char* what, void* ra);  // raises unless 
 void effectsInit();
 
 // ---- packages (pkg.cpp): a directory with a fut.pkg manifest ----
-struct ForeignMod { std::string kind, name, target; int line; };  // kind: js, wasm or c; target: its file or library
+struct ForeignMod { std::string kind, name, target; int line; bool main = false; };  // kind: js, wasm or c; target: its file or library;
+// main: (js) its functions run on the host's main thread (a page's: the DOM), whichever thread calls them
 struct PackageDep { std::string name, dir; int line; };
 struct Package {
   std::string dir, manifest, name, version, root;  // root: the file whose pub names are the package's interface

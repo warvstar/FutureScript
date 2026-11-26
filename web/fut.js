@@ -27,6 +27,13 @@
 //     thread}) with this thread's {module, memory, tid, arg} (web/thread.mjs). Without it, fut-mt.wasm runs every
 //     isolate on this thread, seeded.
 //   thread: (set by thread.mjs) this is one of fut-mt.wasm's threads: run it (wasi_thread_start), not a program
+//   main: (a thread that isn't the host's main thread, in a browser: web/fut-worker.js) {ctl, data, bell(), post(msg)}:
+//     the line to the page's thread (web/browser.js), which runs the JavaScript a thread proxies to it
+//   proxy: which JavaScript runs on the host's main thread (through opts.main) rather than the thread calling it:
+//     "declared" (default): a package's modules declared main (fut.pkg: js dom ./dom.js main), and globals only the
+//     main thread has (document, alert); "all": every js module and global function too; "none": nothing.
+//     A small libc and Math always run where they are called.
+//   pending: (with main) an Int32Array the page counts the messages it sent this thread in, unread
 // The interpreter's try_call(cb, ctx): runs the C++ callback cb(ctx) (a try_table's body) and returns its result, or
 // catches a fut exception, stores its payload (i64) at ctx, puts the stack pointer back and returns -1. Static, so a
 // Worker can upload it compiled.
@@ -47,6 +54,47 @@ export function tryCallBytes(shared) {  // shared: for fut-mt.wasm, whose memory
     ...sec(7, [1, ...str("try_call"), 0, 0]),
     ...sec(10, [1, code.length, ...code])]);
 }
+// Values of type any (and fn) cross as JSON text; what is not data crosses by reference (see jsval.cpp): fut
+// functions as JS functions that call them (fnOf(id)), JS objects that are not plain data as ids fut holds as Refs
+// (refOf(value) -> id, refGet(id) -> value). fut functions made by fnOf carry their id under FUT.
+export const MARK = "\0", FUT = Symbol("fut function");
+export function jsonCodec(fnOf, refOf, refGet) {
+  const fromFut = (s) => JSON.parse(s, (k, v) => {
+    if (!v || typeof v != "object" || Array.isArray(v) || !(MARK in v)) return v;
+    return v[MARK] == "fn" ? fnOf(v.id) : v[MARK] == "js" ? refGet(v.id) : Number(v.v);
+  });
+  const toFut = (v) => JSON.stringify(v, (k, x) => {
+    if (typeof x == "number") return Number.isFinite(x) ? x : { [MARK]: "num", v: String(x) };
+    if (typeof x == "bigint") return Number(x);
+    if (x === undefined) return null;
+    if (typeof x == "function") return x[FUT] != null ? { [MARK]: "fn", id: x[FUT] } : { [MARK]: "js", id: refOf(x) };
+    if (typeof x == "symbol") return { [MARK]: "js", id: refOf(x) };
+    if (x && typeof x == "object" && !Array.isArray(x) && !(MARK in x)) {
+      const p = Object.getPrototypeOf(x);
+      if (p !== Object.prototype && p !== null) return { [MARK]: "js", id: refOf(x) };  // a class's instance, a DOM node
+    }
+    return x;
+  });
+  return { fromFut, toFut };
+}
+// A worker thread's line to the page's thread, for calls the page runs (opts.main): a word of state and the
+// message (JSON text) in a growable buffer, both shared. The worker waits (Atomics.wait); the page, which can't, is
+// rung (a message) and spins only while a fut function it called synchronously runs on the worker.
+//   IDLE -> REQ (worker: a call) -> TAKEN (page) -> REPLY (page: its result) -> IDLE (worker)
+//   while TAKEN: CB (page: call fut function) -> CBREPLY (worker: its result) -> TAKEN (page); a REQ may come
+//   meanwhile (that fut function calls the page too)
+export const CH = { IDLE: 0, REQ: 1, TAKEN: 2, REPLY: 3, CB: 4, CBREPLY: 5 };
+export function channel() {
+  return { ctl: new Int32Array(new SharedArrayBuffer(8)), data: new SharedArrayBuffer(1 << 16, { maxByteLength: 1 << 30 }) };
+}
+export function chanPut(ch, state, msg) {
+  const b = new TextEncoder().encode(JSON.stringify(msg));
+  if (ch.data.byteLength < b.length) ch.data.grow(Math.max(b.length, ch.data.byteLength * 2));
+  new Uint8Array(ch.data, 0, b.length).set(b), (ch.ctl[1] = b.length);
+  Atomics.store(ch.ctl, 0, state), Atomics.notify(ch.ctl, 0);
+}
+export const chanGet = (ch) => JSON.parse(new TextDecoder().decode(new Uint8Array(ch.data, 0, Atomics.load(ch.ctl, 1)).slice()));
+
 export class Restart extends Error {}  // unwinds to the driver, which reruns main()
 export class Exit extends Error { constructor(code) { super("exit " + code), (this.code = code); } }
 export class FutError extends Error { constructor(text) { super(text.split("\n")[0]), (this.text = text); } }  // from apply()
@@ -142,18 +190,56 @@ export async function createFut(opts) {
     atof: (s) => parseFloat(s) || 0, getenv: (n) => opts.getenv?.(n) ?? null, ldexp: (x, e) => x * 2 ** e,
     pow: Math.pow, sqrt: Math.sqrt, floor: Math.floor, ceil: Math.ceil, fabs: Math.abs, fmod: (a, b) => a % b,
   };
-  const externs = [], externWasm = [];
+  const externs = [], externWasm = [];  // by index; a function, or {lib, name} the main thread runs (proxied)
+  const proxyMode = opts.main ? opts.proxy ?? "declared" : "none";
   // A package's modules (js jwt ./jwt.js, wasm zlib ./zlib.wasm), by lib ("js:/path"): loaded before the compile that
   // binds them (it asks: fut_info(3)), and again when their file changes; each bound function keeps its index, so a
   // reloaded module's functions replace the old ones under the code already calling them.
   const modules = new Map(), bound = new Map();  // bound: lib + "\n" + name -> extern index
-  const pick = (m, file, name) => (typeof m.exports?.[name] == "function" ? m.exports[name]
+  const callable = (f) => typeof f == "function" || f?.lib != null;
+  const pick = (m, file, name) => (callable(m.exports?.[name]) ? m.exports[name]
     : () => { throw new Error(`${name} is not exported by ${file} any more`); });
+  const isModule = (lib) => /^(js|js\+main|wasm):/.test(lib);
+  const proxied = (lib) => proxyMode == "all" ? lib.startsWith("js") : proxyMode == "declared" && lib.startsWith("js+main:");
+  // A call the host's main thread runs (opts.main), waiting for it here. A fut function it calls meanwhile
+  // (synchronously, as Array.map does) runs here, as if called during an extern call.
+  let mainExc = null;  // a fut error from such a function, which fails the call: thrown again here when it does
+  function mainCall(req) {
+    const ch = opts.main;
+    chanPut(ch, CH.REQ, req), opts.main.bell();
+    for (;;) {
+      let s;
+      while ((s = Atomics.load(ch.ctl, 0)) != CH.REPLY && s != CH.CB) Atomics.wait(ch.ctl, 0, s);
+      const m = chanGet(ch);
+      if (s == CH.REPLY) {
+        Atomics.store(ch.ctl, 0, CH.IDLE);
+        if (m.err == null) return m.value;
+        const e = mainExc ?? new Error(m.err);
+        throw ((mainExc = null), e);
+      }
+      let r;
+      ex.fut_sync(1);
+      try { r = { value: cstr(withStr(m.json, (p) => ex.fut_apply(m.id, p))) }; } catch (e) {
+        if (e instanceof Restart || e instanceof Exit) throw e;
+        r = { err: e instanceof WebAssembly.Exception && e.is(tag) ? cstr(ex.fut_error_line(e.getArg(tag, 0))) : String(e?.message ?? e) };
+        if (e instanceof WebAssembly.Exception) mainExc = e;
+      } finally { ex.fut_sync(-1); }
+      chanPut(ch, CH.CBREPLY, r);
+    }
+  }
+  const libObject = (lib) => { let o = globalThis; for (const k of lib.split(".")) if ((o = o?.[k]) == null) return null; return o; };
+  const lookupGlobal = (lib, name) => {  // a function of this thread's globals, or null
+    const o = lib ? libObject(lib) : globalThis, f = lib ? o?.[name]?.bind?.(o) : o[name];
+    return typeof f == "function" ? f : null;
+  };
   async function loadModule(lib) {
     const at = lib.indexOf(":"), kind = lib.slice(0, at), file = lib.slice(at + 1), stamp = opts.stamp?.(file), old = modules.get(lib);
     try {
       let exports;
-      if (kind == "js") {
+      if (proxied(lib)) {  // the page loads it; here, a stand-in for each function it exports
+        exports = {};
+        for (const name of mainCall({ op: "load", lib, stamp })) exports[name] = { lib, name };
+      } else if (kind.startsWith("js")) {
         if (!opts.importModule) throw new Error("this host cannot load JavaScript modules");
         exports = await opts.importModule(file, stamp);
       } else {
@@ -161,7 +247,7 @@ export async function createFut(opts) {
         if (!bytes) throw new Error("cannot read it");
         exports = (await WebAssembly.instantiate(bytes, {})).instance.exports;
       }
-      const m = { exports, stamp, kind };
+      const m = { exports, stamp, kind: kind.startsWith("js") ? "js" : kind };
       modules.set(lib, m);
       for (const [key, i] of bound) if (key.startsWith(lib + "\n")) externs[i] = pick(m, file, key.slice(lib.length + 1));
       if (old) opts.verbose && write(2, `[fut] reloaded ${file}\n`);
@@ -186,29 +272,41 @@ export async function createFut(opts) {
       if (!any) return 0;
     }
   }
-  function externLookup(lib, name) {
-    let f;
-    if (lib.startsWith("js:") || lib.startsWith("wasm:")) {
+  // at: the index another thread's host bound it to (this thread binds it the same), else a new one
+  function externLookup(lib, name, at) {
+    const put = (f) => (at != null ? ((externs[at] = f), at) : externs.push(f) - 1);
+    if (isModule(lib)) {
       const m = modules.get(lib);
       if (!m) return -3;  // not loaded yet: the compile reports it, and compileWith loads it
       if (m.failed) return -2;
-      if (typeof m.exports[name] != "function") return -1;
+      if (!callable(m.exports[name])) return -1;
       const key = lib + "\n" + name;
-      let i = bound.get(key);
-      if (i == null) bound.set(key, (i = externs.push(null) - 1));
-      return (externs[i] = m.exports[name]), (externWasm[i] = m.kind == "wasm"), i;
+      let i = at ?? bound.get(key);
+      if (i == null) i = externs.push(null) - 1;
+      return bound.set(key, i), (externs[i] = m.exports[name]), (externWasm[i] = m.kind == "wasm"), i;
     }
-    if (!lib) f = libc[name] ?? Math[name] ?? globalThis[name];
-    else {
-      let o = globalThis;
-      for (const k of lib.split(".")) if ((o = o?.[k]) == null) return -2;
-      f = o[name]?.bind?.(o);
+    const builtin = !lib && (libc[name] ?? Math[name]);
+    if (builtin) return put(builtin);
+    // the main thread's: what proxy says goes there, and what only it has (document, alert)
+    if (proxyMode == "all" || (proxyMode == "declared" && !lookupGlobal(lib, name))) {
+      const has = mainCall({ op: "has", lib, name });
+      if (has) return put({ lib, name });
     }
-    return typeof f == "function" ? externs.push(f) - 1 : -1;
+    const f = lookupGlobal(lib, name);
+    return f ? put(f) : lib && !libObject(lib) ? -2 : -1;
+  }
+  // A host function another thread's host bound (its compile ran there): bound here at the same index, by name.
+  function externResolve(fn) {
+    const nm = cstr(ex.fut_extern_name(fn)), at = nm.indexOf("\n");
+    if (at < 0) return;
+    const lib = nm.slice(0, at), name = nm.slice(at + 1);
+    const bind = () => void (externLookup(lib, name, fn) < 0 && (externs[fn] = () => { throw new Error(`${name} isn't a function on this thread`); }));
+    if (isModule(lib) && !modules.has(lib)) return loadModule(lib).then(bind);
+    bind();
   }
   // Values of type any (and fn) cross as JSON text; what is not data crosses by reference (see jsval.cpp): fut
   // functions as JS functions that call them, JS objects that are not plain data as ids fut holds as Refs.
-  const MARK = "\0", FUT = Symbol("fut function");
+  // (ids from 2^31 are the page's: values its JavaScript gave fut, through opts.main)
   const refs = new Map(), refIds = new Map();  // id -> value, value -> id: one id per value while fut holds it
   let refNext = 1;  // never reused, so an id names one value
   const refOf = (v) => { let id = refIds.get(v); if (id == null) refIds.set(v, (id = refNext++)), refs.set(id, v); return id; };
@@ -217,22 +315,7 @@ export async function createFut(opts) {
     const f = (...args) => callFut(id, args);
     return (f[FUT] = id), unpin.register(f, id), f;
   }
-  const fromFut = (s) => JSON.parse(s, (k, v) => {
-    if (!v || typeof v != "object" || Array.isArray(v) || !(MARK in v)) return v;
-    return v[MARK] == "fn" ? futFn(v.id) : v[MARK] == "js" ? refs.get(v.id) : Number(v.v);
-  });
-  const toFut = (v) => JSON.stringify(v, (k, x) => {
-    if (typeof x == "number") return Number.isFinite(x) ? x : { [MARK]: "num", v: String(x) };
-    if (typeof x == "bigint") return Number(x);
-    if (x === undefined) return null;
-    if (typeof x == "function") return x[FUT] != null ? { [MARK]: "fn", id: x[FUT] } : { [MARK]: "js", id: refOf(x) };
-    if (typeof x == "symbol") return { [MARK]: "js", id: refOf(x) };
-    if (x && typeof x == "object" && !Array.isArray(x) && !(MARK in x)) {
-      const p = Object.getPrototypeOf(x);
-      if (p !== Object.prototype && p !== null) return { [MARK]: "js", id: refOf(x) };  // a class's instance, a DOM node
-    }
-    return x;
-  });
+  const { fromFut, toFut } = jsonCodec(futFn, refOf, (id) => refs.get(id));
   // A fut function called from JavaScript. During an extern call (fut is waiting for it: a callback, as Array.map
   // makes) it runs right away and returns its result; otherwise it runs at the program's next safepoint, and the
   // call returns a Promise of its result.
@@ -244,12 +327,15 @@ export async function createFut(opts) {
       ex.fut_sync(1);
       try { return fromFut(cstr(withStr(json, (p) => ex.fut_apply(id, p)))); } finally { ex.fut_sync(-1); }
     }
+    if (opts.thread) return Promise.reject(new Error("JavaScript can call a fut function later (not during an extern call) only if the program's main isolate gave it"));
     return new Promise((res, rej) => (callbacks.push({ id, json, res, rej }), poke()));
   }
+  // The page calls a fut function (browser.js): JSON in and out, as it has its own JavaScript values
+  const callRaw = (id, json) => new Promise((res, rej) => (callbacks.push({ id, json, res, rej, raw: true }), poke()));
   async function runCallbacks() {
     for (const c of callbacks.splice(0)) {
       try {
-        c.res(await applyFn(c.id, () => c.json));
+        c.res(await (c.raw ? applyRaw(c.id, c.json) : applyFn(c.id, () => c.json)));
       } catch (e) {
         if (e instanceof Restart || e instanceof Exit) throw e;
         report(e), c.rej(new Error(errorText(e).split("\n")[0]));
@@ -263,12 +349,15 @@ export async function createFut(opts) {
   }
   // An extern call. A JS function that returns a Promise suspends the fut code calling it (that fiber, or the
   // program) until it settles, as sleep() does. A JS exception becomes a fut error (try catches it).
+  function rawArgs(sig, args) {  // for the page: strings and JSON text as they are (its JavaScript reads them)
+    const d = dv();
+    return [...sig].map((t, i) => {
+      const x = d.getFloat64(args + i * 8, true);
+      return t == "s" || t == "a" || t == "f" ? cstr(x) : t == "i" ? x | 0 : t == "l" ? Math.trunc(x) : x;
+    });
+  }
   function ffi(fn, sigP, args, ret, failedP, now) {
-    const sig = cstr(sigP), d = dv(), a = [], big = externWasm[fn];
-    for (let i = 0; i < sig.length; i++) {
-      const x = d.getFloat64(args + i * 8, true), t = sig[i];
-      a.push(t == "s" ? cstr(x) : t == "a" || t == "f" ? fromFut(cstr(x)) : t == "i" ? x | 0 : t == "l" ? (big ? BigInt(Math.trunc(x)) : Math.trunc(x)) : x);
-    }
+    const sig = cstr(sigP);
     const done = (r) => {
       if (ret == 115 /* s */) return r == null ? -1 : ((held = enc.encode(String(r))), held.length);
       if (ret == 97 /* a */) return (held = enc.encode(toFut(r))), held.length;
@@ -279,10 +368,26 @@ export async function createFut(opts) {
       dv().setInt32(failedP, 1, true);
       return (held = enc.encode(String(e?.message ?? e))), held.length;
     };
-    if (!externs[fn] && opts.thread) return failed(new Error("this isolate runs on a worker thread, and extern functions (JavaScript's) run only on the main one: call it from the program's main isolate"));
+    if (externs[fn] === undefined) {  // bound by another thread's host: bind it here
+      const p = externResolve(fn);
+      if (p) return now ? failed(new Error("its module isn't loaded on this thread yet, and fut code JavaScript called synchronously can't wait for it")) : p.then(() => ffi(fn, sigP, args, ret, failedP, now));
+    }
+    const f = externs[fn];
+    if (typeof f != "function") {  // the main thread's (proxied): it reads the arguments, and gives the result, as text
+      ffiDepth++;
+      try {
+        const r = mainCall({ op: "call", lib: f.lib, name: f.name, sig, ret, args: rawArgs(sig, args) });
+        return ret == 115 /* s */ || ret == 97 /* a */ ? (r == null ? -1 : ((held = enc.encode(r)), held.length)) : ret == 118 /* v */ ? 0 : Number(r);
+      } catch (e) { return failed(e); } finally { if (!--ffiDepth && pollLater) (pollLater = false), poke(); }
+    }
+    const d = dv(), a = [], big = externWasm[fn];
+    for (let i = 0; i < sig.length; i++) {
+      const x = d.getFloat64(args + i * 8, true), t = sig[i];
+      a.push(t == "s" ? cstr(x) : t == "a" || t == "f" ? fromFut(cstr(x)) : t == "i" ? x | 0 : t == "l" ? (big ? BigInt(Math.trunc(x)) : Math.trunc(x)) : x);
+    }
     let r;
     ffiDepth++;
-    try { r = externs[fn](...a); } catch (e) { return failed(e); } finally { if (!--ffiDepth && pollLater) (pollLater = false), poke(); }
+    try { r = f(...a); } catch (e) { return failed(e); } finally { if (!--ffiDepth && pollLater) (pollLater = false), poke(); }
     if (r && typeof r.then == "function") {
       if (now) return failed(new Error("it returned a Promise, which fut code JavaScript called synchronously can't wait for"));
       return Promise.resolve(r).then(done).catch(failed);
@@ -373,6 +478,7 @@ export async function createFut(opts) {
   }
   const call = (slot) => enter(() => callP(slot));
   const applyFn = (id, json) => enter(async () => fromFut(cstr(await withStrAsync(json(), (p) => applyP(id, p)))));
+  const applyRaw = (id, json) => enter(async () => cstr(await withStrAsync(json, (p) => applyP(id, p))));
   async function evalRepl(more) {  // compile and run replBuf, unless it is unfinished and `more` may follow
     const s = await compileWith(() => withStr(replBuf, (p) => withStr("<repl>", (n) => ex.fut_compile(n, 0, 1, p))));
     if (s == -1 && more) return;
@@ -394,9 +500,13 @@ export async function createFut(opts) {
     if (reload) write(2, `[fut] ${cstr(ex.fut_info(0))} (${(performance.now() - t0).toFixed(2)} ms, ${ex.fut_live() >> 10} KB code)\n`);
     return s;
   }
+  let polling = 0;  // hostPoll depth: a callback it runs reaches safepoints too
   async function hostPoll() {  // at a safepoint (not inside atomic { }): typed lines, callbacks, then a reload if a file changed
-    await evalInbox();
-    await runCallbacks();
+    // The page's messages, which set this poll (browser.js): read them first. Not inside a callback, where they
+    // would run (to completion) before the callback had done its part: as on one thread, events come in order.
+    if (!polling) while (opts.pending && Atomics.load(opts.pending, 0) > 0) await new Promise((r) => setTimeout(r));
+    polling++;
+    try { await evalInbox(), await runCallbacks(); } finally { polling--; }
     if (!fileChanged) return;
     // Isolates the program started share its code, but not its globals: a reload waits until they have ended.
     if (ex.fut_isolates() > 1) return void setTimeout(poke, 50);
@@ -440,7 +550,8 @@ export async function createFut(opts) {
       write(2, "[fut] main() changed: restarting it\n");
     return (inMain = false), finish(st);
   }
-  const event = () => new Promise((r) => (wake = r));
+  // the next event; at once if one came while the last was handled (a poke then found no one waiting)
+  const event = () => (callbacks.length || inbox.length || fileChanged ? Promise.resolve() : new Promise((r) => (wake = r)));
   async function waitChange() {  // typed lines still run meanwhile, so the stopped program's state can be inspected
     for (;;) {
       await event(), await evalInbox();
@@ -489,7 +600,7 @@ export async function createFut(opts) {
     extern: (lib, name) => externLookup(cstr(lib), cstr(name)),
     ffi: S(ffi),
     ffi_now: (...a) => ffi(...a, true),  // inside a synchronous callback (fut_sync): a Promise can't be waited for
-    ref_gone(id) { refIds.delete(refs.get(id)), refs.delete(id); },
+    ref_gone(id) { id >= 2 ** 31 ? opts.main?.post({ refGone: id }) : (refIds.delete(refs.get(id)), refs.delete(id)); },
     resume: S(resume), yield: S(yieldTo), fiber_gone: (f) => fibers.delete(f),
     vm: (p) => void (vmG.value = p),
     ctx_switch: S(ctxSwitch), ctx_gone: (c) => ctxs.delete(c),
@@ -561,6 +672,8 @@ export async function createFut(opts) {
 
   return {
     exports: ex,
+    memory: mem,
+    callRaw,  // (browser.js) the page calls a fut function: JSON text in, a Promise of JSON text
     async compile(file, tests) {  // compile only (errors printed), as test() would if tests: did it compile?
       if (!tests) return (path = file), !!(await load(false));
       withStr("", (p) => ex.fut_tests_begin(1, p));

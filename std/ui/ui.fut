@@ -156,8 +156,14 @@ fn place(list, key, view, shown, end) {
 pub fn field(s: r.Signal, props): any { return bindText("input", s, props) }
 fn bindText(tag, s, props) {
   var n = el(tag, props, nil)
-  r.effect(fn() { setProp(n, "value", s.get()) })
-  listen(n, "input", fn(e) { s.set(e.value) })
+  // What the box last said it holds isn't written back: its events may be handled after more typing (fut-mt.wasm
+  // handles them on another thread), and writing an older value would undo that typing.
+  var said = nil
+  r.effect(fn() { if s.get() != said { setProp(n, "value", s.get()) } })
+  listen(n, "input", fn(e) {
+    said = e.value
+    s.set(e.value)
+  })
   return n
 }
 

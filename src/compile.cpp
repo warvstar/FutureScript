@@ -1898,7 +1898,7 @@ struct Compiler : Gen {
       if (!fm) failAt(lt.p, lt.line, "@extern package %s has no module '%s': add 'js %s ./file.js' (or wasm, or c) to %s", p->name.c_str(), m.c_str(), m.c_str(), p->manifest.c_str());
       if (WASM && fm->kind == "c") failAt(lt.p, lt.line, "@extern module %s is a C library (c %s %s), which only the native build loads: add a js or wasm version of it to %s", m.c_str(), m.c_str(), fm->target.c_str(), p->manifest.c_str());
       if (!WASM && fm->kind != "c") failAt(lt.p, lt.line, "@extern module %s is %s (%s %s %s), which only the wasm build loads: add a C version (c %s <library>) to %s", m.c_str(), fm->kind == "js" ? "JavaScript" : "WebAssembly", fm->kind.c_str(), m.c_str(), ::base(fm->target).c_str(), m.c_str(), p->manifest.c_str());
-      lib = fm->kind == "c" ? fm->target : fm->kind + ":" + fm->target, shownLib = "module " + m + " (" + fm->target + ")";
+      lib = fm->kind == "c" ? fm->target : fm->kind + (fm->main ? "+main:" : ":") + fm->target, shownLib = "module " + m + " (" + fm->target + ")";
       if (fm->kind != "c" && std::find(modFiles.begin(), modFiles.end(), fm->target) == modFiles.end()) modFiles.push_back(fm->target);
     }
     if (!atKw(K_fn)) fail("@syntax expected 'fn'");

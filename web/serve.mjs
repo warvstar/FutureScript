@@ -11,6 +11,8 @@ import { fileURLToPath } from "node:url";
 const root = fileURLToPath(new URL("..", import.meta.url)), port = +(process.argv[2] ?? 8000);
 const types = { ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript", ".wasm": "application/wasm" };
 const clients = new Set();
+// Cross-origin isolated: the page may share memory (SharedArrayBuffer), so it runs fut-mt.wasm, a worker each thread
+const isolated = { "cross-origin-opener-policy": "same-origin", "cross-origin-embedder-policy": "require-corp" };
 watch(root, { recursive: true }, (_, f) => {
   if (f && /(\.fut|\.js|\.wasm|\/fut\.pkg|^fut\.pkg)$/.test(f)) for (const c of clients) c.write(`data: /${f}\n\n`);  // a program's files, its packages' manifests and modules
 });
@@ -25,6 +27,6 @@ createServer(async (req, res) => {
   if (!file.startsWith(root)) return res.writeHead(403).end();
   try {
     const body = await readFile(file);
-    res.writeHead(200, { "content-type": types[extname(file)] ?? "text/plain; charset=utf-8", "cache-control": "no-store" }).end(body);
+    res.writeHead(200, { "content-type": types[extname(file)] ?? "text/plain; charset=utf-8", "cache-control": "no-store", ...isolated }).end(body);
   } catch { res.writeHead(404).end(); }
 }).listen(port, "127.0.0.1", () => console.log(`fut: http://localhost:${port}/?file=examples/paddle.fut`));

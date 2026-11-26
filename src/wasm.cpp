@@ -26,8 +26,8 @@ HOST(extern) int host_extern(const char* lib, const char* name);  // a host func
 HOST(ffi) double host_ffi(int fn, const char* sig, const double* args, int ret, int* failed);  // a string or any result:
 HOST(ffi_now) double host_ffi_now(int fn, const char* sig, const double* args, int ret, int* failed);  // the same, not
 // suspending: inside a callback JavaScript makes synchronously (fut_sync), where nothing can suspend
-static int syncDepth;   // fut code JavaScript called synchronously, from inside an extern call (fut_sync)
-static bool syncPoll;   // a host poll wanted meanwhile: it waits until that code returns
+static TLS int syncDepth;   // fut code JavaScript called synchronously, from inside an extern call (fut_sync): this thread's
+static TLS bool syncPoll;   // a host poll wanted meanwhile: it waits until that code returns
                                                                                               // its length (in take);
                                                                                               // failed: the message's
 HOST(ref_gone) void host_ref_gone(u32 id);                     // no fut code holds JavaScript value id any more
@@ -373,8 +373,16 @@ void* futAdapter(void* cpp) {
   i32(k, (int32_t)slotOf(cpp)), k.c.insert(k.c.end(), {CALL_INDIRECT, 1 + NH, 0, ENDOP});
   return jitInstall(k);
 }
+// What each host function index names (lib, a newline, the name): a thread whose host didn't bind it (only the
+// compiling thread's did) looks it up itself (fut_extern_name).
+static std::vector<std::string> externNames;  // (under codeMu)
 void* externLookup(const std::string& lib, const std::string& name, const char** err) {
   int i = host_extern(lib.c_str(), name.c_str());
+  if (i >= 0) {
+    Locked code(codeMu);
+    if ((size_t)i >= externNames.size()) externNames.resize(i + 1);
+    externNames[i] = lib + "\n" + name;
+  }
   if (i == -2) *err = "cannot load";
   if (i == -3) *err = "pending";  // a module the host has not loaded yet
   return i < 0 ? nullptr : (void*)(uintptr_t)(i + 1);
@@ -577,6 +585,10 @@ EXPORT(fut_init) void futInit(int flags) {  // installs the natives' adapters
   if (interpMode) interpInit();
   rtInit(), jitCollect(), refRelease = host_ref_gone;
 }
+EXPORT(fut_extern_name) const char* futExternName(int i) {  // "lib\nname" of host function i, or ""
+  Locked code(codeMu);
+  return (text = i >= 0 && (size_t)i < externNames.size() ? externNames[i] : ""), text.c_str();
+}
 EXPORT(fut_set_trycall) void futSetTryCall(u32 slot) { interpSetTryCall(slot); }  // the host's try_call (see interp.cpp)
 EXPORT(fut_isolates) int futIsolates() { return isolates; }  // running now: the program's first, and those it spawned
 EXPORT(fut_seed) void futSeed(double seed) { isolateSeed = (uint64_t)seed; }  // --seed n
@@ -664,7 +676,7 @@ EXPORT(fut_map) int futMap(int pub, int json, const char* only, const char* prog
 // A fut function JavaScript holds (pinned as id), called with args (a JSON array): its result as JSON text. An
 // error in it propagates as a fut exception. Called directly while an extern call is in progress (a callback, as
 // Array.map makes), else at a safepoint, through a promising wrapper.
-static std::string applied;
+static TLS std::string applied;  // (a thread's: fut functions run on several at once)
 EXPORT(fut_sync) void futSync(int d) {  // the host calls fut code synchronously (1), and it returned (-1)
   syncDepth += d;
   if (!syncDepth && syncPoll) syncPoll = false, __atomic_fetch_or(&vm->poll, 1u, __ATOMIC_RELAXED);
