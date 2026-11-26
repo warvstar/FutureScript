@@ -4,6 +4,7 @@
 import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
 import { createFut } from "./fut.js";
 import { nodeOptions } from "./node.mjs";
 
@@ -39,6 +40,7 @@ if (testFiles.length > 1) {
   process.exit(status);
 }
 let watched = [file], rewatch = () => {};
+const pending = new Int32Array(new SharedArrayBuffer(4));  // the watcher's messages not yet read (see opts.pending)
 // FUT_WASM: another build of fut.wasm (build/fut-mt.wasm, the threads build: isolates run on workers)
 const wasmPath = process.env.FUT_WASM ? resolve(process.env.FUT_WASM) : fileURLToPath(new URL("../build/fut.wasm", import.meta.url));
 const fut = await createFut({
@@ -52,6 +54,7 @@ const fut = await createFut({
   wasm: readFileSync(wasmPath),
   exit: (code) => process.exit(code),
   files: (f) => ((watched = f), rewatch()),
+  pending,
   dump: process.env.FUT_DUMP && ((n) => (b) => writeFileSync(`${process.env.FUT_DUMP}/m${n++}.wasm`, b))(0),  // debugging: emitted modules
 });
 
@@ -81,14 +84,30 @@ if (!file) {  // REPL
     prompt = await fut.line(lines.shift());
   }
 }
-if (watch) {  // poll modification times, like the native watcher; lines typed run in the program
-  const stamp = () => watched.map((f) => { try { return statSync(f).mtimeMs; } catch { return 0; } }).join();
-  let last = stamp();
-  rewatch = () => (last = stamp());  // the files a reload compiled: changes are counted from now
+// Poll modification times, like the native watcher, on a thread of its own: this one may be waiting (fut-mt.wasm's
+// main isolate, blocked on a channel), so the watcher sets the program's poll bit and counts its message, which the
+// program reads at its next poll, or while it waits (see waitFor). Lines typed run in the program.
+const watcher = `
+  const { parentPort, workerData: { pending, memory, pollAt } } = require("node:worker_threads");
+  const { statSync } = require("node:fs");
+  let files = [], last = "";
+  const stamp = () => files.map((f) => { try { return statSync(f).mtimeMs; } catch { return 0; } }).join();
+  parentPort.on("message", (f) => ((files = f), (last = stamp())));  // the files a reload compiled: changes count from now
   setInterval(() => {
     const s = stamp();
-    if (s != last) setTimeout(() => ((last = stamp()), fut.changed()), 30), (last = s);
-  }, 100);
+    if (s == last) return;
+    last = s;
+    setTimeout(() => {
+      last = stamp(), Atomics.add(pending, 0, 1);
+      if (memory) Atomics.or(new Uint32Array(memory.buffer), pollAt >> 2, 1);
+      parentPort.postMessage("changed");
+    }, 30);
+  }, 100);`;
+if (watch) {
+  const shared = fut.memory.buffer instanceof SharedArrayBuffer;
+  const w = new Worker(watcher, { eval: true, workerData: { pending, memory: shared ? fut.memory : null, pollAt: fut.exports.fut_poll() } });
+  w.unref(), w.on("message", () => (Atomics.sub(pending, 0, 1), fut.changed()));
+  (rewatch = () => w.postMessage(watched))();
   listen((l) => l != null && fut.type(l));
 }
 const st = await fut.run(file, watch);

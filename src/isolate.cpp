@@ -291,7 +291,7 @@ struct Reload {
   std::string err;        // the first part that failed
 };
 Reload& rl = *new Reload;
-#if __wasm__
+#if ONE_THREAD
 void rlLeft() {}
 void reloadPoint() {}  // (a reload waits until the program is down to one isolate: fut.js)
 #else
@@ -442,6 +442,8 @@ std::string waitFor(std::vector<Iso*>* q, const char* what, void* ra) {
     while (!m->woken) {
 #if __wasm__
       if (exitAsked.load() >= 0) exitNow();
+      // The host's events (a changed file, a typed line, the page's) set poll bit 1, and can't signal the cv: look.
+      if (m == r && (__atomic_load_n(&vm->poll, __ATOMIC_ACQUIRE) & 1)) m->nudged = true;  // (vm: m's, on its own thread)
 #endif
       if (std::exchange(m->nudged, false) && pollHook) {  // a reload or a typed line: run it now, then wait again
         m->waiting = false, r->blocked--;
@@ -451,7 +453,14 @@ std::string waitFor(std::vector<Iso*>* q, const char* what, void* ra) {
         chanMu.lock();
         return "";   // the caller looks again at what it waits for
       }
+#if __wasm__
+      timespec t;
+      clock_gettime(CLOCK_REALTIME, &t);
+      if ((t.tv_nsec += 20000000) >= 1000000000) t.tv_sec++, t.tv_nsec -= 1000000000;
+      pthread_cond_timedwait(&m->cv, &chanMu.m, &t);  // (so it looks at the poll every 20 ms)
+#else
       pthread_cond_wait(&m->cv, &chanMu.m);
+#endif
     }
   else
 #endif
@@ -885,8 +894,21 @@ V n_cores() {
   return box((double)sysconf(_SC_NPROCESSORS_ONLN));
 #endif
 }
-#if !__wasm__
+#if !ONE_THREAD
 // Run code as a driver would (main.cpp's run): unchecked effects, no handlers; an error is caught, its text in err.
+#if __wasm__
+int partRun(void* code, std::string& err) {  // (fut's errors are wasm exceptions here: catchFut catches them)
+  void* handler = vm->handler;
+  u32 txn = vm->txn, eff = effEnter();
+  vm->handler = nullptr;
+  V e = NIL;
+  std::string trace;
+  bool failed = catchFut([](void* c) { vmCall(c, {}); }, code, &e, &trace);
+  if (failed) txnUnwind(txn), err = errorLine(e) + "\n" + trace;
+  vm->handler = handler, effLeave(eff);
+  return failed ? 1 : 0;
+}
+#else
 int partRun(void* code, std::string& err) {
   jmp_buf jb, *outer = errJmp;
   std::string* sink = errSink;
@@ -900,6 +922,7 @@ int partRun(void* code, std::string& err) {
   errJmp = outer, errSink = sink, errValue = val, vm->handler = handler, effLeave(eff);
   return st;
 }
+#endif
 void parkForReload(Iso* m) {  // (chanMu held, and held again on return)
   m->state = Iso::PARKED, m->rlParked = true, rlLeft();
   chanMu.unlock();
@@ -944,7 +967,7 @@ template <class F> void others(F f) {  // each isolate of the reloader's program
 #endif
 }  // namespace
 
-#if !__wasm__
+#if !ONE_THREAD
 bool isolatesStop() {
   if (isolates <= 1) return false;
   Locked l(chanMu);
@@ -1010,7 +1033,7 @@ void isolatesExit(int code) {
 }
 #endif
 void isolateReloadPoint() {
-#if !__wasm__
+#if !ONE_THREAD
   reloadPoint();
 #endif
 }

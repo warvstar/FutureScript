@@ -196,8 +196,8 @@ No shared objects. All waiting on each other: a deadlock error naming each wait.
 commit; `recv`/`join`/`spawn` there raise. Unjoined failures fail the program. Pool of `cores()` threads (`--threads n`); `fut test`
 (and `--seed n`) runs them on one thread, interleaved by the seed (default 1): same seed, same run. Under `-w` a reload
 stops all isolates, then each runs the new top level and `reload()`; all commit or all roll back. Wasm: fut.wasm has one
-thread, always seeded (default 1); fut-mt.wasm (the threads build) has the pool, on workers. A reload there waits for
-the isolates to end.
+thread, always seeded (default 1); fut-mt.wasm (the threads build) has the pool, on workers, and reloads as natively;
+in fut.wasm a reload waits for the isolates to end.
 
 ## Modules, packages
 

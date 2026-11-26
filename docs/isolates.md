@@ -172,11 +172,11 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
 4. **Hot reload across isolates.** Done.
    - Work: stop the world, then the two-phase commit.
    - Test: the hot-reload suite with workers running (`build.py`'s `hot_isolates`).
-5. **Wasm workers.**
-   - Step one, done: isolates in wasm on one thread (the VM base global; contexts switched with JSPI; seeded).
-   - Step two, done in Node: per-worker instantiation over shared memory (fut-mt.wasm, a threads build), the
-     table log.
-   - Left: the browser (blocking on a page's main thread, COOP/COEP), and reloads with isolates running.
+5. **Wasm workers.** Done.
+   - Step one: isolates in wasm on one thread (the VM base global; contexts switched with JSPI; seeded).
+   - Step two, in Node: per-worker instantiation over shared memory (fut-mt.wasm, a threads build), the table log.
+   - Step three: the browser (every thread a worker, as Emscripten's PROXY_TO_PTHREAD; COOP/COEP; opt-in proxying).
+   - Step four: reloads with isolates running, in fut-mt.wasm (Node and the browser), as phase 4 does natively.
 6. **Shared buffers and `parallel for`, for C-like throughput.**
    - Work: typed buffers (`f64buffer(n)` and the like) live outside every heap, so all isolates read and write them
      directly. Sending a buffer moves its ownership instead of copying it.
@@ -293,8 +293,8 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
 - **Ending.** fut.js waits for a program's isolates when it ends, and after each test (`fut_isolates_finish`, a
   promising call), as main.cpp does natively.
 - **Limits.** A file reload under `-w` waits until the isolates the program started have ended: other isolates
-  share its code but have globals of their own, which nothing copies into them yet (natively, phase 4 does). A
-  call that waits on the host (`sleep`, `fetch`) holds up every isolate.
+  share its code but have globals of their own, which nothing copies into them yet (natively, phase 4 does; in
+  fut-mt.wasm, step four). A call that waits on the host (`sleep`, `fetch`) holds up every isolate.
 - **Cloudflare Workers.** A Worker can't compile code, so every bundle ships `try_call` compiled (`try.wasm`), and
   `run()` there takes `--seed n` (and `--threads n`, which does nothing on one thread). `tests/specs/isolates.fut`
   passes in a bundle compiled ahead of time (`build.py`'s Worker check runs it).
@@ -383,6 +383,32 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
   - The main isolate can't run on the page's own thread (spinning instead of waiting, suspending through JSPI for
     long waits): the C library's locks (malloc's) wait too, and Emscripten patches its C library for that.
   - A module's state is per thread; a module that keeps state across isolates must be declared `main`.
-  - Keys and the mouse reach a busy root when it next yields to the page (`present()`), as on one thread.
+  - Keys and the mouse reach a busy root when it next yields to the page (`present()`), as on one thread. (A root
+    waiting on a channel or a task looks at its poll bit every 20 ms: see step four.)
 - **Speed.** Eight isolates each looping 2*10^7 times: 120 to 250 ms in Chrome on 12 threads, 710 to 780 ms in
   fut.wasm on the page's thread (natively: 75 ms).
+
+## Phase 5, step four as built: reloads with isolates running
+
+- **The same protocol as natively** (phase 4): fut-mt.wasm builds `isolatesStop`, `isolatesSync`, `isolatesParts`
+  and `isolatesVerdict` (they were native only), and exports them (`fut_isolates_stop` and so on). `hostPoll` in
+  `fut.js` does what main.cpp's `hotReload` does: stop the others (each at its next poll, bit 16, or where it
+  waits), compile, copy the globals to them, run the new top level and `reload()` in a transaction on the root,
+  then have each isolate run them in a transaction of its own; all commit, or all roll back with the code. A REPL
+  line compiles with the others stopped too (`compileStopped`). Unseeded only: with `--seed`, or with no pool,
+  every isolate is on the root's thread, and a reload waits until they have ended, as in fut.wasm.
+- **A part's error.** Natively `partRun` catches it with `setjmp`; in wasm a fut error is a wasm exception, which
+  `catchFut` (the host's `try_call`) catches.
+- **A root that waits.** Natively a watcher thread signals a root waiting on a channel or a task
+  (`isolateNudge`). In wasm the host's events can't signal a condition variable: they set the root's poll bit in
+  the shared memory. So a root waits there 20 ms at a time, and when it finds bit 1 set runs its poll (`waitFor`).
+  In Node the root is the main thread, and a waiting one runs no timers: `web/run.mjs`'s file watcher is a worker
+  of its own that sets the bit and counts its message (`opts.pending`, as the page's are), which the root reads at
+  that poll. A line typed on stdin still waits until the root next yields.
+- **Code.** A retired body's table slot can be reused while another isolate is still inside it: its frame doesn't
+  need the slot, and its direct calls are within its own module, so compiled code is safe. Interpreted bodies
+  (`FUT_INTERP`) are kept until the program is down to one isolate, as native code is.
+- **Test.** `build.py`'s `hot_isolates` runs on fut-mt.wasm too: three workers, a reload that fails in the workers
+  only and rolls back everywhere, then one that gives each its own new var and `reload()` run, with main waiting in
+  `recv()` all along. Checked by hand: isolates that never wait, reloaded three times in a row
+  (Node and Chrome), and a REPL line redefining a function they call.

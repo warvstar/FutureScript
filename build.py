@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and test fut.   python3 build.py [build | debug | wasm [--threads] | test [--debug | --wasm | --wasm-mt] [NAME...] | tsan [N] [NAME...] | fuzz [N] | clean]"""
+"""Build and test fut.   python3 build.py [build | debug | wasm [--threads] | test [--debug | --wasm | --wasm-mt] [NAME...] | tsan [N] [NAME...] | fuzz [N] | gpu [--check] | clean]"""
 import json, os, random, re, shutil, subprocess, sys, tempfile, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -279,9 +279,10 @@ def hot_isolates(exe):
     """A reload with isolates running: each stops, runs the new top level and reload() in a transaction of its own,
     and all commit or all roll back. Here a part that fails in a worker only undoes the reload everywhere (main's
     reload() too), and the next one gives each isolate its own new var and reload() run. Main waits in recv() all
-    along, and reloads from there. (Native only: in wasm, spawn raises.)"""
-    if exe.suffix == ".wasm":
-        return True, "native only"
+    along, and reloads from there. (Native, and fut-mt.wasm: in fut.wasm, isolates run on one thread, and a reload
+    waits until they have ended.)"""
+    if exe.name == "fut.wasm":
+        return True, "not in fut.wasm"
     head = "var who = \"main\"\nvar reloads = 0\nfn reload() { reloads += 1 }\n"
     rest = ("fn worker(i, c) { who = \"w{i}\"  var last = 0\n"
             "  while true { var v = tick()\n    if v != last { c.send(report(i, v))  last = v }\n    if v == 3 { return }\n    sleep(0.01) } }\n"
@@ -885,6 +886,59 @@ def isolates(exe, n, only=()):
     return failed
 
 
+# std/gpu's native library: a flat C API over Dawn (Google's WebGPU), from a pinned prebuilt release
+DAWN_URL = ("https://github.com/google/dawn/releases/download/v20261125.181839/"
+            "Dawn-ee1f8a3036637fffb80b86eae3eb9921b2c66aff-macos-latest-Release.tar.gz")
+DAWN_SHA256 = "41bfeff500d0273d3de0873db639535aebbf087c99dff252d132a51098b2f071"
+DAWN = ROOT / "build" / "dawn" / "Dawn-ee1f8a3036637fffb80b86eae3eb9921b2c66aff-macos-latest-Release"
+GPU_FRAMEWORKS = ["Metal", "QuartzCore", "IOSurface", "Foundation", "IOKit", "CoreFoundation", "CoreGraphics"]
+
+
+def dawn():
+    """The Dawn release in build/dawn/: downloaded (and its sha256 checked) and extracted if missing."""
+    if (DAWN / "lib" / "libwebgpu_dawn.a").exists():
+        return DAWN
+    import hashlib, tarfile, urllib.request
+    tgz = DAWN.with_name(DAWN.name + ".tar.gz")
+    tgz.parent.mkdir(parents=True, exist_ok=True)
+    if not tgz.exists() or hashlib.sha256(tgz.read_bytes()).hexdigest() != DAWN_SHA256:
+        print("downloading", DAWN_URL, flush=True)
+        part = tgz.with_suffix(".part")
+        try:
+            with urllib.request.urlopen(DAWN_URL) as r, open(part, "wb") as f:
+                shutil.copyfileobj(r, f)
+        except urllib.error.URLError as e:  # e.g. python.org's Python without its certificates: the system's curl has them
+            print(f"urllib: {e.reason}; trying curl", flush=True)
+            subprocess.run(["curl", "-fL", "--retry", "2", "-o", str(part), DAWN_URL], check=True)
+        got = hashlib.sha256(part.read_bytes()).hexdigest()
+        if got != DAWN_SHA256:
+            part.unlink()
+            sys.exit(f"{DAWN_URL}: sha256 {got}, expected {DAWN_SHA256}")
+        part.rename(tgz)
+    with tarfile.open(tgz) as t:
+        t.extractall(DAWN.parent, filter="data")
+    return DAWN
+
+
+def gpu(check=False):
+    """build/libfutgpu.dylib from std/gpu/futgpu.cpp and Dawn (only when stale). check: build and run the headless
+    smoke test (std/gpu/futgpu_check.c) against it."""
+    d, src = dawn(), ROOT / "std" / "gpu" / "futgpu.cpp"
+    lib = ROOT / "build" / "libfutgpu.dylib"
+    if not lib.exists() or lib.stat().st_mtime < max(src.stat().st_mtime, (d / "lib" / "libwebgpu_dawn.a").stat().st_mtime):
+        print("clang++ futgpu.cpp", flush=True)
+        subprocess.run(["clang++", *FLAGS, "-O2", "-fvisibility=hidden", "-dynamiclib", "-I", str(d / "include"), str(src),
+                        str(d / "lib" / "libwebgpu_dawn.a"), *(a for f in GPU_FRAMEWORKS for a in ("-framework", f)), "-lobjc",
+                        "-Wl,-exported_symbol,_fg_*", "-Wl,-dead_strip", "-install_name", "@rpath/libfutgpu.dylib", "-o", str(lib)],
+                       check=True)
+    if check:
+        exe = ROOT / "build" / "futgpu_check"
+        subprocess.run(["clang", "-std=c11", "-Wall", "-Wextra", "-O1", str(ROOT / "std" / "gpu" / "futgpu_check.c"), str(lib),
+                        "-Wl,-rpath," + str(lib.parent), "-o", str(exe)], check=True)
+        return subprocess.run([str(exe)]).returncode
+    return 0
+
+
 def install(where=None):
     """Build, then link <where>/fut (default ~/.local/bin) to build/fut. A link, not a copy: each rebuild is what
     runs, and fut finds std/ (and web/) beside the binary's real path."""
@@ -912,6 +966,8 @@ if __name__ == "__main__":
         install(sys.argv[2] if len(sys.argv) > 2 else None)
     elif cmd == "wasm":
         build(wasm=True, threads="--threads" in sys.argv)
+    elif cmd == "gpu":
+        sys.exit(gpu("--check" in sys.argv))
     elif cmd == "tsan":
         n = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 4
         sys.exit(1 if isolates(build(tsan=True), n, [a for a in sys.argv[2:] if not a.isdigit()]) else 0)
