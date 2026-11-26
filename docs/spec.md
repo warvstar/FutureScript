@@ -14,7 +14,6 @@ fut map f.fut [--pub] [pkg]    where everything is: packages, files, declaration
 fut explain [code]             an error code's rule and fix (no code: all codes)
 fut api f.fut                  rewrite the .api files after an interface change
 fut -w f.fut                   run, hot-reload on save; stdin lines run inside the program
-fut worker build ...           Cloudflare Workers bundles (README)
 node web/run.mjs ...           the same CLI on WebAssembly
 ```
 
@@ -97,13 +96,10 @@ expect throws { Sq(1).sid = 2 }
 fn half(n: num): num ! { return n / 2 }   // types: num str bool list map fn any Class T?
 var lvl: num = 1                           // checked on every store
 expect throws { half("x") }
-type Method = "GET" | "POST"               // A | B, literals "s" 3 true nil
-type User = {name: str, age: num?}         // shape: open, matches maps and instances; T? field may be missing
-type Tree = {value: num, kids: list<Tree>} // list<T> map<V> map<K, V>; pub type for other files
-fn ages(us: list<User>): num ! { return us.len() }   // u.nmae on a typed var: compile error
+type User = {name: str, age: num?}         // also A | B, "GET" 3 true nil, list<T>, map<K, V>; pub type
+fn ages(us: list<User>): num ! { return us.len() }   // given u: User, u.nmae is a compile error
 var us = [{name: "a"}]
-expect ages(us) == 1
-expect throws { us.push(3) }               // a list keeps its checked element type: stores are checked
+ages(us) expect throws { us.push(3) }      // a checked list stays checked
 effect Log { fn log(m: str) }
 fn work() ! Log, clock { Log.log("hi") }   // ! = may only do these; bare ! = nothing; none = unchecked
 var out = []
