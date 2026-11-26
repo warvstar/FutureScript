@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and test fut.   python3 build.py [build | debug | wasm | test [--debug | --wasm] [NAME...] | tsan [N] [NAME...] | fuzz [N] | clean]"""
+"""Build and test fut.   python3 build.py [build | debug | wasm [--threads] | test [--debug | --wasm | --wasm-mt] [NAME...] | tsan [N] [NAME...] | fuzz [N] | clean]"""
 import json, os, random, re, shutil, subprocess, sys, tempfile, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -15,18 +15,23 @@ WASM_FLAGS = ["--target=wasm32-wasip1", "--sysroot=/opt/homebrew/share/wasi-sysr
               "-mllvm", "-wasm-enable-sjlj"]
 WASM_LINK = ["-mexec-model=reactor", "-lsetjmp", "-Wl,--export=__stack_pointer", "-Wl,--export-table", "-Wl,--growable-table",
              "-Wl,-z,stack-size=8388608", "-Wl,--stack-first"]
+# The threads build: memory imported and shared (each thread's instance has the same), up to 4 GB. It starts at
+# 768 MB (reserved, touched as used): growing it while threads run is slow to reach the others (wasm.cpp's sbrk)
+WASM_MT_FLAGS = ["--target=wasm32-wasip1-threads", "-pthread", *WASM_FLAGS[1:]]
+WASM_MT_LINK = [*WASM_LINK, "-Wl,--import-memory,--shared-memory,--max-memory=4294967296", "-Wl,--initial-memory=805306368"]
 NATIVE_ONLY, WASM_ONLY = {"main.cpp", "jit.cpp", "sys.cpp"}, {"wasm.cpp", "interp.cpp"}
 NATIVE_SPECS = set()  # specs only the native build runs
 WASM_SPECS = {"hello_ui.fut", "ui_test.fut"}  # std/ui is the DOM's (a JavaScript module): the wasm build only
 
 
-def build(debug=False, wasm=False, tsan=False):
-    """Compile each src/*.cpp to its own object in parallel (only stale ones), then link."""
-    kind = "wasm" if wasm else "debug" if debug else "tsan" if tsan else ""
-    out = ROOT / "build" / "fut.wasm" if wasm else OUT.with_name("fut-" + kind) if kind else OUT
+def build(debug=False, wasm=False, tsan=False, threads=False):
+    """Compile each src/*.cpp to its own object in parallel (only stale ones), then link.
+    wasm and threads: fut-mt.wasm, whose isolates run on threads (web workers) over shared memory."""
+    kind = ("wasm-mt" if threads else "wasm") if wasm else "debug" if debug else "tsan" if tsan else ""
+    out = ROOT / "build" / ("fut-mt.wasm" if threads else "fut.wasm") if wasm else OUT.with_name("fut-" + kind) if kind else OUT
     objdir = ROOT / "build" / ("obj-" + kind if kind else "obj")
     objdir.mkdir(parents=True, exist_ok=True)
-    opt = {"wasm": ["-O2", *WASM_FLAGS], "debug": ["-O1", "-g", "-fsanitize=address,undefined"],
+    opt = {"wasm": ["-O2", *WASM_FLAGS], "wasm-mt": ["-O2", *WASM_MT_FLAGS], "debug": ["-O1", "-g", "-fsanitize=address,undefined"],
            "tsan": ["-O1", "-g", "-fsanitize=thread"]}.get(kind, ["-O2"])
     cxx = str(LLVM) if wasm else "clang++"
     skip = NATIVE_ONLY if wasm else WASM_ONLY
@@ -44,14 +49,16 @@ def build(debug=False, wasm=False, tsan=False):
             sys.exit(1)
     stamp.write_text(flags)
     if stale or not out.exists():
-        link = WASM_LINK if wasm else ["-lobjc", "-lcurl"]
+        link = (WASM_MT_LINK if threads else WASM_LINK) if wasm else ["-lobjc", "-lcurl"]
         subprocess.run([cxx, *(o for o in opt if o not in ("-mllvm", "-wasm-enable-sjlj")), *(str(o) for _, o in objs), *link, "-o", str(out)], check=True)
     return out
 
 
 def runner(exe):
     """The command that runs a fut program: the native binary, or the WebAssembly build under Node."""
-    return ["node", str(ROOT / "web" / "run.mjs")] if exe.suffix == ".wasm" else [str(exe)]
+    if exe.suffix != ".wasm":
+        return [str(exe)]
+    return ["env", f"FUT_WASM={exe}", "node", str(ROOT / "web" / "run.mjs")]
 
 
 def test(exe, only=()):
@@ -663,8 +670,8 @@ def runner_worker(exe):
     """Cloudflare Workers (web/worker.mjs): a serve bundle answers requests and test bundles (in shards, with run()
     children) pass, all under Node with code generation off as in a Worker; a module that doesn't match fails loudly.
     With wrangler on PATH, the serve bundle also answers a request in workerd (wrangler dev)."""
-    if exe.suffix != ".wasm":
-        return True, "wasm only"
+    if exe.suffix != ".wasm" or exe.name == "fut-mt.wasm":
+        return True, "the single-thread wasm build only"
     d, w = ROOT / "build" / "worker-check", str(ROOT / "web" / "worker.mjs")
     shutil.rmtree(d, ignore_errors=True)
     node = lambda *a: subprocess.run(["node", w, *a], capture_output=True, text=True, timeout=120)
@@ -846,9 +853,10 @@ if __name__ == "__main__":
     if cmd == "clean":
         subprocess.run(["rm", "-rf", str(ROOT / "build")])
     elif cmd == "test":
-        sys.exit(1 if test(build("--debug" in sys.argv, "--wasm" in sys.argv), [a for a in sys.argv[2:] if not a.startswith("--")]) else 0)
+        mt = "--wasm-mt" in sys.argv  # the threads build (fut-mt.wasm)
+        sys.exit(1 if test(build("--debug" in sys.argv, "--wasm" in sys.argv or mt, threads=mt), [a for a in sys.argv[2:] if not a.startswith("--")]) else 0)
     elif cmd == "wasm":
-        build(wasm=True)
+        build(wasm=True, threads="--threads" in sys.argv)
     elif cmd == "tsan":
         n = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 4
         sys.exit(1 if isolates(build(tsan=True), n, [a for a in sys.argv[2:] if not a.isdigit()]) else 0)

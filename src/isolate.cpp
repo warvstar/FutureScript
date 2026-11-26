@@ -26,11 +26,13 @@
 //   same interleaving; between those points isolates share nothing, so nothing else can differ.
 #include "fut.h"
 #include <unordered_map>
-#if !__wasm__
+#if !ONE_THREAD
 #include <pthread.h>
 #include <sched.h>
-#include <sys/mman.h>
 #include <unistd.h>
+#endif
+#if !__wasm__
+#include <sys/mman.h>
 #endif
 #if defined(__has_feature)
 #if __has_feature(thread_sanitizer)
@@ -95,7 +97,7 @@ struct Sched {             // where runnable isolates wait for a thread: a seede
   // a pool thread's:
   int load = 0;            // isolates given to it, not yet ended
   Iso* cur = nullptr;      // the one it runs
-#if !__wasm__
+#if !ONE_THREAD
   pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
 #endif
 };
@@ -121,7 +123,7 @@ struct Iso {
   size_t size = 0;
   char* saved = nullptr;   // its isolate-local variables while switched out (and the thread's own while in)
   void* tsan = nullptr;
-#if !__wasm__
+#if !ONE_THREAD
   pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
 #endif
   bool waiting = false, woken = false;
@@ -187,9 +189,7 @@ void stateSwap(char* b) { for (auto& l : isoLocals()) l.swap(b + l.off); }
 constexpr size_t ISO_STACK = 256 << 10, ISO_GUARD = 16 << 10;  // as a fiber's
 char* stackNew() { return (char*)aligned_alloc(16, ISO_STACK); }
 void stackFree(char* s) { free(s); }
-#define THREAD  // one thread
 #else
-#define THREAD thread_local
 constexpr size_t ISO_STACK = 8 << 20, ISO_GUARD = 256 << 10;  // as the main thread's; reserved, and pages are only touched as they are used
 std::vector<char*>& spareStacks = *new std::vector<char*>;  // stacks of ended isolates, for the next spawns (under chanMu)
 char* stackNew() {
@@ -215,6 +215,11 @@ void stackFree(char* s) {
   }
   munmap(s, ISO_STACK);
 }
+#endif
+#if ONE_THREAD
+#define THREAD  // one thread
+#else
+#define THREAD thread_local
 constexpr double SLICE = 0.01;          // a pool isolate's turn, while others wait for a thread
 Sched& pooled = *new Sched;               // a pool program's root has this (each spawned isolate gets a pool thread's)
 std::vector<Sched*>& pool = *new std::vector<Sched*>;  // the pool's threads (under chanMu)
@@ -247,7 +252,7 @@ void arrived() {  // just switched to: finish with the isolate switched away fro
 // state already says what becomes of it. Returns when something switches back to m.
 void switchTo(Iso* m, Iso* to) {
   if (to) {
-#if !__wasm__
+#if !ONE_THREAD
     while (to->onStack.load(std::memory_order_acquire)) sched_yield();  // its last thread is still leaving it
 #endif
     to->onStack.store(true, std::memory_order_relaxed), to->since.store(now(), std::memory_order_relaxed);
@@ -288,11 +293,14 @@ struct Reload {
 Reload& rl = *new Reload;
 #if __wasm__
 void rlLeft() {}
-Sched* poolThread() { return nullptr; }  // (never: wasm's programs are all seeded)
 void reloadPoint() {}  // (a reload waits until the program is down to one isolate: fut.js)
 #else
 pthread_cond_t rlCv = PTHREAD_COND_INITIALIZER;  // the reloader waits on it for the others to stop, or to report
 void rlLeft() { if (rl.phase) pthread_cond_broadcast(&rlCv); }  // an isolate stopped running (chanMu held)
+#endif
+#if ONE_THREAD
+Sched* poolThread() { return nullptr; }  // (never: one thread's programs are all seeded)
+#else
 void* ticker(void*) {  // ask isolates that had a whole slice to yield, while another of their thread's waits
   for (;;) {
     usleep((useconds_t)(SLICE * 1e6));
@@ -314,11 +322,11 @@ void detached(void* (*f)(void*), void* arg) {
 #endif
 void ready(Iso* i) {  // runnable: queue it (chanMu held)
   i->state = Iso::RUNNABLE, i->sched->runq.push_back(i);
-#if !__wasm__
+#if !ONE_THREAD
   if (!i->sched->det) pthread_cond_signal(&i->sched->cv);
 #endif
 }
-#if !__wasm__
+#if !ONE_THREAD
 void* worker(void* p) {  // a pool thread: runs the isolates given to it, each until it waits, yields or ends
   Sched* w = (Sched*)p;
 #ifdef FUT_TSAN
@@ -340,7 +348,7 @@ void* worker(void* p) {  // a pool thread: runs the isolates given to it, each u
 Sched* poolThread() {  // the pool thread a new isolate goes to: a new one while there are fewer than cores() (chanMu held)
   Sched* best = nullptr;
   for (Sched* w : pool) if (!best || w->load < best->load) best = w;
-  size_t most = isolateThreads > 0 ? (size_t)isolateThreads : (size_t)sysconf(_SC_NPROCESSORS_ONLN);
+  size_t most = isolateThreads > 0 ? (size_t)isolateThreads : (size_t)WASM_OR(hostCores(), sysconf(_SC_NPROCESSORS_ONLN));
   if (!best || (best->load && pool.size() < most)) {
     if (pool.empty()) detached(ticker, nullptr);
     pool.push_back(best = new Sched);
@@ -369,12 +377,14 @@ void park(Iso* m) {
 // every run)
 void schedule(Iso* r) {  // r's program spawns for the first time: how its isolates will run (chanMu held)
   if (r->sched) return;
-#if __wasm__
+#if ONE_THREAD
   uint64_t seed = isolateSeed ? isolateSeed : 1;
 #else
   if (!isolateSeed) { r->sched = &pooled; return; }
   uint64_t seed = isolateSeed;
+#if !__wasm__
   threadStack(r->lo, r->size);
+#endif
 #endif
   r->sched = new Sched{true, seed, seed};
   r->pinned = false, r->saved = stateNew();
@@ -390,7 +400,7 @@ Iso* self() {
 void wake(Iso* i) {  // (chanMu held)
   if (!i->waiting || i->woken) return;
   i->woken = true, i->root->blocked--;
-#if !__wasm__
+#if !ONE_THREAD
   if (i->pinned) pthread_cond_signal(&i->cv);
   else
 #endif
@@ -412,6 +422,13 @@ void deadlock(Iso* r) {  // every isolate of r's program waits (chanMu held): wa
   for (Iso* i : stuck) i->dead = rep, wake(i);
 }
 const char* STOPPED = "stopped: the program this isolate belongs to ended with an error";
+#if __wasm__ && !ONE_THREAD
+// A thread that is not the main one ends the process (a fatal error on a worker, which can't end it from there):
+// the main thread does, at its next poll (bit 64) or wait.
+std::atomic<int> exitAsked{-1};
+pthread_t mainThread = pthread_self();  // (static initialization runs on it)
+[[noreturn]] void exitNow() { chanMu.unlock(), exit(exitAsked.load()); }
+#endif
 // Wait (chanMu held) until woken; q: the list a waker finds this isolate in. "" or the error to raise.
 std::string waitFor(std::vector<Iso*>* q, const char* what, void* ra) {
   Iso* m = self();
@@ -420,9 +437,12 @@ std::string waitFor(std::vector<Iso*>* q, const char* what, void* ra) {
   m->waiting = true, m->woken = false, m->what = what, m->ra = ra;
   Iso* r = m->root;
   if (++r->blocked >= r->live) deadlock(r);
-#if !__wasm__
+#if !ONE_THREAD
   if (m->pinned)
     while (!m->woken) {
+#if __wasm__
+      if (exitAsked.load() >= 0) exitNow();
+#endif
       if (std::exchange(m->nudged, false) && pollHook) {  // a reload or a typed line: run it now, then wait again
         m->waiting = false, r->blocked--;
         if (q) std::erase(*q, m);
@@ -582,7 +602,7 @@ struct Reader {
     }
   }
 };
-V decode(const Msg& m) { Reader r(m); return r.get(); }
+V decode(const Msg& m) { codeSync(); Reader r(m); return r.get(); }  // (it may hold code compiled on another thread)
 
 // ---- channels ----
 std::string doSend(ChanState* c, Msg&& msg, void* ra) {  // "" or the error
@@ -843,8 +863,10 @@ V t_done(V tv) {
   return boxb(taskOf(tv)->done);
 }
 V n_cores() {
-#if __wasm__
+#if ONE_THREAD
   return box(1);
+#elif __wasm__
+  return box(hostCores());
 #else
   return box((double)sysconf(_SC_NPROCESSORS_ONLN));
 #endif
@@ -955,6 +977,22 @@ void isolateNudge() {
 }
 #endif
 
+void isolateExitPoint() {
+#if __wasm__ && !ONE_THREAD
+  if (exitAsked.load() >= 0 && pthread_equal(pthread_self(), mainThread)) chanMu.lock(), exitNow();
+#endif
+}
+#if __wasm__ && !ONE_THREAD
+void isolatesExit(int code) {
+  int none = -1;
+  exitAsked.compare_exchange_strong(none, code);
+  bool locked = false;  // (this thread may hold it, failing)
+  for (int i = 0; i < 1000 && !locked; i++) locked = !pthread_mutex_trylock(&chanMu.m) || (sched_yield(), false);
+  eachVM([](VM* v, void*) { __atomic_fetch_or(&v->poll, 64u, __ATOMIC_RELAXED); }, nullptr);
+  for (Iso* i : isos) if (i->pinned) pthread_cond_broadcast(&i->cv);
+  if (locked) pthread_mutex_unlock(&chanMu.m);
+}
+#endif
 void isolateReloadPoint() {
 #if !__wasm__
   reloadPoint();
@@ -972,7 +1010,7 @@ void isolatesMark(void (*mark)(V)) {
 }
 bool isolateStopped() { return me && me->stop.load(std::memory_order_relaxed); }
 void isolateYield() {
-#if !__wasm__
+#if !ONE_THREAD
   __atomic_fetch_and(&vm->poll, ~8u, __ATOMIC_RELAXED);
   Iso* m = me;
   if (!m || m->pinned || m->sched->det || locksHeld) return;

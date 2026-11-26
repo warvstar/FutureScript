@@ -1,18 +1,17 @@
 #!/usr/bin/env node
 // Run fut on WebAssembly in Node: node web/run.mjs [-w | -v] [file.fut]   (no file: REPL). Same flags as build/fut,
 // including `node web/run.mjs test [--json] [--filter text] file.fut`.
-import { spawnSync } from "node:child_process";
-import { readFileSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { readFileSync, statSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createFut } from "./fut.js";
+import { nodeOptions } from "./node.mjs";
 
 let file = "", watch = false, verbose = false, json = false, filter = "", check = false, pub = false, only = "";
 const testFiles = [];
 const argv = process.argv.slice(2), testing = argv[0] == "test", api = argv[0] == "api", map = argv[0] == "map", explain = argv[0] == "explain";
 const usage = "usage: node web/run.mjs [-w | -v] [--seed n] [file.fut]   (no file: REPL)\n       node web/run.mjs test [--json] [--filter text] file.fut\n       node web/run.mjs api [--check] file.fut\n       node web/run.mjs map [--pub] [--json] file.fut [package | file]\n       node web/run.mjs explain [code]\n";
-let seed = 0;  // --seed n: which interleaving of a program's isolates (they take turns on the one thread)
+let seed = 0, threads = 0;  // --seed n: which interleaving of a program's isolates; --threads n: the pool's size (fut-mt.wasm)
 for (let i = testing || api || map ? 1 : 0; i < argv.length && !explain; i++) {
   const a = argv[i];
   if (map && a == "--pub") pub = true;
@@ -24,7 +23,7 @@ for (let i = testing || api || map ? 1 : 0; i < argv.length && !explain; i++) {
   else if (testing && a == "--timeout" && i + 1 < argv.length) i++;  // tests share one process here: no per-test timeout
   else if (testing && a == "--changed") {}  // ... and no traces: every test runs
   else if (a == "--seed" && i + 1 < argv.length) seed = +argv[++i];
-  else if (a == "--threads" && i + 1 < argv.length) i++;  // (one thread here)
+  else if (a == "--threads" && i + 1 < argv.length) threads = +argv[++i];
   else if (a == "-w" && !testing) watch = verbose = true;
   else if (a == "-v") verbose = true;
   else if (a[0] == "-") process.stderr.write(usage), process.exit(2);
@@ -39,34 +38,20 @@ if (testFiles.length > 1) {
   }
   process.exit(status);
 }
-function writeAll(fd, b) {  // stdout may be a non-blocking pipe
-  for (let o = 0; o < b.length;) {
-    try { o += writeSync(fd, b, o); } catch (e) { if (e.code != "EAGAIN") throw e; }
-  }
-}
-let watched = [file], rewatch = () => {}, runs = 0;
+let watched = [file], rewatch = () => {};
+// FUT_WASM: another build of fut.wasm (build/fut-mt.wasm, the threads build: isolates run on workers)
+const wasmPath = process.env.FUT_WASM ? resolve(process.env.FUT_WASM) : fileURLToPath(new URL("../build/fut.wasm", import.meta.url));
 const fut = await createFut({
-  wasm: readFileSync(new URL("../build/fut.wasm", import.meta.url)),
-  std: process.env.FUT_STD || fileURLToPath(new URL("../std", import.meta.url)),
-  verbose,
-  seed,
+  ...nodeOptions({
+    std: process.env.FUT_STD || fileURLToPath(new URL("../std", import.meta.url)),
+    verbose,
+    seed: seed || (testing ? 1 : 0),  // a test's isolates interleave the same way every run
+    threads,
+    interp: !!process.env.FUT_INTERP,  // FUT_INTERP=1: interpret the compiled code (as a static Cloudflare Worker would)
+  }),
+  wasm: readFileSync(wasmPath),
   exit: (code) => process.exit(code),
-  interp: !!process.env.FUT_INTERP,  // FUT_INTERP=1: interpret the compiled code (as a static Cloudflare Worker would)
-  read(p) { try { return readFileSync(p); } catch { return null; } },
-  save(p, text) { try { return text == null ? rmSync(p) : writeFileSync(p, text), true; } catch { return false; } },
-  write: writeAll,
-  getenv: (n) => process.env[n],
-  importModule: (p, stamp) => import(pathToFileURL(p).href + "?v=" + (stamp ?? 0)),  // a new URL loads it again
-  stamp(p) { try { return statSync(p).mtimeMs; } catch { return 0; } },
   files: (f) => ((watched = f), rewatch()),
-  run(args, file, source, timeout) {  // run(): this script again, in a child process
-    let tmp = null;
-    if (source != null) writeFileSync((tmp = join(tmpdir(), `fut-run-${process.pid}-${runs++}.fut`)), source), (file = tmp);
-    const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...args, file], { timeout: timeout * 1000, stdio: ["ignore", "pipe", "pipe"], encoding: "utf8" });
-    if (tmp) unlinkSync(tmp);
-    const timedOut = r.error?.code == "ETIMEDOUT";
-    return { code: r.status ?? 128 + (r.signal == "SIGKILL" ? 9 : r.signal == "SIGTERM" ? 15 : 6), out: r.stdout ?? "", err: r.stderr ?? "", timedOut };
-  },
   dump: process.env.FUT_DUMP && ((n) => (b) => writeFileSync(`${process.env.FUT_DUMP}/m${n++}.wasm`, b))(0),  // debugging: emitted modules
 });
 

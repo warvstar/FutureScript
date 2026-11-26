@@ -7,6 +7,7 @@
 //  - Fibers: each has its own shadow stack; the host suspends and resumes their wasm stacks with JSPI.
 //  - Compile errors longjmp back to fut_compile (this libc++ has no C++ exceptions).
 #include "wasm.h"
+#include <cerrno>
 #include <cmath>
 #include <map>
 #include <unordered_map>
@@ -39,6 +40,7 @@ HOST(ctx_gone) void host_ctx_gone(void* ctx);
 HOST(trycall) u32 host_trycall();                             // try_call's table slot (instantiated now, if need be)
 HOST(last_trace) int host_last_trace();                       // the last fut error thrown: its frames' text (in take)
 HOST(where) int host_where();                                 // the innermost fut frame running: "f (file:line)" (in take)
+HOST(cores) int host_cores();                                 // threads the host can run at once
 HOST(sleep) void host_sleep(double seconds);                   // suspending
 HOST(poll) void host_poll();                                   // suspending: run typed lines, reload changed files
 HOST(run) int host_run(const char* args, const char* source, double timeout);  // suspending: run(): the result's length (in take), -1: none
@@ -61,6 +63,71 @@ std::string interpTrace_(const char* (*where)(int slot, int off));
 // ---------------- code: modules, table slots, line tables ----------------
 JitBatch::JitBatch() {}
 JitBatch::~JitBatch() {}
+// Threads (the threads build): each thread has its own instance of fut.wasm and of every module the compiler
+// emitted, and its own function table, which must hold what every other thread's holds, slot for slot. Every change
+// to a table is made by a thread holding codeMu, which first catches up (tableSync), then logs it; the others make
+// the changes they have yet to before they could reach them: whenever they switch isolates, decode a message (it may
+// hold a function compiled since), or reach a safepoint (bit 32 asks them to: tier 2 code to adopt).
+#if ONE_THREAD
+static u32 tableInstall(const uint8_t* mod, u32 len, const int32_t* ops, u32 nops) { return host_install(mod, len, ops, nops), 0; }
+static u32 tableGrow(u32 n, u32 fill) { return host_grow(n, fill); }
+static u32 tableTryCall() { return host_trycall(); }
+void codeSync() {}
+#else
+struct TableOp { int kind; std::vector<uint8_t> mod; std::vector<int32_t> ops; u32 n, fill; };  // 0 install, 1 grow, 2 try_call
+static std::deque<TableOp> tableLog;  // (under codeMu)
+static std::atomic<u32> tableLen;
+static thread_local u32 tableAt;      // how much of it this thread's table has
+// The C library has no thread exit hooks for thread_local destructors. fut's threads (a pool's, the ticker) never
+// end, and the main thread's end is the process's: nothing to run.
+extern "C" int __cxa_thread_atexit(void (*)(void*), void*, void*) { return 0; }
+// malloc's memory (the C library's sbrk, replaced). A thread that grows the memory sees the new size at once, but
+// V8 tells the other threads' instances (and their JavaScript) asynchronously, and until they hear, memory past the
+// old end is out of bounds to them. So grow well ahead of use: what malloc hands out was grown long before. (The
+// linked initial memory is large too, and malloc starts with that: most programs never grow it.)
+extern "C" void* sbrk(intptr_t inc) {
+  constexpr size_t PAGE = 65536, AHEAD = 64 << 20;
+  static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+  static size_t brk;
+  pthread_mutex_lock(&mu);
+  size_t have = __builtin_wasm_memory_size(0) * PAGE;
+  if (!brk) brk = have;  // (malloc has had __heap_base..__heap_end, the linked initial memory)
+  void* r = (void*)brk;
+  if (inc < 0 || (uint64_t)brk + inc + AHEAD > (uint64_t)4 << 30) r = (void*)-1, errno = ENOMEM;  // (size_t is 32 bits)
+  else if (brk + inc + AHEAD > have && __builtin_wasm_memory_grow(0, (brk + inc + AHEAD - have + PAGE - 1) / PAGE) == SIZE_MAX &&
+           brk + inc > have && __builtin_wasm_memory_grow(0, (brk + inc - have + PAGE - 1) / PAGE) == SIZE_MAX)
+    r = (void*)-1, errno = ENOMEM;  // (not even without the room ahead)
+  else brk += inc;
+  pthread_mutex_unlock(&mu);
+  return r;
+}
+static void replay(const TableOp& o) {
+  if (o.kind == 0) host_install(o.mod.empty() ? nullptr : o.mod.data(), (u32)o.mod.size(), o.ops.data(), (u32)o.ops.size() / 2);
+  else if (o.kind == 1) host_grow(o.n, o.fill);
+  else host_trycall();
+}
+static void tableSync() {  // (codeMu held)
+  for (u32 n = tableLen.load(std::memory_order_acquire); tableAt < n; tableAt++) replay(tableLog[tableAt]);
+}
+void codeSync() {
+  if (tableAt == tableLen.load(std::memory_order_acquire)) return;
+  Locked code(codeMu);
+  tableSync();
+}
+static u32 logged(TableOp&& o) {  // make the change here, then log it for the other threads
+  Locked code(codeMu);
+  tableSync();
+  u32 r = o.kind == 0 ? (replay(o), 0) : o.kind == 1 ? host_grow(o.n, o.fill) : host_trycall();
+  tableLog.push_back(std::move(o)), tableAt = tableLen.fetch_add(1, std::memory_order_release) + 1;
+  eachVM([](VM* v, void*) { if (v != vm) __atomic_fetch_or(&v->poll, 32u, __ATOMIC_RELAXED); }, nullptr);
+  return r;
+}
+static u32 tableInstall(const uint8_t* mod, u32 len, const int32_t* ops, u32 nops) {
+  return logged({0, std::vector<uint8_t>(mod, mod + (mod ? len : 0)), std::vector<int32_t>(ops, ops + 2 * nops), 0, 0});
+}
+static u32 tableGrow(u32 n, u32 fill) { return logged({1, {}, {}, n, fill}); }
+static u32 tableTryCall() { return logged({2, {}, {}, 0, 0}); }
+#endif
 struct Func { Code k; u32 slot; };
 static std::vector<Func> batch;            // installed by the next jitCollect
 static std::vector<int32_t> ops;           // table copies to make after it
@@ -72,7 +139,7 @@ struct LineTab { std::string name, file; std::vector<std::pair<int, int>> lines;
 static std::map<u32, LineTab> lineTabs;    // by body slot
 static u32 slot() {
   if (freeSlots.empty()) {
-    u32 first = host_grow(64, undefSlot);
+    u32 first = tableGrow(64, undefSlot);
     for (u32 i = 64; i-- > 0;) freeSlots.push_back(first + i);
   }
   u32 s = freeSlots.back();
@@ -153,7 +220,8 @@ void jitCollect() {  // install the batch as one module, then make the queued ta
     funcType(s, "i:l");
     section(m, 1, s), s.clear();
     wa::uleb(s, 5);
-    name(s, "env"), name(s, "memory"), s.insert(s.end(), {2, 0, 0});
+    name(s, "env"), name(s, "memory"), s.insert(s.end(), {2, ONE_THREAD ? 0 : 3, 0});  // (threads: shared, as fut.wasm's)
+    if (!ONE_THREAD) wa::uleb(s, 65536);
     name(s, "env"), name(s, "table"), s.insert(s.end(), {1, 0x70, 0, 0});
     name(s, "env"), name(s, "sp"), s.insert(s.end(), {3, I32, 1});
     name(s, "env"), name(s, "vm"), s.insert(s.end(), {3, I32, 1});  // global 1: the running isolate's VM block
@@ -229,8 +297,8 @@ void jitCollect() {  // install the batch as one module, then make the queued ta
     std::vector<int32_t> all;
     interpAdd(bodies, interpBodies, all);
     all.insert(all.end(), ops.begin(), ops.end());
-    host_install(nullptr, 0, all.data(), (u32)all.size() / 2);
-  } else if (m.size() > 8 || !ops.empty()) host_install(m.size() > 8 ? m.data() : nullptr, (u32)m.size(), ops.data(), (u32)ops.size() / 2);
+    tableInstall(nullptr, 0, all.data(), (u32)all.size() / 2);
+  } else if (m.size() > 8 || !ops.empty()) tableInstall(m.size() > 8 ? m.data() : nullptr, (u32)m.size(), ops.data(), (u32)ops.size() / 2);
   for (size_t i = 0; i < fresh.size(); i++) cells[bodies[i]] = fresh[i];
   for (size_t i = 0; i < ops.size(); i += 2) {
     u32 dst = ops[i];
@@ -308,6 +376,7 @@ V vmEnter(void* code, V* args) {
 [[noreturn]] void throwValue(V v, void*) { host_throw(v); }
 void traceAdd(const std::string&) {}  // wasm traces come from the engine
 std::string codeWhere(void*) { return ""; }
+int hostCores() { return host_cores(); }
 std::string hereWhere() {
   std::string s;
   if (int n = host_where(); n > 0) s.resize(n), host_take(s.data());
@@ -387,23 +456,32 @@ void restartMain() { host_restart(); }
 // A context is named by its shadow stack pointer while it waits (a fresh one by the top of its stack), which no other
 // context can have.
 static std::unordered_map<void*, void (*)()> freshCtx;  // made, not yet started: their entry
-void* ctxFrame(uintptr_t* top, void (*entry)()) { return freshCtx[top] = entry, top; }
+static Mutex ctxMu;                                     // (made on one thread, started on another)
+void* ctxFrame(uintptr_t* top, void (*entry)()) { Locked l(ctxMu); return freshCtx[top] = entry, top; }
 void ctxSwap(void** save, void* to) {
   void* sp = getsp();
   *save = sp, host_ctx_switch(sp, to), setsp(sp);
 }
 EXPORT(fut_ctx_start) void ctxStart(void* top) {  // the host starts a fresh context: on its own stack, at its entry
   setsp(top);
-  auto it = freshCtx.find(top);
-  void (*entry)() = it->second;
-  freshCtx.erase(it), entry();
+  void (*entry)();
+  {
+    Locked l(ctxMu);
+    auto it = freshCtx.find(top);
+    entry = it->second, freshCtx.erase(it);
+  }
+  entry();
 }
 void ctxGone(void* ctx) { host_ctx_gone(ctx); }
 extern u32 tryCallSlot;  // interp.cpp
 struct TryBox { int64_t payload; void (*body)(void*); void* ctx; };  // payload first: try_call stores it there
 static int tryTramp(TryBox* b) { return b->body(b->ctx), 0; }
 bool catchFut(void (*body)(void*), void* ctx, V* err, std::string* trace) {
-  if (!tryCallSlot) tryCallSlot = host_trycall();
+  if (!tryCallSlot) {
+    Locked code(codeMu);
+    if (!tryCallSlot) tryCallSlot = tableTryCall();
+  }
+  codeSync();  // (another thread may have made it)
   TryBox b{0, body, ctx};
   if (((int (*)(u32, TryBox*))(uintptr_t)tryCallSlot)(wa::slotOf((void*)tryTramp), &b) != -1) return false;
   if (err) *err = (V)b.payload;
@@ -449,8 +527,8 @@ bool runProcess(const std::vector<std::string>& args, const std::string& file, c
   return true;
 }
 static void safepoint() {  // rt_poll: a collection the allocator asked for, then the host's events
-  u32 p = vm->poll;
-  vm->poll = 0;
+  u32 p = __atomic_exchange_n(&vm->poll, 0, __ATOMIC_RELAXED);
+  codeSync();
   if (gcWanted()) gcCollect();
   if (p & 1) syncDepth ? void(syncPoll = true) : vm->txn ? void(txnPollLater = true) : host_poll();  // reloads and typed lines wait for transactions to end
 }
@@ -460,7 +538,7 @@ static void rt_hot(void* t, V* args, int n) {  // a tier-1 body reached its call
   for (int i = 0; i < n; i++) m |= u32(isNum(args[i])) << i;
   tierUp(t, m);
 }
-void vmSwitched() { host_vm(vm); }
+void vmSwitched() { host_vm(vm), codeSync(); }
 void platformInit() {
   stackTop = (uintptr_t*)&__stack_high, vm->limit = &__stack_low + (64 << 10), vmSwitched();
   vm->helpers[H_FFI] = (void*)rt_ffi, vm->helpers[H_HOT] = (void*)rt_hot;
@@ -472,7 +550,7 @@ void platformInit() {
 }
 
 // ---------------- the host's entry points ----------------
-static std::string text;  // what the last string-returning export returned
+static TLS std::string text;  // what the last string-returning export returned
 static Compiled last;
 EXPORT(fut_std) void futStd(const char* dir) { stdRoot = canonicalPath(dir); }  // the host says where std/ is
 // flags: 1 verbose, 2 no tier 2 (nothing compiles after a program loads: a Cloudflare Worker can't compile code)
@@ -486,6 +564,10 @@ EXPORT(fut_init) void futInit(int flags) {  // installs the natives' adapters
 EXPORT(fut_set_trycall) void futSetTryCall(u32 slot) { interpSetTryCall(slot); }  // the host's try_call (see interp.cpp)
 EXPORT(fut_isolates) int futIsolates() { return isolates; }  // running now: the program's first, and those it spawned
 EXPORT(fut_seed) void futSeed(double seed) { isolateSeed = (uint64_t)seed; }  // --seed n
+EXPORT(fut_threads) void futThreads(int n) { isolateThreads = n; }               // --threads n
+#if !ONE_THREAD
+EXPORT(fut_exit_request) void futExitRequest(int code) { isolatesExit(code); }  // a worker thread's exit
+#endif
 EXPORT(fut_heap) void futHeap(u32 mb) { gcRegion(size_t(mb) << 20); }  // before fut_init
 void setUntimed(bool on);  // test.cpp
 EXPORT(fut_untimed) void futUntimed(u32 on) { setUntimed(on); }  // a host whose clock stands still while code runs
@@ -535,6 +617,7 @@ EXPORT(fut_error_line) const char* futErrorLine(V v) { return (text = errorLine(
 // what fails it now: a deadlock among them, or one that failed with nothing joining it. (Suspending: call it promising.)
 EXPORT(fut_isolates_finish) const char* futIsolatesFinish(int failed) { return (text = isolatesFinish(failed)).c_str(); }
 EXPORT(fut_where) const char* futWhere(int slot, int off) {  // "name (file:line)" for a frame at module offset off
+  Locked code(codeMu);  // (another thread's compile may be adding to them)
   auto it = lineTabs.find(slot);
   if (it == lineTabs.end() || it->second.file.empty()) return "";
   int line = 0;

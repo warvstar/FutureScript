@@ -723,6 +723,7 @@ static void rt_poll() {
   u32 bits = __atomic_load_n(&vm->poll, __ATOMIC_RELAXED);
   if (bits & 16) isolateReloadPoint();  // a reload stops this isolate
   if (bits & 8) isolateYield();         // a pool isolate's turn is up
+  if (bits & 64) isolateExitPoint();     // (wasm threads) a worker thread asked the main one to end the process
   if (pollHook) pollHook();
 }
 

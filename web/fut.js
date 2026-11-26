@@ -18,13 +18,19 @@
 //   stamp(path): anything that changes when the file does (a modification time), for reloading modules
 //   std: the directory of the standard library's packages (import "std/strings")
 //   exit(code): end the process (an isolate called exit(), or failed in the host); default: the error is thrown
+//   poolSize: (fut-mt.wasm) at most this many threads run a program's isolates (default: cores)
+//   cores: how many threads can run at once (default navigator.hardwareConcurrency)
 //   seed: the seed that picks how a program's isolates take turns (they share the one thread; default 1)
 //   serve: bool -- run(file, true) keeps going after the program finishes: events call the fut functions it gave
 //     JavaScript (a page std/ui built), and edits reload it, until the page closes
+//   threads: (fut-mt.wasm, the threads build) {start(thread)}: start a worker that runs createFut({...options,
+//     thread}) with this thread's {module, memory, tid, arg} (web/thread.mjs). Without it, fut-mt.wasm runs every
+//     isolate on this thread, seeded.
+//   thread: (set by thread.mjs) this is one of fut-mt.wasm's threads: run it (wasi_thread_start), not a program
 // The interpreter's try_call(cb, ctx): runs the C++ callback cb(ctx) (a try_table's body) and returns its result, or
 // catches a fut exception, stores its payload (i64) at ctx, puts the stack pointer back and returns -1. Static, so a
 // Worker can upload it compiled.
-export function tryCallBytes() {
+export function tryCallBytes(shared) {  // shared: for fut-mt.wasm, whose memory is
   const str = (t) => [t.length, ...new TextEncoder().encode(t)], sec = (id, b) => [id, b.length, ...b];
   const imp = (name, desc) => [...str("env"), ...str(name), ...desc];
   const code = [2, 1, 0x7f, 1, 0x7e,                       // locals: the saved sp (i32), the payload (i64)
@@ -36,7 +42,7 @@ export function tryCallBytes() {
     0x20, 2, 0x24, 0, 0x41, 0x7f, 0x0b];                     // sp = saved; -1
   return new Uint8Array([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
     ...sec(1, [3, 0x60, 1, 0x7f, 1, 0x7f, 0x60, 2, 0x7f, 0x7f, 1, 0x7f, 0x60, 1, 0x7e, 0]),
-    ...sec(2, [4, ...imp("table", [1, 0x70, 0, 0]), ...imp("memory", [2, 0, 0]), ...imp("sp", [3, 0x7f, 1]), ...imp("tag", [4, 0, 2])]),
+    ...sec(2, [4, ...imp("table", [1, 0x70, 0, 0]), ...imp("memory", shared ? [2, 3, 0, 0x80, 0x80, 0x04] : [2, 0, 0]), ...imp("sp", [3, 0x7f, 1]), ...imp("tag", [4, 0, 2])]),
     ...sec(3, [1, 1]),
     ...sec(7, [1, ...str("try_call"), 0, 0]),
     ...sec(10, [1, code.length, ...code])]);
@@ -45,12 +51,39 @@ export class Restart extends Error {}  // unwinds to the driver, which reruns ma
 export class Exit extends Error { constructor(code) { super("exit " + code), (this.code = code); } }
 export class FutError extends Error { constructor(text) { super(text.split("\n")[0]), (this.text = text); } }  // from apply()
 
+// The memory a module imports, if it does (fut-mt.wasm's: shared): its limits in pages, from the import section.
+function memoryImport(bytes) {
+  let p = 8;
+  const u = () => { let r = 0, k = 0, b; do { b = bytes[p++]; r += (b & 0x7f) * 2 ** k, (k += 7); } while (b & 0x80); return r; };
+  const name = () => { const n = u(), s = new TextDecoder().decode(bytes.subarray(p, p + n)); return (p += n), s; };
+  while (p < bytes.length) {
+    const id = bytes[p++], size = u(), end = p + size;
+    if (id == 2) {
+      for (let n = u(); n-- > 0;) {
+        const mod = name(), field = name(), kind = bytes[p++];
+        if (kind == 0) u();
+        else if (kind == 1) p++, bytes[p++] & 1 ? (u(), u()) : u();
+        else if (kind == 3) p += 2;
+        else if (kind == 4) p++, u();
+        else if (kind == 2) {
+          const flags = bytes[p++], initial = u(), maximum = flags & 1 ? u() : undefined;
+          return { module: mod, name: field, initial, maximum, shared: !!(flags & 2) };
+        }
+      }
+      return null;
+    }
+    p = end;
+  }
+  return null;
+}
+
 export async function createFut(opts) {
   const enc = new TextEncoder(), dec = new TextDecoder();
   const tag = new WebAssembly.Tag({ parameters: ["i64"] });
   let ex, mem, table, spG, held = new Uint8Array(0);
   const u8 = () => new Uint8Array(mem.buffer), dv = () => new DataView(mem.buffer);
-  const cstr = (p) => { const m = u8(); let e = p; while (m[e]) e++; return dec.decode(m.subarray(p, e)); };
+  let shared = false;  // fut-mt.wasm: the memory is shared (and TextDecoder takes no view of shared memory)
+  const cstr = (p) => { const m = u8(); let e = p; while (m[e]) e++; return dec.decode(shared ? m.slice(p, e) : m.subarray(p, e)); };
   const write = (fd, s) => opts.write(fd, typeof s == "string" ? enc.encode(s) : s);
   function withStr(s, f) {  // f(pointer to s as a C string)
     const b = enc.encode(s), p = ex.fut_alloc(b.length + 1);
@@ -84,8 +117,24 @@ export async function createFut(opts) {
       return dv().setBigUint64(p, BigInt(Math.round(ns)), true), 0;
     },
     fd_close: () => 0, fd_seek: () => 70,
-    proc_exit(code) { throw new Exit(code); },
+    proc_exit(code) {
+      if (opts.thread) ex.fut_exit_request(code);  // not the main thread: the main thread ends the process
+      throw new Exit(code);
+    },
+    sched_yield: () => 0,
+    poll_oneoff(inP, outP, n, nP) {  // threads: usleep (the ticker's), one clock subscription: wait it out
+      const d = dv();
+      let ms = 0;
+      for (let i = 0; i < n; i++) if (d.getUint8(inP + i * 48 + 8) == 0) ms = Math.max(ms, Number(d.getBigUint64(inP + i * 48 + 24, true)) / 1e6);
+      Atomics.wait(sleeper, 0, 0, ms);
+      for (let i = 0; i < n; i++) {
+        d.setBigUint64(outP + i * 32, d.getBigUint64(inP + i * 48, true), true);
+        d.setUint16(outP + i * 32 + 8, 0, true), d.setUint8(outP + i * 32 + 10, d.getUint8(inP + i * 48 + 8));
+      }
+      return d.setUint32(nP, n, true), 0;
+    },
   };
+  const sleeper = typeof SharedArrayBuffer == "function" ? new Int32Array(new SharedArrayBuffer(4)) : null;
 
   // ---- extern fn: JS functions. No library: a small libc, then Math, then globals; "a.b": that object's ----
   const libc = {
@@ -264,7 +313,7 @@ export async function createFut(opts) {
   // and, once it has suspended, resumes the next (or starts it: a promising call of fut_ctx_start) ----
   const ctxs = new Map();  // a waiting context (its shadow stack pointer) -> what resumes it
   let ctxStart, lastThrown = null, trySlot = 0;
-  const tryCallSlot = () => trySlot || (trySlot = table.grow(1, new WebAssembly.Instance(opts.tryModule ?? new WebAssembly.Module(tryCallBytes()), { env }).exports.try_call));
+  const tryCallSlot = () => trySlot || (trySlot = table.grow(1, new WebAssembly.Instance(opts.tryModule ?? new WebAssembly.Module(tryCallBytes(shared)), { env }).exports.try_call));
   const ctxSwitch = (save, to) => new Promise((res) => {
     ctxs.set(save, res);
     queueMicrotask(() => {
@@ -272,13 +321,16 @@ export async function createFut(opts) {
       if (c) return ctxs.delete(to), c();
       // An isolate catches fut's errors itself (catchFut): what escapes is the host's (exit(), a trap). The program
       // can't go on: its isolates wait on each other.
-      ctxStart(to).catch((e) => {
-        if (!(e instanceof Exit)) report(e);
-        if (opts.exit) return opts.exit(e instanceof Exit ? e.code : 1);
-        setTimeout(() => { throw e; });
-      });
+      ctxStart(to).catch(hostFailed);
     });
   });
+
+  function hostFailed(e) {  // not fut's error (exit(), a trap): it ends the process
+    if (!(e instanceof Exit)) report(e);
+    if (opts.thread) return void (e instanceof Exit || ex.fut_exit_request(1));  // the main thread ends it
+    if (opts.exit) return opts.exit(e instanceof Exit ? e.code : 1);
+    setTimeout(() => { throw e; });
+  }
 
   // ---- stack traces: V8 names our frames name@slot and gives the module offset; fut_where maps it to a line ----
   function trace(e) {
@@ -441,6 +493,7 @@ export async function createFut(opts) {
     vm: (p) => void (vmG.value = p),
     ctx_switch: S(ctxSwitch), ctx_gone: (c) => ctxs.delete(c),
     trycall: () => tryCallSlot(),
+    cores: () => opts.cores ?? ((typeof navigator == "object" && navigator.hardwareConcurrency) || 1),
     where() {  // the innermost fut frame: the first of a trace taken here
       const t = trace(opts.interp ? { futTrace: cstr(ex.fut_interp_trace()) } : { stack: new Error().stack });
       return (held = enc.encode(t.split("\n")[0].replace(/^ {2}at /, ""))), held.length;
@@ -471,18 +524,34 @@ export async function createFut(opts) {
     }),
   };
   const wasmMod = opts.wasm instanceof WebAssembly.Module ? opts.wasm : await WebAssembly.compile(opts.wasm);
-  const inst = await WebAssembly.instantiate(wasmMod, { host, wasi_snapshot_preview1: wasi });
-  ex = inst.exports, (mem = ex.memory), (table = ex.__indirect_function_table), (spG = ex.__stack_pointer);
+  // fut-mt.wasm: one memory, shared by every thread's instance; a thread asks for another (wasi thread-spawn)
+  const memImp = opts.thread ? null : opts.wasm instanceof WebAssembly.Module ? opts.memoryLimits : memoryImport(opts.wasm);
+  if (opts.thread) mem = opts.thread.memory, (shared = true);
+  else if (memImp) mem = new WebAssembly.Memory({ initial: memImp.initial, maximum: memImp.maximum, shared: memImp.shared }), (shared = memImp.shared);
+  const tids = opts.thread?.tids ?? (shared ? new Int32Array(new SharedArrayBuffer(4)).fill(1) : null);
+  const spawn = (arg) => {  // a new thread: its tid (> 0), or -1 if the host cannot start one
+    if (!opts.threads) return -1;
+    const tid = Atomics.add(tids, 0, 1);
+    try { opts.threads.start({ module: wasmMod, memory: mem, tid, arg, tids }); } catch (e) { return report(e), -1; }
+    return tid;
+  };
+  const inst = await WebAssembly.instantiate(wasmMod, { host, wasi_snapshot_preview1: wasi, wasi: { "thread-spawn": spawn }, env: { memory: mem } });
+  ex = inst.exports, (mem ??= ex.memory), (table = ex.__indirect_function_table), (spG = ex.__stack_pointer);
   Object.assign(env, { memory: mem, table, sp: spG, tag, vm: vmG });
   const callP = WebAssembly.promising(ex.fut_call), applyP = WebAssembly.promising(ex.fut_apply);
   fiberStart = WebAssembly.promising(ex.fut_fiber_start), ctxStart = WebAssembly.promising(ex.fut_ctx_start);
   const finishP = WebAssembly.promising(ex.fut_isolates_finish);
+  if (opts.thread) {  // one of fut-mt.wasm's threads: it runs (wasi_thread_start) until the process ends
+    WebAssembly.promising(ex.wasi_thread_start)(opts.thread.tid, opts.thread.arg).catch(hostFailed);
+    return null;
+  }
   if (opts.interp) ex.fut_set_trycall(tryCallSlot());
   ex._initialize();
   if (opts.untimed) ex.fut_untimed(1);  // a Worker's clock moves only across I/O: expect grows can't time code there
   if (opts.heapMB) ex.fut_heap(opts.heapMB);  // the heap's size (default 256 MB): a Cloudflare Worker has 128 MB in all
   ex.fut_init((opts.verbose ? 1 : 0) | (opts.noTier ? 2 : 0) | (opts.interp ? 4 : 0)), (pollAt = ex.fut_poll());
   if (opts.std) withStr(opts.std, (p) => ex.fut_std(p));
+  if (opts.poolSize) ex.fut_threads(opts.poolSize);  // fut-mt.wasm: at most this many threads run isolates (default cores)
   if (opts.seed) ex.fut_seed(opts.seed);  // how a program's isolates interleave (default 1)  // where the standard library's packages are
 
   const pinned = new Map();  // name -> id, for apply()

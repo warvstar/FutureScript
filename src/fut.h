@@ -344,12 +344,14 @@ VM* vmNew();
 void threadInit();  // a new isolate's thread: its stack bounds (stackTop, vm->limit)
 #if __wasm__
 void vmSwitched();       // vm changed: JIT code reaches it through a wasm global the host holds
+void codeSync();         // threads: this thread's function table catches up with the code others compiled
 void ctxGone(void* ctx);  // a context switched away from for the last time: the host drops its suspended stack
 // Run body(ctx), catching a fut error (a wasm exception, which C++ can't catch: the host's try_call does): true if
 // one was raised, with the value raised in *err and (trace) its frames.
 bool catchFut(void (*body)(void*), void* ctx, V* err, std::string* trace);
 #else
 inline void vmSwitched() {}  // (JIT code has it in x28, loaded on entry)
+inline void codeSync() {}
 inline void ctxGone(void*) {}
 #endif
 void ctxSwap(void** save, void* to);           // save this context's registers and sp in *save, resume `to`
@@ -476,6 +478,7 @@ void traceAdd(const std::string& frames);  // frames to print after the next unc
 std::string codeWhere(void* ra);  // "f (file.fut:12)" for a return address in JIT code, or ""
 #if __wasm__
 std::string hereWhere();  // the innermost fut frame running, as codeWhere gives it (wasm has no return addresses)
+int hostCores();           // the threads the host can run at once (navigator.hardwareConcurrency)
 #endif
 void emitOut(std::string_view line);  // print(): to outSink (locked: an isolate's workers share it) or stdout
 
@@ -493,6 +496,8 @@ void isolatePoint();         // a seeded program may switch isolates here (each 
 // (fut test, which defaults to seed 1, and --seed n).
 inline uint64_t isolateSeed;
 inline int isolateThreads;  // the pool's size (--threads n; 0: cores())
+void isolateExitPoint();     // (wasm threads) at a poll: end the process, if another thread asked (isolatesExit)
+void isolatesExit(int code);
 std::string isolateSeedNote();  // a failed test's: the seed that replays it, if its isolates were scheduled by one
 // Hot reload across isolates (main.cpp's hotReload, on the root): stop the program's other isolates at safe points
 // (false: there are none), copy compiled functions and classes into their globals, have each run the new top level
