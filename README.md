@@ -465,7 +465,7 @@ The binary finds `std/` next to the directory it is in (`build/fut` uses `std/`)
 
 ### Pages
 
-`std/ui` builds a page from functions over `std/reactive` signals. There is no virtual DOM and no re-rendering of a whole view. Each child or prop given as a function is an effect that updates its own nodes: text in place, anything else replaced between two markers. A prop whose value comes out the same doesn't touch the DOM.
+`std/ui` builds a page from functions over `std/reactive` signals. There is no virtual DOM and no re-rendering of a whole view. Each child or prop given as a function is an effect that updates its own nodes: text in place, anything else replaced between two markers. A prop whose value comes out the same doesn't touch the DOM. In a view, an element's fixed part (tags, classes, literal attributes and text) is a template, built once and cloned for each use, and only its live parts are wired: a row of the benchmark table is one clone and five calls.
 
 ```
 import "std/ui"

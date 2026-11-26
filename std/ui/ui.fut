@@ -40,6 +40,8 @@ extern dom fn store(str, str): void
 extern dom fn createSvg(str): any
 extern dom fn modal(any, any): void
 extern dom fn measure(any): any
+extern dom fn template(any): num
+extern dom fn instance(num, num): any
 
 // What kind of child v is: "none" (nil, false, true), "text" (a string or number), "fn", "list" or "node".
 fn kindOf(v) {
@@ -52,18 +54,24 @@ fn kindOf(v) {
 }
 
 // Add child c to node p: text, a node, a list of children, or a function whose result is shown and kept current.
-fn add(p, c) {
+fn add(p, c) { addAt(p, nil, c) }
+fn ins(p, before, n) {  // n into p, or before node before (when given)
+  if before == nil { append(p, n) } else { put(before, n) }
+}
+fn addAt(p, before, c) {
   var k = kindOf(c)
-  if k == "text" { append(p, text(str(c))) }
-  else if k == "node" { append(p, c) }
-  else if k == "list" { for x in c { add(p, x) } }
-  else if k == "fn" { region(p, c) }
+  if k == "text" { ins(p, before, text(str(c))) }
+  else if k == "node" { ins(p, before, c) }
+  else if k == "list" { for x in c { addAt(p, before, x) } }
+  else if k == "fn" { region(p, before, c, nil) }
 }
 
-// A part of p that shows f()'s result, and shows it again when what f read changes. Text is one text node, whose
-// characters change; anything else goes between two markers (made when first needed), replacing what was there.
-fn region(p, f) {
-  var shown = {text: nil, said: nil, start: nil, end: nil}
+// A part of p (or before node before) that shows f()'s result, and shows it again when what f read changes. Text
+// is one text node (given: one already there), whose characters change; anything else goes between two markers,
+// made when first needed, replacing what was there.
+fn region(p, before, f, given) {
+  var shown = {text: given, said: nil, start: nil, end: nil}
+  if given != nil { shown.said = "" }
   r.effect(fn() {
     var v = f()
     var k = kindOf(v)
@@ -75,14 +83,14 @@ fn region(p, f) {
     if k == "text" && shown.start == nil {  // the first time: no markers
       shown.said = str(v)
       shown.text = text(shown.said)
-      append(p, shown.text)
+      ins(p, before, shown.text)
       return
     }
     if shown.start == nil {
       shown.start = anchor()
       shown.end = anchor()
-      if shown.text == nil { append(p, shown.start) append(p, shown.end) }
-      else { put(shown.text, shown.start) put(shown.text, shown.end) }
+      if shown.text == nil { ins(p, before, shown.start) ins(p, before, shown.end) }
+      else { put(shown.text, shown.start) put(shown.text, shown.end) remove(shown.text) }  // the markers where the text was
     }
     clearBetween(shown.start, shown.end)
     shown.text = nil
@@ -97,6 +105,31 @@ fn region(p, f) {
     }
   })
 }
+
+// ---- templates (src/views.cpp): a view's element with its fixed part made once and cloned, the rest wired ----
+var tplIds = {}  // key -> [template id, how many nodes an instance gives]
+pub fn tpl(key: str, desc: fn, wire: fn): any {
+  var t = nil
+  if tplIds.has(key) { t = tplIds[key] }
+  else {
+    var d = desc()
+    t = [template(d), 1 + wired(d) - d[2] % 2]  // (the root is wired as the first node)
+    tplIds[key] = t
+  }
+  var n = instance(t[0], t[1])
+  wire(n)
+  return n[0]
+}
+fn wired(d) {  // how many of desc's nodes fut wires (see dom.js's template)
+  if d == nil { return 1 }
+  if typeOf(d) != "list" { return 0 }
+  var c = d[2] % 2 + floor(d[2] / 2)
+  for i in 3..d.len() { c += wired(d[i]) }
+  return c
+}
+pub fn wire(n, props) { for k in props { prop(n, k, props[k]) } }  // a template's element: its live props
+pub fn hole(marker, c) { addAt(nil, marker, c) }  // a template's place for a child
+pub fn textAt(t, f: fn) { region(nil, nil, f, t) }  // a template's text, kept current
 
 // Prop k of node n: "on<event>" takes a handler, given {type, value, checked, key}; a function shows its current
 // result; "class" (a keyword: write {"class": ...}), "id" and other attributes take text (nil or false removes one); "value" and "checked" set the
@@ -185,6 +218,7 @@ fn place(list, key, view, st, start, end) {
     var e = {item: item, start: nil, end: nil, dispose: nil}
     e.dispose = r.root(fn() {
       var v = view(item)
+      if kindOf(v) == "list" && v.len() == 1 { v = v[0] }  // (a view's block: a list)
       if kindOf(v) == "node" {  // one element: it is its own start and end
         e.start = v
         e.end = v

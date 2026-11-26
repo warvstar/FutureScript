@@ -6,12 +6,16 @@
 //   view Row(t) { ...body... }      fn Row(t), returning the nodes its body makes; mount(Page) shows Page
 //
 // A body is elements, one a line (`row .task .done: t.done { check "x" bind: t.done }`). Any expression in a view is a function of the state it reads: only that part of
-// the page changes when the state does. The rewrite keeps every line where it was, so errors point at the source.
+// the page changes when the state does. An element's fixed part (tags, classes, literal attributes and text) becomes a
+// template, made once and cloned (ui.tpl); only its live parts are wired. The rewrite keeps every line where it was, so
+// errors point at the source.
 #include "fut.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <set>
+#include <tuple>
 #include <map>
 
 namespace {
@@ -219,8 +223,9 @@ struct Views {
     out += s.substr(c.tb, c.b - c.tb) + "})";
     return std::exchange(out, saved);
   }
-  void ifBlock(int n) {
-    std::string k = "_k" + std::to_string(n), r = k + ".push(fn() {";
+  void ifBlock(int n) { out += "_k" + std::to_string(n) + ".push(" + ifExpr(n) + ")"; }
+  std::string ifExpr(int n) {  // if/else if/else children: a function giving the branch's list
+    std::string r = "fn() {";
     for (bool first = true;; first = false) {
       take();  // if
       std::string saved = std::exchange(out, "");
@@ -234,9 +239,14 @@ struct Views {
       r += " else { return " + block(n + 1) + " }";
       break;
     }
-    out += r + " return nil })";
+    return r + " return nil }";
   }
   void forBlock(int n) {
+    std::string lead;
+    std::string e = forExpr(n, lead);
+    out += lead + "_k" + std::to_string(n) + ".push(" + e + ")";
+  }
+  std::string forExpr(int n, std::string& lead) {  // for x in list key k { children }: ui.each(...)
     take();  // for
     Tok v = take();
     if (v.k != 'i') fail(v.b, "expected a name after 'for'");
@@ -245,12 +255,139 @@ struct Views {
     std::string saved = std::exchange(out, "");
     std::string list = expr(true, true), key = var;
     if (Tok kw = peek(); is(s, kw, "key")) take(), key = expr();
-    std::string lead = std::exchange(out, saved);
-    out += lead + "_k" + std::to_string(n) + ".push(ui.each(fn() { return " + list + " }, fn(" + var + ") { return " + key +
-           " }, fn(" + var + ") { return " + block(n + 1) + " }))";
+    lead = std::exchange(out, saved);
+    return "ui.each(fn() { return " + list + " }, fn(" + var + ") { return " + key + " }, fn(" + var + ") { return " + block(n + 1) +
+           " })";
   }
+  // ---- an element as a tree, for a template (ui.tpl): its fixed part made once and cloned ----
+  struct El;
+  struct Kid {
+    char k;            // 't' literal text, 's' a string with holes (code: a function), 'd' any other child (code), 'e' an element
+    std::string code;
+    std::shared_ptr<El> el;
+  };
+  struct El {
+    std::string name, bind;
+    std::vector<std::string> fixed;
+    std::vector<std::pair<std::string, std::string>> when;
+    std::vector<std::tuple<std::string, std::string, bool>> attrs;  // name, code, a handler's
+    std::vector<Kid> kids;
+  };
   // tag .class .class: cond name: value on event { ... } content... { children }
   void element(int n) {
+    size_t at = i;
+    std::string was = out, nl;
+    auto e = elTree(n, nl);
+    if (!e) { i = at, out = was, elementMake(n); return; }  // a block with statements in it: as before
+    out += "_k" + std::to_string(n) + ".push(" + code(*e) + ")" + nl;
+  }
+  // The element from i as a tree, or nullptr when its block has statements (var, assignments). nl: its newlines.
+  std::shared_ptr<El> elTree(int n, std::string& nl) {
+    auto e = std::make_shared<El>();
+    e->name = textOf(s, take());
+    std::string saved = std::exchange(out, "");
+    for (;;) {
+      Tok t = peek();
+      if (!t.k || t.nl || is(s, t, "}")) break;
+      Tok n2 = peek(t.e);
+      if (is(s, t, ".") && n2.k == 'i' && !n2.sp()) {
+        i = n2.b;
+        std::string c = markName();
+        if (Tok col = peek(); is(s, col, ":") && !col.sp()) take(), e->when.push_back({c, expr()});
+        else e->fixed.push_back(c);
+      } else if (t.k == 'i' && is(s, n2, ":") && !n2.sp()) {
+        take(), take();
+        std::string a = textOf(s, t);
+        if (a == "class") e->when.push_back({"=" + expr(), "true"});
+        else if (a == "bind") e->bind = expr();
+        else e->attrs.push_back({a, expr(), false});
+      } else if (is(s, t, "on") && n2.k == 'i' && is(s, peek(n2.e), "{")) {
+        take(), take(), take();
+        e->attrs.push_back({"on" + textOf(s, n2), "fn(e) {" + braceBody() + "}", true});
+      } else if (is(s, t, "{")) {
+        if (!kidsTree(n + 1, e->kids)) return out = saved, nullptr;
+        break;
+      } else e->kids.push_back(kidOf(expr()));
+    }
+    nl += lines(std::exchange(out, saved));
+    return e;
+  }
+  Kid kidOf(const std::string& x) { return literal(x) ? Kid{'t', x, nullptr} : x[0] == '"' ? Kid{'s', live(x), nullptr} : Kid{'d', live(x), nullptr}; }
+  bool kidsTree(int n, std::vector<Kid>& kids) {  // { children } (consumed), or false: statements in it
+    take();
+    for (;;) {
+      Tok t = peek();
+      if (!t.k) fail(t.b, "this view's block has no closing '}'");
+      if (is(s, t, "}")) { take(); return true; }
+      out += s.substr(t.tb, t.b - t.tb), i = t.b;  // (only its newlines are kept)
+      std::string word = t.k == 'i' ? textOf(s, t) : "";
+      Tok n2 = peek(t.e);
+      if (word == "if") { kids.push_back({'d', ifExpr(n), nullptr}); continue; }
+      if (word == "for") { std::string lead; std::string e = forExpr(n, lead); out += lead, kids.push_back({'d', e, nullptr}); continue; }
+      if (word == "var" || (word == "state" && n2.k == 'i')) return false;
+      if (t.k == 's') { kids.push_back(kidOf(expr())); continue; }
+      if (t.k == 'i' && word[0] >= 'A' && word[0] <= 'Z' && is(s, n2, "(") && !n2.sp()) { kids.push_back({'d', expr(), nullptr}); continue; }
+      if (t.k == 'i' && !assignOp(s, n2) && !((is(s, n2, "(") || is(s, n2, ".")) && !n2.sp())) {
+        std::string nl;
+        auto c = elTree(n, nl);
+        if (!c) return false;
+        out += nl, kids.push_back({'e', "", c});
+        continue;
+      }
+      if (!assignOp(s, peek(exprEnd(i, false)))) { kids.push_back({'d', live(expr(false)), nullptr}); continue; }
+      return false;  // an assignment
+    }
+  }
+  static bool templated(const El& e) {  // fut's own tags that do more than an element, binding and SVG: ui.make
+    static const std::set<std::string> own = {"field", "choice", "area", "check", "dialog", "link", "svg", "g", "path", "line",
+      "polyline", "polygon", "rect", "circle", "ellipse", "defs", "linearGradient", "stop", "title", "label"};
+    return e.bind.empty() && !own.count(e.name);
+  }
+  std::string code(const El& e) {  // the element's code: a template's, else ui.make's
+    if (!templated(e)) return makeCode(e);
+    std::string wire;
+    int at = 0;
+    std::string desc = descOf(e, at, wire, true);
+    uint64_t h = 1469598103934665603ull;
+    for (char c : desc) h = (h ^ (unsigned char)c) * 1099511628211ull;
+    char key[24];
+    snprintf(key, sizeof key, "t%llx", (unsigned long long)h);
+    return "ui.tpl(\"" + std::string(key) + "\", fn() { return " + desc + " }, fn(_n) {" + wire + " })";
+  }
+  std::string makeCode(const El& e) {
+    std::vector<std::string> props, kids;
+    if (!e.fixed.empty() || !e.when.empty()) props.push_back(classProp(e.fixed, e.when));
+    if (!e.bind.empty()) props.push_back("\"bind\": \x01" + e.bind);
+    for (auto& [a, c, h] : e.attrs) props.push_back(quote(a) + ": " + (h ? c : live(c)));
+    for (auto& k : e.kids) kids.push_back(k.k == 'e' ? code(*k.el) : k.code);
+    return "ui.make(" + quote(e.name) + ", {" + join(props) + "}, [" + join(kids) + "])";
+  }
+  // e's part of a template's description (see dom.js's template), and the code wiring its live parts onto the
+  // nodes an instance gives (_n[1], _n[2], ...: in this order; the root is _n[0]).
+  std::string descOf(const El& e, int& at, std::string& wire, bool root) {
+    std::string tag = e.name;
+    std::vector<std::string> fixed = e.fixed, stat, live_;
+    if (tag == "row" || tag == "column" || tag == "text") fixed.insert(fixed.begin(), tag), tag = "div";
+    if (!fixed.empty() || !e.when.empty()) (e.when.empty() ? stat : live_).push_back(classProp(fixed, e.when));
+    for (auto& [a, c, h] : e.attrs) {
+      bool fixedAttr = !h && literal(c) && a != "value" && a != "checked" && a != "disabled";
+      (fixedAttr ? stat : live_).push_back(quote(a) + ": " + (h ? c : live(c)));
+    }
+    bool slot = e.kids.size() == 1 && e.kids[0].k == 's';  // one string with holes: a text node it keeps current
+    int flags = (live_.empty() ? 0 : 1) | (slot ? 2 : 0);
+    if (flags & 1) wire += " ui.wire(_n[" + std::to_string(root ? 0 : ++at) + "], {" + join(live_) + "})";
+    if (slot) wire += " ui.textAt(_n[" + std::to_string(++at) + "], " + e.kids[0].code + ")";
+    std::string d = "[" + quote(tag) + ", {" + join(stat) + "}, " + std::to_string(flags);
+    if (!slot)
+      for (auto& k : e.kids) {
+        if (k.k == 't') { if (k.code != "true" && k.code != "false" && k.code != "nil") d += ", " + k.code; }
+        else if (k.k == 'e' && templated(*k.el)) d += ", " + descOf(*k.el, at, wire, false);
+        else d += ", nil", wire += " ui.hole(_n[" + std::to_string(++at) + "], " + (k.k == 'e' ? code(*k.el) : k.code) + ")";
+      }
+    return d + "]";
+  }
+
+  void elementMake(int n) {
     Tok tag = take();
     std::string name = textOf(s, tag);
     std::vector<std::string> props, kids, fixed;

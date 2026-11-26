@@ -42,6 +42,10 @@ export async function startFut(o) {
     return c;
   };
   const gone = new Set();  // fresh ids the worker dropped before its queued call reached the page
+  function keep(w, id, v) {
+    if (gone.delete(id)) return;  // (already dropped there)
+    refs.set(id, v), refIds.set(v, id), holders.set(id, new Set([w]));
+  }
   function refGone(w, id) {
     if (id >= FRESH && !holders.has(id)) return void gone.add(id);
     const h = holders.get(id);
@@ -62,10 +66,8 @@ export async function startFut(o) {
       for (const c of q.before) {
         try {
           const r = runCall(w, c);
-          if (c.id != null) {  // a fresh object, under the id the worker gave it
-            if (gone.delete(c.id)) continue;  // (already dropped there)
-            refs.set(c.id, r), refIds.set(r, c.id), holders.set(c.id, new Set([w]));
-          }
+          if (c.id != null) keep(w, c.id, r);  // a fresh object, under the id the worker gave it
+          if (c.ids) c.ids.forEach((id, i) => keep(w, id, r[i]));  // fresh objects
         } catch (e) { failed ??= `${c.name}(): ${e?.message ?? e}`; }
       }
       if (failed) throw new Error(failed);
@@ -76,14 +78,14 @@ export async function startFut(o) {
       return import(file + "?v=" + (q.stamp ?? 0)).then((m) => {
         modules.set(q.lib, m);
         const names = Object.keys(m).filter((k) => typeof m[k] == "function");
-        return { names, fresh: names.filter((k) => m[k].fresh) };
+        return { names, fresh: names.filter((k) => m[k].fresh), lists: names.filter((k) => m[k].freshList) };
       });
     }
     if (q.op == "has") return !!globalFn(q.lib, q.name);
     return runCall(w, q);
   }
   function runCall(w, q) {
-    if (q.id != null) {  // fresh: the object itself (registered by run)
+    if (q.id != null || q.ids) {  // fresh: the object itself (registered by run)
       const f = modules.get(q.lib)?.[q.name], c = codec(w);
       return f(...q.args.map((x, i) => (q.sig[i] == "a" || q.sig[i] == "f" ? c.fromFut(x) : x)));
     }

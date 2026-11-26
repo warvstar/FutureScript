@@ -4,6 +4,7 @@ const doc = globalThis.document ?? fakeDocument();
 
 // fresh: it makes a new object, so a fut thread calling it from a worker needn't wait for it (see fut.js's flush)
 const fresh = (f) => ((f.fresh = true), f);
+const freshList = (f) => ((f.freshList = true), f);  // a list of new objects: as many as its last argument says
 export const create = fresh((tag) => doc.createElement(tag));
 export const text = fresh((s) => doc.createTextNode(s));
 export const anchor = fresh(() => doc.createComment(""));
@@ -12,6 +13,30 @@ export const setText = (n, s) => void (n.data = s);
 export const append = (p, c) => void p.appendChild(c);
 export const put = (ref, n) => void ref.parentNode.insertBefore(n, ref);  // n (or a fragment's nodes) just before ref
 export const remove = (n) => void n.parentNode?.removeChild(n);
+// ---- templates: a view's fixed part, made once and cloned for each use (src/views.cpp, ui.tpl) ----
+// desc: text, null (a place for a child: a comment), or [tag, attrs, flags, ...children]; flags 1: fut wires the
+// element (its live props, handlers), 2: its one child is text fut keeps current (an empty text node, given).
+const templates = [];
+export function template(desc) {
+  const paths = [];  // where the nodes fut wires are, in order
+  const make = (d, path) => {
+    if (d === null) return paths.push(path), doc.createComment("");
+    if (!Array.isArray(d)) return doc.createTextNode(String(d));
+    const [tag, attrs, flags, ...kids] = d, e = doc.createElement(tag);
+    for (const k in attrs) if (attrs[k] != null && attrs[k] !== false) e.setAttribute(k, attrs[k] === true ? "" : String(attrs[k]));
+    if (flags & 1 && path.length) paths.push(path);  // (the root is the first node anyway)
+    if (flags & 2) paths.push([...path, 0]), e.appendChild(doc.createTextNode(""));
+    kids.forEach((k, i) => e.appendChild(make(k, [...path, i])));
+    return e;
+  };
+  return templates.push({ root: make(desc, []), paths }) - 1;
+}
+// A copy of template id, then the nodes fut wires: [root, ...] (count of them: a worker gives each an id first)
+export const instance = freshList((id, count) => {
+  const { root, paths } = templates[id], n = root.cloneNode(true), out = [n];
+  for (const p of paths) { let x = n; for (const i of p) x = x.childNodes[i]; out.push(x); }
+  return out;
+});
 export function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); }
 export function clearBetween(a, b) { while (a.nextSibling && a.nextSibling !== b) a.parentNode.removeChild(a.nextSibling); }
 export function moveRange(a, b, ref) {  // the nodes from a to b, inclusive, to just before ref
@@ -110,19 +135,21 @@ function fakeDocument() {
       }
       return c;
     }
+    cloneNode(deep) { const c = this.shallow(); if (deep) for (const k of this.childNodes) c.appendChild(k.cloneNode(true)); return c; }
     removeChild(c) { const i = this.childNodes.indexOf(c); if (i >= 0) this.childNodes.splice(i, 1), (c.parentNode = null); return c; }
     get textContent() { return this.childNodes.map((c) => c.textContent).join(""); }
     set textContent(s) { for (const c of this.childNodes.slice()) this.removeChild(c); this.appendChild(new Text(s)); }
     get outerHTML() { return this.childNodes.map((c) => c.outerHTML).join(""); }
   }
-  class Text extends Node { constructor(s) { super(); this.data = String(s); } get textContent() { return this.data; } get outerHTML() { return esc(this.data); } }
-  class Comment extends Node { get textContent() { return ""; } get outerHTML() { return "<!---->"; } }
-  class Fragment extends Node {}
+  class Text extends Node { constructor(s) { super(); this.data = String(s); } get textContent() { return this.data; } get outerHTML() { return esc(this.data); } shallow() { return new Text(this.data); } }
+  class Comment extends Node { get textContent() { return ""; } get outerHTML() { return "<!---->"; } shallow() { return new Comment(); } }
+  class Fragment extends Node { shallow() { return new Fragment(); } }
   class Element extends Node {
     constructor(tag) { super(); this.tagName = tag; this.attrs = new Map(); this.listeners = {}; this.value = ""; this.checked = false; this.disabled = false; }
     setAttribute(k, v) { this.attrs.set(k, String(v)); }
     removeAttribute(k) { this.attrs.delete(k); }
     getAttribute(k) { return this.attrs.get(k) ?? null; }
+    shallow() { const e = new Element(this.tagName); e.attrs = new Map(this.attrs); return e; }
     addEventListener(t, f) { (this.listeners[t] ??= []).push(f); }
     dispatchEvent(e) { e.target ??= this; for (let n = this; n; n = n.parentNode) for (const f of n.listeners?.[e.type] ?? []) f(e); }
     get outerHTML() {

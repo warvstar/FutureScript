@@ -55,6 +55,15 @@ test "reactive props" {
   expect htmlOf(n) == "<div class=\"on\"></div>"
 }
 
+test "a function child's text becomes nodes, and text again" {
+  var fancy = r.signal(false)
+  var host = page(fn() { return el("span", nil, fn() { if fancy.get() { return el("em", nil, "x") } return "plain" }) })
+  expect htmlOf(host).has("<span>plain</span>")
+  fancy.set(true)
+  expect htmlOf(host).has("<span><!----><em>x</em><!----></span>")
+  fancy.set(false)
+  expect htmlOf(host).has("<span><!---->plain<!----></span>")
+}
 test "each: any reordering, insertion and removal comes out in order" {
   var items = r.signal([])
   var made = {n: 0}

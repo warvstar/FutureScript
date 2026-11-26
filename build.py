@@ -22,7 +22,7 @@ WASM_MT_LINK = [*WASM_LINK, "-Wl,--import-memory,--shared-memory,--max-memory=42
 NATIVE_ONLY, WASM_ONLY = {"main.cpp", "jit.cpp", "sys.cpp"}, {"wasm.cpp", "interp.cpp"}
 NATIVE_SPECS = {"gpu_test.fut", "gpu_particles.fut"}  # specs only the native build runs (std/gpu: Dawn, as a C library)
 GPU_SPECS = {"gpu_test.fut", "gpu_particles.fut"}  # these need build/libfutgpu.dylib (python3 build.py gpu)
-WASM_SPECS = {"hello_ui.fut", "ui_test.fut", "views.fut", "garden.fut", "dashboard.fut"}  # std/ui is the DOM's (a JavaScript module): the wasm build only
+WASM_SPECS = {"hello_ui.fut", "ui_test.fut", "views.fut", "garden.fut", "dashboard.fut", "templates.fut"}  # std/ui is the DOM's (a JavaScript module): the wasm build only
 
 
 def build(debug=False, wasm=False, tsan=False, threads=False):

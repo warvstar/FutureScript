@@ -66,6 +66,8 @@ pub class FormField {
 // Go to path p (the address becomes #p).
 pub fn go(p: str)
 
+pub fn hole(marker, c)
+
 // The HTML a node is now, and an event on it as a user would cause it ({value} typed, {checked} ticked): for tests.
 pub fn htmlOf(n): str
 
@@ -135,4 +137,10 @@ pub fn style(sheet: str)
 // An SVG element (tag, props, kids), as el() makes HTML ones. "label" makes SVG's <text>.
 pub fn svg(tag: str, props, kids): any
 
+pub fn textAt(t, f: fn)
+
+pub fn tpl(key: str, desc: fn, wire: fn): any
+
 pub fn trigger(n, event: str, data)
+
+pub fn wire(n, props)

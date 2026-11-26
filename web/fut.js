@@ -261,7 +261,7 @@ export async function createFut(opts) {
       if (proxied(lib)) {  // the page loads it; here, a stand-in for each function it exports
         exports = {};
         const got = mainCall({ op: "load", lib, stamp });
-        for (const name of got.names) exports[name] = { lib, name, fresh: got.fresh.includes(name) };
+        for (const name of got.names) exports[name] = { lib, name, fresh: got.fresh.includes(name), freshList: got.lists.includes(name) };
       } else if (kind.startsWith("js")) {
         if (!opts.importModule) throw new Error("this host cannot load JavaScript modules");
         exports = await opts.importModule(file, stamp);
@@ -405,12 +405,14 @@ export async function createFut(opts) {
     }
     const f = externs[fn];
     if (typeof f != "function") {  // the main thread's (proxied): it reads the arguments, and gives the result, as text
-      const fresh = f.fresh && ret == 97 /* a */ && freshNext < 2 ** 30;
-      if (opts.freshBase && (ret == 118 /* v */ || fresh)) {  // (the root: it flushes when it waits; see flush)  // nothing to wait for: queued (see flush)
+      const fresh = (f.fresh || f.freshList) && ret == 97 /* a */ && freshNext < 2 ** 30;
+      if (opts.freshBase && (ret == 118 /* v */ || fresh)) {  // nothing to wait for: queued (the root's only: see flush)
         const c = { lib: f.lib, name: f.name, sig, ret, args: rawArgs(sig, args) };
-        if (fresh) c.id = opts.freshBase + freshNext++;
+        if (fresh && f.freshList) c.ids = Array.from({ length: c.args.at(-1) }, () => opts.freshBase + freshNext++);
+        else if (fresh) c.id = opts.freshBase + freshNext++;
         queued.push(c);
         if (queued.length >= 8192) flush();
+        if (c.ids) return (held = enc.encode(JSON.stringify(c.ids.map((id) => ({ [MARK]: "js", id }))))), held.length;
         return fresh ? -2 - c.id : 0;
       }
       ffiDepth++;
