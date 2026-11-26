@@ -14,6 +14,7 @@ static std::vector<std::string> watched;  // the program file and everything it 
 static std::vector<std::string> inbox;    // lines typed into a running program (both guarded by watchMu)
 static std::string replBuf;               // REPL input so far (more lines may follow)
 static bool inMain;
+static VM* mainVM;  // the watcher threads set its poll flag (vm is each thread's own)
 static int fileChanged;
 
 static Compiled load(bool reload) {
@@ -31,14 +32,14 @@ static Compiled load(bool reload) {
 }
 static int run(void* code) {  // 0 ok, 1 runtime error, 2 restart requested
   jmp_buf jb, *outer = errJmp;
-  void* handler = vm.handler;  // REPL lines typed into a running program must not land in its try blocks
-  u32 txn = vm.txn;            // an uncaught error rolls back the transactions opened since
+  void* handler = vm->handler;  // REPL lines typed into a running program must not land in its try blocks
+  u32 txn = vm->txn;            // an uncaught error rolls back the transactions opened since
   int st = 0;
   u32 eff = effEnter();        // unchecked, with no handlers, whatever the code it interrupts may do
-  errJmp = &jb, vm.handler = nullptr;
+  errJmp = &jb, vm->handler = nullptr;
   if (int r = setjmp(jb)) st = r, txnUnwind(txn);
   else vmCall(code);
-  errJmp = outer, vm.handler = handler, effLeave(eff);
+  errJmp = outer, vm->handler = handler, effLeave(eff);
   return st;
 }
 static Global* fnNamed(int sym) {
@@ -52,6 +53,51 @@ static int start(Compiled& c) {  // run the top level, then main() (rerun when a
   inMain = false;
   return st;
 }
+// ---- --isolates N: the same code in N isolates at once, each on a thread of its own ----
+// Isolates share no mutable state, so each must behave exactly as it would alone: the same output, the same end.
+struct IsoJob { std::vector<void*> code; std::string out, err; int st = 0; };
+static void* isolateMain(void* p) {
+  IsoJob& j = *(IsoJob*)p;
+  vm = vmNew();
+  Heap* h = heapNew(vm->runs);
+  heapUse(h), threadInit();
+  for (auto& g : globals) if (g.slot >= 0 && g.o) vm->globals[g.slot] = box(g.o);  // its functions and classes
+  outSink = &j.out, errSink = &j.err;
+  for (void* c : j.code) if ((j.st = run(c))) break;
+  outSink = errSink = nullptr;
+  heapFree(h), vmFree(vm), vm = nullptr;
+  return nullptr;
+}
+static std::vector<IsoJob> inIsolates(int n, const std::vector<void*>& code) {
+  std::vector<IsoJob> jobs(n, IsoJob{code});
+  std::vector<pthread_t> th(n);
+  pthread_attr_t a;
+  pthread_attr_init(&a), pthread_attr_setstacksize(&a, 64 << 20);
+  isolates = n + 1;  // this one too: it waits, but its stack holds code
+  for (int i = 0; i < n; i++) pthread_create(&th[i], &a, isolateMain, &jobs[i]);
+  for (auto t : th) pthread_join(t, nullptr);
+  isolates = 1;
+  return jobs;
+}
+static std::string firstLine(const std::string& s) { return s.substr(0, s.find('\n')); }
+static std::string differs(const std::vector<IsoJob>& jobs) {  // how isolate k (if any) ended up unlike the first
+  for (size_t k = 1; k < jobs.size(); k++)
+    if (jobs[k].out != jobs[0].out || jobs[k].st != jobs[0].st || firstLine(jobs[k].err) != firstLine(jobs[0].err))
+      return "isolate " + std::to_string(k) + " ended differently: " + (jobs[k].st ? "error: " + firstLine(jobs[k].err) : "ok") +
+             (jobs[k].out != jobs[0].out ? " (different output)" : "");
+  return "";
+}
+static int startIsolates(Compiled& c, int n) {  // the program: its top level, then main()
+  std::vector<void*> code{c.chunk};
+  if (Global* m = fnNamed(S_main)) code.push_back(m->stub);
+  auto jobs = inIsolates(n, code);
+  jitRetire((u32*)c.chunk);
+  fwrite(jobs[0].out.data(), 1, jobs[0].out.size(), stdout), fflush(stdout);
+  if (jobs[0].st) fprintf(stderr, "runtime error: %s", jobs[0].err.c_str());
+  if (std::string d = differs(jobs); !d.empty()) return fprintf(stderr, "[fut] %s\n", d.c_str()), 1;
+  return jobs[0].st ? 1 : 0;
+}
+
 static void eval(bool more) {  // compile and run replBuf, unless it is unfinished and `more` may follow
   try {
     Compiled c = compile("<repl>", false, true, &replBuf);
@@ -71,8 +117,8 @@ static void evalInbox() {
 // Runs at a safepoint (loop back-edge) on the main thread when a watched file changed or a line was typed. Inside
 // a transaction (atomic { }) both wait for it to end.
 static void hotReload() {
-  vm.poll = 0;
-  if (vm.txn) return void(txnPollLater = true);
+  vm->poll = 0;
+  if (vm->txn) return void(txnPollLater = true);
   evalInbox();
   if (!__atomic_exchange_n(&fileChanged, 0, __ATOMIC_ACQUIRE)) return;
   Compiled c = load(true);
@@ -104,7 +150,7 @@ static long long stamp() {
 }
 static void waitChange() {  // typed lines still run meanwhile, so the stopped program's state can be inspected
   for (;; gfxPump(), usleep(50000))
-    if (__atomic_exchange_n(&vm.poll, 0, __ATOMIC_ACQUIRE) && (evalInbox(), __atomic_exchange_n(&fileChanged, 0, __ATOMIC_ACQUIRE))) return;
+    if (__atomic_exchange_n(&vm->poll, 0, __ATOMIC_ACQUIRE) && (evalInbox(), __atomic_exchange_n(&fileChanged, 0, __ATOMIC_ACQUIRE))) return;
 }
 
 // One test in a child process (fork, after the top level ran): its globals, a crash or a hang stay in it.
@@ -148,6 +194,19 @@ static int runTests(const TestRun& o) {
   try {
     c = compile(path, false, false, nullptr, true);
   } catch (std::exception& e) { return reportCompileError(e.what()), 2; }
+  if (o.isolates) {  // each test in o.isolates isolates at once, each running the top level first
+    int bad = 0;
+    for (auto& t : c.tests) {
+      if (!t.pending.empty() || (!o.filter.empty() && t.name.find(o.filter) == std::string::npos)) continue;
+      auto jobs = inIsolates(o.isolates, {c.chunk, t.code});
+      std::string why = jobs[0].st ? "error: " + firstLine(jobs[0].err) : differs(jobs);
+      printf("%s%s%s%s\n", why.empty() ? "ok      " : "FAIL    ", t.name.c_str(), why.empty() ? "" : "\n  ", why.c_str());
+      bad += !why.empty();
+    }
+    jitRetire((u32*)c.chunk);
+    printf("%s (%d isolates each)\n", bad ? (std::to_string(bad) + " failed").c_str() : "all passed", o.isolates);
+    return bad ? 1 : 0;
+  }
   std::string err;
   errSink = &err;
   int st = run(c.chunk);
@@ -205,7 +264,8 @@ int main(int argc, char** argv) {
   bool mapMode = argc > 1 && std::string(argv[1]) == "map", mapPub = false, mapJson = false;
   std::string mapOnly;
   TestRun topts;
-  const char* usage = "usage: fut [-w | -v | --asm] [file.fut]   (no file: REPL)\n       fut test [--json] [--filter text] [--timeout s] file.fut\n"
+  const char* usage = "usage: fut [-w | -v | --asm | --isolates n] [file.fut]   (no file: REPL)\n"
+                      "       fut test [--json] [--filter text] [--timeout s] [--isolates n] file.fut\n"
                       "       fut api [--check] file.fut\n       fut map [--pub] [--json] file.fut [package | file]\n";
   for (int i = 1 + (testMode || apiMode || mapMode); i < argc; i++) {
     std::string a = argv[i];
@@ -218,7 +278,8 @@ int main(int argc, char** argv) {
       if (a == "--check") apiCheck = true;
       else if (a[0] == '-') return fputs(usage, stderr), 2;
       else path = a;
-    } else if (testMode && a == "--json") topts.json = true;
+    } else if (a == "--isolates" && i + 1 < argc && atoi(argv[i + 1]) > 0 && !WASM) topts.isolates = atoi(argv[++i]);
+    else if (testMode && a == "--json") topts.json = true;
     else if (testMode && a == "--filter" && i + 1 < argc) topts.filter = argv[++i];
     else if (testMode && a == "--timeout" && i + 1 < argc && atof(argv[i + 1]) > 0) topts.timeout = atof(argv[++i]);
     else if (a == "-w" && !testMode) watch = verbose = true;
@@ -236,18 +297,19 @@ int main(int argc, char** argv) {
   if (asmMode) return dumpAsm();
   watched = {path};
   Compiled c = load(false);
+  if (topts.isolates && !watch) return c.chunk ? startIsolates(c, topts.isolates) : 1;
   if (watch) {  // started after the first load, so the baseline covers every imported file
     // The watcher only raises a flag; the main thread recompiles at its next safepoint.
-    pollHook = hotReload;
+    pollHook = hotReload, mainVM = vm;
     pthread_t th;
     pthread_create(&th, nullptr, [](void*) -> void* {
       for (long long t = stamp(), n;; usleep(100000))
-        if ((n = stamp()) != t) usleep(30000), t = stamp(), __atomic_store_n(&fileChanged, 1, __ATOMIC_RELAXED), __atomic_store_n(&vm.poll, 1, __ATOMIC_RELEASE);
+        if ((n = stamp()) != t) usleep(30000), t = stamp(), __atomic_store_n(&fileChanged, 1, __ATOMIC_RELAXED), __atomic_store_n(&mainVM->poll, 1, __ATOMIC_RELEASE);
     }, nullptr);
     pthread_create(&th, nullptr, [](void*) -> void* {  // a REPL into the running program: lines run at the next safepoint
       char* line = nullptr;
       size_t cap = 0;
-      for (ssize_t n; (n = getline(&line, &cap, stdin)) > 0; __atomic_store_n(&vm.poll, 1, __ATOMIC_RELEASE))
+      for (ssize_t n; (n = getline(&line, &cap, stdin)) > 0; __atomic_store_n(&mainVM->poll, 1, __ATOMIC_RELEASE))
         pthread_mutex_lock(&watchMu), inbox.emplace_back(line, n), pthread_mutex_unlock(&watchMu);
       return nullptr;
     }, nullptr);

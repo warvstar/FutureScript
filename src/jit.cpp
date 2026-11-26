@@ -53,18 +53,21 @@ __attribute__((naked)) static void enterHandler(Handler*, V, VM*) {
   asm("ldr x9, [x0, #8]\n mov sp, x9\n ldr x29, [x0, #16]\n ldr x26, [x0, #24]\n ldr x9, [x0, #32]\n"
       "mov x28, x2\n movz x27, #0x7ffc, lsl #48\n mov x0, x1\n br x9");
 }
-static std::string fiberTrace;  // frames of a fiber that ended with an error, printed if nothing catches it
+static TLS std::string fiberTrace;  // frames of a fiber that ended with an error, printed if nothing catches it
 [[noreturn]] void throwValue(V v, void* ra) {
-  if (auto* h = (Handler*)vm.handler)  // the transactions opened inside the try roll back before its handler runs
-    vm.handler = h->prev, txnUnwind((u32)h->txn), effLoad({h->allowed, h->hstack, (u32)h->who, h->inv}), fiberTrace.clear(), __asan_handle_no_return(), enterHandler(h, v, &vm);
+  if (auto* h = (Handler*)vm->handler)  // the transactions opened inside the try roll back before its handler runs
+    vm->handler = h->prev, txnUnwind((u32)h->txn), effLoad({h->allowed, h->hstack, (u32)h->who, h->inv}), fiberTrace.clear(), __asan_handle_no_return(), enterHandler(h, v, vm);
   // Uncaught: the site that failed, then every JIT frame found by walking the frame-pointer chain.
   std::vector<std::string> fr;
-  if (auto d = frameDesc((uintptr_t)ra); !d.empty()) fr.push_back(d);
-  bool seen = fr.empty();
-  eachReturnAddress([&](uintptr_t r) {
-    if (!seen && r == (uintptr_t)ra) seen = true;
-    else if (auto d = frameDesc(r); !d.empty()) fr.push_back(d);
-  });
+  {
+    Locked code(codeMu);  // the line tables, which another isolate's compile may be adding to (and no longjmp inside)
+    if (auto d = frameDesc((uintptr_t)ra); !d.empty()) fr.push_back(d);
+    bool seen = fr.empty();
+    eachReturnAddress([&](uintptr_t r) {
+      if (!seen && r == (uintptr_t)ra) seen = true;
+      else if (auto d = frameDesc(r); !d.empty()) fr.push_back(d);
+    });
+  }
   std::string trace;
   for (size_t i = 0; i < fr.size(); i++) {
     if (fr.size() > 16 && i == 10) trace += "  ... " + std::to_string(fr.size() - 15) + " more frames\n", i = fr.size() - 5;
@@ -116,16 +119,16 @@ __attribute__((naked)) static void fiberSwap(void**, void*) {
   asm("sub sp, sp, #160\n" SWAP_REGS("stp") "mov x9, sp\n str x9, [x0]\n mov sp, x1\n" SWAP_REGS("ldp") "add sp, sp, #160\n ret");
 }
 constexpr size_t FIBER_STACK = 1 << 20;  // reserved; pages are only touched as they are used
-static char* mainLimit;
-static jmp_buf* mainErr;
-static void* mainHandler;
-static std::vector<Fiber*> fibers;  // every fiber not yet collected (their suspended frames count for jitCollect)
+static TLS char* mainLimit;  // the isolate's main stack, while a fiber runs
+static TLS jmp_buf* mainErr;
+static TLS void* mainHandler;
+static TLS std::vector<Fiber*> fibers;  // every fiber not yet collected (their suspended frames count for jitCollect)
 static void switchTo(Fiber* to) {   // from the running context to `to` (null: the main stack)
   Fiber* from = fiberCur;
-  if (from) from->err = errJmp, from->handler = vm.handler;
-  else fiberMainTop = stackTop, mainLimit = (char*)vm.limit, mainErr = errJmp, mainHandler = vm.handler;
-  fiberCur = to, stackTop = to ? to->top : fiberMainTop, vm.limit = to ? to->limit : mainLimit, errJmp = to ? to->err : mainErr;
-  vm.handler = to ? to->handler : mainHandler;
+  if (from) from->err = errJmp, from->handler = vm->handler;
+  else fiberMainTop = stackTop, mainLimit = (char*)vm->limit, mainErr = errJmp, mainHandler = vm->handler;
+  fiberCur = to, stackTop = to ? to->top : fiberMainTop, vm->limit = to ? to->limit : mainLimit, errJmp = to ? to->err : mainErr;
+  vm->handler = to ? to->handler : mainHandler;
   fiberSwap(from ? &from->sp : &fiberMainSp, to ? to->sp : fiberMainSp);
 }
 static void fiberStart() {  // the bottom frame of every fiber
@@ -164,8 +167,8 @@ static std::vector<u32*> retired;
 static u32* trap;
 static V (*enter)(void* code, const V* args, VM* vm);
 
-static int writeDepth;
-static uint8_t *dirtyLo, *dirtyHi;
+static TLS int writeDepth;  // write mode is per thread (pthread_jit_write_protect_np)
+static TLS uint8_t *dirtyLo, *dirtyHi;
 JitBatch::JitBatch() { if (!writeDepth++) pthread_jit_write_protect_np(0), dirtyLo = jit + JIT_SIZE, dirtyHi = jit; }
 JitBatch::~JitBatch() {
   if (--writeDepth) return;
@@ -175,10 +178,13 @@ JitBatch::~JitBatch() {
 // A forked child (fut test runs each test in one) can start with this thread's JIT pages in write mode, so the
 // first instruction fetched from them faults (about 1 fork in 25); set execute mode explicitly.
 void jitForked() { pthread_jit_write_protect_np(writeDepth ? 0 : 1); }
+// Written code is made visible to instruction fetch right away, not at the end of the batch: another isolate's
+// thread may follow a stub patched later in the same batch into it, and would fetch stale bytes.
 static void jitWrite(u32* p, const u32* src, size_t n) {
   JitBatch b;
   memcpy(p, src, n * 4);
-  dirtyLo = std::min(dirtyLo, (uint8_t*)p), dirtyHi = std::max(dirtyHi, (uint8_t*)(p + n));
+  if (isolates > 1) sys_icache_invalidate(p, n * 4);
+  else dirtyLo = std::min(dirtyLo, (uint8_t*)p), dirtyHi = std::max(dirtyHi, (uint8_t*)(p + n));
 }
 static u32* jitAlloc(size_t n) {
   size_t bytes = (n * 4 + 15) & ~size_t(15);
@@ -244,6 +250,7 @@ void jitCollect() {  // free retired code that no frame on the stack will return
   for (Fiber* f : fibers)
     if (f != fiberCur && f->stack && f->state != FIB_NEW) eachReturnAddress(keep, (uintptr_t*)((uintptr_t*)f->sp)[10], f->top);
   std::erase_if(retired, [&](u32* b) {
+    if (isolates > 1) return false;  // only this isolate's stacks were looked at: keep it until it is alone
     auto it = lineTabs.find(b);
     if (it == lineTabs.end()) return true;
     for (uintptr_t r : ras) if ((u32*)r > b && (u32*)r <= it->second.hi) return false;
@@ -279,7 +286,7 @@ u32* staleThunk(int sym) {  // x1 = caller's return address (b from the stub lea
   Code k{{mov(1, 30), movz(0, sym & 0xffff, 0), movk(0, (u32)sym >> 16, 1), ldr(16, 28, HOFF(H_STALE)), blr(16)}, {}, {}, "<stale>", ""};
   return jitInstall(k);
 }
-V vmEnter(void* code, V* args) { return enter(code, args, &vm); }
+V vmEnter(void* code, V* args) { return enter(code, args, vm); }
 bool readFile(const std::string& path, std::string& out) {
   FILE* f = fopen(path.c_str(), "rb");
   if (!f) return false;
@@ -315,17 +322,20 @@ void sleepFor(double s) {
   timespec t{(time_t)s, (long)((s - (time_t)s) * 1e9)};
   nanosleep(&t, nullptr);
 }
-void platformInit() {
+void threadInit() {  // this thread's stack, for the GC and the JIT's overflow checks
   pthread_t self = pthread_self();
   stackTop = (uintptr_t*)pthread_get_stackaddr_np(self);
-  vm.limit = (char*)stackTop - pthread_get_stacksize_np(self) + (256 << 10);
-  vm.helpers[H_FFI] = (void*)rt_ffi, vm.helpers[H_HOT] = (void*)rt_hot;
+  vm->limit = (char*)stackTop - pthread_get_stacksize_np(self) + (256 << 10);
+}
+void platformInit() {
+  threadInit();
+  vm->helpers[H_FFI] = (void*)rt_ffi, vm->helpers[H_HOT] = (void*)rt_hot;
   jit = (uint8_t*)mmap(nullptr, JIT_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
   if (jit == MAP_FAILED) perror("mmap"), exit(1);
   using namespace a64;
   Code t{{ldr(16, 28, HOFF(H_UNDEF)), blr(16)}, {}, {}, "<undefined>", ""};
   trap = jitInstall(t);
-  // enter(code, args[8], &vm): save the callee-saved regs we pin (x26 stack limit, x27 QNAN, x28 VM), load args, call.
+  // enter(code, args[8], vm): save the callee-saved regs we pin (x26 stack limit, x27 QNAN, x28 VM), load args, call.
   Code e{{stp_pre(29, 30), addi(29, SP, 0), stp_pre(26, 27), stp_pre(28, 19), mov(9, 0), mov(28, 2), ldr(26, 28, 8),
           movz(27, 0x7ffc, 3), mov(10, 1)}, {}, {}, "<enter>", ""};
   for (u32 i = 0; i < 8; i++) e.c.push_back(ldr(i, 10, i * 8));

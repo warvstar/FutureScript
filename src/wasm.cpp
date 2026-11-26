@@ -195,7 +195,7 @@ static void i32(Code& k, int32_t v) { k.c.push_back(wa::I32_CONST), wa::sleb(k.c
 u32* staleThunk(int sym) {  // rt_stale(sym)
   using namespace wa;
   Code k = thunk({LOCAL_GET, SP, GLOBAL_SET, 0, I64_CONST}, "<stale>");  // C++ frames go below the caller's
-  wa::sleb(k.c, sym), i32(k, 0), i32(k, (int32_t)slotOf(vm.helpers[H_STALE]));
+  wa::sleb(k.c, sym), i32(k, 0), i32(k, (int32_t)slotOf(vm->helpers[H_STALE]));
   k.c.insert(k.c.end(), {CALL_INDIRECT, 1 + H_STALE, 0, UNREACHABLE, ENDOP});
   return jitInstall(k);
 }
@@ -226,7 +226,7 @@ static V rt_ffi(V* w, Ext* e) {
 u32* ffiCode(Ext* e) {  // rt_ffi(window, e)
   using namespace wa;
   Code k = thunk({LOCAL_GET, SP, GLOBAL_SET, 0, LOCAL_GET, W}, "<extern>");
-  i32(k, (int32_t)slotOf(e)), i32(k, (int32_t)slotOf(vm.helpers[H_FFI]));
+  i32(k, (int32_t)slotOf(e)), i32(k, (int32_t)slotOf(vm->helpers[H_FFI]));
   k.c.insert(k.c.end(), {CALL_INDIRECT, 1 + H_FFI, 0, ENDOP});
   return jitInstall(k);
 }
@@ -273,11 +273,11 @@ void fiberStack(Fiber* b) {
   if (!b->stack) ERR("out of memory for fiber stacks");
   b->limit = b->stack + (16 << 10), b->top = (uintptr_t*)(b->stack + FIBER_STACK), b->sp = b->top;
 }
-static void use(Fiber* f) { fiberCur = f, stackTop = f ? f->top : fiberMainTop, vm.limit = f ? f->limit : mainLimit; }
+static void use(Fiber* f) { fiberCur = f, stackTop = f ? f->top : fiberMainTop, vm->limit = f ? f->limit : mainLimit; }
 static void enter(Fiber* f) { use(f), setsp(f ? f->sp : fiberMainSp); }  // f (null: main) runs again, on its shadow stack
 static void leave() {  // save the running context's shadow stack
   if (Fiber* f = fiberCur) f->sp = getsp();
-  else fiberMainSp = getsp(), fiberMainTop = stackTop, mainLimit = (char*)vm.limit;
+  else fiberMainSp = getsp(), fiberMainTop = stackTop, mainLimit = (char*)vm->limit;
 }
 __attribute__((noinline)) static void fiberBody(Fiber* f) {
   use(f), f->val = fiberCall(f);
@@ -332,13 +332,11 @@ bool runProcess(const std::vector<std::string>& args, const std::string& file, c
   r.timedOut = to, r.out = res.substr(nl + 1, outLen), r.err = res.substr(nl + 1 + outLen);
   return true;
 }
-void gcCollect();
-extern bool gcWanted;
 static void safepoint() {  // rt_poll: a collection the allocator asked for, then the host's events
-  u32 p = vm.poll;
-  vm.poll = 0;
-  if (gcWanted) gcCollect();
-  if (p & 1) vm.txn ? void(txnPollLater = true) : host_poll();  // reloads and typed lines wait for transactions to end
+  u32 p = vm->poll;
+  vm->poll = 0;
+  if (gcWanted()) gcCollect();
+  if (p & 1) vm->txn ? void(txnPollLater = true) : host_poll();  // reloads and typed lines wait for transactions to end
 }
 static V undefFn() { ERR("call to undefined function"); }
 static void rt_hot(void* t, V* args, int n) {  // a tier-1 body reached its call count
@@ -347,8 +345,8 @@ static void rt_hot(void* t, V* args, int n) {  // a tier-1 body reached its call
   tierUp(t, m);
 }
 void platformInit() {
-  stackTop = (uintptr_t*)&__stack_high, vm.limit = &__stack_low + (64 << 10);
-  vm.helpers[H_FFI] = (void*)rt_ffi, vm.helpers[H_HOT] = (void*)rt_hot;
+  stackTop = (uintptr_t*)&__stack_high, vm->limit = &__stack_low + (64 << 10);
+  vm->helpers[H_FFI] = (void*)rt_ffi, vm->helpers[H_HOT] = (void*)rt_hot;
   undefSlot = wa::slotOf(callable<undefFn>());
   jitCollect();
   for (u32 s : freeSlots) ops.push_back((int32_t)s), ops.push_back((int32_t)undefSlot);  // grown before undefFn existed
@@ -413,7 +411,7 @@ EXPORT(fut_tests_end) int futTestsEnd() { return testsEnd(); }
 EXPORT(fut_api) int futApi(int mode, const char* program) {
   return mode == 2 ? writeInterfaces(last, program) : reportInterfaces(checkInterfaces(last), mode == 1, program);
 }
-EXPORT(fut_poll) u32* futPoll() { return &vm.poll; }
+EXPORT(fut_poll) u32* futPoll() { return &vm->poll; }
 // fut map: the declarations of the last compile; the number shown
 EXPORT(fut_map) int futMap(int pub, int json, const char* only, const char* program) { return printMap(last, pub, json, only, program); }
 // A fut function JavaScript holds (pinned as id), called with args (a JSON array): its result as JSON text. An
@@ -442,7 +440,7 @@ EXPORT(fut_apply) const char* futApply(int id, const char* args) {
 EXPORT(fut_unpin) void futUnpin(int id) { jsUnpin(id); }
 // Transactions, for the host: a hot reload's top level and reload() hook run inside one (see hostPoll in fut.js),
 // and an error that reaches the host rolls back those opened since the call began.
-EXPORT(fut_txn_depth) u32 futTxnDepth() { return vm.txn; }
+EXPORT(fut_txn_depth) u32 futTxnDepth() { return vm->txn; }
 // Code the host runs (top level, main, a REPL line, a reload) is unchecked and starts with no handlers, whatever the
 // code it interrupts may do; leaving puts that code's effect state back (see effEnter).
 EXPORT(fut_eff_enter) u32 futEffEnter() { return effEnter(); }

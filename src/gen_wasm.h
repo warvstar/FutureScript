@@ -69,7 +69,7 @@ struct Gen : CState {
       else get(R0 + i), w ? op(I32_WRAP) : void();
       pa[i] = {};
     }
-    i32c(slotOf(vm.helpers[h])), callTable(1 + h);
+    i32c(slotOf(vm->helpers[h])), callTable(1 + h);
     if (char r = strchr(s, ':')[1]) r == 'i' ? (op(I64_EXTEND_U), set(R0)) : set(R0);
   }
   void imm(u32 r, V v) { i64c((int64_t)v), set(R0 + r); }
@@ -77,7 +77,7 @@ struct Gen : CState {
   void addImm(u32 r, u32 k) { get(R0 + r), i64c(k), op(I64_ADD), set(R0 + r); }
   void gmem(u32 r, int g, bool store = false) {
     i32c(0);
-    store ? (get(R0 + r), mem(I64_STORE, 3, slotOf(&vm.globals[g]))) : (mem(I64_LOAD, 3, slotOf(&vm.globals[g])), set(R0 + r));
+    store ? (get(R0 + r), mem(I64_STORE, 3, slotOf(&vm->globals[g]))) : (mem(I64_LOAD, 3, slotOf(&vm->globals[g])), set(R0 + r));
   }
   int npar() { return F->npar; }
   void base(int s) { get(s < npar() ? W : FP); }                 // the pointer slot s is addressed from
@@ -122,7 +122,7 @@ struct Gen : CState {
     set(wl(h));
   }
   void poll() {  // safepoint: hot reload, REPL lines, garbage collection
-    i32c(0), mem(I32_LOAD, 2, slotOf(&vm.poll)), open(IF, VOID, UNLIKELY), syncSp(), i32c(slotOf(vm.helpers[H_POLL])), callTable(1 + H_POLL), close();
+    i32c(0), mem(I32_LOAD, 2, slotOf(&vm->poll)), open(IF, VOID, UNLIKELY), syncSp(), i32c(slotOf(vm->helpers[H_POLL])), callTable(1 + H_POLL), close();
   }
   void ret() { if (F->init) ldl(0, F->selfHome); br(BR, 0), F->live = false; }  // to the epilogue
 
@@ -137,8 +137,8 @@ struct Gen : CState {
     u32 size = ((F->maxd - F->npar) * 8 + 15) & ~15u;
     if (!size && F->calls) size = 16;      // keeps the stack check for recursion
     if (F->effHome >= 0) {  // the caller's effects
-      i32c(0), get(F->effHome), mem(I64_STORE, 3, slotOf(&vm.allowed));
-      i32c(0), get(F->effHome + 1), op(I32_WRAP), mem(I32_STORE, 2, slotOf(&vm.who));
+      i32c(0), get(F->effHome), mem(I64_STORE, 3, slotOf(&vm->allowed));
+      i32c(0), get(F->effHome + 1), op(I32_WRAP), mem(I32_STORE, 2, slotOf(&vm->who));
     }
     get(R0), op(ENDOP);
     Code& k = F->k;
@@ -168,8 +168,8 @@ struct Gen : CState {
     set(FP);
     if (size) {
       // FP < limit, or a safepoint wanted (poll, the high half, nonzero): one load and compare (see rt_stack)
-      get(FP), op(I64_EXTEND_U), i32c(0), mem(I64_LOAD, 3, slotOf(&vm.limit)), op(I64_LT_U);
-      open(IF, VOID, UNLIKELY), syncSp(), i32c(slotOf(vm.helpers[H_STACK])), callTable(1 + H_STACK), close();
+      get(FP), op(I64_EXTEND_U), i32c(0), mem(I64_LOAD, 3, slotOf(&vm->limit)), op(I64_LT_U);
+      open(IF, VOID, UNLIKELY), syncSp(), i32c(slotOf(vm->helpers[H_STACK])), callTable(1 + H_STACK), close();
     }
     // The stack check is also the safepoint (a function that calls has a frame). A leaf needs none of its own:
     // its caller has one, and so do its loops.
@@ -244,24 +244,24 @@ struct Gen : CState {
   void jump(Loop& lp, bool brk) { br(BR, brk ? lp.depth : lp.depth + 2); }
   void leaveTries(size_t) {}  // wasm try blocks are structured: leaving one needs nothing
   // block $done { block $catch (result i64) { try_table (catch $fut -> $catch) { body } br $done } e = it; reset sp; ... }
-  // A frame slot keeps vm.txn at entry: the handler rolls back the transactions opened since (rt_txunwind). Four
-  // more keep the effect state (vm.allowed, vm.hstack, vm.who, vm.inv), which the handler puts back.
+  // A frame slot keeps vm->txn at entry: the handler rolls back the transactions opened since (rt_txunwind). Four
+  // more keep the effect state (vm->allowed, vm->hstack, vm->who, vm->inv), which the handler puts back.
   void effSlot(int s, u32 at, bool w32) { base(s), i32c(0), mem(w32 ? I32_LOAD : I64_LOAD, w32 ? 2 : 3, at), w32 ? op(I64_EXTEND_U) : void(), mem(I64_STORE, 3, off(s)); }
   void effBack(int s, u32 at, bool w32) { i32c(0), base(s), mem(I64_LOAD, 3, off(s)), w32 ? op(I32_WRAP) : void(), mem(w32 ? I32_STORE : I64_STORE, w32 ? 2 : 3, at); }
   TryAt tryBegin() {
     TryAt t{F->depth};
     slot(), base(t.r), txnDepth(), op(I64_EXTEND_U), mem(I64_STORE, 3, off(t.r));
     slot(), slot(), slot(), slot();
-    effSlot(t.r + 1, slotOf(&vm.allowed), false), effSlot(t.r + 2, slotOf(&vm.hstack), false), effSlot(t.r + 3, slotOf(&vm.who), true);
-    effSlot(t.r + 4, slotOf(&vm.inv), false);
+    effSlot(t.r + 1, slotOf(&vm->allowed), false), effSlot(t.r + 2, slotOf(&vm->hstack), false), effSlot(t.r + 3, slotOf(&vm->who), true);
+    effSlot(t.r + 4, slotOf(&vm->inv), false);
     open(BLOCK), open(BLOCK, I64), open(TRY_TABLE), u(1), b(0), u(0), u(0);  // one catch: tag 0, label 0
     return t;
   }
-  void txnDepth() { i32c(0), mem(I32_LOAD, 2, slotOf(&vm.txn)); }
+  void txnDepth() { i32c(0), mem(I32_LOAD, 2, slotOf(&vm->txn)); }
   void tryCatch(TryAt& t) {
     close(), br(BR, F->blocks - 1), close(), set(R0);
-    effBack(t.r + 1, slotOf(&vm.allowed), false), effBack(t.r + 2, slotOf(&vm.hstack), false), effBack(t.r + 3, slotOf(&vm.who), true);
-    effBack(t.r + 4, slotOf(&vm.inv), false);
+    effBack(t.r + 1, slotOf(&vm->allowed), false), effBack(t.r + 2, slotOf(&vm->hstack), false), effBack(t.r + 3, slotOf(&vm->who), true);
+    effBack(t.r + 4, slotOf(&vm->inv), false);
     txnDepth(), base(t.r), mem(I64_LOAD, 3, off(t.r)), op(I32_WRAP), op(I32_GT_U), open(IF, VOID, UNLIKELY);
     ld(1, t.r), helper(H_TXUNWIND), close();
   }
@@ -322,13 +322,13 @@ struct Gen : CState {
     st(0, slot()), callWindow(base, 1, S_push, false), close();
   }
   void field(int64_t sym, bool store) {  // r0 = object (r2 = value to store); result in r0
-    u32 ic = slotOf(&vm.ics[newIC(store)]);
+    u32 ic = slotOf(&vm->ics[newIC(store)]);
     open(BLOCK), open(BLOCK);  // $done, $miss
     isPtr(0, false), br(BR_IF, F->blocks, UNLIKELY);
     addr(0), mem(I64_LOAD, 3, 0), i32c(0), mem(I64_LOAD, 3, ic), op(I64_NE), br(BR_IF, F->blocks, UNLIKELY);
-    if (store) {  // the high half: 1, a `num` field; 2, a store from outside to a class with invariants (vm.invObj)
+    if (store) {  // the high half: 1, a `num` field; 2, a store from outside to a class with invariants (vm->invObj)
       i32c(0), mem(I32_LOAD, 2, ic + 12), i32c(1), op(I32_AND), isNumber(2), op(I32_EQZ), op(I32_AND), br(BR_IF, F->blocks, UNLIKELY);
-      i32c(0), mem(I32_LOAD, 2, ic + 12), i32c(2), op(I32_AND), open(IF, VOID, UNLIKELY), i32c(0), get(R0), mem(I64_STORE, 3, slotOf(&vm.invObj)), close();
+      i32c(0), mem(I32_LOAD, 2, ic + 12), i32c(2), op(I32_AND), open(IF, VOID, UNLIKELY), i32c(0), get(R0), mem(I64_STORE, 3, slotOf(&vm->invObj)), close();
     }
     addr(0), mem(I32_LOAD, 2, INST_SLOTS), i32c(0), mem(I32_LOAD, 2, ic + 8), i32c(3), op(I32_SHL), op(I32_ADD), set(T);  // the slot (low half)
     if (store) get(T), get(R0 + 2), mem(I64_STORE, 3, 0), mv(0, 2);
@@ -336,15 +336,15 @@ struct Gen : CState {
     br(BR, F->blocks - 1), close();
     karg(1, sym), karg(store ? 3 : 2, ic), helper(store ? H_SETF : H_GETF), close();
   }
-  // A method of a class with invariants: link its record (slots rec, rec + 1) into vm.inv; r0 = self, and then
+  // A method of a class with invariants: link its record (slots rec, rec + 1) into vm->inv; r0 = self, and then
   // whether this is an outside call. invLeave unlinks it.
   void invEnter(int rec) { addsp(1, rec), helper(H_INVENTER); }
-  void invLeave(int rec) { i32c(0), base(rec), mem(I64_LOAD, 3, off(rec)), mem(I64_STORE, 3, slotOf(&vm.inv)); }
-  // After a store from outside an object: r1 = vm.invObj (rt_setf: the object, whose invariants must hold now), which
+  void invLeave(int rec) { i32c(0), base(rec), mem(I64_LOAD, 3, off(rec)), mem(I64_STORE, 3, slotOf(&vm->inv)); }
+  // After a store from outside an object: r1 = vm->invObj (rt_setf: the object, whose invariants must hold now), which
   // is cleared; nothing (0): skip to invPendingEnd.
   int invPendingBegin() {
-    i32c(0), mem(I64_LOAD, 3, slotOf(&vm.invObj)), set(R0 + 1), get(R0 + 1), i64c(0), op(I64_NE), open(IF, VOID, UNLIKELY);
-    i32c(0), i64c(0), mem(I64_STORE, 3, slotOf(&vm.invObj));
+    i32c(0), mem(I64_LOAD, 3, slotOf(&vm->invObj)), set(R0 + 1), get(R0 + 1), i64c(0), op(I64_NE), open(IF, VOID, UNLIKELY);
+    i32c(0), i64c(0), mem(I64_STORE, 3, slotOf(&vm->invObj));
     return 0;
   }
   void invPendingEnd(int) { close(); }
@@ -353,16 +353,16 @@ struct Gen : CState {
     karg(1, (int64_t)t), karg(2, site), helper(H_TYPECHK);
     if (numFast) close();
   }
-  // A function that declares effects (see gen_a64.h): the caller's vm.allowed and vm.who go to two i64 locals.
+  // A function that declares effects (see gen_a64.h): the caller's vm->allowed and vm->who go to two i64 locals.
   void effectsIn(uint64_t mask, int site) {
     u32 a = F->effHome = L0 + (u32)F->k.wlocals.size(), w = a + 1;
     F->k.wlocals.push_back(I64), F->k.wlocals.push_back(I64);
-    i32c(0), mem(I64_LOAD, 3, slotOf(&vm.allowed)), set(a);
+    i32c(0), mem(I64_LOAD, 3, slotOf(&vm->allowed)), set(a);
     i64c((int64_t)mask), get(a), i64c(-1), op(I64_XOR), op(I64_AND), i64c(0), op(I64_NE);  // any declared effect not allowed?
     open(IF, VOID, UNLIKELY), karg(0, site), helper(H_EFFECT), close();
-    i32c(0), mem(I32_LOAD, 2, slotOf(&vm.who)), op(I64_EXTEND_U), set(w);
+    i32c(0), mem(I32_LOAD, 2, slotOf(&vm->who)), op(I64_EXTEND_U), set(w);
     i32c(0), get(a), i64c(EFF_LEVEL), op(I64_SHR_U), i64c(1), op(I64_ADD), i64c(EFF_LEVEL), op(I64_SHL), i64c((int64_t)mask), op(I64_OR);
-    mem(I64_STORE, 3, slotOf(&vm.allowed)), i32c(0), i32c(site), mem(I32_STORE, 2, slotOf(&vm.who));
+    mem(I64_STORE, 3, slotOf(&vm->allowed)), i32c(0), i32c(site), mem(I32_STORE, 2, slotOf(&vm->who));
   }
   void capAddr() { base(F->cloHome), mem(I64_LOAD, 3, off(F->cloHome)), op(I32_WRAP); }  // this closure object
   void capLoad(int i) { capAddr(), mem(I64_LOAD, 3, CLO_ENV + 8 * i), set(R0); }
@@ -391,7 +391,7 @@ struct Gen : CState {
   }
   void callWindow(int base, int n, int sym, bool super) {
     if (sym && !super) {
-      u32 ic = slotOf(&vm.ics[newIC()]);
+      u32 ic = slotOf(&vm->ics[newIC()]);
       if (n) ld(0, base);  // the receiver (with no arguments, r0 still holds it: see Compiler::call)
       open(BLOCK), open(BLOCK);  // $done, $miss
       isPtr(0, false), br(BR_IF, F->blocks, UNLIKELY);
@@ -404,11 +404,11 @@ struct Gen : CState {
   // C(args) for a top-level class C: allocated inline on an inline-cache hit, as in gen_a64.h.
   void ld32(u32 addr, u32 off = 0) { get(addr), mem(I32_LOAD, 2, off); }
   void constructCall(int base, int n) {
-    u32 ic = slotOf(&vm.ics[newIC()]);
+    u32 ic = slotOf(&vm->ics[newIC()]);
     open(BLOCK), open(BLOCK);  // $done, $miss
     ld(0, base), get(R0), i32c(0), mem(I64_LOAD, 3, ic), op(I64_NE), br(BR_IF, F->blocks, UNLIKELY);
     addr(0), set(T2);                                                                     // T2 = the class
-    i32c((int32_t)slotOf(&vm)), ld32(T2, CLS_IRUN), op(I32_ADD), set(T3);                  // T3 = its run
+    i32c((int32_t)slotOf(vm)), ld32(T2, CLS_IRUN), op(I32_ADD), set(T3);                  // T3 = its run
     ld32(T3), set(T4), get(T4), ld32(T2, CLS_IRUN + 4), op(I32_ADD), set(T);              // T4 = cur, T = cur + size
     get(T), ld32(T3, 4), op(I32_GT_U), br(BR_IF, F->blocks, UNLIKELY);                    // the run is used up
     get(T3), get(T), mem(I32_STORE, 2, 0);
@@ -440,7 +440,7 @@ struct Gen : CState {
     int c = sizeClass(CLO_ENV + 8 * n);
     bool inl = c < NCLS && sizeClasses[c] < 4096;
     if (inl) {
-      u32 run = slotOf(&vm.runs[c]);
+      u32 run = slotOf(&vm->runs[c]);
       open(BLOCK), open(BLOCK);  // $done, $full
       i32c(0), mem(I32_LOAD, 2, run), op(LOCAL_TEE), u(T4), i32c(sizeClasses[c]), op(I32_ADD), op(LOCAL_TEE), u(T);
       i32c(0), mem(I32_LOAD, 2, run + 4), op(I32_GT_U), br(BR_IF, F->blocks, UNLIKELY);
@@ -458,7 +458,7 @@ struct Gen : CState {
     // No declared parameters, nothing to speculate on: tier 2 would only move the body to a module of its own,
     // where V8 can no longer inline it into its callers; and the counter makes it bigger.
     if ((int)homes.size() == first) return;
-    u32 ic = slotOf(&vm.ics[newIC()]);
+    u32 ic = slotOf(&vm->ics[newIC()]);
     i32c(0), i32c(0), mem(I64_LOAD, 3, ic + 8), i64c(1), op(I64_ADD), op(LOCAL_TEE), u(R0), mem(I64_STORE, 3, ic + 8);
     get(R0), i64c(HOT), op(I64_EQ), open(IF, VOID, UNLIKELY);
     get(W), i32c(8 * first), op(I32_ADD), op(I64_EXTEND_U), set(R0 + 1);

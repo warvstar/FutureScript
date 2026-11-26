@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <unordered_set>
 
-bool txnPollLater;
 namespace {
 struct Saved { Obj* o; std::vector<V> v; std::vector<u32> idx; u32 used = 0; };  // a map's entries: key, value, ...
 struct Level {
@@ -22,7 +21,7 @@ struct Level {
   std::vector<Saved> saved;      // each object as it was before its first write
   std::unordered_set<Obj*> seen;
 };
-std::vector<Level> levels;
+TLS std::vector<Level> levels;  // per isolate
 }  // namespace
 
 static Saved save(Obj* o) {
@@ -61,15 +60,15 @@ static void restore(Saved& s) {
   }
 }
 static void depthChanged() {
-  vm.txn = (u32)levels.size();
-  if (!vm.txn && txnPollLater) txnPollLater = false, __atomic_fetch_or(&vm.poll, 1u, __ATOMIC_RELEASE);  // a reload waited
+  vm->txn = (u32)levels.size();
+  if (!vm->txn && txnPollLater) txnPollLater = false, __atomic_fetch_or(&vm->poll, 1u, __ATOMIC_RELEASE);  // a reload waited
 }
 
 void clearSetICs();
 void txnBegin() {
   if (levels.empty()) clearSetICs();  // stores now go through rt_setf, which saves the instance first
   Level& l = levels.emplace_back();
-  l.owner = fiberCur, l.globals.assign(vm.globals, vm.globals + globalCount());
+  l.owner = fiberCur, l.globals.assign(vm->globals, vm->globals + globalCount());
   depthChanged();
 }
 void txnCommit() {
@@ -86,7 +85,7 @@ void txnAbort() {
   if (levels.empty()) return;
   Level& l = levels.back();
   for (auto& s : l.saved) restore(s);
-  std::copy(l.globals.begin(), l.globals.end(), vm.globals);
+  std::copy(l.globals.begin(), l.globals.end(), vm->globals);
   levels.pop_back(), depthChanged();
 }
 void txnUnwind(u32 depth) { while (levels.size() > depth) txnAbort(); }
@@ -120,12 +119,12 @@ void txnMark(void (*markV)(V)) {
 static V atomicBegin() {
   txnBegin();
   Level& l = levels.back();
-  l.atomic = true, l.allowed = vm.allowed, l.who = vm.who;
-  vm.allowed = ((vm.allowed >> EFF_LEVEL) + 1) << EFF_LEVEL | (vm.allowed & EFF_BITS & ~EFF_IO), vm.who = WHO_ATOMIC;
+  l.atomic = true, l.allowed = vm->allowed, l.who = vm->who;
+  vm->allowed = ((vm->allowed >> EFF_LEVEL) + 1) << EFF_LEVEL | (vm->allowed & EFF_BITS & ~EFF_IO), vm->who = WHO_ATOMIC;
   return NIL;
 }
 static V atomicEnd(V v) {
-  if (!levels.empty() && levels.back().atomic) vm.allowed = levels.back().allowed, vm.who = levels.back().who;
+  if (!levels.empty() && levels.back().atomic) vm->allowed = levels.back().allowed, vm->who = levels.back().who;
   return txnCommit(), v;
 }
 // contract@begin(who) / contract@end(): around a spec's checks that call code. Checking a contract must not change
@@ -134,15 +133,15 @@ static V atomicEnd(V v) {
 static V contractBegin(V who) {
   txnBegin();
   Level& l = levels.back();
-  l.contract = true, l.allowed = vm.allowed, l.who = vm.who, l.allocs = gcAllocations();
-  vm.allowed = ((vm.allowed >> EFF_LEVEL) + 1) << EFF_LEVEL, vm.who = (u32)num(who);
+  l.contract = true, l.allowed = vm->allowed, l.who = vm->who, l.allocs = gcAllocations();
+  vm->allowed = ((vm->allowed >> EFF_LEVEL) + 1) << EFF_LEVEL, vm->who = (u32)num(who);
   return NIL;
 }
 static V contractEnd() {
   if (levels.empty() || !levels.back().contract) return NIL;
   Level& l = levels.back();
   gcUncounted += gcAllocations() - l.allocs;
-  vm.allowed = l.allowed, vm.who = l.who, txnAbort();
+  vm->allowed = l.allowed, vm->who = l.who, txnAbort();
   return NIL;
 }
 static V rt_capset(V v, Clo* c, uint64_t i) { return txnTouch(c), c->env()[i] = v; }  // a captured variable, inside one
@@ -150,5 +149,5 @@ static V rt_txunwind(V v, uint64_t depth) { return txnUnwind((u32)depth), v; }  
 void txnInit() {
   native<atomicBegin>("atomic@begin"), native<atomicEnd>("atomic@end");
   native<contractBegin>("contract@begin"), native<contractEnd>("contract@end");
-  vm.helpers[H_CAPSET] = (void*)rt_capset, vm.helpers[H_TXUNWIND] = (void*)rt_txunwind;
+  vm->helpers[H_CAPSET] = (void*)rt_capset, vm->helpers[H_TXUNWIND] = (void*)rt_txunwind;
 }

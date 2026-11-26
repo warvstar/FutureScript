@@ -58,4 +58,4 @@ static V rt_typechk(V v, uint64_t t, uint64_t site) {  // compiled code: checks 
   if (!typeAccepts(t, v)) typeFail((int)site, v, RA());
   return v;
 }
-void typesInit() { vm.helpers[H_TYPECHK] = (void*)rt_typechk; }
+void typesInit() { vm->helpers[H_TYPECHK] = (void*)rt_typechk; }

@@ -243,8 +243,8 @@ struct Gen : CState {
   }
   void jump(Loop& lp, bool brk) { (brk ? lp.brk : lp.cont).push_back(E(B)); }
   void leaveTries(size_t k) { if (F->tries.size() > k) ld(9, F->tries[k]), E(str(9, 28, VM_HANDLER)); }  // unlink tries k..
-  // try { } catch e { }: the record (prev, sp, fp, x26, handler pc, vm.txn, then the effect state: vm.allowed,
-  // vm.hstack, vm.who, vm.inv) lives in ten frame slots and is linked into vm.handler; a throw (or runtime error) unlinks
+  // try { } catch e { }: the record (prev, sp, fp, x26, handler pc, vm->txn, then the effect state: vm->allowed,
+  // vm->hstack, vm->who, vm->inv) lives in ten frame slots and is linked into vm->handler; a throw (or runtime error) unlinks
   // it, rolls back the transactions opened since, puts the effect state back, and jumps to the handler with x0 = the value.
   TryAt tryBegin() {
     if (!F->noRegs) fail("internal: try in a function not prepared for it");
@@ -334,7 +334,7 @@ struct Gen : CState {
     E(ldr(11, ic, lo + 8)), E(ldr(10, 9, INST_SLOTS));
     if (set) {  // bit 32 of the slot: a `num` field (rt_setf), so the value must be a number
       E(tbz32(11, 4)), E(mvn(12, 2)), E(tstq(12)), miss.push_back(E(bcond(EQ)));
-      E(tbz33(11, 2)), E(str(0, 28, EOFF + 32));  // bit 33: a store from outside to a class with invariants (vm.invObj)
+      E(tbz33(11, 2)), E(str(0, 28, EOFF + 32));  // bit 33: a store from outside to a class with invariants (vm->invObj)
       E(strregw(2, 10, 11)), E(mov(0, 2));
     }
     else E(ldrreg(10, 10, 11)), E(addi(12, 27, 4)), E(cmp(10, 12)), miss.push_back(E(bcond(EQ))), E(mov(0, 10));  // ABSENT: slow
@@ -343,11 +343,11 @@ struct Gen : CState {
     if (lo) E(addi(ic, ic, lo));
     imm(1, sym), helper(set ? H_SETF : H_GETF), patch(done);
   }
-  // A method of a class with invariants: link its record (slots rec, rec + 1) into vm.inv; x0 = self, and then
+  // A method of a class with invariants: link its record (slots rec, rec + 1) into vm->inv; x0 = self, and then
   // whether this is an outside call. invLeave unlinks it.
   void invEnter(int rec) { addsp(1, rec), helper(H_INVENTER); }
   void invLeave(int rec) { ld(9, rec), E(str(9, 28, EOFF + 24)); }
-  // After a store from outside an object: x1 = vm.invObj (rt_setf: the object, whose invariants must hold now), which
+  // After a store from outside an object: x1 = vm->invObj (rt_setf: the object, whose invariants must hold now), which
   // is cleared; nothing (0): jump to invPendingEnd.
   int invPendingBegin() { E(ldr(1, 28, EOFF + 32)); int j = E(cbzx(1)); E(str(31, 28, EOFF + 32)); return j; }
   void invPendingEnd(int j) { patch(j); }
@@ -357,7 +357,7 @@ struct Gen : CState {
     if (skip >= 0) patch(skip);
   }
   // A function that declares effects: its caller must be allowed them (else rt_effect raises), and until it returns
-  // only they are allowed. vm.allowed = (level + 1) << EFF_LEVEL | mask; vm.who = site. The old values go to two slots.
+  // only they are allowed. vm->allowed = (level + 1) << EFF_LEVEL | mask; vm->who = site. The old values go to two slots.
   void effectsIn(uint64_t mask, int site) {
     int s = F->effHome = slot();
     slot();
@@ -407,11 +407,12 @@ struct Gen : CState {
     Jumps miss;
     u32 lo = icAt(4);
     ld(0, base), E(ldr(9, 4, lo)), E(cmp(0, 9)), miss.push_back(E(bcond(NE)));
-    E(andaddr(9, 0)), E(ldr(10, 9, CLS_IRUN));                   // w10: run offset; x10 >> 32: cell size
+    E(andaddr(9, 0)), E(addi(17, 9, CLS_IHDR)), E(ldar(17, 17));  // x17: the header, first (see reshape)
+    E(ldr(10, 9, CLS_IRUN));                                      // w10: run offset; x10 >> 32: cell size
     E(addxw(11, 28, 10)), E(ldp_off(12, 13, 11, 0));             // x12, x13 = run cur, end
     E(addlsr(14, 12, 10, 32)), E(cmp(14, 13)), miss.push_back(E(bcond(HI)));
-    E(str(14, 11, 0)), E(ldr(10, 9, CLS_IHDR)), E(addi(15, 12, 24));
-    E(str(10, 12, 0)), E(stp_off(9, 15, 12, 8)), E(addi(16, 27, 4));  // header; cls, slots; x16 = ABSENT
+    E(str(14, 11, 0)), E(addi(15, 12, 24));
+    E(str(17, 12, 0)), E(stp_off(9, 15, 12, 8)), E(addi(16, 27, 4));  // header; cls, slots; x16 = ABSENT
     int fill = here();                                            // every slot, and any rounding slack after them
     E(strpost(16, 15, 8)), E(cmp(15, 14)), patch(E(bcond(LO)), fill);
     E(orrptr(0, 12)), st(0, base), E(ldr(9, 4, lo + 8));

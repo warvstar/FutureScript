@@ -1,6 +1,6 @@
 # Isolates and channels
 
-Status: design, not started. This is how fut gets parallelism: many isolates run at once, each owning its own heap,
+Status: phase 1 (the runtime split per isolate) is done; phase 2 (the language) is next. This is how fut gets parallelism: many isolates run at once, each owning its own heap,
 and they share data only by sending it over channels. There is no shared mutable memory, so there are no locks,
 no memory orderings and no data races to write. Read this before you add any global state to the runtime.
 
@@ -94,7 +94,9 @@ fut has one mutator. These are its global states, and where each goes:
 **Reaching the current isolate from C++.** On macOS a `thread_local` costs a call through a TLV descriptor on each
 access. Most helpers don't touch the VM at all; the ones that do (allocation slow paths, `touch`, effects) get the
 `Isolate*` once per call. If measuring shows that is too slow, hot helpers can take the VM block as an argument:
-JIT code always has it in x28.
+JIT code always has it in x28. Measured after phase 1: `maps` (string keys, about five thread-local reads per loop
+iteration, in `rt_geti`, `rt_seti` and `gcAlloc`) runs about 1.5% more instructions for them; `nbody`, `fib` and
+`mandelbrot` don't change.
 
 **Conservative scanning.** An isolate scans only its own stacks. A word on its stack that happens to point into
 another isolate's page is ignored: `find` checks the page's owner. Otherwise one isolate would mark another's
@@ -154,7 +156,10 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
    - Work: the `Isolate` struct; per-isolate VM blocks, heaps, fibers, journals and error state; the image; page
      owners; class-layout publication; locks on the shared tables.
    - Test: a mode that runs every spec in N isolates at once in one process, under ThreadSanitizer. Any state still
-     shared shows up as a race.
+     shared shows up as a race. Done: `fut test --isolates N` and `fut --isolates N prog.fut`; `build.py test` runs
+     every spec in 4 isolates, and `build.py tsan [N]` does the same under ThreadSanitizer. TSan sees only the C++
+     runtime: JIT code isn't instrumented, which is why the VM block, inline caches and heaps are per isolate rather
+     than locked.
 2. **`spawn`, `join`, channels, copying, the `spawn`/`chan` effects, sends deferred in `atomic`, deadlock reports.**
    - Work: one thread per isolate.
    - Test: a parallel mandelbrot in `bench/`, against C on 8 threads.

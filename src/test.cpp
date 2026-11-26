@@ -2,8 +2,12 @@
 #include "fut.h"
 #include <cmath>
 
-static std::vector<ExpectSite> sites;
-int expectSite(ExpectSite s) { return sites.push_back(std::move(s)), (int)sites.size() - 1; }
+// Shared by every isolate: tier-up registers sites again while others run, so a deque (its elements never move) and a
+// lock around growth and lookup.
+static std::deque<ExpectSite> sites;
+static Mutex sitesMu;
+int expectSite(ExpectSite s) { Locked l(sitesMu); return sites.push_back(std::move(s)), (int)sites.size() - 1; }
+static const ExpectSite& siteAt(size_t i) { Locked l(sitesMu); return sites.at(i); }
 
 // The first expect that failed in the running test. Kept even if the test catches the error expect throws.
 struct Failure { bool set = false; int site = -1; std::string why, left, right, at, what; };  // at/what: where lists or maps differ
@@ -55,7 +59,7 @@ static bool same(V a, V b, std::string& at, std::string& what) {
   }
   return a == b;
 }
-static Failure failure;
+static TLS Failure failure;
 
 static std::string oneLine(std::string s) {  // an expression's source on one line: a line break and its indent become one space
   std::string o;
@@ -81,7 +85,7 @@ static std::vector<std::string> details(const ExpectSite& s, const Failure& f) {
 
 // expect@(site, left, right): checks left op right (or left's truthiness); a failure is recorded and raised.
 static V expectAt(V site, V l, V r) {
-  const ExpectSite& s = sites.at((size_t)num(site));
+  const ExpectSite& s = siteAt((size_t)num(site));
   Failure f;
   bool ok;
   if (s.throws && l == ABSENT) ok = false, f.why = "nothing was thrown";
@@ -211,13 +215,15 @@ static V growsAt(V site, V clo, V growth, V byAllocs) {
   ERR("expect failed: %s (%s)", oneLine(s.text).c_str(), fl.why.c_str());
 }
 // ---- property tests from specs (the compiler writes the loop: see Compiler::specProperties) ----
-static std::vector<PropSite> props;
+static std::deque<PropSite> props;  // shared by every isolate, like the expect sites
+static Mutex propsMu;
 int propSite(PropSite p) {
   p.expect = expectSite({p.file, p.text, "", "", p.line});
+  Locked l(propsMu);
   return props.push_back(std::move(p)), (int)props.size() - 1;
 }
 namespace {
-uint64_t prng = 1;
+TLS uint64_t prng = 1;  // per isolate: each runs its property tests from the same seed
 uint64_t rnd() { return prng ^= prng >> 12, prng ^= prng << 25, prng ^= prng >> 27, prng * 0x2545F4914F6CDD1Dull; }
 int below(int n) { return n <= 0 ? 0 : (int)(rnd() % (uint64_t)n); }
 double unit() { return double(rnd() >> 11) * 0x1p-53; }
@@ -338,7 +344,7 @@ std::string showCall(const std::string& f, V args) {
   return s + ")";
 }
 }  // namespace
-static PropSite& propAt(V site) { return props.at((size_t)num(site)); }
+static PropSite& propAt(V site) { Locked l(propsMu); return props.at((size_t)num(site)); }
 static V propGen(V site, V n) {
   PropSite& p = propAt(site);
   int i = (int)num(n), size = std::min(1 + i / 2, 50);
@@ -430,7 +436,7 @@ static V propDone(V site, V ok, V n) {  // too few inputs met the requires to ca
 }
 // expect prints { ... }: print() output inside the block is collected (nested captures stack) and becomes the value.
 struct Capture { std::string* prev; std::string buf; };
-static std::vector<Capture*> captures;
+static TLS std::vector<Capture*> captures;
 static void endCaptures() {  // a test that returned or crashed out of a capture
   for (; !captures.empty(); captures.pop_back()) outSink = captures.back()->prev, delete captures.back();
 }
@@ -541,7 +547,7 @@ std::string testReport(const TestCase& t, bool err, const std::string& e, char& 
     char b[32];
     snprintf(b, sizeof b, "%.3f", ms), j += ",\"ms\":" + std::string(b);
     if (failure.set) {
-      const ExpectSite& s = sites[failure.site];
+      const ExpectSite& s = siteAt(failure.site);
       j += ",\"expect\":{\"file\":" + json(s.file) + ",\"line\":" + std::to_string(s.line) + ",\"expr\":" + json(oneLine(s.text));
       if (!failure.why.empty()) j += ",\"reason\":" + json(failure.why);
       if (!failure.left.empty()) j += ",\"left\":{\"expr\":" + json(oneLine(s.left)) + ",\"value\":" + json(failure.left) + "}";
@@ -556,7 +562,7 @@ std::string testReport(const TestCase& t, bool err, const std::string& e, char& 
   }
   std::string s = std::string(failure.set ? "FAIL    " : err ? "ERROR   " : "ok      ") + t.name;
   if (failure.set) {
-    const ExpectSite& x = sites[failure.site];
+    const ExpectSite& x = siteAt(failure.site);
     s += " (" + where(t) + ")\n  " + x.file.substr(x.file.rfind('/') + 1) + ":" + std::to_string(x.line) + ": expect " + oneLine(x.text) + "\n";
     for (auto& d : details(x, failure)) s += "    " + d + "\n";
   } else if (err) s += " (" + where(t) + ")\n" + indent("runtime error: " + e.substr(0, e.find_last_not_of('\n') + 1), "  ");

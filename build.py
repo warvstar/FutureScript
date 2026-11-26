@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and test fut.   python3 build.py [build | debug | wasm | test [--debug | --wasm] [NAME...] | fuzz [N] | clean]"""
+"""Build and test fut.   python3 build.py [build | debug | wasm | test [--debug | --wasm] [NAME...] | tsan [N] [NAME...] | fuzz [N] | clean]"""
 import json, os, random, re, shutil, subprocess, sys, tempfile, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -18,12 +18,14 @@ WASM_LINK = ["-mexec-model=reactor", "-lsetjmp", "-Wl,--export=__stack_pointer",
 NATIVE_ONLY, WASM_ONLY = {"main.cpp", "jit.cpp"}, {"wasm.cpp"}
 
 
-def build(debug=False, wasm=False):
+def build(debug=False, wasm=False, tsan=False):
     """Compile each src/*.cpp to its own object in parallel (only stale ones), then link."""
-    out = ROOT / "build" / "fut.wasm" if wasm else OUT.with_name("fut-debug") if debug else OUT
-    objdir = ROOT / "build" / ("obj-wasm" if wasm else "obj-debug" if debug else "obj")
+    kind = "wasm" if wasm else "debug" if debug else "tsan" if tsan else ""
+    out = ROOT / "build" / "fut.wasm" if wasm else OUT.with_name("fut-" + kind) if kind else OUT
+    objdir = ROOT / "build" / ("obj-" + kind if kind else "obj")
     objdir.mkdir(parents=True, exist_ok=True)
-    opt = ["-O2", *WASM_FLAGS] if wasm else ["-O1", "-g", "-fsanitize=address,undefined"] if debug else ["-O2"]
+    opt = {"wasm": ["-O2", *WASM_FLAGS], "debug": ["-O1", "-g", "-fsanitize=address,undefined"],
+           "tsan": ["-O1", "-g", "-fsanitize=thread"]}.get(kind, ["-O2"])
     cxx = str(LLVM) if wasm else "clang++"
     skip = NATIVE_ONLY if wasm else WASM_ONLY
     stamp, flags = objdir / "flags", " ".join([cxx, *FLAGS, *opt])  # a change of flags rebuilds; an edit to this script does not
@@ -77,7 +79,9 @@ def test(exe, only=()):
     jobs = ([("hot reload: " + n, lambda n=n, f=f: check("hot reload: " + n, f)) for n, f in HOT_TESTS]  # the slowest (they sleep) start first
             + [(t.name, lambda t=t: program(t)) for t in sorted((ROOT / "tests").glob("*.fut"))]
             + [("specs/" + t.name, lambda t=t: spec(t)) for t in sorted((ROOT / "tests" / "specs").glob("*.fut"))]
-            + [(n, lambda n=n, f=f: check(n, f)) for n, f in RUNNER_TESTS])
+            + [(n, lambda n=n, f=f: check(n, f)) for n, f in RUNNER_TESTS]
+            + (isolateJobs(exe, 4) if exe == OUT else []))  # the plain native build: wasm runs one isolate (docs/isolates.md,
+    # phase 5), and the sanitizer builds are slow enough that more load makes timed tests (expect grows) flaky
     jobs = [job for name, job in jobs if not only or any(w in name for w in only)]
     start = time.time()
     with ThreadPoolExecutor(os.cpu_count() or 8) as ex:
@@ -527,6 +531,34 @@ def fuzz(exe, n=300, seed=None):
     return len(bad)
 
 
+def isolated(exe, t, n):
+    """A spec run in n isolates at once in one process: it must pass in every one, and under `tsan` the sanitizer must
+    report nothing."""
+    r = subprocess.run([str(exe), "test", "--isolates", str(n), str(t)], capture_output=True, text=True, timeout=600,
+                       env={**os.environ, "TSAN_OPTIONS": "halt_on_error=1 second_deadlock_stack=1"})
+    ok = r.returncode == 0 and "WARNING: ThreadSanitizer" not in r.stderr
+    return f"isolates: specs/{t.name}", ok, (r.stdout[-2000:] + r.stderr[-6000:]).strip().replace("\n", "\n  ")
+
+
+def isolateJobs(exe, n):
+    return [(f"isolates: specs/{t.name}", lambda t=t: isolated(exe, t, n)) for t in sorted((ROOT / "tests" / "specs").glob("*.fut"))]
+
+
+def isolates(exe, n, only=()):
+    """`tsan`: every spec in n isolates at once, under ThreadSanitizer, one job per core."""
+    jobs = [job for name, job in isolateJobs(exe, n) if not only or any(w in name for w in only)]
+    with ThreadPoolExecutor(os.cpu_count() or 8) as ex:
+        results = list(ex.map(lambda job: job(), jobs))
+    failed = 0
+    for name, ok, detail in results:
+        print(f"{'ok  ' if ok else 'FAIL'} {name}")
+        if not ok:
+            failed += 1
+            print("  " + detail)
+    print(f"isolates: {failed} failed (each spec in {n} isolates)")
+    return failed
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "build"
     if cmd == "clean":
@@ -535,6 +567,9 @@ if __name__ == "__main__":
         sys.exit(1 if test(build("--debug" in sys.argv, "--wasm" in sys.argv), [a for a in sys.argv[2:] if not a.startswith("--")]) else 0)
     elif cmd == "wasm":
         build(wasm=True)
+    elif cmd == "tsan":
+        n = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 4
+        sys.exit(1 if isolates(build(tsan=True), n, [a for a in sys.argv[2:] if not a.isdigit()]) else 0)
     elif cmd == "fuzz":
         sys.exit(1 if fuzz(build(True), int(sys.argv[2]) if len(sys.argv) > 2 else 300) else 0)
     else:

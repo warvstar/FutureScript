@@ -1,5 +1,6 @@
 // fut: a tiny class-based language that JIT-compiles straight to arm64 and hot-reloads by patching machine code.
 #pragma once
+#include <atomic>
 #include <bit>
 #include <csetjmp>
 #include <cstdint>
@@ -22,6 +23,33 @@ constexpr bool WASM = true;  // the WebAssembly build (wasm.cpp, gen_wasm.h)
 #else
 constexpr bool WASM = false;
 #endif
+// Isolates run on threads of their own; the little state they share (pages, code, symbols, class layouts) is
+// guarded by these. Wasm runs one isolate: nothing to guard.
+// TLS: per isolate (thread). Wasm has one, and no thread exit hooks for TLS destructors: plain globals there.
+#if __wasm__
+#define TLS
+struct Mutex { void lock() {} void unlock() {} };
+using RMutex = Mutex;
+#else
+#define TLS thread_local
+#include <pthread.h>
+struct Mutex {
+  pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+  void lock() { pthread_mutex_lock(&m); }
+  void unlock() { pthread_mutex_unlock(&m); }
+};
+struct RMutex : Mutex { RMutex() { m = PTHREAD_RECURSIVE_MUTEX_INITIALIZER; } };  // the holder may lock it again
+#endif
+struct Locked {
+  Mutex& m;
+  explicit Locked(Mutex& m) : m(m) { m.lock(); }
+  ~Locked() { m.unlock(); }
+};
+inline std::atomic<int> isolates{1};  // running: with more than one, code no frame of this isolate uses may be another's
+struct Run;
+// Compiling and the code region it writes (JIT memory, line tables, stubs, the compiler's tables): one isolate at a
+// time. Reading code that is running needs no lock: installing new code is one aligned 4-byte store (a stub).
+inline RMutex codeMu;
 
 // ---- NaN-boxed values: doubles are themselves; everything else lives in the quiet-NaN space ----
 constexpr V QNAN = 0x7ffc000000000000, SIGN = 1ull << 63, PTR = QNAN | SIGN, ADDR = 0xffffffffffff;
@@ -48,6 +76,33 @@ struct Str : Obj {
 struct List : Obj { static constexpr K KIND = K::List; std::vector<V> v; };
 struct Fn : Obj { static constexpr K KIND = K::Fn; void* code; int arity, name, op = 0; };  // op: an effect operation (effects.cpp)
 inline u32 classCount;
+// A class's field layout: field syms, the index being the slot. Every isolate shares it. It only grows, under
+// layoutMu, so a field's slot never changes (each isolate's caches stay right) and readers need no lock.
+inline Mutex layoutMu;
+struct Layout {
+  std::atomic<int*> data{nullptr};
+  std::atomic<u32> n{0};
+  u32 cap = 0;
+  u32 size() const { return n.load(std::memory_order_acquire); }
+  int find(int s) const {
+    u32 k = size();
+    const int* d = data.load(std::memory_order_acquire);
+    for (u32 i = 0; i < k; i++) if (d[i] == s) return (int)i;
+    return -1;
+  }
+  u32 add(int s) {  // its slot, appending it if new (hold layoutMu). Old arrays are kept: a reader may hold one.
+    if (int i = find(s); i >= 0) return (u32)i;
+    u32 k = size();
+    if (k == cap) {
+      int* d = new int[cap = cap ? 2 * cap : 8];
+      if (k) memcpy(d, data.load(std::memory_order_relaxed), k * sizeof(int));
+      data.store(d, std::memory_order_release);
+    }
+    data.load(std::memory_order_relaxed)[k] = s;
+    n.store(k + 1, std::memory_order_release);
+    return k;
+  }
+};
 struct Class : Obj {
   static constexpr K KIND = K::Class;
   // Read by JIT constructors (see reshape): a new instance's header word, the VM offset of the run its
@@ -59,7 +114,7 @@ struct Class : Obj {
   Fn* init = nullptr;  // find(S_init), cached until the next reload
   Class* super;
   std::vector<std::pair<int, Fn*>> methods;  // few per class, and looked up only on inline-cache misses
-  std::vector<int> layout;                    // field syms; the index is the slot, shared by all instances
+  Layout layout;                              // field syms; the index is the slot, shared by all instances
   std::vector<std::pair<int, V>> fields;      // fields declared in the class body (`var hp = 10`) and their defaults
   struct FieldType { int sym; uint64_t type; int site; };
   std::vector<FieldType> ftypes;              // declared fields with a type (`var hp: num = 10`): checked on every store
@@ -105,13 +160,14 @@ struct Fiber : Obj {
   uint64_t allowed;  // its effect state while switched out (effects.cpp): what it may perform, who narrowed it,
   V hstack;          // and its innermost handler
   u32 who;
-  uint64_t inv;      // and its innermost running method of a class with invariants (vm.inv)
+  uint64_t inv;      // and its innermost running method of a class with invariants (vm->inv)
   int state, fail, idx;  // fail: an error ended it (its resumer re-raises it); idx: in the live-fiber list
 };
 enum { FIB_NEW, FIB_SUSPENDED, FIB_RUNNING, FIB_DONE };
-extern Fiber* fiberCur;                       // the running fiber (null: the main stack)
-extern void* fiberMainSp;                     // the main stack while a fiber runs (for the GC)
-extern uintptr_t* fiberMainTop;
+// Per isolate (each runs on a thread of its own): TLS, like the rest of an isolate's runtime state.
+inline TLS Fiber* fiberCur;          // the running fiber (null: the main stack)
+inline TLS void* fiberMainSp;        // the main stack while a fiber runs (for the GC)
+inline TLS uintptr_t* fiberMainTop;
 void fiberFree(Fiber*);      // release its stack (the platform half: jit.cpp / wasm.cpp, as are the next four)
 void fiberStack(Fiber*);     // give a new fiber its stack
 void fiberRun(Fiber*, bool start);  // switch to it; returns when it yields or ends
@@ -139,7 +195,17 @@ constexpr int NCLS = sizeof sizeClasses / sizeof *sizeClasses;
 constexpr int sizeClass(size_t bytes) { int c = 0; while (c < NCLS && sizeClasses[c] < bytes) c++; return c; }  // NCLS: large
 void* gcAlloc(size_t bytes);
 uint64_t gcAllocations();  // objects the program allocated so far (not counting gcUncounted)
-extern uint64_t gcUncounted;  // objects allocated for contracts' bookkeeping, which `expect allocs` doesn't count
+extern TLS uint64_t gcUncounted;  // objects allocated for contracts' bookkeeping, which `expect allocs` doesn't count
+// Heaps: one per isolate, plus the image (never collected), where what compiled code points at is allocated:
+// constants, functions, classes. Allocation goes to the image while an ImageScope is alive (compiling, startup).
+struct Heap;
+Heap* heapNew(Run* runs);  // runs: the isolate's VM block's, which JIT code bumps too
+void heapUse(Heap*);       // the current thread's isolate allocates here
+void heapFree(Heap*);
+struct ImageScope { ImageScope(); ~ImageScope(); ImageScope(const ImageScope&) = delete; };
+bool gcWanted();           // wasm: a collection waits for the next safepoint
+void gcCollect();
+void isolateMark(void (*mark)(V));  // the isolate's own roots kept by the runtime (rt.cpp)
 void gcOwn(Obj*);  // o holds malloc'd memory: finalize it when the GC finds it dead
 template <class T> T* make(size_t extra = 0) {
   T* o = new (gcAlloc(sizeof(T) + extra)) T();
@@ -149,7 +215,7 @@ template <class T> T* make(size_t extra = 0) {
 }
 Str* newStr(std::string_view, std::string_view = {});
 void gcInit();
-extern uintptr_t* stackTop;
+inline TLS uintptr_t* stackTop;
 
 // ---- symbols: keywords are interned first so `sym < NKW` means keyword ----
 #define KEYWORDS(X) X(var) X(fn) X(class) X(if) X(else) X(while) X(for) X(in) X(return) X(break) X(continue) \
@@ -184,10 +250,16 @@ struct VM { void* limit; u32 poll; void* handler; u32 txn; Run runs[NCLS + 1]; v
 #else
 struct VM { u32 poll, txn; void* limit; void* handler; Run runs[NCLS + 1]; void* helpers[NH]; uint64_t allowed; V hstack; u32 who, pad; uint64_t inv; V invObj; V globals[MAXG]; IC ics[MAXIC]; };
 #endif
-extern VM vm;
+// The running isolate's VM block (JIT code has it in x28). Each isolate has its own: its globals, inline caches,
+// allocation runs and handler chain. vmNew makes one for a new isolate (helpers set, caches empty, globals nil).
+inline TLS VM* vm;
+VM* vmNew();
+void threadInit();  // a new isolate's thread: its stack bounds (stackTop, vm->limit)
+void vmFree(VM*);
+void eachVM(void (*f)(VM*, void*), void* ctx);  // every isolate's (under the runtime lock)
 constexpr int ROFF(int c) { return 24 + 16 * c; }  // first, so ldp reaches every run from x28
 constexpr int HOFF(int h) { return ROFF(NCLS + 1) + 8 * h; }
-constexpr int EOFF = HOFF(NH);  // vm.allowed; vm.hstack at +8, vm.who at +16, vm.inv at +24, vm.invObj at +32
+constexpr int EOFF = HOFF(NH);  // vm->allowed; vm->hstack at +8, vm->who at +16, vm->inv at +24, vm->invObj at +32
 constexpr int GOFF(int g) { return EOFF + 40 + 8 * g; }
 constexpr u32 VM_HANDLER = 16;
 constexpr u32 IOFF(int i) { return (GOFF(MAXG) + 15) / 16 * 16 + 16 * i; }
@@ -282,9 +354,9 @@ void gfxInit(), gfxPump();  // window, drawing, input (gfx.cpp)
 std::string toStr(V, bool quote = false);
 const char* typeName(V);
 extern void (*pollHook)();
-extern jmp_buf* errJmp;
-extern std::string* outSink;  // when set, print() appends here instead of writing to stdout (a test's output)
-extern std::string* errSink;  // when set, an uncaught error's message and trace go here instead of to stderr
+inline TLS jmp_buf* errJmp;
+inline TLS std::string* outSink;  // when set, print() appends here instead of writing to stdout (a test's output)
+inline TLS std::string* errSink;  // when set, an uncaught error's message and trace go here instead of to stderr
 
 // ---- tests (test.cpp): `expect` sites, and the runner behind `fut test` ----
 struct ExpectSite { std::string file, text, left, right; int line = 0, op = -1; bool throws = false; std::string contract; };  // op < 0: truthiness
@@ -298,7 +370,7 @@ struct PropSite { std::string file, text, discard; int line = 0, expect = -1; bo
 int propSite(PropSite);
 void testInit();
 V binopValue(V a, V b, int op);  // a op b, as the language computes it (raises on bad operands)
-struct TestRun { bool json = false; std::string filter; double timeout = 10; };
+struct TestRun { bool json = false; std::string filter; double timeout = 10; int isolates = 0; };
 extern std::string mainFile;  // the program's file: run() finds relative files next to it
 void mapPut(Map*, std::string_view key, V v);
 struct ProcResult { int code = 0; std::string out, err; bool timedOut = false; };
@@ -320,11 +392,11 @@ void txnCommit();
 void txnAbort();                // roll back the innermost
 void txnUnwind(u32 depth);      // roll back until depth are open
 void txnTouch(Obj*);            // o is about to change: save it, unless the innermost transaction has already
-inline void touch(Obj* o) { if (vm.txn) txnTouch(o); }
+inline void touch(Obj* o) { if (vm->txn) txnTouch(o); }
 bool txnOpenIn(Fiber*);         // does f have a transaction open? (it may not yield)
 bool txnAtomic();               // is an atomic block open? (io can't be undone there)
 void txnMark(void (*mark)(V));  // GC roots: what rollbacks would put back
-extern bool txnPollLater;       // a reload or typed line waits for the transactions to end
+inline TLS bool txnPollLater;      // a reload or typed line waits for the transactions to end
 int globalCount();              // global slots in use
 
 // ---- contracts: a class's invariants compile to a hidden method inv@(who); calling it on anything without one
@@ -342,11 +414,11 @@ int typeSite(const std::string& what, const std::string& type);  // what a check
 void typesInit();
 
 // ---- effects (effects.cpp): declared effect sets (`fn f() ! io, clock`), checked at run time, and handlers ----
-// vm.allowed holds the effects code may perform now in its low 44 bits (all set: unchecked) and, above them, a
-// level that each narrowing (a declared function, an atomic block) raises by one. vm.who names the narrowing.
+// vm->allowed holds the effects code may perform now in its low 44 bits (all set: unchecked) and, above them, a
+// level that each narrowing (a declared function, an atomic block) raises by one. vm->who names the narrowing.
 constexpr int EFF_LEVEL = 44;
 constexpr uint64_t EFF_IO = 1, EFF_CLOCK = 2, EFF_RANDOM = 4, EFF_YIELD = 8, EFF_BITS = (1ull << EFF_LEVEL) - 1;
-constexpr u32 WHO_ATOMIC = ~0u;  // vm.who inside an atomic block (it takes io away)
+constexpr u32 WHO_ATOMIC = ~0u;  // vm->who inside an atomic block (it takes io away)
 enum { OP_YIELD = 1, OP_EXTERN = 2 };  // operations with fixed ids; builtins and user effects' get theirs at startup / compile time
 int effSite(const std::string& fn, uint64_t mask, const std::string& text);  // a declaring function: what errors name
 uint64_t effBit(int sym);                     // a user effect's bit (0: too many effects)
@@ -473,6 +545,7 @@ constexpr u32 fcmpz(u32 n) { return 0x1e602008 | n << 5; }                      
 constexpr u32 fcvtzu(u32 d, u32 n) { return 0x9e790000 | n << 5 | d; }                // x = (uint64) d, truncating
 constexpr u32 ucvtf(u32 d, u32 n) { return 0x9e630000 | n << 5 | d; }                 // d = (double) x, unsigned
 constexpr u32 sub(u32 d, u32 n, u32 m) { return 0xcb000000 | m << 16 | n << 5 | d; }
+constexpr u32 ldar(u32 t, u32 n) { return 0xc8dffc00 | n << 5 | t; }  // load-acquire
 constexpr u32 fneg(u32 d, u32 n) { return 0x1e614000 | n << 5 | d; }
 constexpr u32 fmovdd(u32 d, u32 n) { return 0x1e604000 | n << 5 | d; }
 constexpr u32 fmovi(u32 d, u32 imm8) { return 0x1e601000 | imm8 << 13 | d; }  // fmov d, #imm (see fimm8)

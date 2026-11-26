@@ -6,13 +6,13 @@
 #include <cstdarg>
 #include <unordered_map>
 #include <time.h>
+#if !__wasm__
+#include <sys/mman.h>
+#endif
 
-VM vm;
 std::deque<Global> globals;
 static std::vector<Fn*> builtins[8];  // by object kind, then method sym
 std::vector<V> consts;
-jmp_buf* errJmp;
-std::string *outSink, *errSink;
 std::string mainFile;
 void (*pollHook)();
 std::string* asmListing;
@@ -20,7 +20,12 @@ bool verbose;
 static_assert(offsetof(Obj, cid) == 4 && sizeof(Str) == 16 && sizeof(Obj) == 8 && offsetof(Class, isize) == CLS_IRUN + 4);
 
 // ---------------- symbols ----------------
-static std::deque<std::string> names;  // deque: stable storage for the views in `tab`
+// Names live in blocks that never move (stable storage for the views in `tab`), so symName reads without a lock
+// while another isolate's compile interns more. Interning locks.
+constexpr int NB = 1024;
+static std::atomic<std::string*> nameBlocks[1 << 12];
+static std::atomic<int> nnames;
+static Mutex symMu;
 struct SymSlot { std::string_view s; uint32_t h; int id = -1; };
 static std::vector<SymSlot> tab(1 << 10);  // open addressing, FNV-1a, power-of-two size
 static SymSlot& symSlot(std::string_view s, uint32_t h) {  // s's slot, or the empty one to put it in
@@ -31,13 +36,21 @@ static SymSlot& symSlot(std::string_view s, uint32_t h) {  // s's slot, or the e
 int intern(std::string_view s) {
   uint32_t h = 2166136261u;
   for (char c : s) h = (h ^ (uint8_t)c) * 16777619u;
-  if (SymSlot& e = symSlot(s, h); e.id >= 0) return e.id;
-  else e = {names.emplace_back(s), h, (int)names.size() - 1};
-  if (names.size() * 2 > tab.size())
+  Locked g(symMu);
+  SymSlot& e = symSlot(s, h);
+  if (e.id >= 0) return e.id;
+  int id = nnames.load(std::memory_order_relaxed);
+  if (id >= NB * (1 << 12)) fputs("fut: too many names\n", stderr), exit(1);
+  std::string* b = nameBlocks[id / NB].load(std::memory_order_relaxed);
+  if (!b) nameBlocks[id / NB].store(b = new std::string[NB], std::memory_order_release);
+  b[id % NB] = s;
+  e = {b[id % NB], h, id};
+  nnames.store(id + 1, std::memory_order_release);
+  if ((size_t)(id + 1) * 2 > tab.size())
     for (auto& e : std::exchange(tab, std::vector<SymSlot>(tab.size() * 2))) if (e.id >= 0) symSlot(e.s, e.h) = e;
-  return (int)names.size() - 1;
+  return id;
 }
-const std::string& symName(int s) { return names[s]; }
+const std::string& symName(int s) { return nameBlocks[s / NB].load(std::memory_order_acquire)[s % NB]; }
 
 static int nextGlobal;
 int globalCount() { return nextGlobal; }
@@ -47,20 +60,54 @@ Global& global(int sym) {
 }
 Global* findGlobal(int sym) { return (size_t)sym < globals.size() && globals[sym].slot >= 0 ? &globals[sym] : nullptr; }
 static Fn* builtin(K k, uint64_t s) { return s < builtins[(int)k].size() ? builtins[(int)k][s] : nullptr; }
+// Inline caches live in each isolate's VM block, at the same index in all of them. A new one is made empty in
+// every block (no isolate runs the code using it yet); filling and clearing touch only the running isolate's.
 static int nics;
 static constexpr uint64_t EMPTY = ~0ull;  // matches no header
 static std::vector<int> setICs;
+static Mutex icMu;  // nics, setICs, vms
+static std::vector<VM*> vms;
 int newIC(bool set) {
+  Locked g(icMu);
   if (nics == MAXIC) compileFail("too many inline caches", false);
   if (set) setICs.push_back(nics);
-  return vm.ics[nics].key = EMPTY, nics++;
+  for (VM* v : vms) v->ics[nics].key = EMPTY;
+  return nics++;
 }
-void clearSetICs() { for (int i : setICs) vm.ics[i].key = EMPTY; }
+void clearSetICs() { Locked g(icMu); for (int i : setICs) vm->ics[i].key = EMPTY; }
 u32 icEpoch = 1;
-void clearICs() {
+void clearICs() {  // a reload: every isolate is stopped
+  Locked g(icMu);
   icEpoch++;
-  for (int i = 0; i < nics; i++) vm.ics[i].key = EMPTY;
+  for (VM* v : vms) for (int i = 0; i < nics; i++) v->ics[i].key = EMPTY;
 }
+VM* vmNew() {
+#if __wasm__
+  VM* v = (VM*)calloc(1, sizeof(VM));
+#else  // most of it (globals, caches) is only touched as it is used
+  VM* v = (VM*)mmap(nullptr, sizeof(VM), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+  if (v == MAP_FAILED) perror("mmap"), exit(1);
+#endif
+  Locked g(icMu);
+  if (!vms.empty()) memcpy(v->helpers, vms[0]->helpers, sizeof v->helpers);
+  for (V& x : v->globals) x = NIL;
+  for (int i = 0; i < nics; i++) v->ics[i].key = EMPTY;
+  v->allowed = EFF_BITS, v->hstack = NIL;  // unchecked, no handlers (as effectsInit)
+  vms.push_back(v);
+  return v;
+}
+void vmFree(VM* v) {
+  {
+    Locked g(icMu);
+    std::erase(vms, v);
+  }
+#if __wasm__
+  free(v);
+#else
+  munmap(v, sizeof(VM));
+#endif
+}
+void eachVM(void (*f)(VM*, void*), void* ctx) { Locked g(icMu); for (VM* v : vms) f(v, ctx); }
 static uint64_t header(Obj* o) { uint64_t h; memcpy(&h, o, 8); return h; }
 
 // ---------------- values ----------------
@@ -160,16 +207,22 @@ static V rt_binop(V a, V b, uint64_t op) {
 }
 // Fields: slow paths of the inline caches emitted by the compiler; they also fill the cache.
 // Strings the runtime makes for m.name keys (m["name"]) and single characters are made once and kept in consts.
-static V cached(V& slot, std::string_view s) { return slot ? slot : (consts.push_back(box(newStr(s))), slot = consts.back()); }
-static V mapKey(uint64_t s) { static std::vector<V> keys; return cached(growAt(keys, s), symName(s)); }
+// Per isolate, since they are in its heap: isolateMark keeps them.
+static TLS std::vector<V> keyStrs;
+static TLS V charStrs[256];
+static V cached(V& slot, std::string_view s) { return slot ? slot : (slot = box(newStr(s))); }
+static V mapKey(uint64_t s) { return cached(growAt(keyStrs, s), symName(s)); }
+void isolateMark(void (*mark)(V)) {
+  for (V v : keyStrs) if (v) mark(v);
+  for (V v : charStrs) if (v) mark(v);
+}
 static V rt_geti(V a, V i);
 static V rt_seti(V a, V i, V v);
 static V rt_getf(V o, uint64_t s, IC* ic) {
   if (is(o, K::Map)) return rt_geti(o, mapKey(s));
   if (is(o, K::Inst)) {
     Inst* in = as<Inst>(o);
-    auto& l = in->cls->layout;
-    if (u32 i = u32(std::find(l.begin(), l.end(), (int)s) - l.begin()); i < in->nslots && in->slots[i] != ABSENT) {
+    if (u32 i = (u32)in->cls->layout.find((int)s); i < in->nslots && in->slots[i] != ABSENT) {
       if (ic) *ic = {header(in), i};
       return in->slots[i];
     }
@@ -179,11 +232,14 @@ static V rt_getf(V o, uint64_t s, IC* ic) {
   ERR("%s has no field '%s'", typeName(o), symName(s).c_str());
 }
 // What JIT constructors read from a class: a new instance has room for every field the class has had so far.
+// Hold layoutMu. Isolates construct while it changes: the cell size is written (one word) before the header that
+// says how many slots, and constructors read the header first (ldar), so a cell always has room for its slots.
 void reshape(Class* c) {
   u32 cap = (u32)std::min<size_t>(c->layout.size(), 0xffff);
   int k = sizeClass(sizeof(Inst) + cap * 8);
-  c->ihdr = (uint64_t)K::Inst | (uint64_t)cap << 16 | (uint64_t)c->id << 32;
-  c->irun = u32((char*)&vm.runs[k] - (char*)&vm), c->isize = k < NCLS ? sizeClasses[k] : 16;  // too big: runs[NCLS] is empty, so 16 never fits
+  uint64_t run = u32((char*)&vm->runs[k] - (char*)vm) | (uint64_t)(k < NCLS ? sizeClasses[k] : 16) << 32;  // too big: runs[NCLS] is empty, so 16 never fits
+  __atomic_store_n((uint64_t*)&c->irun, run, __ATOMIC_RELAXED);
+  __atomic_store_n(&c->ihdr, (uint64_t)K::Inst | (uint64_t)cap << 16 | (uint64_t)c->id << 32, __ATOMIC_RELEASE);
 }
 static V rt_setf(V o, uint64_t s, V v, IC* ic) {
   bool outside = s & SETF_OUTSIDE;
@@ -194,9 +250,12 @@ static V rt_setf(V o, uint64_t s, V v, IC* ic) {
   touch(in);  // in a transaction: saved before its first change (the cache isn't filled, so every store comes here)
   if (in->cls->closed() && !in->cls->declared((int)s))
     ERR("%s has no field '%s' (its fields are declared: add 'var %s' to the class)", symName(in->cls->name).c_str(), symName(s).c_str(), symName(s).c_str());
-  auto& l = in->cls->layout;
-  u32 i = u32(std::find(l.begin(), l.end(), (int)s) - l.begin());
-  if (i == l.size()) l.push_back((int)s), reshape(in->cls);
+  int f = in->cls->layout.find((int)s);
+  if (f < 0) {
+    Locked g(layoutMu);
+    f = (int)in->cls->layout.add((int)s), reshape(in->cls);
+  }
+  u32 i = (u32)f;
   if (i >= in->nslots) {  // a field this instance had no room for: move the slots out of line
     u32 n = (u32)in->cls->layout.size();
     if (n > 0xffff) ERR("too many fields");
@@ -209,16 +268,16 @@ static V rt_setf(V o, uint64_t s, V v, IC* ic) {
   const Class::FieldType* ty = in->cls->typed((int)s);
   if (ty && !typeAccepts(ty->type, v)) typeFail(ty->site, v, RA());
   // A store from outside an instance whose class has invariants: the site checks them next (bit 33 of the cached slot
-  // tells its fast path to ask the same, through vm.invObj).
+  // tells its fast path to ask the same, through vm->invObj).
   bool inv = outside && in->cls->find(invariantSym());
-  if (inv) vm.invObj = o;
+  if (inv) vm->invObj = o;
   // A `num` field's store sites check inline (bit 32 of the slot tells them to); other typed fields' stores come here.
-  if (ic && !vm.txn && (!ty || ty->type == TY_NUM)) *ic = {header(in), i | (ty ? 1ull << 32 : 0) | (inv ? 1ull << 33 : 0)};
+  if (ic && !vm->txn && (!ty || ty->type == TY_NUM)) *ic = {header(in), i | (ty ? 1ull << 32 : 0) | (inv ? 1ull << 33 : 0)};
   return in->slots[i] = v;
 }
 #define INDEX(i, n) (isNum(i) && num(i) >= 0 && num(i) < (n) ? (size_t)num(i) : (ERR("index %s out of range (len %zu)", toStr(i).c_str(), (size_t)(n)), 0))
 #define NUMARG(v, f) (isNum(v) ? num(v) : (ERR(f "() expects a number"), 0.0))
-static V char1(V s, size_t i) { static V c[256]; return cached(c[(uint8_t)as<Str>(s)->s()[i]], {as<Str>(s)->s() + i, 1}); }
+static V char1(V s, size_t i) { return cached(charStrs[(uint8_t)as<Str>(s)->s()[i]], {as<Str>(s)->s() + i, 1}); }
 static void mapSet(Map* m, V k, V v) {
   if ((m->used + 1) * 4 > m->idx.size() * 3) {  // grow (and drop deleted slots): rebuild the index
     m->idx.assign(std::bit_ceil(m->e.size() * 2 + 8), 0), m->used = (u32)m->e.size();
@@ -306,14 +365,18 @@ static void* rt_prep(V* w, uint64_t n, uint64_t sym, V sup, IC* ic) {
   } else if (is(r, K::Clo)) f = as<Clo>(r)->fn;
   else if (is(r, K::Class)) {
     Class* c = as<Class>(r);
-    reshape(c);
+    if (!__atomic_load_n(&c->ihdr, __ATOMIC_ACQUIRE)) {  // its first construction: what JIT constructors read
+      Locked g(layoutMu);
+      reshape(c);
+    }
     u32 cap = (u32)std::min<size_t>(c->layout.size(), 0xffff);
     Inst* in = make<Inst>(cap * 8);
     in->cls = c, in->cid = c->id, in->nslots = (uint16_t)cap, in->slots = in->inl();
     for (V* p = in->slots; p < in->slots + cap; p++) __atomic_store_n(p, ABSENT, __ATOMIC_RELAXED);  // no memset call
     w[0] = box(in);
-    if (c->initEpoch != icEpoch) c->init = c->find(S_init), c->initEpoch = icEpoch;
-    if (!(f = c->init)) {
+    if (__atomic_load_n(&c->initEpoch, __ATOMIC_ACQUIRE) != icEpoch)  // isolates may race to fill it: same value
+      __atomic_store_n(&c->init, c->find(S_init), __ATOMIC_RELAXED), __atomic_store_n(&c->initEpoch, icEpoch, __ATOMIC_RELEASE);
+    if (!(f = __atomic_load_n(&c->init, __ATOMIC_RELAXED))) {
       if (n) ERR("%s takes no arguments (no init)", symName(as<Class>(r)->name).c_str());
       if (ctor) *ctor = {r, (uint64_t)identCode};
       return identCode;
@@ -329,7 +392,7 @@ static V rt_numchk(V v) { return isNum(v) ? v : (ERR("expected a number, got %s"
 static void rt_poll();
 static void rt_stack() {  // wasm: the entry check also fails while a safepoint is wanted (gen_wasm.h)
   char here;
-  if (WASM && vm.poll && &here + 256 >= (char*)vm.limit) return rt_poll();
+  if (WASM && vm->poll && &here + 256 >= (char*)vm->limit) return rt_poll();
   ERR("stack overflow");
 }
 static void rt_undef() { ERR("call to undefined function"); }
@@ -339,9 +402,6 @@ static void rt_stale(uint64_t sym, void* ra) {
 }
 
 // ---------------- fibers and C calls: the parts both platforms share ----------------
-Fiber* fiberCur;
-void* fiberMainSp;
-uintptr_t* fiberMainTop;
 V vmCall(void* code, std::initializer_list<V> a) {
   V args[8] = {};
   std::copy(a.begin(), a.end(), args);
@@ -355,7 +415,7 @@ V newFiber(V fn) {
   if (f->arity - is(fn, K::Clo) > 1) ERR("a fiber's function takes at most one parameter (the first value sent)");
   Fiber* b = make<Fiber>();
   b->fn = fn, b->val = NIL, fiberStack(b);
-  b->allowed = vm.allowed, b->who = vm.who, b->hstack = NIL, b->inv = 0;  // it may do what its creator may, and has its own handlers
+  b->allowed = vm->allowed, b->who = vm->who, b->hstack = NIL, b->inv = 0;  // it may do what its creator may, and has its own handlers
   return box(b);
 }
 V fiberResume(V fv, V v) {  // run fv until it yields (giving the yielded value) or returns (its result)
@@ -369,7 +429,7 @@ V fiberResume(V fv, V v) {  // run fv until it yields (giving the yielded value)
   (void)keep;
   effLoad({f->allowed, f->hstack, f->who, f->inv});
   fiberRun(f, start);
-  f->allowed = vm.allowed, f->hstack = vm.hstack, f->who = vm.who, f->inv = vm.inv;
+  f->allowed = vm->allowed, f->hstack = vm->hstack, f->who = vm->who, f->inv = vm->inv;
   effLoad(mine);
   if (f->state == FIB_DONE) {
     fiberFree(f);
@@ -468,7 +528,7 @@ static Fn* nativeFn(const char* name, void* f, int arity) {
 void native(const char* name, void* f, int arity) {
   Global& g = global(intern(name));
   g.kind = 'n';
-  vm.globals[g.slot] = box(g.o = nativeFn(name, f, arity));
+  vm->globals[g.slot] = box(g.o = nativeFn(name, f, arity));
 }
 void method(K k, int sym, void* f, int arity) { consts.push_back(box(growAt(builtins[(int)k], sym) = nativeFn(symName(sym).c_str(), f, arity))); }
 
@@ -484,12 +544,14 @@ void rtInit() {
   }
   static const char* syms[] = {KEYWORDS(SYM_STR) EXTRA_SYMS(SYM_STR)};
   for (const char* s : syms) intern(s);
-  for (V& g : vm.globals) g = NIL;
+  vm = vmNew();  // the main isolate's
+  gcInit();
+  heapUse(heapNew(vm->runs));
+  ImageScope image;  // the natives, and what the runtime keeps for good
   void* h[NH] = {(void*)rt_poll, (void*)rt_stack, (void*)rt_binop, (void*)rt_getf, (void*)rt_setf, (void*)rt_geti,
                  (void*)rt_seti, (void*)rt_prep, (void*)rt_list, (void*)rt_iter, (void*)rt_numchk, (void*)rt_undef,
                  (void*)rt_map, (void*)rt_closure, (void*)rt_stale, (void*)rt_echo, nullptr, (void*)rt_yield, nullptr, (void*)rt_throw};
-  memcpy(vm.helpers, h, sizeof h);  // H_FFI and H_HOT: platformInit
-  gcInit();
+  memcpy(vm->helpers, h, sizeof h);  // H_FFI and H_HOT: platformInit
   identCode = callable<+[](V self) { return self; }>();
   platformInit();
   txnInit();

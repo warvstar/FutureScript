@@ -115,7 +115,7 @@ struct Fun {  // per-function emission state
   std::vector<int> tries;  // slots of the active try records, outermost first
   int atomics = 0;         // atomic blocks open here: return, break and continue commit them
   int handles = 0;         // handle bodies open here: return, break and continue remove their handlers
-  // Declared effects (`fn f() ! io`): where the caller's vm.allowed and vm.who are kept (arm64: two frame slots;
+  // Declared effects (`fn f() ! io`): where the caller's vm->allowed and vm->who are kept (arm64: two frame slots;
   // wasm: two locals) while the function runs; the epilogue every return goes through puts them back. -1: none.
   int effHome = -1;
   // Its declared result type (`fn f(): num`; 0: none), checked in the epilogue every return goes through, so after

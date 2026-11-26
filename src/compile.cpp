@@ -1953,7 +1953,7 @@ struct Compiler : Gen {
   template <class T> T* globalObj(int sym) {  // the Fn/Class bound to a top-level name, kept across reloads
     Global& g = global(sym);
     if (!g.o || g.o->kind != T::KIND) g.o = make<T>(), ((T*)g.o)->name = sym;
-    vm.globals[g.slot] = box(g.o);
+    vm->globals[g.slot] = box(g.o);
     return (T*)g.o;
   }
   Compiled commit(Code& chunk) {
@@ -2041,8 +2041,9 @@ struct Compiler : Gen {
       Class* c = globalObj<Class>(cd.sym);
       c->super = cd.super >= 0 ? (Class*)global(cd.super).o : nullptr;
       c->methods = cd.methods, c->fields = cd.fields, c->ftypes = cd.ftypes;
+      Locked g(layoutMu);
       size_t n = c->layout.size();
-      for (auto& [f, d] : cd.fields) if (std::find(c->layout.begin(), c->layout.end(), f) == c->layout.end()) c->layout.push_back(f);
+      for (auto& [f, d] : cd.fields) c->layout.add(f);
       if (c->layout.size() != n) reshape(c);  // new instances get room for every declared field
     }
     for (int s : inits) if (!global(s).inited) global(s).inited = true, out.newVars.push_back(s);
@@ -2061,7 +2062,9 @@ struct Compiler : Gen {
 
 void tierUp(void* p, u32 numArgs) {
   Tier& t = *(Tier*)p;
-  if (t.fast || t.failed || !t.body) return;
+  Locked code(codeMu);
+  if (t.fast || t.failed || !t.body) return;  // (another isolate may have just compiled it)
+  ImageScope image;
   JitBatch writable;
   static Compiler* c;  // on the heap, like `active` below
   for (bool assume : {true, false}) {
@@ -2079,7 +2082,9 @@ void tierUp(void* p, u32 numArgs) {
 // no destructors), and the next compile frees what it left.
 static Compiler* active;
 Compiled compile(const std::string& path, bool reload, bool echo, const std::string* text, bool tests) {
-  JitBatch writable;  // nothing JIT-compiled runs during a compile
+  Locked code(codeMu);  // one compile at a time, whichever isolate asks (tierUp too)
+  ImageScope image;     // what it makes, compiled code points at, in every isolate
+  JitBatch writable;    // nothing JIT-compiled runs during a compile
   delete active;
   Compiler& c = *(active = new Compiler);
   c.reload = reload, c.echo = echo, c.testing = tests;
