@@ -233,8 +233,22 @@ fn worstCase(r) {  // the most a request can cost: ~2.5 chars a token, all of it
 
 // ---- the API ----
 fn request(role, tools, messages) { return requestAs(role, MODELS[role], tools, messages) }
-fn requestAs(role, model, tools, messages) {  // {body, model}
-  var body = {model: model, max_tokens: PRICES[model].maxTok, system: system(role), messages: messages, cache_control: {type: "ephemeral"}}
+fn requestAs(role, model, tools, messages) { return requestWith(system(role), model, tools, messages) }
+fn workerRequest(w) {  // a conversation keeps the prompt it started with: its thinking blocks are bound to that prefix
+  if w.prompt == nil || w.messages.len() <= 1 { w.prompt = ROLE.worker }
+  return requestWith([{type: "text", text: COMMON, cache_control: {type: "ephemeral"}}, {type: "text", text: w.prompt}], w.model || MODELS.worker, WORKER_TOOLS, w.messages)
+}
+fn stripThinking(w) {  // the API refused the conversation's thinking blocks: go on without them
+  for m in w.messages {
+    if m.role == "assistant" {  // always a list of blocks (msg.content)
+      var keep = []
+      for b in m.content { if b.type != "thinking" && b.type != "redacted_thinking" { keep.push(b) } }
+      m.content = keep
+    }
+  }
+}
+fn requestWith(sys, model, tools, messages) {  // {body, model}
+  var body = {model: model, max_tokens: PRICES[model].maxTok, system: sys, messages: messages, cache_control: {type: "ephemeral"}}
   if tools != nil { body.tools = tools }
   return {body: json(body), model: model}
 }
@@ -510,6 +524,7 @@ fn giveUp(w, why) {
   w.task = nil
   w.phase = "idle"
   w.messages = []
+  w.stripped = false
 }
 fn runTool(w, name, inp) {
   var wt = w.wt
@@ -671,6 +686,7 @@ fn merge(w) {
   w.task = nil
   w.phase = "idle"
   w.messages = []
+  w.stripped = false
   w.reviews = 0
 }
 
@@ -871,7 +887,7 @@ fn main() {
     var reqs = []
     var who = []
     for w in workers {
-      if w.phase == "work" { reqs.push(requestAs("worker", w.model || MODELS.worker, WORKER_TOOLS, w.messages)) who.push({kind: "worker", w: w}) }
+      if w.phase == "work" { reqs.push(workerRequest(w)) who.push({kind: "worker", w: w}) }
       else if w.phase == "review" { reqs.push(reviewRequest(w)) who.push({kind: "review", w: w}) }
     }
     var idle = 0
@@ -908,7 +924,10 @@ fn main() {
       if r.status != 200 {
         if r.status == 429 || r.status >= 500 || r.status == 0 { limited = true }
         log(h.kind + " request failed: " + str(r.status) + " " + clip(r.body || r.error || "", 300))
-        if r.status == 400 && h.kind == "worker" { giveUp(h.w, "the API rejected the conversation (400)") }
+        if r.status == 400 && h.kind == "worker" {
+          if (r.body || "").has("thinking") && !h.w.stripped { stripThinking(h.w) h.w.stripped = true log("w" + str(h.w.i) + ": dropped its thinking blocks, which the API refused") }
+          else { giveUp(h.w, "the API rejected the conversation (400)") }
+        }
         if r.status == 400 && h.kind == "decide" { proposals = [] }
         continue
       }
