@@ -47,7 +47,7 @@ static void quote(std::string_view s, std::string& o) {
   o += '"';
 }
 static void enc(V v, std::string& o, int depth) {
-  if (depth > 256) ERR("a value nested too deeply (or containing itself) to pass to JavaScript");
+  if (depth > 256) ERR("@js a value nested too deeply (or containing itself) to pass to JavaScript");
   if (isNum(v)) {
     double d = num(v);
     if (std::isnan(d)) o += "{\"\\u0000\":\"num\",\"v\":\"NaN\"}";
@@ -74,7 +74,7 @@ static void enc(V v, std::string& o, int depth) {
       o += '{';
       bool first = true;
       for (auto& [k, e] : ((Map*)x)->e) {
-        if (!is(k, K::Str)) ERR("a map passed to JavaScript must have string keys (this one has a %s key)", typeName(k));
+        if (!is(k, K::Str)) ERR("@js a map passed to JavaScript must have string keys (this one has a %s key)", typeName(k));
         o += first ? "" : ",", first = false, quote(as<Str>(k)->sv(), o), o += ':', enc(e, o, depth + 1);
       }
       o += '}';
@@ -82,8 +82,8 @@ static void enc(V v, std::string& o, int depth) {
     }
     case K::Fn: case K::Clo: o += "{\"\\u0000\":\"fn\",\"id\":" + std::to_string(pin(v)) + "}"; return;
     case K::Ref: o += "{\"\\u0000\":\"js\",\"id\":" + std::to_string(((Ref*)x)->id) + "}"; return;
-    case K::Inst: ERR("an instance of %s can't pass to JavaScript (pass a map of what it needs)", symName(((Inst*)x)->cls->name).c_str());
-    default: ERR("a %s can't pass to JavaScript", typeName(v));
+    case K::Inst: ERR("@js an instance of %s can't pass to JavaScript (pass a map of what it needs)", symName(((Inst*)x)->cls->name).c_str());
+    default: ERR("@js a %s can't pass to JavaScript", typeName(v));
   }
 }
 std::string toJs(V v) {
@@ -96,7 +96,7 @@ namespace {
 struct Parser {
   const char *p, *e;
   void ws() { while (p < e && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) p++; }
-  [[noreturn]] void bad() { building.clear(), ERR("JavaScript gave fut a value it can't read"); }
+  [[noreturn]] void bad() { building.clear(), ERR("@js JavaScript gave fut a value it can't read"); }
   bool lit(const char* w) {
     size_t n = strlen(w);
     if ((size_t)(e - p) < n || memcmp(p, w, n)) return false;

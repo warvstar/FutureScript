@@ -52,7 +52,7 @@ static std::string describe(V v) {  // the value a check rejected, for its messa
 
 void typeFail(int site, V v, void* ra) {
   TypeSite& s = sites[site];
-  rtError(ra, "%s must be %s, got %s", s.what.c_str(), s.type.c_str(), describe(v).c_str());
+  rtError(ra, "@type %s must be %s, got %s", s.what.c_str(), s.type.c_str(), describe(v).c_str());
 }
 static V rt_typechk(V v, uint64_t t, uint64_t site) {  // compiled code: checks v, which it then keeps
   if (!typeAccepts(t, v)) typeFail((int)site, v, RA());

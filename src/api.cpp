@@ -359,6 +359,20 @@ static std::string shown(const std::string& file, const std::string& program) {
   for (size_t i = common; i < dir.size(); i++) if (dir[i] == '/') up += "../";
   return up + f.substr(common);
 }
+// A declaration's version: a hash of its lines (line..end) as written. An agent that read it can check, before
+// writing, that nobody changed it since (fut map --json: "hash").
+static std::string spanHash(const std::string& src, int line, int end) {
+  size_t a = 0;
+  for (int l = 1; l < line && a != std::string::npos; l++) a = src.find('\n', a), a = a == std::string::npos ? a : a + 1;
+  if (a == std::string::npos) a = src.size();
+  size_t b = a;
+  for (int l = line; l <= end && b < src.size(); l++) b = src.find('\n', b), b = b == std::string::npos ? src.size() : b + 1;
+  uint64_t h = 1469598103934665603ull;
+  for (size_t i = a; i < b; i++) h = (h ^ (unsigned char)src[i]) * 1099511628211ull;
+  char o[17];
+  snprintf(o, sizeof o, "%016llx", (unsigned long long)h);
+  return std::string(o, 12);
+}
 static std::string json(const std::string& s) {
   std::string o = "\"";
   for (unsigned char c : s) {
@@ -482,7 +496,8 @@ int printMap(const Compiled& c, bool pubOnly, bool asJson, const std::string& on
           o += "{\"type\":\"" + d->kind + "\"" + (p ? ",\"package\":" + json(p->name) : "") + ",\"file\":" + json(shown(f, program)) + ",\"name\":" + json(d->name);
           if (!d->owner.empty()) o += ",\"in\":" + json(d->owner);
           if (!d->mod.empty()) o += ",\"module\":" + json(d->mod);
-          o += std::string(",\"pub\":") + (d->pub ? "true" : "false") + ",\"sig\":" + json(d->sig) + ",\"line\":" + std::to_string(d->line) + ",\"end\":" + std::to_string(d->end) + "}\n";
+          o += std::string(",\"pub\":") + (d->pub ? "true" : "false") + ",\"sig\":" + json(d->sig) + ",\"line\":" + std::to_string(d->line) + ",\"end\":" + std::to_string(d->end) +
+               ",\"hash\":\"" + spanHash(files[i]->second, d->line, d->end) + "\"}\n";
           n++;
         }
         emit();

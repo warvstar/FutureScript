@@ -9,9 +9,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { createFut } from "./fut.js";
 
 let file = "", watch = false, verbose = false, json = false, filter = "", check = false, pub = false, only = "";
-const argv = process.argv.slice(2), testing = argv[0] == "test", api = argv[0] == "api", map = argv[0] == "map";
-const usage = "usage: node web/run.mjs [-w | -v] [file.fut]   (no file: REPL)\n       node web/run.mjs test [--json] [--filter text] file.fut\n       node web/run.mjs api [--check] file.fut\n       node web/run.mjs map [--pub] [--json] file.fut [package | file]\n";
-for (let i = testing || api || map ? 1 : 0; i < argv.length; i++) {
+const argv = process.argv.slice(2), testing = argv[0] == "test", api = argv[0] == "api", map = argv[0] == "map", explain = argv[0] == "explain";
+const usage = "usage: node web/run.mjs [-w | -v] [file.fut]   (no file: REPL)\n       node web/run.mjs test [--json] [--filter text] file.fut\n       node web/run.mjs api [--check] file.fut\n       node web/run.mjs map [--pub] [--json] file.fut [package | file]\n       node web/run.mjs explain [code]\n";
+for (let i = testing || api || map ? 1 : 0; i < argv.length && !explain; i++) {
   const a = argv[i];
   if (map && a == "--pub") pub = true;
   else if (map && a == "--json") json = true;
@@ -65,6 +65,7 @@ function listen(onLine) {
   process.stdin.on("end", () => onLine(null));
 }
 
+if (explain) process.exit(fut.explain(argv[1]));
 if (testing || api || map) {
   if (!file) process.stderr.write(usage), process.exit(2);
   process.exit(testing ? await fut.test(file, json, filter) : api ? await fut.api(file, check) : await fut.map(file, pub, json, only));

@@ -540,6 +540,13 @@ extern void (*refRelease)(u32 id);    // the host's side of that (wasm)
 #define RA() __builtin_return_address(0)
 #endif
 #define ERR(...) rtError(RA(), __VA_ARGS__)
+// Error codes (errors.cpp): a format string may start with @ and a code, then a space; takeCode strips it and returns the code.
+const char* takeCode(const char*& fmt);
+void noteRaised(V msg, const std::string& text, const char* code);  // rtError: this message value carries this code
+const char* raisedCode(V v);          // the code of a runtime error's message value, or null (a value the program threw)
+std::string errorLine(V v);           // its text, then " [code]" if it has one
+std::string splitCode(std::string& line);  // takes a trailing " [code]" off a message line: the code, or ""
+int explain(const char* code);        // fut explain [code]
 
 // ---- arm64 encoders (checked against the system assembler) ----
 namespace a64 {

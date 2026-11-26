@@ -127,7 +127,7 @@ struct Gen : CState {
     for (int r : F->rets) patch(r);
     if (F->retTy) typeCheck(F->retTy, F->retSite, F->retTy == TY_NUM);  // the result, outside every try: see Fun::retTy
     if (F->exit) F->live = true, F->facts.reset(), F->exit();          // its spec's exit checks (they may use the frame)
-    if (F->maxd > 4000) fail("function too large");
+    if (F->maxd > 4000) fail("@limit function too large");
     if (F->noRegs) F->maxreg = 7, F->maxfreg = 8;
     int pairs = (F->maxreg + 1) / 2, fpairs = (F->maxfreg + 1) / 2;  // x19.. then d8.. pairs, just below x29
     u32 bytes = ((F->maxd * 8 + 15) & ~15) + 16 * (pairs + fpairs);

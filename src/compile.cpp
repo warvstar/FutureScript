@@ -186,7 +186,7 @@ struct Compiler : Gen {
     auto root = pkgRootOf.find(*m);
     auto surface = surfaceOf.find(*m);
     bool pkg = root != pkgRootOf.end() || surface != surfaceOf.end();  // tier 2 has only the surface
-    if (!accept('.')) failAt(t.p, t.line, "'%s' is a %s: use %s.name", name(t.sym), pkg ? "package" : "module", name(t.sym));
+    if (!accept('.')) failAt(t.p, t.line, "@not-a-value '%s' is a %s: use %s.name", name(t.sym), pkg ? "package" : "module", name(t.sym));
     Tok n = cur;
     n.sym = intern(*m + "." + symName(ident()));
     int raw = prev.sym;
@@ -195,22 +195,22 @@ struct Compiler : Gen {
       if (surface != surfaceOf.end() && surface->second.count(raw) && declared) return n;
       std::string rf = root != pkgRootOf.end() ? ::base(root->second) : "its root file";
       if (declared)
-        failAt(n.p, n.line, "'%s' is pub inside package %s but not part of its interface: only what %s makes pub (or re-exports with pub import) is", name(raw), name(t.sym), rf.c_str());
-      failAt(n.p, n.line, "package %s has no '%s' in its interface (what %s makes pub, or re-exports with pub import)", name(t.sym), name(raw), rf.c_str());
+        failAt(n.p, n.line, "@not-in-interface '%s' is pub inside package %s but not part of its interface: only what %s makes pub (or re-exports with pub import) is", name(raw), name(t.sym), rf.c_str());
+      failAt(n.p, n.line, "@not-in-interface package %s has no '%s' in its interface (what %s makes pub, or re-exports with pub import)", name(t.sym), name(raw), rf.c_str());
     }
-    if (!declared) failAt(n.p, n.line, "module '%s' has no '%s'", name(t.sym), name(prev.sym));
-    if ((size_t)n.sym >= pubSym.size() || !pubSym[n.sym]) failAt(n.p, n.line, "'%s' is private to module '%s' (mark it pub there to use it here)", name(prev.sym), name(t.sym));
+    if (!declared) failAt(n.p, n.line, "@undefined-name module '%s' has no '%s'", name(t.sym), name(prev.sym));
+    if ((size_t)n.sym >= pubSym.size() || !pubSym[n.sym]) failAt(n.p, n.line, "@private '%s' is private to module '%s' (mark it pub there to use it here)", name(prev.sym), name(t.sym));
     return n;
   }
   [[noreturn]] void undefined(const Tok& t) {
     const std::string& full = symName(t.sym);
     int s = intern(full.substr(full.rfind('.') + 1));  // as written: globalSym may have put a package's prefix on it
     if (auto it = privateIn.find(s); it != privateIn.end() && it->second != file && pkgOf(it->second) == pkgOf(file))
-      failAt(t.p, t.line, "'%s' is private to %s (mark it pub there to use it here)", name(s), ::base(it->second).c_str());
+      failAt(t.p, t.line, "@private '%s' is private to %s (mark it pub there to use it here)", name(s), ::base(it->second).c_str());
     if (const std::string& P = pkgPrefix(file); !P.empty())
       if (Global* g = findGlobal(s); g && g->kind != 'n')
-        failAt(t.p, t.line, "undefined name '%s' (package %s sees its own names, its dependencies' through their names, and builtins; not the program's)", name(s), pkgOf(file)->name.c_str());
-    failAt(t.p, t.line, "undefined name '%s'", name(s));
+        failAt(t.p, t.line, "@undefined-name undefined name '%s' (package %s sees its own names, its dependencies' through their names, and builtins; not the program's)", name(s), pkgOf(file)->name.c_str());
+    failAt(t.p, t.line, "@undefined-name undefined name '%s'", name(s));
   }
   int globalSym(int s) {  // the file's own names first, then its package's, then global (builtins only, in a package)
     if (auto it = nsOf.find(file); it != nsOf.end())
@@ -229,7 +229,7 @@ struct Compiler : Gen {
   }
   Tok lex(Lexer& l) {
     Tok t = l.next();
-    if (t.t == T_ERR) lexAtEnd = !*l.p, failAt(t.p, t.line, "%s", l.err);
+    if (t.t == T_ERR) lexAtEnd = !*l.p, failAt(t.p, t.line, "@syntax %s", l.err);
     return t;
   }
   void next() { const char* e = lx.p; prev = cur, cur = lex(lx), prevEnd = e; }
@@ -238,9 +238,9 @@ struct Compiler : Gen {
   bool at(int t) { return cur.t == t; }
   bool atKw(int k) { return cur.t == T_ID && cur.sym == k; }
   bool accept(int t) { return at(t) ? next(), true : false; }
-  void expect(int t) { if (!accept(t)) fail("expected '%c'", t); }
+  void expect(int t) { if (!accept(t)) fail("@syntax expected '%c'", t); }
   int ident() {
-    if (!at(T_ID) || cur.sym < NKW) fail("expected a name");
+    if (!at(T_ID) || cur.sym < NKW) fail("@syntax expected a name");
     return next(), prev.sym;
   }
   void konst(std::string_view s) { consts.push_back(box(newStr(s))), imm(0, consts.back()); }
@@ -252,20 +252,20 @@ struct Compiler : Gen {
     Ty ty;
     if (atKw(K_fn)) next(), ty.code = TY_FN;
     else {
-      if (!at(T_ID) || cur.sym < NKW) fail("expected a type (num, str, bool, list, map, fn, any, or a class)");
+      if (!at(T_ID) || cur.sym < NKW) fail("@unknown-type expected a type (num, str, bool, list, map, fn, any, or a class)");
       next();
       static const char* const kinds[] = {"any", "num", "str", "bool", "list", "map"};
       for (int i = 0; i < 6; i++) if (symName(prev.sym) == kinds[i]) ty.code = TY_ANY + i;
       if (!ty.code) {
         Tok n = topName(prev);
         Global* g = findGlobal(n.sym);
-        if (!g || g->kind != 'c') failAt(t.p, t.line, "unknown type '%s' (num, str, bool, list, map, fn, any, or a class)", std::string(t.p, prevEnd).c_str());
+        if (!g || g->kind != 'c') failAt(t.p, t.line, "@unknown-type unknown type '%s' (num, str, bool, list, map, fn, any, or a class)", std::string(t.p, prevEnd).c_str());
         ty.code = tyClass(n.sym);
       }
     }
     ty.text = (ty.code & 15) == TY_CLS ? symName(int(ty.code >> 8)) : std::string(t.p, prevEnd);  // a module's class: bank.Account
     if (at('?') && !cur.nl) {
-      if (ty.code == TY_ANY) fail("'any' already includes nil");
+      if (ty.code == TY_ANY) fail("@unknown-type 'any' already includes nil");
       next(), ty.code |= TY_OPT, ty.text += "?";
     }
     return ty;
@@ -312,9 +312,9 @@ struct Compiler : Gen {
       if (n == b) return text += n, bit;
     Tok q = topName(prev);
     Global* g = findGlobal(q.sym);
-    if (!g || g->kind != 'e') failAt(t.p, t.line, "unknown effect '%s' (io, clock, random, yield, spawn, chan, or one declared with 'effect')", std::string(t.p, prevEnd).c_str());
+    if (!g || g->kind != 'e') failAt(t.p, t.line, "@unknown-effect unknown effect '%s' (io, clock, random, yield, spawn, chan, or one declared with 'effect')", std::string(t.p, prevEnd).c_str());
     uint64_t b = effBit(q.sym);
-    if (!b) failAt(t.p, t.line, "too many effects (a program can declare at most %d)", EFF_LEVEL - EFF_BUILTIN);
+    if (!b) failAt(t.p, t.line, "@limit too many effects (a program can declare at most %d)", EFF_LEVEL - EFF_BUILTIN);
     return text += std::string(t.p, prevEnd), b;
   }
   const std::vector<std::pair<int, int>>* opsOf(int effSym) {
@@ -324,22 +324,22 @@ struct Compiler : Gen {
   }
   // E.op after the effect's name (just read, as t): the operation's id and arity
   std::pair<int, int> effectOp(const Tok& t) {
-    if (!accept('.')) failAt(t.p, t.line, "'%s' is an effect: perform its operations as %s.name(...)", name(t.sym), name(t.sym));
+    if (!accept('.')) failAt(t.p, t.line, "@not-a-value '%s' is an effect: perform its operations as %s.name(...)", name(t.sym), name(t.sym));
     Tok ot = cur;
     int o = ident();
     if (auto* l = opsOf(t.sym))
       for (auto [s, a] : *l) if (s == o) return {effOpId(symName(t.sym) + "." + symName(o)), a};
-    failAt(ot.p, ot.line, "effect '%s' has no operation '%s'", name(t.sym), name(o));
+    failAt(ot.p, ot.line, "@undefined-name effect '%s' has no operation '%s'", name(t.sym), name(o));
   }
   void perform(const Tok& t) {  // E.op(args): a call that rt_prep sends to the nearest handler (see effPrep)
     Tok ot = cur;
     auto [op, arity] = effectOp(t);
-    if (!at('(') || cur.nl) failAt(ot.p, ot.line, "expected '(': perform an operation by calling it");
+    if (!at('(') || cur.nl) failAt(ot.p, ot.line, "@syntax expected '(': perform an operation by calling it");
     next();
     int base = slot();
     imm(0, box(effOpFn(op))), st(0, base);
     int n = exprList(')');
-    if (n != arity) failAt(ot.p, ot.line, "'%s' expects %d arguments, got %d", effOpName(op).c_str(), arity, n);
+    if (n != arity) failAt(ot.p, ot.line, "@arity '%s' expects %d arguments, got %d", effOpName(op).c_str(), arity, n);
     callWindow(base, n, 0, false);
   }
   // handle { body } with op(params) { ... } ...: each handler is compiled first, as a closure, so it is ready when
@@ -347,7 +347,7 @@ struct Compiler : Gen {
   void handleStmt() {
     Mark body = mark();
     skipBlock();
-    if (!atKw(S_with)) fail("expected 'with': handle { ... } with op(params) { ... }");
+    if (!atKw(S_with)) fail("@syntax expected 'with': handle { ... } with op(params) { ... }");
     int base = F->depth, n = 0;
     while (atKw(S_with) && peek().t == T_ID) {
       next();
@@ -360,12 +360,12 @@ struct Compiler : Gen {
         Global* g = findGlobal(q.sym);
         if (g && g->kind == 'e') std::tie(op, arity) = effectOp(q);
         else if (g && g->kind == 'n' && (op = effBuiltinOp(q.sym))) arity = effOpArity(op);
-        else failAt(t.p, t.line, "'%s' is not an effect's operation (print, clock, sleep, random, run, yield, the graphics builtins, or Effect.name)", std::string(t.p, prevEnd).c_str());
+        else failAt(t.p, t.line, "@unknown-effect '%s' is not an effect's operation (print, clock, sleep, random, run, yield, the graphics builtins, or Effect.name)", std::string(t.p, prevEnd).c_str());
       }
       imm(0, box((double)op)), st(0, slot());
-      if (!at('(')) fail("expected '(' and the operation's parameters");
+      if (!at('(')) fail("@syntax expected '(' and the operation's parameters");
       Fn* h = lambda(t);
-      if (h->arity - 1 != arity) failAt(t.p, t.line, "a handler for %s takes %d parameters, not %d", effOpName(op).c_str(), arity, h->arity - 1);
+      if (h->arity - 1 != arity) failAt(t.p, t.line, "@arity a handler for %s takes %d parameters, not %d", effOpName(op).c_str(), arity, h->arity - 1);
       st(0, slot()), n += 2;
     }
     collect(base, n, H_LIST);
@@ -469,8 +469,8 @@ struct Compiler : Gen {
   }
   void directCall(const Tok& t, Global& g) {  // known top-level fn: called through its stub; reloads repoint the stub
     int base = F->depth, n = exprList(')', true), a = arityOf(t.sym, g);
-    if (a < 0) failAt(t.p, t.line, "'%s' is not defined", name(t.sym));
-    if (a != n) failAt(t.p, t.line, "'%s' expects %d arguments, got %d", name(t.sym), a, n);
+    if (a < 0) failAt(t.p, t.line, "@undefined-name '%s' is not defined", name(t.sym));
+    if (a != n) failAt(t.p, t.line, "@arity '%s' expects %d arguments, got %d", name(t.sym), a, n);
     callDirect(base, n, g.stub);
   }
 
@@ -492,7 +492,7 @@ struct Compiler : Gen {
       } else if (*p == '{') {
         const char* q = p + 1;
         for (int d = 1; q < e && (d += (*q == '{') - (*q == '}')); q++) {}
-        if (q >= e) failAt(p, t.line, "unclosed '{' in string");
+        if (q >= e) failAt(p, t.line, "@syntax unclosed '{' in string");
         flush(true);  // always start from a string, so `"{x}"` is a string even when x is a number
         int s = slot(), line = t.line + (int)std::count(t.p, p, '\n');
         st(0, s), subExpr(p + 1, q, line), combine(s, O_ADD);
@@ -513,7 +513,7 @@ struct Compiler : Gen {
   void subExpr(const char* s, const char* e, int line) {  // compile source text [s, e) as one expression
     detour(file, srcStart, s, line, [&] {
       expr();
-      if (cur.p != e) failAt(cur.p, cur.line, "expected '}' to end the interpolation");
+      if (cur.p != e) failAt(cur.p, cur.line, "@syntax expected '}' to end the interpolation");
     });
   }
   void collect(int base, int n, int h) { addsp(0, base), imm(1, n), helper(h), F->depth = base; }  // list/map from slots
@@ -562,7 +562,7 @@ struct Compiler : Gen {
       load(v);
     }
     st(0, fs);
-    if (!at('(') || cur.nl) fail("expected the arguments of the function to spawn: spawn f(args)");
+    if (!at('(') || cur.nl) fail("@syntax expected the arguments of the function to spawn: spawn f(args)");
     next();
     int lb = F->depth, n = exprList(')');
     collect(lb, n, H_LIST), st(0, slot());
@@ -580,7 +580,7 @@ struct Compiler : Gen {
       case '{': return mapLit(), LV{};
       case '[': { int base = F->depth, n = exprList(']'); return collect(base, n, H_LIST), LV{}; }
       case T_ID: break;
-      default: failAt(t.p, t.line, t.t == T_EOF ? "unexpected end of file" : "unexpected '%c'", t.t);
+      default: failAt(t.p, t.line, t.t == T_EOF ? "@syntax unexpected end of file" : "unexpected '%c'", t.t);
     }
     switch (t.sym) {
       case K_true: return imm(0, TRUE_), LV{};
@@ -588,28 +588,28 @@ struct Compiler : Gen {
       case K_nil: return imm(0, NIL), LV{};
       case K_fn: return lambda(t), LV{};
       case K_yield:  // yield [value]: suspend this fiber; evaluates to the value the next resume sends
-        if (F->atomics) failAt(t.p, t.line, "'yield' inside atomic { }: other code would run while it is half done (yield after it ends)");
+        if (F->atomics) failAt(t.p, t.line, "@atomic 'yield' inside atomic { }: other code would run while it is half done (yield after it ends)");
         at('}') || at(')') || at(']') || at(',') || at(T_EOF) || cur.nl ? imm(0, NIL) : (void)expr();
         return helper(H_YIELD), LV{};
       case K_self: {
         LV v = resolve(F, K_self);
-        if (v.k == LV_NONE) failAt(t.p, t.line, "'self' outside a method");
+        if (v.k == LV_NONE) failAt(t.p, t.line, "@misplaced 'self' outside a method");
         return v.ro = true, v;
       }
       case K_super: {
-        if (F->cls < 0) failAt(t.p, t.line, "'super' outside a method");
+        if (F->cls < 0) failAt(t.p, t.line, "@misplaced 'super' outside a method");
         expect('.');
         int s = ident();
         expect('('), ldl(0, F->selfHome), call(s, true);
         return {};
       }
     }
-    if (t.sym < NKW) failAt(t.p, t.line, "unexpected '%s'", name(t.sym));
+    if (t.sym < NKW) failAt(t.p, t.line, "@syntax unexpected '%s'", name(t.sym));
     if (t.sym == S_spawn && at(T_ID) && !cur.nl && resolve(F, S_spawn).k == LV_NONE) return spawnExpr(), LV{};
     if (t.sym == S_old && olds && at('(') && !cur.nl) {  // in ensures: the value it had on entry (computed then)
       auto it = olds->find(t.p);
-      if (it == olds->end()) failAt(t.p, t.line, "old() is a value as it was on entry: it belongs in an ensures clause");
-      for (int d = 0; next(), d += (prev.t == '(') - (prev.t == ')'), d > 0;) if (at(T_EOF)) fail("expected ')'");
+      if (it == olds->end()) failAt(t.p, t.line, "@misplaced old() is a value as it was on entry: it belongs in an ensures clause");
+      for (int d = 0; next(), d += (prev.t == '(') - (prev.t == ')'), d > 0;) if (at(T_EOF)) fail("@syntax expected ')'");
       return ldl(0, it->second), LV{};
     }
     if (LV v = resolve(F, t.sym); v.k != LV_NONE) return v;
@@ -625,7 +625,7 @@ struct Compiler : Gen {
     if (!g) undefined(t);
     if (traceOn && !tiering) traceRef(!refKey.empty() ? refKey : !owner.empty() ? owner : testRefs, t.sym);
     if (pubContract && g->kind != 'n' && !(t.sym < (int)pubSym.size() && pubSym[t.sym]))  // the .api shows the clause, not the name
-      failAt(t.p, t.line, "%s can only use what its readers can see, and '%s' is private: make it pub, or write the condition without it",
+      failAt(t.p, t.line, "@private %s can only use what its readers can see, and '%s' is private: make it pub, or write the condition without it",
              pubContract, name(prev.sym));
     if (g->kind == 'f' && at('(') && !cur.nl) return next(), directCall(t, *g), t.sym == F->self || returnsNum(t.sym) ? NUM : LV{};
     if (g->kind == 'c' && at('(') && !cur.nl) return next(), construct(*g), LV{};
@@ -723,7 +723,7 @@ struct Compiler : Gen {
   void block() {
     expect('{');
     scope([&] {
-      while (!accept('}')) at(T_EOF) ? fail("expected '}'") : (void)stmt();
+      while (!accept('}')) at(T_EOF) ? fail("@syntax expected '}'") : (void)stmt();
     });
   }
   bool stmt() {  // returns true for a bare expression statement (the REPL echoes those)
@@ -738,10 +738,10 @@ struct Compiler : Gen {
           if (ty.code == TY_ANY) ty = {};
           bool top = F->top && F->scope == 0, init = accept('=');
           std::string what = "var '" + symName(top ? qualify(s) : s) + "'";
-          if (ty.code && !init && !(ty.code & TY_OPT)) failAt(n.p, n.line, "%s is %s, so it needs an initial value", what.c_str(), ty.text.c_str());
+          if (ty.code && !init && !(ty.code & TY_OPT)) failAt(n.p, n.line, "@type %s is %s, so it needs an initial value", what.c_str(), ty.text.c_str());
           Tok v = cur;
           bool num = init ? expr() : (imm(0, NIL), false);
-          if (ty.code && num && (ty.code & 15) != TY_NUM) failAt(v.p, v.line, "%s is %s, but its initial value is a number", what.c_str(), ty.text.c_str());
+          if (ty.code && num && (ty.code & 15) != TY_NUM) failAt(v.p, v.line, "@type %s is %s, but its initial value is a number", what.c_str(), ty.text.c_str());
           checkType(ty, what, num);
           if (top) return gmem(0, global(qualify(s)).slot, true), false;
           int site = ty.code ? typeSite(what, ty.text) : -1;
@@ -768,7 +768,7 @@ struct Compiler : Gen {
         case K_throw: return next(), expr(), helper(H_THROW), F->live = false, false;
         case K_return:
           next();
-          if (F->top) fail("'return' outside a function");
+          if (F->top) fail("@misplaced 'return' outside a function");
         {
           bool n = at('}') || at(T_EOF) || cur.nl ? (imm(0, NIL), false) : expr();
           for (int i = 0; i < F->atomics; i++) callNative("atomic@end", true);  // passes x0 through
@@ -779,13 +779,13 @@ struct Compiler : Gen {
         }
         case K_break: case K_continue:
           next();
-          if (!F->loop) failAt(prev.p, prev.line, "'%s' outside a loop", name(prev.sym));
+          if (!F->loop) failAt(prev.p, prev.line, "@misplaced '%s' outside a loop", name(prev.sym));
           for (int i = F->atomics; i > F->loop->atomics; i--) callNative("atomic@end", true);
           for (int i = F->handles; i > F->loop->handles; i--) callNative("handle@end", true);
           leaveTries(F->loop->tries), jump(*F->loop, prev.sym == K_break), F->live = false;
           return false;
-        case K_class: case K_import: fail("'%s' is only allowed at top level", name(cur.sym));
-        case K_fn: if (!peekIs('(')) fail("named functions are only allowed at top level; use 'var f = fn(...) {...}'"); break;
+        case K_class: case K_import: fail("@misplaced '%s' is only allowed at top level", name(cur.sym));
+        case K_fn: if (!peekIs('(')) fail("@misplaced named functions are only allowed at top level; use 'var f = fn(...) {...}'"); break;
         case S_expect: if (isExpect()) return expectStmt(), false; break;
         case S_atomic: if (peekIs('{') && !peek().nl) return next(), atomicStmt(), false; break;
         case S_handle: if (peekIs('{') && !peek().nl) return next(), handleStmt(), false; break;
@@ -797,7 +797,7 @@ struct Compiler : Gen {
       bool n = v.num;
       return load(v), binRest(1, n, h), true;
     }
-    if (v.k == LV_VAL || v.ro) fail("cannot assign to this");
+    if (v.k == LV_VAL || v.ro) fail("@misplaced cannot assign to this");
     next(), assign(v, t == '=' ? -1 : O_ADD + (t - T_ADDEQ));
     return false;
   }
@@ -823,7 +823,7 @@ struct Compiler : Gen {
   void tryStmt() {
     bool l1 = true;
     TryAt t = tryBlock([&] { l1 = F->live; });
-    if (!atKw(K_catch)) fail("expected 'catch'");
+    if (!atKw(K_catch)) fail("@syntax expected 'catch'");
     next();
     scope([&] {
       if (at(T_ID) && !atKw(K_try)) {
@@ -861,9 +861,9 @@ struct Compiler : Gen {
     bool allocs = atKw(S_allocs) ? (next(), true) : false;
     Tok bt = cur;
     { Lexer l = lx; Tok a = l.next(), b = l.next(), c = l.next();
-      if (!at('{') || a.t != T_ID || b.t != '-' || c.t != '>') fail("expected { n -> ... }: the code to measure, for a size n"); }
+      if (!at('{') || a.t != T_ID || b.t != '-' || c.t != '>') fail("@syntax expected { n -> ... }: the code to measure, for a size n"); }
     lambda(bt, true), st(0, slot());
-    if (!atKw(S_like)) fail("expected 'like' and how it may grow: \"1\", \"log n\", \"n\", \"n log n\", \"n^2\", \"n^3\"");
+    if (!atKw(S_like)) fail("@syntax expected 'like' and how it may grow: \"1\", \"log n\", \"n\", \"n log n\", \"n^2\", \"n^3\"");
     next();
     const char* gs = tokStart(cur);
     expr(), st(0, slot());
@@ -915,7 +915,7 @@ struct Compiler : Gen {
       expr(p + 1);
       s.op = opOf(t), s.right.assign(rs, prevEnd);
       if (prec(cur.t)) {  // `expect a == b && c`: one condition, checked for truthiness
-        if (throws || prints || allocs) fail("expect %s { } compares with one value", throws ? "throws" : prints ? "prints" : "allocs");
+        if (throws || prints || allocs) fail("@syntax expect %s { } compares with one value", throws ? "throws" : prints ? "prints" : "allocs");
         mv(1, 0), ld(0, ls), binop(s.op);
         bool n = false;
         int h = NOH;
@@ -963,7 +963,7 @@ struct Compiler : Gen {
   }
   void forStmt() {  // for x in a..b { }  |  for x in list/map/string/fiber { }
     int nm = ident();
-    if (!atKw(K_in)) fail("expected 'in'");
+    if (!atKw(K_in)) fail("@syntax expected 'in'");
     next();
     scope([&] {
       bool num = expr();
@@ -1072,7 +1072,7 @@ struct Compiler : Gen {
       if (at(':')) {
         Tok c = cur;
         next(), r = type();
-        if (init) failAt(c.p, c.line, "init can't declare a result type: it returns the new instance");
+        if (init) failAt(c.p, c.line, "@class init can't declare a result type: it returns the new instance");
         f.retTy = r.code, f.retSite = typeSite("the result of " + display(nm), r.text);
       }
       if (at('!')) {  // declared effects: ! io, clock (an empty set: performs nothing)
@@ -1084,7 +1084,7 @@ struct Compiler : Gen {
       while (atKw(S_requires) || atKw(S_ensures)) {  // its contract (the prescan has it): compiled below
         next();
         for (int d = 0; !(d == 0 && (at('{') || at('}') || cur.nl)); next()) {
-          if (at(T_EOF)) fail("expected '{'");
+          if (at(T_EOF)) fail("@syntax expected '{'");
           d += nesting(cur);
         }
       }
@@ -1097,7 +1097,7 @@ struct Compiler : Gen {
       }
     }
     int arity = (int)homes.size();
-    if (arity > 64) fail("too many parameters");
+    if (arity > 64) fail("@limit too many parameters");
     for (int i = 0; i < arity; i++) param(i, homes[i]);
     if (traceOn && !f.test && !(f.lambda && owner.empty())) traceTouch(traceMark(f.lambda ? owner : nm));  // fut test: it ran
     for (int i = first; i < arity && i < 8; i++)
@@ -1114,7 +1114,7 @@ struct Compiler : Gen {
     Tier* tier = nullptr;  // (tier 2 compiles a function again without its contract: one with a contract stays in tier 1)
     if (!f.lambda && !f.test && !tiering && !spec && !inv) hotCounter(tier = &tiers[nm], first, homes);
     if (!f.arrow) block();
-    else scope([&] { while (!accept('}')) at(T_EOF) ? fail("expected '}'") : (void)stmt(); });
+    else scope([&] { while (!accept('}')) at(T_EOF) ? fail("@syntax expected '}'") : (void)stmt(); });
     if (f.live) f.retNum = false;  // can end without a return: returns nil
     pend.push_back({stub, fn, arity, finish(), owner, f.lambda || f.test, {}, envFor(file)});  // a test body is installed like a lambda
     if (tier) {
@@ -1187,7 +1187,7 @@ struct Compiler : Gen {
         if (more == 1 || !at(T_AND)) break;
         next();
       }
-      if (!at('{') && !at('}') && !cur.nl) fail("expected the condition to end here (a clause is one line)");
+      if (!at('{') && !at('}') && !cur.nl) fail("@syntax expected the condition to end here (a clause is one line)");
     });
   }
   // A function with a contract: requires, then each old(...) into a home, on entry; ensures where every return
@@ -1304,13 +1304,13 @@ struct Compiler : Gen {
   // default would be one object shared by all; such fields are set in init).
   V constant() {
     const char* why = "a field's default must be a number, string, true, false or nil (set other values in init)";
-    if (accept('-')) return at(T_NUM) ? (next(), box(-prev.n)) : (fail("%s", why), NIL);
+    if (accept('-')) return at(T_NUM) ? (next(), box(-prev.n)) : (fail("@class %s", why), NIL);
     if (accept(T_NUM)) return box(prev.n);
     if (atKw(K_true) || atKw(K_false) || atKw(K_nil)) return next(), prev.sym == K_true ? TRUE_ : prev.sym == K_false ? FALSE_ : NIL;
-    if (!at(T_STR)) fail("%s", why);
+    if (!at(T_STR)) fail("@class %s", why);
     std::string s;
     for (const char *p = cur.p, *e = p + cur.len; p < e; p++) {
-      if (*p == '{') fail("a field's default can't interpolate: set it in init");
+      if (*p == '{') fail("@class a field's default can't interpolate: set it in init");
       if (*p != '\\' || p + 1 == e) { s += *p; continue; }
       char c = *++p;
       s += c == 'n' ? '\n' : c == 't' ? '\t' : c == '0' ? '\0' : c;
@@ -1323,42 +1323,42 @@ struct Compiler : Gen {
     if (accept(':')) {
       ident();
       Global* g = findGlobal(cd.super = topName(prev).sym);
-      if (!g || g->kind != 'c' || cd.super == cd.sym) failAt(prev.p, prev.line, "bad superclass '%s'", name(cd.super));
+      if (!g || g->kind != 'c' || cd.super == cd.sym) failAt(prev.p, prev.line, "@class bad superclass '%s'", name(cd.super));
     }
     expect('{');
     while (!accept('}')) {
-      if (atKw(S_pub)) fail("a class's fields and methods are public when the class is: put 'pub' before 'class'");
+      if (atKw(S_pub)) fail("@misplaced a class's fields and methods are public when the class is: put 'pub' before 'class'");
       if (atKw(K_var)) {  // var name [= constant]: a declared field
         next();
         int s = ident();
-        for (auto& [x, d] : cd.fields) if (x == s) failAt(prev.p, prev.line, "duplicate field '%s'", name(s));
+        for (auto& [x, d] : cd.fields) if (x == s) failAt(prev.p, prev.line, "@duplicate duplicate field '%s'", name(s));
         Ty ty = accept(':') ? type() : Ty{};
         bool given = accept('=');
         Tok dt = cur;
         V d = given ? constant() : NIL;
-        if (ty.code && given && !typeAccepts(ty.code, d)) failAt(dt.p, dt.line, "field '%s' is %s, but its default is not", name(s), ty.text.c_str());
+        if (ty.code && given && !typeAccepts(ty.code, d)) failAt(dt.p, dt.line, "@type field '%s' is %s, but its default is not", name(s), ty.text.c_str());
         if (ty.code) cd.ftypes.push_back({s, ty.code, typeSite("field '" + symName(s) + "' of " + symName(cd.sym), ty.text)});
         cd.fields.push_back({s, d});
         continue;
       }
       if (atKw(S_invariant) && !peek().nl) {  // (the prescan has it: compiled into the methods)
-        if (!cur.nl && prev.t != '{') fail("an invariant goes on its own line");
+        if (!cur.nl && prev.t != '{') fail("@syntax an invariant goes on its own line");
         next();
         for (int d = 0; !(d == 0 && (at('}') || cur.nl)); next()) {
-          if (at(T_EOF)) fail("expected '}'");
-          if (d == 0 && at('{')) fail("an invariant ends at the end of its line (wrap a lambda in parentheses)");
+          if (at(T_EOF)) fail("@syntax expected '}'");
+          if (d == 0 && at('{')) fail("@syntax an invariant ends at the end of its line (wrap a lambda in parentheses)");
           d += nesting(cur);
         }
         continue;
       }
       bool over = atKw(S_override) && peek().t == T_ID && peek().sym == K_fn;
       if (over) next();
-      if (!atKw(K_fn)) fail("expected 'fn', 'override fn', 'var' or 'invariant' in class body");
+      if (!atKw(K_fn)) fail("@syntax expected 'fn', 'override fn', 'var' or 'invariant' in class body");
       next();
       Tok mt = cur;
       int m = ident();
-      for (auto& [x, f] : cd.methods) if (x == m) failAt(prev.p, prev.line, "duplicate method '%s'", name(m));
-      for (auto& [x, d] : cd.fields) if (x == m) failAt(prev.p, prev.line, "'%s' is already a field", name(m));
+      for (auto& [x, f] : cd.methods) if (x == m) failAt(prev.p, prev.line, "@duplicate duplicate method '%s'", name(m));
+      for (auto& [x, d] : cd.fields) if (x == m) failAt(prev.p, prev.line, "@duplicate '%s' is already a field", name(m));
       Fn*& f = methodFns[{cd.sym, m}];
       if (!f) f = make<Fn>(), f->code = newStub(), f->name = m, consts.push_back(box(f));
       cd.methods.push_back({m, f}), cd.written.push_back({m, over, {mt.p, mt.line, file, srcStart}});
@@ -1381,15 +1381,15 @@ struct Compiler : Gen {
     else if (at(T_ID) && !atKw(K_fn)) {
       std::string m = symName(ident());
       const Package* p = pkgOf(file);
-      if (!p) failAt(lt.p, lt.line, "'%s' would be a module of a package, and %s is in no package (a package's fut.pkg lists its modules: js %s ./%s.js)", m.c_str(), ::base(file).c_str(), m.c_str(), m.c_str());
+      if (!p) failAt(lt.p, lt.line, "@extern '%s' would be a module of a package, and %s is in no package (a package's fut.pkg lists its modules: js %s ./%s.js)", m.c_str(), ::base(file).c_str(), m.c_str(), m.c_str());
       fm = p->module(m, !WASM);
-      if (!fm) failAt(lt.p, lt.line, "package %s has no module '%s': add 'js %s ./file.js' (or wasm, or c) to %s", p->name.c_str(), m.c_str(), m.c_str(), p->manifest.c_str());
-      if (WASM && fm->kind == "c") failAt(lt.p, lt.line, "module %s is a C library (c %s %s), which only the native build loads: add a js or wasm version of it to %s", m.c_str(), m.c_str(), fm->target.c_str(), p->manifest.c_str());
-      if (!WASM && fm->kind != "c") failAt(lt.p, lt.line, "module %s is %s (%s %s %s), which only the wasm build loads: add a C version (c %s <library>) to %s", m.c_str(), fm->kind == "js" ? "JavaScript" : "WebAssembly", fm->kind.c_str(), m.c_str(), ::base(fm->target).c_str(), m.c_str(), p->manifest.c_str());
+      if (!fm) failAt(lt.p, lt.line, "@extern package %s has no module '%s': add 'js %s ./file.js' (or wasm, or c) to %s", p->name.c_str(), m.c_str(), m.c_str(), p->manifest.c_str());
+      if (WASM && fm->kind == "c") failAt(lt.p, lt.line, "@extern module %s is a C library (c %s %s), which only the native build loads: add a js or wasm version of it to %s", m.c_str(), m.c_str(), fm->target.c_str(), p->manifest.c_str());
+      if (!WASM && fm->kind != "c") failAt(lt.p, lt.line, "@extern module %s is %s (%s %s %s), which only the wasm build loads: add a C version (c %s <library>) to %s", m.c_str(), fm->kind == "js" ? "JavaScript" : "WebAssembly", fm->kind.c_str(), m.c_str(), ::base(fm->target).c_str(), m.c_str(), p->manifest.c_str());
       lib = fm->kind == "c" ? fm->target : fm->kind + ":" + fm->target, shownLib = "module " + m + " (" + fm->target + ")";
       if (fm->kind != "c" && std::find(modFiles.begin(), modFiles.end(), fm->target) == modFiles.end()) modFiles.push_back(fm->target);
     }
-    if (!atKw(K_fn)) fail("expected 'fn'");
+    if (!atKw(K_fn)) fail("@syntax expected 'fn'");
     next();
     Tok t = cur;
     int s = ident();
@@ -1398,8 +1398,8 @@ struct Compiler : Gen {
     if (err && !strcmp(err, "pending")) {  // the host loads it, then compiles again
       if (std::find(modulesPending.begin(), modulesPending.end(), lib) == modulesPending.end()) modulesPending.push_back(lib);
       fn = (void*)1;
-    } else if (err) failAt(lt.p, lt.line, "cannot load %s", shownLib.c_str());
-    if (!fn) failAt(t.p, t.line, fm && fm->kind != "c" ? "module %s has no function '%s'" : "no C function '%s'", fm ? fm->name.c_str() : name(s), name(s));
+    } else if (err) failAt(lt.p, lt.line, "@extern cannot load %s", shownLib.c_str());
+    if (!fn) failAt(t.p, t.line, fm && fm->kind != "c" ? "@extern module %s has no function '%s'" : "@extern no C function '%s'", fm ? fm->name.c_str() : name(s), name(s));
     // any: a value copied as JSON (lists and maps; functions and JS objects by reference); fn: a fut function
     // JavaScript can call. Both only into JavaScript; a wasm module's functions take numbers.
     bool js = WASM && (!fm || fm->kind == "js");
@@ -1407,13 +1407,13 @@ struct Compiler : Gen {
       int ty = atKw(K_fn) ? (next(), K_fn) : ident();
       std::string n = ty == K_fn ? "fn" : symName(ty);
       bool num = n == "num" || n == "int" || n == "long" || (ret && n == "void");
-      if (fm && fm->kind == "wasm" && !num) failAt(prev.p, prev.line, "a wasm module's functions take and return numbers (num, int, long%s)", ret ? ", void" : "");
-      if ((n == "any" || (n == "fn" && !ret)) && !js) failAt(prev.p, prev.line, "'%s' values cross only into JavaScript (a js module, or the wasm build's host)", n.c_str());
+      if (fm && fm->kind == "wasm" && !num) failAt(prev.p, prev.line, "@extern a wasm module's functions take and return numbers (num, int, long%s)", ret ? ", void" : "");
+      if ((n == "any" || (n == "fn" && !ret)) && !js) failAt(prev.p, prev.line, "@extern '%s' values cross only into JavaScript (a js module, or the wasm build's host)", n.c_str());
       if (n == "any") return 'a';
       if (n == "fn" && !ret) return 'f';
       for (const char* c : {"num", "int", "long", "ptr", "str", "void"})
         if (n == c && (ret || c[0] != 'v')) return c[0] == 'n' ? 'd' : c[0];
-      failAt(prev.p, prev.line, "unknown extern type '%s' (num, int, long, ptr, str%s%s)", n.c_str(), js ? ", any, fn" : "", ret ? ", void" : "");
+      failAt(prev.p, prev.line, "@extern unknown extern type '%s' (num, int, long, ptr, str%s%s)", n.c_str(), js ? ", any, fn" : "", ret ? ", void" : "");
     };
     std::string sig;
     expect('(');
@@ -1421,12 +1421,12 @@ struct Compiler : Gen {
       do sig += type(false); while (accept(','));
       expect(')');
     }
-    if (sig.size() > 7) failAt(t.p, t.line, "extern functions take at most 7 parameters");
+    if (sig.size() > 7) failAt(t.p, t.line, "@limit extern functions take at most 7 parameters");
     char ret = accept(':') ? type(true) : 'v';
     // A bare `!` declares that the function performs nothing (sin, strlen): the caller's promise, as its types are.
     // Without it, a call performs io.
     bool pure = at('!') && !cur.nl;
-    if (pure && (next(), at(T_ID) && !cur.nl)) fail("an extern fn performs io, or with a bare '!' nothing: it can't declare other effects");
+    if (pure && (next(), at(T_ID) && !cur.nl)) fail("@extern an extern fn performs io, or with a bare '!' nothing: it can't declare other effects");
     externs.push_back({qualify(s), fn, sig, ret, pure});
   }
   // effect Name { fn op(params) [: type] ... }: operations with no body. Code performs one as Name.op(args); the
@@ -1435,18 +1435,18 @@ struct Compiler : Gen {
     Tok nt = cur;
     int raw = ident(), s = qualify(raw);
     for (const char* b : {"io", "clock", "random", "yield", "spawn", "chan"})
-      if (symName(raw) == b) failAt(nt.p, nt.line, "'%s' is a builtin effect", b);
-    if (!effBit(s)) failAt(nt.p, nt.line, "too many effects (a program can declare at most %d)", EFF_LEVEL - EFF_BUILTIN);
+      if (symName(raw) == b) failAt(nt.p, nt.line, "@duplicate '%s' is a builtin effect", b);
+    if (!effBit(s)) failAt(nt.p, nt.line, "@limit too many effects (a program can declare at most %d)", EFF_LEVEL - EFF_BUILTIN);
     expect('{');
     EffectDef d{s, {}};
     std::vector<int> seen;
     while (!accept('}')) {
-      if (atKw(S_pub)) fail("an effect's operations are public when the effect is: put 'pub' before 'effect'");
-      if (!atKw(K_fn)) fail("expected 'fn' (an operation: fn name(params)) in an effect");
+      if (atKw(S_pub)) fail("@misplaced an effect's operations are public when the effect is: put 'pub' before 'effect'");
+      if (!atKw(K_fn)) fail("@syntax expected 'fn' (an operation: fn name(params)) in an effect");
       next();
       Tok ot = cur;
       int o = ident();
-      if (std::find(seen.begin(), seen.end(), o) != seen.end()) failAt(ot.p, ot.line, "duplicate operation '%s'", name(o));
+      if (std::find(seen.begin(), seen.end(), o) != seen.end()) failAt(ot.p, ot.line, "@duplicate duplicate operation '%s'", name(o));
       seen.push_back(o);
       std::string q = symName(s) + "." + symName(o);
       EffOpDef od{effOpId(q), 0, {}, 0, {}, -1};
@@ -1460,12 +1460,12 @@ struct Compiler : Gen {
         } while (accept(','));
         expect(')');
       }
-      if (od.arity > 7) failAt(ot.p, ot.line, "an operation takes at most 7 parameters");
+      if (od.arity > 7) failAt(ot.p, ot.line, "@limit an operation takes at most 7 parameters");
       if (accept(':')) {
         Ty r = type();
         od.rtype = r.code, od.rsite = typeSite("the result of " + q + "()", r.text);
       }
-      if (at('{')) fail("an effect's operations have no body: a handler gives one (handle { } with %s(...) { })", q.c_str());
+      if (at('{')) fail("@misplaced an effect's operations have no body: a handler gives one (handle { } with %s(...) { })", q.c_str());
       d.ops.push_back(std::move(od));
     }
     effDefs.push_back(std::move(d));
@@ -1473,7 +1473,7 @@ struct Compiler : Gen {
   void skipBlock() {  // a balanced { ... }, unparsed
     expect('{');
     for (int d = 1; d; next()) {
-      if (at(T_EOF)) fail("expected '}'");
+      if (at(T_EOF)) fail("@syntax expected '}'");
       d += at('{') - at('}');
     }
   }
@@ -1485,7 +1485,7 @@ struct Compiler : Gen {
     next();
     std::string nm;
     for (const char *p = prev.p, *e = p + prev.len; p < e; p++) nm += *p == '\\' && p + 1 < e ? *++p : *p;
-    if (!at('{')) fail("expected '{' after the test's name");
+    if (!at('{')) fail("@syntax expected '{' after the test's name");
     Mark body = mark();
     skipBlock();
     if (!testing) return;
@@ -1516,8 +1516,8 @@ struct Compiler : Gen {
   }
   void declare(const Tok& t, char kind, int arity) {
     Global& g = global(t.sym);
-    if (g.kind == 'n') failAt(t.p, t.line, "cannot redefine builtin '%s'", name(t.sym));
-    if (char& k = growAt(declKind, t.sym); k && (kind != 'v' || k != 'v')) failAt(t.p, t.line, "'%s' is already defined", name(t.sym));
+    if (g.kind == 'n') failAt(t.p, t.line, "@duplicate cannot redefine builtin '%s'", name(t.sym));
+    if (char& k = growAt(declKind, t.sym); k && (kind != 'v' || k != 'v')) failAt(t.p, t.line, "@duplicate '%s' is already defined", name(t.sym));
     else k = kind;
     g.kind = kind;
     if (kind == 'f' && !g.stub) g.stub = newStub();
@@ -1534,29 +1534,29 @@ struct Compiler : Gen {
   Target importTarget(const Tok& t) {
     std::string s(t.p, (size_t)t.len);
     const Package* here = pkgOf(file);
-    if (s.empty()) failAt(t.p, t.line, "expected a file or package name");
+    if (s.empty()) failAt(t.p, t.line, "@syntax expected a file or package name");
     if (s.starts_with("std/") && !s.ends_with(".fut")) {  // a standard library package: no dep line needed
       std::string n = s.substr(4);
       const Package* p = n.empty() || n.find('/') != std::string::npos || stdRoot.empty() ? nullptr : packageAt(stdRoot + "/" + n);
-      if (!p || p->name != n) failAt(t.p, t.line, "no standard library package '%s'%s", s.c_str(), stdRoot.empty() ? " (the standard library was not found: set FUT_STD to its directory)" : "");
+      if (!p || p->name != n) failAt(t.p, t.line, "@import no standard library package '%s'%s", s.c_str(), stdRoot.empty() ? " (the standard library was not found: set FUT_STD to its directory)" : "");
       return linkPackage(t, p, here);
     }
     if (s.find('/') == std::string::npos && !s.ends_with(".fut")) {  // a package
-      if (!here) failAt(t.p, t.line, "'%s' is a package name, and %s is in no package: put a fut.pkg next to it (name app, then dep %s <its directory>), or import a file by path (\"./%s.fut\")", s.c_str(), ::base(file).c_str(), s.c_str(), s.c_str());
-      if (s == here->name) failAt(t.p, t.line, "this file is in package %s: import its files by path (\"./file.fut\")", s.c_str());
+      if (!here) failAt(t.p, t.line, "@import '%s' is a package name, and %s is in no package: put a fut.pkg next to it (name app, then dep %s <its directory>), or import a file by path (\"./%s.fut\")", s.c_str(), ::base(file).c_str(), s.c_str(), s.c_str());
+      if (s == here->name) failAt(t.p, t.line, "@import this file is in package %s: import its files by path (\"./file.fut\")", s.c_str());
       const PackageDep* d = nullptr;
       for (auto& x : here->deps) if (x.name == s) d = &x;
-      if (!d) failAt(t.p, t.line, "package %s does not list '%s': add 'dep %s <its directory>' to %s", here->name.c_str(), s.c_str(), s.c_str(), here->manifest.c_str());
+      if (!d) failAt(t.p, t.line, "@import package %s does not list '%s': add 'dep %s <its directory>' to %s", here->name.c_str(), s.c_str(), s.c_str(), here->manifest.c_str());
       const Package* p = packageAt(d->dir);
       std::string at = here->manifest + ":" + std::to_string(d->line);
-      if (!p) failAt(t.p, t.line, "%s has no fut.pkg (dep %s, %s)", d->dir.c_str(), s.c_str(), at.c_str());
-      if (p->name != s) failAt(t.p, t.line, "the package in %s is named '%s', not '%s' (%s)", d->dir.c_str(), p->name.c_str(), s.c_str(), at.c_str());
+      if (!p) failAt(t.p, t.line, "@import %s has no fut.pkg (dep %s, %s)", d->dir.c_str(), s.c_str(), at.c_str());
+      if (p->name != s) failAt(t.p, t.line, "@import the package in %s is named '%s', not '%s' (%s)", d->dir.c_str(), p->name.c_str(), s.c_str(), at.c_str());
       return linkPackage(t, p, here);
     }
     std::string ip = resolvePath(s);
     if (const Package* there = pkgOf(ip); there != here) {
-      if (there) failAt(t.p, t.line, "'%s' is in package %s: import it by name (import \"%s\")%s", s.c_str(), there->name.c_str(), inStd(there->dir) ? ("std/" + there->name).c_str() : there->name.c_str(), here || inStd(there->dir) ? "" : ", from a package that lists it with dep");
-      failAt(t.p, t.line, "'%s' is outside package %s: a package's files are the ones below its fut.pkg (%s)", s.c_str(), here->name.c_str(), here->dir.c_str());
+      if (there) failAt(t.p, t.line, "@import '%s' is in package %s: import it by name (import \"%s\")%s", s.c_str(), there->name.c_str(), inStd(there->dir) ? ("std/" + there->name).c_str() : there->name.c_str(), here || inStd(there->dir) ? "" : ", from a package that lists it with dep");
+      failAt(t.p, t.line, "@import '%s' is outside package %s: a package's files are the ones below its fut.pkg (%s)", s.c_str(), here->name.c_str(), here->dir.c_str());
     }
     return {ip, ""};
   }
@@ -1576,10 +1576,10 @@ struct Compiler : Gen {
       if (here && reaches(p)) {
         std::string c;
         for (auto& n : chain) c += (c.empty() ? "" : " -> ") + n;
-        failAt(t.p, t.line, "packages can't depend on each other in a cycle: %s (move what both need into a package of its own)", c.c_str());
+        failAt(t.p, t.line, "@import packages can't depend on each other in a cycle: %s (move what both need into a package of its own)", c.c_str());
       }
       if (std::string& o = pkgNamed[(inStd(p->dir) ? "std/" : "") + p->name]; o.empty()) o = p->dir;  // std/x and x may both exist
-      else if (o != p->dir) failAt(t.p, t.line, "two packages are named '%s': %s and %s", s.c_str(), o.c_str(), p->dir.c_str());
+      else if (o != p->dir) failAt(t.p, t.line, "@import two packages are named '%s': %s and %s", s.c_str(), o.c_str(), p->dir.c_str());
       pkgOf(p->root);
       std::string& pre = pkgPreOf[p->dir];
       if (pre.empty()) for (pre = p->name; prefixTaken(pre, p->dir);) pre += "_";
@@ -1592,12 +1592,12 @@ struct Compiler : Gen {
   void clauseScan(Lexer& L, Clause& c, std::vector<At>* olds) {
     Lexer b = L;
     Tok p, t = lex(L);
-    if (t.nl || t.t == '{' || t.t == '}' || t.t == T_EOF) failAt(t.p, t.line, "expected a condition (on the same line)");
+    if (t.nl || t.t == '{' || t.t == '}' || t.t == T_EOF) failAt(t.p, t.line, "@syntax expected a condition (on the same line)");
     c.at = {t.p, t.line, file, srcStart};
     for (int d = 0; !clauseEnds(d, p, t); b = L, p = t, t = lex(L), d += nesting(p)) {
       if (t.t != '(' || t.nl || !(p.t == ')' || p.t == ']' || (p.t == T_ID && (p.sym >= NKW || p.sym == K_fn)))) continue;
       if (p.t != T_ID || p.sym != S_old) c.calls = true;
-      else if (!olds) failAt(p.p, p.line, "old() is a value as it was on entry: it belongs in an ensures clause");
+      else if (!olds) failAt(p.p, p.line, "@misplaced old() is a value as it was on entry: it belongs in an ensures clause");
       else olds->push_back({p.p, p.line, file, srcStart});
     }
     L = b;
@@ -1695,7 +1695,7 @@ struct Compiler : Gen {
       } else if (afterKw && p.sym == K_fn && (depth == 0 || (depth == 1 && cls >= 0))) {
         Tok d = depth ? t : q(t);
         std::string qn = depth ? symName(cls) + "." + symName(t.sym) : symName(d.sym);
-        if (spans.count(qn)) failAt(t.p, t.line, "'%s' is already defined", qn.c_str());
+        if (spans.count(qn)) failAt(t.p, t.line, "@duplicate '%s' is already defined", qn.c_str());
         Span& sp = spans[qn];
         int n = sp.arity = params(&sp.retNum);
         open.push_back({qn, p.p, p.line, depth});
@@ -1734,9 +1734,9 @@ struct Compiler : Gen {
         std::string ip = tg.path;
         Lexer s = L;
         Tok a = lex(s), n = a.t == T_ID && a.sym == S_as ? lex(s) : Tok{};
-        if (a.t == T_ID && a.sym == S_as && (n.t != T_ID || n.sym < NKW)) failAt(n.p, n.line, "expected a %s name after 'as'", tg.pkg.empty() ? "module" : "package");
-        if (re && !tg.pkg.empty()) failAt(t.p, t.line, "'pub import' re-exports a file of this package; a package's dependencies are not part of its interface");
-        if (re && n.t == T_ID) failAt(n.p, n.line, "'pub import' re-exports the file's pub names as they are: leave out 'as'");
+        if (a.t == T_ID && a.sym == S_as && (n.t != T_ID || n.sym < NKW)) failAt(n.p, n.line, "@syntax expected a %s name after 'as'", tg.pkg.empty() ? "module" : "package");
+        if (re && !tg.pkg.empty()) failAt(t.p, t.line, "@import 'pub import' re-exports a file of this package; a package's dependencies are not part of its interface");
+        if (re && n.t == T_ID) failAt(n.p, n.line, "@import 'pub import' re-exports the file's pub names as they are: leave out 'as'");
         if (re) reexports[path].push_back(ip);
         if (!tg.pkg.empty()) aliases[path][n.t == T_ID ? n.sym : intern(::base(std::string(t.p, (size_t)t.len)))] = tg.pkg;  // the package's name
         if (sources.count(ip) && !nsOf.count(ip)) continue;  // the program's own file: already here, with global names
@@ -1749,7 +1749,7 @@ struct Compiler : Gen {
         if (tg.pkg.empty() && n.t == T_ID) aliases[path][n.sym] = pre, isModule[ip] = true;  // import "file" as name: a module
         if (sources.count(ip)) continue;
         std::string& text = sources[ip].text;
-        if (!readSource(ip, text)) failAt(t.p, t.line, "cannot read '%s'", ip.c_str());
+        if (!readSource(ip, text)) failAt(t.p, t.line, "@import cannot read '%s'", ip.c_str());
         files.push_back(ip), prescan(ip, text.c_str());
       }
     }
@@ -1774,7 +1774,7 @@ struct Compiler : Gen {
       if (atKw(S_test) && peekIs(T_STR)) { next(), testDecl(); if (trace) traceCuts.push_back({item, prevEnd}); continue; }
       if (atKw(K_import)) {
         next();
-        if (!at(T_STR)) fail("expected a file or package name");
+        if (!at(T_STR)) fail("@syntax expected a file or package name");
         next();
         std::string ip = importTarget(prev).path;
         if (at(T_ID) && cur.sym == S_as) next(), ident();
@@ -2038,18 +2038,18 @@ struct Compiler : Gen {
         for (int s = cd.super; s >= 0 && owner < 0 && view(s, v); s = v.super)
           for (auto [m, a] : v.methods) if (m == w.sym) owner = s, arity = a;
         std::string m = symName(w.sym), q = symName(cd.sym) + "." + m;
-        if (owner < 0 && w.over) failHere(w.at, "'%s' is marked override, but no superclass of %s has a method '%s'", m, symName(cd.sym), m);
+        if (owner < 0 && w.over) failHere(w.at, "@override '%s' is marked override, but no superclass of %s has a method '%s'", m, symName(cd.sym), m);
         if (owner < 0) continue;
-        if (!w.over) failHere(w.at, "'%s' overrides %s: write 'override fn %s' if that is intended", m, symName(owner) + "." + m, m);
+        if (!w.over) failHere(w.at, "@override '%s' overrides %s: write 'override fn %s' if that is intended", m, symName(owner) + "." + m, m);
         if (int mine = spans.at(q).arity; mine != arity)
-          failHere(w.at, "'%s' takes %s, but %s, which it overrides, takes %s", m, params(mine), symName(owner) + "." + m, params(arity));
+          failHere(w.at, "@override '%s' takes %s, but %s, which it overrides, takes %s", m, params(mine), symName(owner) + "." + m, params(arity));
         // Callers that hold a superclass's instance rely on its method's types, so an override declares the same.
         auto a = sigs.find(symName(owner) + "." + m), b = sigs.find(q);
         if (a != sigs.end() && b != sigs.end() && a->second.types != b->second.types)
-          failHere(w.at, "'%s' must declare the same types as %s, which it overrides: %s, not %s", m, symName(owner) + "." + m, a->second.text, b->second.text);
+          failHere(w.at, "@override '%s' must declare the same types as %s, which it overrides: %s, not %s", m, symName(owner) + "." + m, a->second.text, b->second.text);
         // ...and may perform only what the method it replaces declares (a subset: doing less breaks no caller).
         if (a != sigs.end() && b != sigs.end() && a->second.eff && (!b->second.eff || (b->second.effMask & ~a->second.effMask)))
-          failHere(w.at, "'%s' must declare effects within those of %s, which it overrides (%s), not %s", m, symName(owner) + "." + m,
+          failHere(w.at, "@override '%s' must declare effects within those of %s, which it overrides (%s), not %s", m, symName(owner) + "." + m,
                    a->second.effText, b->second.eff ? b->second.effText : "none (unchecked)");
       }
     // Fields: in a class that declares its fields (or inherits declared ones), self.name must be one of them.
@@ -2058,7 +2058,7 @@ struct Compiler : Gen {
       bool closed = false, found = false;
       for (int s = u.cls; s >= 0 && view(s, v); s = v.super)
         for (auto& [f, d] : *v.fields) closed = true, found |= f == u.sym;
-      if (closed && !found) failHere(u.at, "%s has no field '%s' (declare it in the class: var %s)", symName(u.cls), symName(u.sym), symName(u.sym));
+      if (closed && !found) failHere(u.at, "@no-field %s has no field '%s' (declare it in the class: var %s)", symName(u.cls), symName(u.sym), symName(u.sym));
     }
   }
 

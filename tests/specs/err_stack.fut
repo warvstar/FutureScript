@@ -7,5 +7,5 @@ test "unbounded recursion stops the program with a stack overflow error" {
   expect !r.timedOut
   expect r.code == 1
   expect r.out == "before\n"
-  expect r.err.has("runtime error: stack overflow\n")
+  expect r.err.has("runtime error: stack overflow [stack-overflow]\n")
 }

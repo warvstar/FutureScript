@@ -208,7 +208,7 @@ test "effect, handle and with stay usable as names" {
 test "an uncaught effect error names the place it was performed" {
   var r = run("progs/effects_uncaught.fut")
   expect r.code == 1
-  expect r.err.has("runtime error: print() performs io, which report() does not declare (it declares ! clock)\n")
+  expect r.err.has("runtime error: print() performs io, which report() does not declare (it declares ! clock) [effect]\n")
   expect r.err.has("progs/effects_uncaught.fut:2)")
 }
 test "compile errors" {

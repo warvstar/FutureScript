@@ -35,7 +35,7 @@ static Package* load(const std::string& dir) {
   if (!readFile(path, text)) return noManifest[dir] = true, nullptr;
   auto p = std::make_unique<Package>();
   p->dir = dir, p->manifest = path;
-  auto bad = [&](int line, const std::string& m) { compileFail(path + ":" + std::to_string(line) + ": error: " + m, false); };
+  auto bad = [&](int line, const std::string& m) { compileFail(path + ":" + std::to_string(line) + ": error: " + m + " [manifest]", false); };
   int ln = 0;
   for (size_t i = 0; i <= text.size();) {
     size_t j = text.find('\n', i);

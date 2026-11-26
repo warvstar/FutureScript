@@ -16,7 +16,7 @@ WASM_FLAGS = ["--target=wasm32-wasip1", "--sysroot=/opt/homebrew/share/wasi-sysr
 WASM_LINK = ["-mexec-model=reactor", "-lsetjmp", "-Wl,--export=__stack_pointer", "-Wl,--export-table", "-Wl,--growable-table",
              "-Wl,-z,stack-size=8388608", "-Wl,--stack-first"]
 NATIVE_ONLY, WASM_ONLY = {"main.cpp", "jit.cpp", "sys.cpp"}, {"wasm.cpp"}
-NATIVE_SPECS = {"isolates.fut"}  # spawn needs threads: in wasm, isolates will be web workers (docs/isolates.md, phase 5)
+NATIVE_SPECS = {"isolates.fut", "codes_isolates.fut"}  # spawn needs threads: in wasm, isolates will be web workers (docs/isolates.md, phase 5)
 
 
 def build(debug=False, wasm=False, tsan=False):
@@ -395,7 +395,7 @@ def runner_packages(exe):
     loose = d / "loose.fut"
     loose.write_text('import "geom"\n')
     errs.append(run(str(loose)).stderr)
-    want = ["is pub inside package geom but not part of its interface", "package geom has no 'hidden' in its interface",
+    want = ["is pub inside package geom but not part of its interface: only what geom.fut makes pub (or re-exports with pub import) is [not-in-interface]", "package geom has no 'hidden' in its interface",
             "is in package geom: import it by name", "package app does not list 'nope'", "not the program's",
             "packages can't depend on each other in a cycle: app -> geom -> app", "is in no package"]
     a = run("api", main)
@@ -437,8 +437,11 @@ def runner_map(exe):
     (d / "geom" / "geom.fut").write_text(PKG_TREE["geom/geom.fut"].replace("pub fn area(r) {", "pub fn area(r)\n  requires r >= 0\n{"))
     (d / "geom" / "vec.fut").write_text(PKG_TREE["geom/vec.fut"].replace("pub class Vec {\n", "pub class Vec {\n  invariant self.x != nil\n"))
     marked = run(main, "geom").stdout  # contracts take no room: the map shows declarations only
+    recs2 = [json.loads(l) for l in run("--json", main).stdout.splitlines() if l.startswith("{")]
     tree(d, PKG_TREE)
     ln = next((r for r in recs if r.get("name") == "len"), {})
+    hashes = lambda rs: {r["name"]: r.get("hash") for r in rs if "hash" in r}
+    h1, h2 = hashes(recs), hashes(recs2)  # a declaration's hash changes with its text, not with where it is
     ok = (t.returncode == 0 and "pkg app 0.0.0  // fut.pkg" in t.stdout and "pkg geom 0.3.0  // ../geom/fut.pkg" in t.stdout
           and "  geom.fut  // root" in t.stdout and "    fn hidden()" in t.stdout and "      fn len()" in t.stdout
           and "pub class Vec  // 1-4" in t.stdout.replace("   ", " ").replace("  //", "  //")
@@ -446,7 +449,8 @@ def runner_map(exe):
           and area.get("package") == "geom" and area.get("line") == 3 and area.get("pub") is True
           and ln.get("in") == "Vec" and ln.get("line") == 3 and ln.get("end") == 3
           and "pkg app" not in f.stdout and "pkg geom" in f.stdout and none.returncode == 1
-          and re.search(r"pub fn area\(r\) +// 3-5\n", marked) and re.search(r"pub class Vec +// 1-5\n", marked) and "invariant" not in marked)
+          and re.search(r"pub fn area\(r\) +// 3-5\n", marked) and re.search(r"pub class Vec +// 1-5\n", marked) and "invariant" not in marked
+          and len(h1.get("area") or "") == 12 and h1["area"] != h2.get("area") and h1.get("len") == h2.get("len") and h1.get("hidden") == h2.get("hidden"))
     return ok, f"text: {t.stdout!r}\n  pub: {p.stdout!r}\n  json: {j.stdout[:400]!r}\n  filtered: {f.stdout!r}\n  contracts marked: {marked!r}"
 
 
@@ -574,6 +578,33 @@ def runner_changed(exe):
     return ok, f"got:  {got}\n  want: {want}\n  json: {j.stdout!r}"
 
 
+def runner_codes(exe):
+    """Error codes: every "@code" in the source is registered in errors.cpp, every registered one is used, and each is
+    raised by tests/specs/codes.fut unless exempt below. fut explain prints a code's rule and fix."""
+    src = "".join(p.read_text() for p in sorted((ROOT / "src").glob("*.[ch]*")) if p.name != "errors.cpp")
+    used = set(re.findall(r'"@([a-z-]+) ', src)) | {"manifest"}  # pkg.cpp appends [manifest] itself
+    table = (ROOT / "src" / "errors.cpp").read_text()
+    registered = re.findall(r'\{"([a-z-]+)", "', table)
+    tested = set(re.findall(r"\[([a-z-]+)\]", "".join((ROOT / "tests" / "specs" / f).read_text() for f in ["codes.fut", "codes_isolates.fut"])))
+    exempt = {"not-in-interface": "needs packages: runner_packages checks it", "manifest": "needs a fut.pkg",
+              "stale-call": "needs a hot reload", "memory": "needs memory to run out", "js": "needs JavaScript modules",
+              "isolate": "needs one isolate to fail while another runs"}
+    # every error the source raises states its code: a format string passed to ERR, rtError, fail or failAt starts "@code "
+    uncoded = []
+    for f in sorted((ROOT / "src").glob("*.[ch]*")):
+        t = f.read_text()
+        for m in re.finditer(r'\b(ERR\(|rtError\(ra,|fail\(|failAt\([^"()]*,)\s*"((?:[^"\\]|\\.)*)"', t):
+            if not m.group(2).startswith("@") and m.group(2) not in ("%s", "c") and not m.group(2).startswith(("internal", "param order")):
+                uncoded.append(f"{f.name}:{t.count(chr(10), 0, m.start()) + 1}: {m.group(2)[:60]}")
+    e = subprocess.run([*runner(exe), "explain", "index"], capture_output=True, text=True, timeout=60)
+    u = subprocess.run([*runner(exe), "explain", "nope"], capture_output=True, text=True, timeout=60)
+    missing = {"unregistered": sorted(used - set(registered)), "unused": sorted(set(registered) - used),
+               "untested": sorted(set(registered) - tested - set(exempt)), "dup": len(registered) != len(set(registered)), "uncoded": uncoded}
+    ok = (not any(missing.values()) and e.returncode == 0 and e.stdout.startswith("index: ") and "\nfix: " in e.stdout
+          and u.returncode == 1)
+    return ok, f"{missing}\n  explain: {e.stdout!r} {e.stderr!r} / {u.returncode}"
+
+
 RUNNER_TESTS = [("fut test --json: statuses, details, output", runner_json),
                 ("packages: names, interfaces, boundaries, versions", runner_packages),
                 ("fut map: packages, files, declarations", runner_map),
@@ -581,6 +612,7 @@ RUNNER_TESTS = [("fut test --json: statuses, details, output", runner_json),
                 ("fut test: tests first, filter, compile error, todo()", runner_text),
                 ("fut api: interfaces written, checked by fut test", runner_api),
                 ("docs/spec.md: every fut block passes", runner_spec),
+                ("error codes: registered, used, raised, explained", runner_codes),
                 ("fut test --changed: reruns what an edit affects", runner_changed),
                 ("std: imports without dep, names, property tests, pure externs", runner_std)]
 

@@ -8,9 +8,9 @@ static std::vector<u32> px;  // 0x00RRGGBB, top row first
 static int W, H;
 static bool down[0x10000], mouseDown;  // keys by (lowercased) character; arrows are 0xF700..0xF703
 static Pt mouse;
-#define NUM(v, f) (isNum(v) ? num(v) : (ERR(f "() expects numbers"), 0.0))
+#define NUM(v, f) (isNum(v) ? num(v) : (ERR(f "@argument () expects numbers"), 0.0))
 static int clip(double v, int hi) { return v > 0 ? (v < hi ? (int)v : hi) : 0; }  // NaN -> 0
-#define COLOR(c, f) (isNum(c) ? clip(num(c), 0xffffff) : (ERR(f "() expects a 0xRRGGBB color"), 0))
+#define COLOR(c, f) (isNum(c) ? clip(num(c), 0xffffff) : (ERR(f "@argument () expects a 0xRRGGBB color"), 0))
 static int lower(int c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
 
 #if __wasm__
@@ -20,11 +20,11 @@ extern "C" __attribute__((export_name("fut_key"))) void futKey(int c, int isDown
 extern "C" __attribute__((export_name("fut_mouse"))) void futMouse(double x, double y, int isDown) { mouse = {x, y}, mouseDown = isDown; }
 static V n_window(V w, V h) {
   W = clip(NUM(w, "window"), 4096), H = clip(NUM(h, "window"), 4096);
-  if (!host_window(W, H)) ERR("window() needs a display: run this in a browser (node web/serve.mjs)");
+  if (!host_window(W, H)) ERR("@host window() needs a display: run this in a browser (node web/serve.mjs)");
   return px.assign((size_t)W * H, 0), NIL;
 }
 static V n_present() {
-  if (px.empty()) ERR("present() before window()");
+  if (px.empty()) ERR("@host present() before window()");
   return fflush(stdout), boxb(host_present(px.data(), W, H));
 }
 void gfxPump() {}
@@ -76,7 +76,7 @@ void gfxPump() {  // handle pending window events (also called while a stopped p
   mouse = msg<Pt>(win, "mouseLocationOutsideOfEventStream"), mouse.y = H - mouse.y;
 }
 static V n_present() {  // show the frame, handle events, wait for the next 1/60 s tick; false once the window is closed
-  if (!win) ERR("present() before window()");
+  if (!win) ERR("@host present() before window()");
   void* img = cg<void* (*)(void*)>("CGBitmapContextCreateImage")(ctx);
   msg<void>(layer, "setContents:", (id)img), cg<void (*)(void*)>("CGImageRelease")(img);
   msg<void>(cls("CATransaction"), "flush"), fflush(stdout), gfxPump();
@@ -102,7 +102,7 @@ static V n_circle(V x, V y, V r, V c) {
   return NIL;
 }
 static V n_key(V k) {
-  if (!is(k, K::Str)) ERR("key() expects a name like \"a\", \"space\" or \"left\"");
+  if (!is(k, K::Str)) ERR("@argument key() expects a name like \"a\", \"space\" or \"left\"");
   std::string_view s = as<Str>(k)->sv();
   static const std::pair<std::string_view, int> named[] = {{"up", 0xF700}, {"down", 0xF701}, {"left", 0xF702}, {"right", 0xF703},
                                                            {"space", ' '}, {"enter", '\r'}, {"escape", 27}, {"tab", '\t'}};

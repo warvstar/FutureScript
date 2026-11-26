@@ -105,7 +105,7 @@ static V expectAt(V site, V l, V r) {
   auto d = details(s, f);
   for (size_t i = 0; i < d.size(); i++) msg += (i ? ", " : " (") + d[i] + (i + 1 == d.size() ? ")" : "");
   if (!failure.set) failure = f;
-  ERR("%s", msg.c_str());
+  ERR("@expect %s", msg.c_str());
 }
 // contract@fail(site, left, right, who): a contract's clause was false (the compiled code checked it). Raises an error
 // saying whose fault it is (the site's contract: "the caller broke f()'s contract: requires"), the condition and its
@@ -120,7 +120,8 @@ static V contractFail(V site, V l, V r, V who) {
   std::string msg = head + " " + oneLine(s.text);
   auto d = s.op >= 0 ? details(s, f) : std::vector<std::string>{};  // (a condition checked as one: "is false" adds nothing)
   for (size_t i = 0; i < d.size(); i++) msg += (i ? ", " : " (") + d[i] + (i + 1 == d.size() ? ")" : "");
-  ERR("%s", msg.c_str());
+  // whose fault: the caller's (requires), the function's (ensures), or the class's (an invariant)
+  ERR(s.contract.ends_with(": requires") ? "@requires %s" : s.contract.ends_with(": ensures") ? "@ensures %s" : "@invariant %s", msg.c_str());
 }
 // expect allocs { ... }: allocs@begin() before the block, allocs@end(what it returned) after: objects allocated between.
 static V allocsBegin() { return box((double)gcAllocations()); }
@@ -174,7 +175,7 @@ static V growsAt(V site, V clo, V growth, V byAllocs) {
   const ExpectSite& s = sites.at((size_t)num(site));
   Growth want;
   if (!is(growth, K::Str) || !parseGrowth(as<Str>(growth)->sv(), want))
-    ERR("expect grows: '%s' is not a growth (\"1\", \"log n\", \"n\", \"n log n\", \"n^2\", \"n^3\")", toStr(growth, false).c_str());
+    ERR("@argument expect grows: '%s' is not a growth (\"1\", \"log n\", \"n\", \"n log n\", \"n^2\", \"n^3\")", toStr(growth, false).c_str());
   volatile V keep = clo;
   (void)keep;
   Fn* f = as<Clo>(clo)->fn;
@@ -225,7 +226,7 @@ static V growsAt(V site, V clo, V growth, V byAllocs) {
   }
   fl.why += ")";
   if (!failure.set) failure = fl;
-  ERR("expect failed: %s (%s)", oneLine(s.text).c_str(), fl.why.c_str());
+  ERR("@expect expect failed: %s (%s)", oneLine(s.text).c_str(), fl.why.c_str());
 }
 // ---- property tests from specs (the compiler writes the loop: see Compiler::specProperties) ----
 static std::deque<PropSite> props;  // shared by every isolate, like the expect sites
@@ -427,7 +428,7 @@ static V propDiscard(V site, V e) {  // e says the input broke a requires of the
   if (!failure.set) failure = f;
   std::string one = why;
   for (size_t i; (i = one.find("\n    ")) != std::string::npos;) one.replace(i, 5, "; ");
-  ERR("expect failed: %s (%s)", p.text.c_str(), one.c_str());
+  ERR("@expect expect failed: %s (%s)", p.text.c_str(), one.c_str());
 }
 static V propFail(V site, V in, V e, V n) {
   PropSite& p = propAt(site);
@@ -473,7 +474,7 @@ static V n_run(V o) {
   std::vector<std::string> args;
   double timeout = 10;
   auto strOf = [](V v, const char* what) {
-    if (!is(v, K::Str)) ERR("run(): %s must be a string, got %s", what, typeName(v));
+    if (!is(v, K::Str)) ERR("@argument run(): %s must be a string, got %s", what, typeName(v));
     return std::string(as<Str>(v)->sv());
   };
   if (is(o, K::Str)) file = strOf(o, "the file");
@@ -482,15 +483,15 @@ static V n_run(V o) {
       std::string key = strOf(k, "an option name");
       if (key == "file") file = strOf(v, "file");
       else if (key == "source") src = strOf(v, "source"), hasSrc = true;
-      else if (key == "timeout") timeout = isNum(v) && num(v) > 0 ? num(v) : (ERR("run(): timeout must be a positive number"), 0.0);
+      else if (key == "timeout") timeout = isNum(v) && num(v) > 0 ? num(v) : (ERR("@argument run(): timeout must be a positive number"), 0.0);
       else if (key == "args" && is(v, K::List)) for (V a : as<List>(v)->v) args.push_back(strOf(a, "each of args"));
-      else ERR("run(): unknown option '%s' (file, source, args, timeout)", key.c_str());
+      else ERR("@argument run(): unknown option '%s' (file, source, args, timeout)", key.c_str());
     }
-  } else ERR("run() expects a file name or {file, source, args, timeout}, got %s", typeName(o));
-  if (hasSrc == !file.empty()) ERR("run(): give exactly one of file and source");
+  } else ERR("@argument run() expects a file name or {file, source, args, timeout}, got %s", typeName(o));
+  if (hasSrc == !file.empty()) ERR("@argument run(): give exactly one of file and source");
   if (!file.empty() && file[0] != '/') file = canonicalPath(mainFile.substr(0, mainFile.rfind('/') + 1) + file);
   ProcResult r;
-  if (!runProcess(args, file, hasSrc ? &src : nullptr, timeout, r)) ERR("run(): could not start fut");
+  if (!runProcess(args, file, hasSrc ? &src : nullptr, timeout, r)) ERR("@host run(): could not start fut");
   Map* m = make<Map>();
   volatile V keep = box(m);  // on the stack while the strings below allocate
   (void)keep;
@@ -578,7 +579,8 @@ std::string testReport(const TestCase& t, bool err, const std::string& e, char& 
       j += "}";
     } else if (err) {
       size_t nl = e.find('\n');
-      j += ",\"message\":" + json(e.substr(0, nl)) + ",\"trace\":" + json(nl == std::string::npos ? "" : e.substr(nl + 1));
+      std::string msg = e.substr(0, nl), c = splitCode(msg);
+      j += ",\"message\":" + json(msg) + (c.empty() ? "" : ",\"code\":" + json(c)) + ",\"trace\":" + json(nl == std::string::npos ? "" : e.substr(nl + 1));
     }
     return j + ",\"output\":" + json(out) + "}\n" + traceReport(t);
   }
@@ -642,10 +644,12 @@ void reportCompileError(const std::string& m) {
       j += ",\"file\":" + json(head.substr(0, c1)) + ",\"line\":" + std::to_string(line) + ",\"col\":" + std::to_string(col);
     head = head.substr(e + 9);
   }
-  emit(j + ",\"message\":" + json(head) + ",\"text\":" + json(m) + "}\n");
+  std::string c = splitCode(head);
+  emit(j + ",\"message\":" + json(head) + (c.empty() ? "" : ",\"code\":" + json(c)) + ",\"text\":" + json(m) + "}\n");
 }
 void reportTopError(const std::string& m) {
   if (!opts.json) return (void)(fflush(stdout), fprintf(stderr, "runtime error: %s", m.c_str()));
   size_t nl = m.find('\n');
-  emit("{\"type\":\"error\",\"message\":" + json(m.substr(0, nl)) + ",\"trace\":" + json(nl == std::string::npos ? "" : m.substr(nl + 1)) + "}\n");
+  std::string msg = m.substr(0, nl), c = splitCode(msg);
+  emit("{\"type\":\"error\",\"message\":" + json(msg) + (c.empty() ? "" : ",\"code\":" + json(c)) + ",\"trace\":" + json(nl == std::string::npos ? "" : m.substr(nl + 1)) + "}\n");
 }

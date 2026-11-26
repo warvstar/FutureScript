@@ -116,17 +116,17 @@ static std::string whoName() { return vm->who && vm->who < sites.size() ? sites[
 [[noreturn]] static void forbidden(const std::string& what, uint64_t effect, void* ra) {
   const char* e = effName[bitIndex(effect)].c_str();
   if (effect == EFF_IO && (vm->who == WHO_ATOMIC || (txnAtomic() && (vm->allowed & effect))))
-    rtError(ra, "%s performs io, which can't be undone inside atomic { } (do it after the block, or handle it inside the block)", what.c_str());
+    rtError(ra, "@atomic %s performs io, which can't be undone inside atomic { } (do it after the block, or handle it inside the block)", what.c_str());
   if (vm->who && vm->who < sites.size())
-    rtError(ra, "%s performs %s, which %s does not declare (%s)", what.c_str(), e, sites[vm->who].fn.c_str(), declares(sites[vm->who]).c_str());
-  rtError(ra, "%s performs %s, which is not allowed here", what.c_str(), e);
+    rtError(ra, "@effect %s performs %s, which %s does not declare (%s)", what.c_str(), e, sites[vm->who].fn.c_str(), declares(sites[vm->who]).c_str());
+  rtError(ra, "@effect %s performs %s, which is not allowed here", what.c_str(), e);
 }
 static void rt_effect(uint64_t site) {  // entering a declaring function whose effects its caller may not perform
   Site& s = sites[site];
   std::string extra = names(s.mask & ~vm->allowed & EFF_BITS);
   if (vm->who == WHO_ATOMIC)
-    rtError(RA(), "%s declares %s, which can't be undone inside atomic { }: it can't be called inside the block", s.fn.c_str(), extra.c_str());
-  rtError(RA(), "%s declares %s, but it is called from inside %s, which does not (%s)", s.fn.c_str(), extra.c_str(),
+    rtError(RA(), "@atomic %s declares %s, which can't be undone inside atomic { }: it can't be called inside the block", s.fn.c_str(), extra.c_str());
+  rtError(RA(), "@effect %s declares %s, but it is called from inside %s, which does not (%s)", s.fn.c_str(), extra.c_str(),
           whoName().c_str(), vm->who && vm->who < sites.size() ? declares(sites[vm->who]).c_str() : "");
 }
 
@@ -174,22 +174,22 @@ void* effPrep(Fn* f, V* w, uint64_t n) {
   OpInfo& o = ops[op];
   std::string what = op == OP_EXTERN ? symName(f->name) + "()" : o.name;
   int arity = op == OP_EXTERN || !o.user ? f->arity : o.arity;
-  if (arity != (int)n) rtError(RA(), "%s expects %d arguments, got %d", what.c_str(), arity, (int)n);
-  if (!o.effect) rtError(RA(), "%s: its effect is not defined", what.c_str());
+  if (arity != (int)n) rtError(RA(), "@arity %s expects %d arguments, got %d", what.c_str(), arity, (int)n);
+  if (!o.effect) rtError(RA(), "@effect %s: its effect is not defined", what.c_str());
   for (size_t i = 0; i < o.ptypes.size() && i < n; i++)
     if (o.ptypes[i] && !typeAccepts(o.ptypes[i], w[i + 1])) typeFail(o.psites[i], w[i + 1], RA());
   V clo, rec;
   if (findHandler(op, clo, rec)) {
     if (!usable(rec, o.effect)) forbidden(what, o.effect, RA());
     Fn* h = is(clo, K::Clo) ? as<Clo>(clo)->fn : is(clo, K::Fn) ? as<Fn>(clo) : nullptr;
-    if (!h || h->arity - is(clo, K::Clo) != (int)n) rtError(RA(), "the handler for %s must take %d parameters", what.c_str(), (int)n);
+    if (!h || h->arity - is(clo, K::Clo) != (int)n) rtError(RA(), "@arity the handler for %s must take %d parameters", what.c_str(), (int)n);
     pending = {clo, rec, op, n};
     memmove(w, w + 1, n * 8);
     return invokeCode;
   }
   if (!(vm->allowed & o.effect) || (o.effect == EFF_IO && txnAtomic())) forbidden(what, o.effect, RA());
   if (traceOn && op != printOp && (o.effect & (EFF_IO | EFF_CLOCK | EFF_RANDOM))) traceImpure();  // (print: captured under fut test)
-  if (o.user) rtError(RA(), "%s was performed, but nothing handles it (handle { ... } with %s { ... })", what.c_str(), o.name.substr(0, o.name.size() - 1).append("...)").c_str());
+  if (o.user) rtError(RA(), "@unhandled %s was performed, but nothing handles it (handle { ... } with %s { ... })", what.c_str(), o.name.substr(0, o.name.size() - 1).append("...)").c_str());
   memmove(w, w + 1, n * 8);
   return f->code;
 }

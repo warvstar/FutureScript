@@ -82,8 +82,8 @@ void traceAdd(const std::string& frames) { fiberTrace += frames; }
   fiberTrace += trace;
   if (fiberCur) fiberCur->val = v, longjmp(*errJmp, 1);  // ends the fiber; fiberResume throws v in its resumer
   if (errValue) *errValue = v, *errSink = fiberTrace;  // an isolate's: its task keeps both (isolate.cpp)
-  else if (errSink) *errSink = toStr(v) + "\n" + fiberTrace;
-  else fflush(stdout), fprintf(stderr, "runtime error: %s\n%s", toStr(v).c_str(), fiberTrace.c_str());
+  else if (errSink) *errSink = errorLine(v) + "\n" + fiberTrace;
+  else fflush(stdout), fprintf(stderr, "runtime error: %s\n%s", errorLine(v).c_str(), fiberTrace.c_str());
   fiberTrace.clear();
   if (errJmp) longjmp(*errJmp, 1);
   exit(1);
@@ -155,7 +155,7 @@ void fiberFree(Fiber* f) {
 }
 void fiberStack(Fiber* b) {
   char* s = (char*)mmap(nullptr, FIBER_STACK, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-  if (s == MAP_FAILED) ERR("out of memory for fiber stacks");
+  if (s == MAP_FAILED) ERR("@memory out of memory for fiber stacks");
   mprotect(s, 16 << 10, PROT_NONE);
   b->stack = s, b->limit = s + (64 << 10), b->top = (uintptr_t*)(s + FIBER_STACK);
   uintptr_t* sp = b->top - 20;  // a fiberSwap frame: x29 = 0 ends frame walks, x30 = fiberStart

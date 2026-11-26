@@ -20,11 +20,11 @@ int reap(int pid, std::vector<std::pair<int, std::string*>> pipes, double timeou
 
 namespace {
 std::string strArg(V v, const char* fn, const char* what) {
-  if (!is(v, K::Str)) ERR("%s(): %s must be a string, got %s", fn, what, typeName(v));
+  if (!is(v, K::Str)) ERR("@argument %s(): %s must be a string, got %s", fn, what, typeName(v));
   return std::string(as<Str>(v)->sv());
 }
 double numArg(V v, const char* fn, const char* what) {
-  if (!isNum(v) || num(v) <= 0) ERR("%s(): %s must be a positive number", fn, what);
+  if (!isNum(v) || num(v) <= 0) ERR("@argument %s(): %s must be a positive number", fn, what);
   return num(v);
 }
 V str(std::string_view s) { return box(newStr(s)); }
@@ -36,7 +36,7 @@ struct Res { long status = 0; std::string body, error; std::vector<std::pair<std
 Req reqOf(V v, const char* fn) {
   Req r;
   if (is(v, K::Str)) return r.url = strArg(v, fn, "the url"), r;
-  if (!is(v, K::Map)) ERR("%s() expects a url or {url, method, headers, body, timeout}, got %s", fn, typeName(v));
+  if (!is(v, K::Map)) ERR("@argument %s() expects a url or {url, method, headers, body, timeout}, got %s", fn, typeName(v));
   for (auto& [k, x] : as<Map>(v)->e) {
     std::string key = strArg(k, fn, "an option name");
     if (key == "url") r.url = strArg(x, fn, "url");
@@ -44,11 +44,11 @@ Req reqOf(V v, const char* fn) {
     else if (key == "body") r.body = strArg(x, fn, "body"), r.hasBody = true;
     else if (key == "timeout") r.timeout = numArg(x, fn, "timeout");
     else if (key == "headers") {
-      if (!is(x, K::Map)) ERR("%s(): headers must be a map of strings", fn);
+      if (!is(x, K::Map)) ERR("@argument %s(): headers must be a map of strings", fn);
       for (auto& [hk, hv] : as<Map>(x)->e) r.headers.push_back(strArg(hk, fn, "a header name") + ": " + strArg(hv, fn, "a header value"));
-    } else ERR("%s(): unknown option '%s' (url, method, headers, body, timeout)", fn, key.c_str());
+    } else ERR("@argument %s(): unknown option '%s' (url, method, headers, body, timeout)", fn, key.c_str());
   }
-  if (r.url.empty()) ERR("%s(): no url", fn);
+  if (r.url.empty()) ERR("@argument %s(): no url", fn);
   return r;
 }
 size_t onBody(char* p, size_t n, size_t k, void* s) { return ((std::string*)s)->append(p, n * k), n * k; }
@@ -98,7 +98,7 @@ V resultOf(const Res& r) {
 }
 template <class Q, class R, class Parse, class Run, class Out>
 V batch(V list, const char* fn, Parse parse, Run run, Out out) {  // each at once, on its own thread
-  if (!is(list, K::List)) ERR("%s() expects a list, got %s", fn, typeName(list));
+  if (!is(list, K::List)) ERR("@argument %s() expects a list, got %s", fn, typeName(list));
   std::vector<Q> qs;
   for (V v : as<List>(list)->v) qs.push_back(parse(v, fn));
   std::vector<R> rs(qs.size());
@@ -121,20 +121,20 @@ struct Out { int code = -1; std::string out, err; bool timedOut = false; };
 Cmd cmdOf(V v, const char* fn) {
   Cmd c;
   auto argv = [&](V l) {
-    if (!is(l, K::List) || as<List>(l)->v.empty()) ERR("%s(): the command must be a non-empty list of strings", fn);
+    if (!is(l, K::List) || as<List>(l)->v.empty()) ERR("@argument %s(): the command must be a non-empty list of strings", fn);
     for (V a : as<List>(l)->v) c.argv.push_back(strArg(a, fn, "each part of the command"));
   };
   if (is(v, K::List)) return argv(v), c;
-  if (!is(v, K::Map)) ERR("%s() expects [argv...] or {cmd, cwd, input, timeout}, got %s", fn, typeName(v));
+  if (!is(v, K::Map)) ERR("@argument %s() expects [argv...] or {cmd, cwd, input, timeout}, got %s", fn, typeName(v));
   for (auto& [k, x] : as<Map>(v)->e) {
     std::string key = strArg(k, fn, "an option name");
     if (key == "cmd") argv(x);
     else if (key == "cwd") c.cwd = strArg(x, fn, "cwd");
     else if (key == "input") c.input = strArg(x, fn, "input"), c.hasInput = true;
     else if (key == "timeout") c.timeout = numArg(x, fn, "timeout");
-    else ERR("%s(): unknown option '%s' (cmd, cwd, input, timeout)", fn, key.c_str());
+    else ERR("@argument %s(): unknown option '%s' (cmd, cwd, input, timeout)", fn, key.c_str());
   }
-  if (c.argv.empty()) ERR("%s(): no cmd", fn);
+  if (c.argv.empty()) ERR("@argument %s(): no cmd", fn);
   return c;
 }
 void spawnOne(const Cmd& c, Out& o) {  // on any thread
@@ -198,7 +198,7 @@ V n_writeFile(V path, V text) {
   FILE* f = fopen(p.c_str(), "wb");
   if (!f || fwrite(s.data(), 1, s.size(), f) != s.size()) {
     if (f) fclose(f);
-    ERR("writeFile(): could not write '%s': %s", p.c_str(), strerror(errno));
+    ERR("@host writeFile(): could not write '%s': %s", p.c_str(), strerror(errno));
   }
   fclose(f);
   return NIL;

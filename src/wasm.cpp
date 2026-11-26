@@ -214,7 +214,7 @@ static V rt_ffi(V* w, Ext* e) {
   if (failed) {  // it threw: a fut error here, which try can catch
     std::string m((size_t)r, 0);
     host_take(m.data());
-    ERR("%s(): %s", symName(e->sym).c_str(), m.c_str());
+    ERR("@js %s(): %s", symName(e->sym).c_str(), m.c_str());
   }
   if (e->ret == 's' || e->ret == 'a') {
     if (r < 0) return NIL;
@@ -278,7 +278,7 @@ void fiberFree(Fiber* f) {
 }
 void fiberStack(Fiber* b) {
   b->stack = (char*)aligned_alloc(16, FIBER_STACK);
-  if (!b->stack) ERR("out of memory for fiber stacks");
+  if (!b->stack) ERR("@memory out of memory for fiber stacks");
   b->limit = b->stack + (16 << 10), b->top = (uintptr_t*)(b->stack + FIBER_STACK), b->sp = b->top;
 }
 static void use(Fiber* f) { fiberCur = f, stackTop = f ? f->top : fiberMainTop, vm->limit = f ? f->limit : mainLimit; }
@@ -346,7 +346,7 @@ static void safepoint() {  // rt_poll: a collection the allocator asked for, the
   if (gcWanted()) gcCollect();
   if (p & 1) vm->txn ? void(txnPollLater = true) : host_poll();  // reloads and typed lines wait for transactions to end
 }
-static V undefFn() { ERR("call to undefined function"); }
+static V undefFn() { ERR("@not-callable call to undefined function"); }
 static void rt_hot(void* t, V* args, int n) {  // a tier-1 body reached its call count
   u32 m = 0;
   for (int i = 0; i < n; i++) m |= u32(isNum(args[i])) << i;
@@ -401,6 +401,7 @@ EXPORT(fut_fn) int futFn(const char* nm) {  // a top-level fn of no arguments: i
 EXPORT(fut_call) V futCall(int slot) { return vmCall((void*)(uintptr_t)slot); }
 EXPORT(fut_retire) void futRetire(int slot) { jitRetire((u32*)(uintptr_t)slot); }
 EXPORT(fut_str) const char* futStr(V v) { return (text = toStr(v)).c_str(); }
+EXPORT(fut_error_line) const char* futErrorLine(V v) { return (text = errorLine(v)).c_str(); }  // with its [code]
 EXPORT(fut_where) const char* futWhere(int slot, int off) {  // "name (file:line)" for a frame at module offset off
   auto it = lineTabs.find(slot);
   if (it == lineTabs.end() || it->second.file.empty()) return "";
@@ -417,6 +418,7 @@ EXPORT(fut_test_finish) void futTestFinish(int i, int errored, const char* err) 
 EXPORT(fut_test_top_error) void futTestTopError(const char* err) { reportTopError(err); }
 EXPORT(fut_tests_end) int futTestsEnd() { return testsEnd(); }
 // The last compile's interfaces: mode 0 reports them as text, 1 as JSON, 2 writes them (fut api); the number
+EXPORT(fut_explain) int futExplain(const char* code) { int r = explain(*code ? code : nullptr); return fflush(stdout), fflush(stderr), r; }
 EXPORT(fut_api) int futApi(int mode, const char* program) {
   return mode == 2 ? writeInterfaces(last, program) : reportInterfaces(checkInterfaces(last), mode == 1, program);
 }
@@ -429,14 +431,14 @@ EXPORT(fut_map) int futMap(int pub, int json, const char* only, const char* prog
 static std::string applied;
 EXPORT(fut_apply) const char* futApply(int id, const char* args) {
   V f = jsPinned(id);
-  if (f == NIL) ERR("a fut function called from JavaScript after it was released");
+  if (f == NIL) ERR("@js a fut function called from JavaScript after it was released");
   V a = fromJs(args);
   std::vector<V>& v = as<List>(a)->v;
   Fn* fn = is(f, K::Clo) ? as<Clo>(f)->fn : as<Fn>(f);
   int want = fn->arity - is(f, K::Clo);
   if ((int)v.size() > want) v.resize(want);  // JavaScript passes extra arguments freely (index, array, ...)
   while ((int)v.size() < want) v.push_back(NIL);
-  if (want > 7) ERR("a function called from JavaScript takes at most 7 parameters");
+  if (want > 7) ERR("@js a function called from JavaScript takes at most 7 parameters");
   V args8[8] = {};
   int k = 0;
   if (is(f, K::Clo)) args8[k++] = f;

@@ -237,14 +237,14 @@ export async function createFut(opts) {
     return fr.join("");
   }
   function describe(e) {
-    if (e instanceof RangeError && /call stack/i.test(e.message)) return "stack overflow";
+    if (e instanceof RangeError && /call stack/i.test(e.message)) return "stack overflow [stack-overflow]";  // V8's own: the code errors.cpp gives rt.cpp's
     return "internal error: " + (e?.message ?? e);
   }
   function errorText(e) {  // the message, a newline, the trace
     let msg, t = "";
     if (e instanceof WebAssembly.Exception && e.is(tag)) {
       const v = e.getArg(tag, 0);
-      (msg = str(v)), (t = (fiberTraces.get(v) ?? "") + trace(e));
+      (msg = cstr(ex.fut_error_line(v))), (t = (fiberTraces.get(v) ?? "") + trace(e));
     } else (msg = describe(e)), opts.verbose && !(e instanceof RangeError) && (t = String(e.stack) + "\n");
     return fiberTraces.clear(), msg + "\n" + t;
   }
@@ -429,6 +429,7 @@ export async function createFut(opts) {
       if (!n && only) write(2, `nothing matches '${only}'\n`);
       return !n && only ? 1 : 0;
     },
+    explain(code) { return withStr(code ?? "", (c) => ex.fut_explain(c)); },  // fut explain [code]: an error code's rule and fix
     async line(l) {  // REPL without a program: returns the next prompt
       (replBuf += l), await evalRepl(l.length > 1);
       return replBuf ? ". " : "> ";

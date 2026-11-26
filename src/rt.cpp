@@ -185,12 +185,15 @@ static u32* mapSlot(Map* m, V k) {  // k's index slot, else the slot to insert i
 static long mapFind(Map* m, V k) { u32 s = *mapSlot(m, k); return s && s != ~0u ? (long)s - 1 : -1; }
 
 [[noreturn]] void rtError(void* ra, const char* fmt, ...) {
+  const char* code = takeCode(fmt);
   char msg[512];
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(msg, sizeof msg, fmt, ap);
   va_end(ap);
-  throwValue(box(newStr(msg)), ra);
+  V v = box(newStr(msg));
+  if (code) noteRaised(v, msg, code);
+  throwValue(v, ra);
 }
 static void rt_throw(V v) { throwValue(v, RA()); }
 
@@ -199,7 +202,7 @@ static V rt_binop(V a, V b, uint64_t op) {
   static const char* ops[] = {"+", "-", "*", "/", "%", "==", "!=", "<", "<=", ">", ">=", "&", "|", "^", "<<", ">>"};
   if (op >= O_BAND) {  // integer operators: on whole numbers (exact up to 2^53), computed in 64 bits
     auto whole = [](V v) { return isNum(v) && std::fabs(num(v)) < 9.2e18 && num(v) == std::trunc(num(v)); };
-    if (!whole(a) || !whole(b)) ERR("'%s' needs whole numbers, got %s and %s", ops[op], toStr(a, true).c_str(), toStr(b, true).c_str());
+    if (!whole(a) || !whole(b)) ERR("@operand '%s' needs whole numbers, got %s and %s", ops[op], toStr(a, true).c_str(), toStr(b, true).c_str());
     int64_t x = (int64_t)num(a), y = (int64_t)num(b);
     bool in = y >= 0 && y < 64;
     return box((double)(op == O_BAND ? x & y : op == O_BOR ? x | y : op == O_BXOR ? x ^ y
@@ -222,7 +225,7 @@ static V rt_binop(V a, V b, uint64_t op) {
     int c = as<Str>(a)->sv().compare(as<Str>(b)->sv());
     return boxb(op == O_LT ? c < 0 : op == O_LE ? c <= 0 : op == O_GT ? c > 0 : c >= 0);
   }
-  ERR("bad operands for '%s': %s and %s", ops[op], typeName(a), typeName(b));
+  ERR("@operand bad operands for '%s': %s and %s", ops[op], typeName(a), typeName(b));
 }
 // Fields: slow paths of the inline caches emitted by the compiler; they also fill the cache.
 // Strings the runtime makes for m.name keys (m["name"]) and single characters are made once and kept in consts.
@@ -246,9 +249,9 @@ static V rt_getf(V o, uint64_t s, IC* ic) {
       return in->slots[i];
     }
     if (const V* d = in->cls->declared((int)s)) return *d;  // never assigned (or declared since it was made): the default
-    if (in->cls->closed()) ERR("%s has no field '%s'", symName(in->cls->name).c_str(), symName(s).c_str());
+    if (in->cls->closed()) ERR("@no-field %s has no field '%s'", symName(in->cls->name).c_str(), symName(s).c_str());
   }
-  ERR("%s has no field '%s'", typeName(o), symName(s).c_str());
+  ERR("@no-field %s has no field '%s'", typeName(o), symName(s).c_str());
 }
 // What JIT constructors read from a class: a new instance has room for every field the class has had so far.
 // Hold layoutMu. Isolates construct while it changes: the cell size is written (one word) before the header that
@@ -264,11 +267,11 @@ static V rt_setf(V o, uint64_t s, V v, IC* ic) {
   bool outside = s & SETF_OUTSIDE;
   s &= ~SETF_OUTSIDE;
   if (is(o, K::Map)) return rt_seti(o, mapKey(s), v);
-  if (!is(o, K::Inst)) ERR("cannot set field '%s' on %s", symName(s).c_str(), typeName(o));
+  if (!is(o, K::Inst)) ERR("@no-field cannot set field '%s' on %s", symName(s).c_str(), typeName(o));
   Inst* in = as<Inst>(o);
   touch(in);  // in a transaction: saved before its first change (the cache isn't filled, so every store comes here)
   if (in->cls->closed() && !in->cls->declared((int)s))
-    ERR("%s has no field '%s' (its fields are declared: add 'var %s' to the class)", symName(in->cls->name).c_str(), symName(s).c_str(), symName(s).c_str());
+    ERR("@no-field %s has no field '%s' (its fields are declared: add 'var %s' to the class)", symName(in->cls->name).c_str(), symName(s).c_str(), symName(s).c_str());
   int f = in->cls->layout.find((int)s);
   if (f < 0) {
     Locked g(layoutMu);
@@ -277,7 +280,7 @@ static V rt_setf(V o, uint64_t s, V v, IC* ic) {
   u32 i = (u32)f;
   if (i >= in->nslots) {  // a field this instance had no room for: move the slots out of line
     u32 n = (u32)in->cls->layout.size();
-    if (n > 0xffff) ERR("too many fields");
+    if (n > 0xffff) ERR("@limit too many fields");
     V* s = (V*)malloc(n * 8);
     std::copy(in->slots, in->slots + in->nslots, s), std::fill(s + in->nslots, s + n, ABSENT);
     if (in->slots != in->inl()) free(in->slots);
@@ -294,8 +297,8 @@ static V rt_setf(V o, uint64_t s, V v, IC* ic) {
   if (ic && !vm->txn && (!ty || ty->type == TY_NUM)) *ic = {header(in), i | (ty ? 1ull << 32 : 0) | (inv ? 1ull << 33 : 0)};
   return in->slots[i] = v;
 }
-#define INDEX(i, n) (isNum(i) && num(i) >= 0 && num(i) < (n) ? (size_t)num(i) : (ERR("index %s out of range (len %zu)", toStr(i).c_str(), (size_t)(n)), 0))
-#define NUMARG(v, f) (isNum(v) ? num(v) : (ERR(f "() expects a number"), 0.0))
+#define INDEX(i, n) (isNum(i) && num(i) >= 0 && num(i) < (n) ? (size_t)num(i) : (ERR("@index index %s out of range (len %zu)", toStr(i).c_str(), (size_t)(n)), 0))
+#define NUMARG(v, f) (isNum(v) ? num(v) : (ERR("@argument " f "() expects a number"), 0.0))
 static V char1(V s, size_t i) { return cached(charStrs[(uint8_t)as<Str>(s)->s()[i]], {as<Str>(s)->s() + i, 1}); }
 void mapSet(Map* m, V k, V v) {
   if ((m->used + 1) * 4 > m->idx.size() * 3) {  // grow (and drop deleted slots): rebuild the index
@@ -315,13 +318,13 @@ static V rt_geti(V a, V i) {
     long e = mapFind(as<Map>(a), i);
     return e < 0 ? NIL : as<Map>(a)->e[e].second;
   }
-  if (!is(a, K::List) && !is(a, K::Str)) ERR("cannot index %s", typeName(a));
+  if (!is(a, K::List) && !is(a, K::Str)) ERR("@index cannot index %s", typeName(a));
   if (is(a, K::List)) return as<List>(a)->v[INDEX(i, as<List>(a)->v.size())];
   return char1(a, INDEX(i, as<Str>(a)->len));
 }
 static V rt_seti(V a, V i, V v) {
   if (is(a, K::Map)) return touch(obj(a)), mapSet(as<Map>(a), i, v), v;
-  if (!is(a, K::List)) ERR("cannot assign into %s", typeName(a));
+  if (!is(a, K::List)) ERR("@index cannot assign into %s", typeName(a));
   auto& l = as<List>(a)->v;
   size_t at = INDEX(i, l.size());
   return touch(obj(a)), l[at] = v;
@@ -334,7 +337,7 @@ static V rt_iter(V c, uint64_t i) {
     V r = as<Fiber>(c)->state == FIB_DONE ? END : fiberResume(c, NIL);
     return as<Fiber>(c)->state == FIB_DONE ? END : r;
   }
-  if (!is(c, K::Str)) ERR("cannot iterate over %s", typeName(c));
+  if (!is(c, K::Str)) ERR("@not-iterable cannot iterate over %s", typeName(c));
   return i < as<Str>(c)->len ? char1(c, i) : END;
 }
 static V rt_list(V* w, uint64_t n) {
@@ -363,7 +366,7 @@ static void* rt_prep(V* w, uint64_t n, uint64_t sym, V sup, IC* ic) {
   IC* ctor = sym ? nullptr : ic;
   if (sym && is(r, K::Map) && !builtin(K::Map, sym) && (int)sym != invariantSym()) {  // m.f(x) calls m["f"]
     long e = mapFind(as<Map>(r), mapKey(sym));
-    if (e < 0) ERR("map has no key '%s' to call", symName(sym).c_str());
+    if (e < 0) ERR("@not-callable map has no key '%s' to call", symName(sym).c_str());
     r = w[0] = as<Map>(r)->e[e].second, sym = 0;
   }
   if (sym) {  // method call (sym 0 is the keyword 'var', never a method name)
@@ -375,14 +378,14 @@ static void* rt_prep(V* w, uint64_t n, uint64_t sym, V sup, IC* ic) {
       if (ic && is(r, K::Inst) && !sup) *ic = {header(obj(r)), (uint64_t)identCode};
       return identCode;
     }
-    if (!f) ERR("%s has no method '%s'", typeName(r), symName(sym).c_str());
+    if (!f) ERR("@no-method %s has no method '%s'", typeName(r), symName(sym).c_str());
     if (ic && is(r, K::Inst) && f->arity == (int)n + 1) *ic = {header(obj(r)), (uint64_t)f->code};
   } else if (is(r, K::Fn)) {
     f = as<Fn>(r);
     if (f->op) return effPrep(f, w, n);  // an effect's operation: a handler, the builtin, or an error
     if (f->arity != (int)n) {
       if (traceOn) traceCalled(f->name);
-      ERR("%s expects %d arguments, got %d", symName(f->name).c_str(), f->arity, (int)n);
+      ERR("@arity %s expects %d arguments, got %d", symName(f->name).c_str(), f->arity, (int)n);
     }
     memmove(w, w + 1, n * 8);
     return f->code;
@@ -402,27 +405,27 @@ static void* rt_prep(V* w, uint64_t n, uint64_t sym, V sup, IC* ic) {
     if (__atomic_load_n(&c->initEpoch, __ATOMIC_ACQUIRE) != icEpoch)  // isolates may race to fill it: same value
       __atomic_store_n(&c->init, c->find(S_init), __ATOMIC_RELAXED), __atomic_store_n(&c->initEpoch, icEpoch, __ATOMIC_RELEASE);
     if (!(f = __atomic_load_n(&c->init, __ATOMIC_RELAXED))) {
-      if (n) ERR("%s takes no arguments (no init)", symName(as<Class>(r)->name).c_str());
+      if (n) ERR("@arity %s takes no arguments (no init)", symName(as<Class>(r)->name).c_str());
       if (ctor) *ctor = {r, (uint64_t)identCode};
       return identCode;
     }
-    if (f->arity != (int)n + 1) ERR("%s expects %d arguments, got %d", symName(f->name).c_str(), f->arity - 1, (int)n);
+    if (f->arity != (int)n + 1) ERR("@arity %s expects %d arguments, got %d", symName(f->name).c_str(), f->arity - 1, (int)n);
     if (ctor) *ctor = {r, (uint64_t)f->code};  // the site allocates inline from now on (until the next reload)
     return f->code;
-  } else ERR("cannot call %s", typeName(r));
-  if (f->arity != (int)n + 1) ERR("%s expects %d arguments, got %d", symName(f->name).c_str(), f->arity - 1, (int)n);
+  } else ERR("@not-callable cannot call %s", typeName(r));
+  if (f->arity != (int)n + 1) ERR("@arity %s expects %d arguments, got %d", symName(f->name).c_str(), f->arity - 1, (int)n);
   return f->code;
 }
-static V rt_numchk(V v) { return isNum(v) ? v : (ERR("expected a number, got %s", typeName(v)), v); }
+static V rt_numchk(V v) { return isNum(v) ? v : (ERR("@operand expected a number, got %s", typeName(v)), v); }
 static void rt_poll();
 static void rt_stack() {  // wasm: the entry check also fails while a safepoint is wanted (gen_wasm.h)
   char here;
   if (WASM && vm->poll && &here + 256 >= (char*)vm->limit) return rt_poll();
-  ERR("stack overflow");
+  ERR("@stack-overflow stack overflow");
 }
-static void rt_undef() { ERR("call to undefined function"); }
+static void rt_undef() { ERR("@not-callable call to undefined function"); }
 static void rt_stale(uint64_t sym, void* ra) {
-  rtError(ra, "stale call to '%s': its parameters changed, but this caller is old code that is still running",
+  rtError(ra, "@stale-call stale call to '%s': its parameters changed, but this caller is old code that is still running",
           symName(sym).c_str());
 }
 
@@ -436,8 +439,8 @@ V fiberCall(Fiber* f) {
   return is(f->fn, K::Clo) ? vmCall(as<Clo>(f->fn)->fn->code, {f->fn, f->val}) : vmCall(as<Fn>(f->fn)->code, {f->val});
 }
 V newFiber(V fn) {
-  Fn* f = is(fn, K::Clo) ? as<Clo>(fn)->fn : is(fn, K::Fn) ? as<Fn>(fn) : (ERR("fiber() expects a function"), nullptr);
-  if (f->arity - is(fn, K::Clo) > 1) ERR("a fiber's function takes at most one parameter (the first value sent)");
+  Fn* f = is(fn, K::Clo) ? as<Clo>(fn)->fn : is(fn, K::Fn) ? as<Fn>(fn) : (ERR("@fiber fiber() expects a function"), nullptr);
+  if (f->arity - is(fn, K::Clo) > 1) ERR("@arity a fiber's function takes at most one parameter (the first value sent)");
   Fiber* b = make<Fiber>();
   b->fn = fn, b->val = NIL, fiberStack(b);
   b->allowed = vm->allowed, b->who = vm->who, b->hstack = NIL, b->inv = 0;  // it may do what its creator may, and has its own handlers
@@ -445,8 +448,8 @@ V newFiber(V fn) {
 }
 V fiberResume(V fv, V v) {  // run fv until it yields (giving the yielded value) or returns (its result)
   Fiber* f = as<Fiber>(fv);
-  if (f->state == FIB_DONE) ERR("resume of a finished fiber");
-  if (f->state == FIB_RUNNING) ERR("resume of a running fiber");
+  if (f->state == FIB_DONE) ERR("@fiber resume of a finished fiber");
+  if (f->state == FIB_RUNNING) ERR("@fiber resume of a running fiber");
   bool start = f->state == FIB_NEW;
   f->val = v, f->resumer = fiberCur, f->state = FIB_RUNNING;
   EffState mine = effSave();  // each fiber has its own effect state (allowed effects, handlers)
@@ -472,8 +475,8 @@ V rt_yield(V v) {
   V r = effYield(v, &handled);  // a handler answers in place; otherwise this code must be allowed to yield
   if (handled) return r;
   Fiber* f = fiberCur;
-  if (!f) ERR("yield outside a fiber");
-  if (txnOpenIn(f)) ERR("yield inside atomic { }: other code would run while it is half done (yield after it ends)");
+  if (!f) ERR("@fiber yield outside a fiber");
+  if (txnOpenIn(f)) ERR("@atomic yield inside atomic { }: other code would run while it is half done (yield after it ends)");
   f->val = v, f->state = FIB_SUSPENDED;
   fiberYield(f);
   return std::exchange(f->val, NIL);  // sent by the next resume
@@ -482,7 +485,7 @@ char ffiCheck(Ext* e, int i, V v) {
   char t = e->sig[i];
   if (t == 'a') return t;  // any: toJs checks what it can pass
   if (t == 'f' ? !is(v, K::Fn) && !is(v, K::Clo) : t == 's' ? !is(v, K::Str) : !isNum(v) || (t != 'd' && !(std::fabs(num(v)) < 9.2e18)))
-    ERR("%s() argument %d: expected %s, got %s", symName(e->sym).c_str(), i + 1, t == 'f' ? "a function" : t == 's' ? "a string" : "a number", typeName(v));
+    ERR("@argument %s() argument %d: expected %s, got %s", symName(e->sym).c_str(), i + 1, t == 'f' ? "a function" : t == 's' ? "a string" : "a number", typeName(v));
   return t;
 }
 u32* ffiThunk(void* fn, const std::string& sig, char ret, int sym) {
@@ -494,7 +497,7 @@ u32* ffiThunk(void* fn, const std::string& sig, char ret, int sym) {
   return t = ffiCode(e);
 }
 static void rt_poll() {
-  if (isolateStopped()) vm->poll = 0, ERR("stopped: the isolate that started this one ended with an error");
+  if (isolateStopped()) vm->poll = 0, ERR("@isolate stopped: the isolate that started this one ended with an error");
   if (pollHook) pollHook();
 }
 
@@ -519,19 +522,19 @@ static V n_len(V v) {
   if (is(v, K::Str)) return box((double)as<Str>(v)->len);
   if (is(v, K::List)) return box((double)as<List>(v)->v.size());
   if (is(v, K::Map)) return box((double)as<Map>(v)->e.size());
-  ERR("len() of %s", typeName(v));
+  ERR("@argument len() of %s", typeName(v));
 }
 double now() { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static V n_clock() { return box(now()); }
 // Strings and lists: slice, find, split, trim, join, and parseNum. Indexes count bytes, as len() and s[i] do.
 static std::string_view svArg(V v, const char* fn) {
-  if (!is(v, K::Str)) ERR("%s expects a string, got %s", fn, typeName(v));
+  if (!is(v, K::Str)) ERR("@argument %s expects a string, got %s", fn, typeName(v));
   return as<Str>(v)->sv();
 }
 static size_t clampIx(V v, size_t n, const char* fn) {
-  if (!isNum(v)) ERR("%s expects numbers, got %s", fn, typeName(v));
+  if (!isNum(v)) ERR("@argument %s expects numbers, got %s", fn, typeName(v));
   double d = num(v);
-  if (d != std::trunc(d)) ERR("%s: an index must be a whole number, got %g", fn, d);
+  if (d != std::trunc(d)) ERR("@index %s: an index must be a whole number, got %g", fn, d);
   return d < 0 ? 0 : d > (double)n ? n : (size_t)d;
 }
 static V s_slice(V s, V a, V b) {  // s.slice(from, to): from..to exclusive, clamped to the string
@@ -549,7 +552,7 @@ static V s_split(V s, V sep) {
   volatile V held = s;  // on the stack while newStr allocates: v points into it
   (void)held;
   std::string_view v = as<Str>(s)->sv(), d = svArg(sep, "split()");
-  if (d.empty()) ERR("split() needs a separator that isn't empty");
+  if (d.empty()) ERR("@argument split() needs a separator that isn't empty");
   List* l = make<List>();
   volatile V keep = box(l);
   (void)keep;
@@ -612,7 +615,7 @@ static V n_time() {  // seconds since 1970
 }
 static V n_json(V v) { return box(newStr(toJs(v))); }  // JSON text, as for JavaScript
 static V n_parseJson(V s) {
-  if (!is(s, K::Str)) ERR("parseJson() expects a string, got %s", typeName(s));
+  if (!is(s, K::Str)) ERR("@argument parseJson() expects a string, got %s", typeName(s));
   return fromJs(std::string(as<Str>(s)->sv()));
 }
 static V n_sleep(V v) { return sleepFor(NUMARG(v, "sleep")), NIL; }
@@ -621,7 +624,7 @@ static V n_sqrt(V v) { return box(std::sqrt(NUMARG(v, "sqrt"))); }
 static V l_push(V l, V v) { touch(obj(l)), as<List>(l)->v.push_back(v); return l; }
 static V l_pop(V l) {
   auto& v = as<List>(l)->v;
-  if (v.empty()) ERR("pop() from empty list");
+  if (v.empty()) ERR("@index pop() from empty list");
   touch(obj(l));
   V x = v.back();
   return v.pop_back(), x;
@@ -690,7 +693,7 @@ void rtInit() {
   gfxInit();
   method<m_has>(K::Map, S_has), method<m_remove>(K::Map, S_remove);
   method<+[](V s, V sub) {  // str.has(part): does it contain part?
-    if (!is(sub, K::Str)) ERR("has() on a string expects a string, got %s", typeName(sub));
+    if (!is(sub, K::Str)) ERR("@argument has() on a string expects a string, got %s", typeName(sub));
     return boxb(as<Str>(s)->sv().find(as<Str>(sub)->sv()) != std::string_view::npos);
   }>(K::Str, S_has);
   method<s_slice>(K::Str, intern("slice")), method<s_find>(K::Str, intern("find")), method<s_split>(K::Str, intern("split"));

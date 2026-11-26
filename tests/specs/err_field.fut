@@ -12,6 +12,6 @@ test "uncaught, it stops the program with a trace" {
   var r = run("progs/err_field_grown.fut")
   expect r.code == 1
   expect r.out == "before\n"
-  expect r.err.has("runtime error: instance has no field 'b'\n  at <top> (")
+  expect r.err.has("runtime error: instance has no field 'b' [no-field]\n  at <top> (")
   expect r.err.has("progs/err_field_grown.fut:6)")
 }

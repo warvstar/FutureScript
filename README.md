@@ -15,6 +15,7 @@ build/fut test --changed f.fut # rerun only the tests an edit can affect; the re
 build/fut -w file.fut          # run and hot-reload on save (file and its imports); type lines to run them inside it
 build/fut api file.fut         # write each imported file's .api (its pub declarations); `fut test` checks them
 build/fut map file.fut         # every package, file and declaration the program uses, with line ranges
+build/fut explain [code]       # an error code's rule and fix ([index], [requires], ...; no code: all of them)
 build/fut --asm file.fut       # disassemble the generated code (uses clang + otool)
 build/fut                      # REPL
 python3 build.py wasm          # -> build/fut.wasm (compiler + runtime for WebAssembly)
@@ -399,6 +400,10 @@ The rest follows from that:
 
 The binary finds `std/` next to the directory it is in (`build/fut` uses `std/`), or at `$FUT_STD`; the WebAssembly hosts pass its location. `std/x` and a program's own package `x` can both be used. `fut test` checks the contracts of std functions only when the test file is itself in `std/`, so a program's tests don't rerun the library's. `python3 build.py test` runs `std/*/*_test.fut`.
 
+### Error codes
+
+Every error the compiler or runtime raises ends with a stable code naming the rule it broke: `undefined name 'x' [undefined-name]`, `index 3 out of range (len 1) [index]`, `the caller broke f()'s contract: requires n > 0 (n is 0) [requires]`. `--json` records carry it as `"code"`. A code is never renamed or reused, so tools and agents can key on it instead of the wording, which may improve. `fut explain index` prints a code's rule and fix; `fut explain` lists them all. The value a `catch` receives is the message alone, and what a program throws itself has no code. `tests/specs/codes.fut` raises every code, and the build checks that each code the source uses is registered in `src/errors.cpp` and raised there.
+
 ### fut map
 
 `fut map main.fut` prints the layout of a program: each package, the files of it the program uses, and every top-level declaration, with line ranges, in fut syntax. It is generated from the sources each time, so it is never stale and never committed. It is for readers who want to know where things are before reading any code, such as an agent picking where to work.
@@ -420,7 +425,7 @@ pkg geom 0.3.0  // ../geom/fut.pkg
       fn len()       // 3
 ```
 
-Private names are included; contracts are not (the source and the `.api` have them). The map and the `.api` come from the same reading of the source, so they always agree. `--pub` shows only what other packages can use: each package's interface, and the `pub` names of files in no package. `--json` prints one object per line (`{"type":"fn", "package", "file", "name", "in", "pub", "sig", "line", "end"}`, plus `package`, `module` and `file` records). A last argument keeps one package (`fut map main.fut geom`) or one file.
+Private names are included; contracts are not (the source and the `.api` have them). The map and the `.api` come from the same reading of the source, so they always agree. `--pub` shows only what other packages can use: each package's interface, and the `pub` names of files in no package. `--json` prints one object per line (`{"type":"fn", "package", "file", "name", "in", "pub", "sig", "line", "end", "hash"}`; `hash` is of the declaration's text, so it changes when the declaration is edited, not when it moves, plus `package`, `module` and `file` records). A last argument keeps one package (`fut map main.fut geom`) or one file.
 
 ## Fibers
 
@@ -589,6 +594,7 @@ Other differences from arm64: file changes and typed lines are delivered only wh
 | `types.cpp` | Optional types: what each check names, the check compiled code calls, and the one field stores make |
 | `effects.cpp` | Effects: declared sets and their checks (entry, perform site), operations and their ids, handler records, `handle`, `random()`; the frame records that tell an outside call for invariants |
 | `api.cpp` | Public interfaces: a file's or a package's `pub` declarations as `.api` text, the version check, the check `fut test` runs, `fut api`, `fut map` |
+| `errors.cpp` | Error codes: the registry (code, rule, fix), finding a runtime error's code from its message value, `fut explain` |
 | `pkg.cpp` | Packages: reading `fut.pkg` manifests, finding a file's package, where the standard library is |
 | `jsval.cpp` | Values crossing into JavaScript: JSON both ways, pinned fut functions, handles (`Ref`) for JS objects |
 | `testcache.cpp` | `fut test --changed`: each test's trace (functions entered, method lookups, names used) with the hashes the compiler gives, checked against the program as compiled now, and the cache file |

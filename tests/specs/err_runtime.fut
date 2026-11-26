@@ -13,7 +13,7 @@ test "uncaught: message, trace through each call, nothing after it runs" {
   var r = run("progs/err_runtime_trace.fut")
   expect r.code == 1
   expect r.out == "before\n"
-  expect r.err.has("runtime error: number has no field 'nope'\n")
+  expect r.err.has("runtime error: number has no field 'nope' [no-field]\n")
   expect r.err.has("  at bad (")
   expect r.err.has("progs/err_runtime_trace.fut:1)\n  at outer (")
   expect r.err.has("progs/err_runtime_trace.fut:2)\n  at <top> (")

@@ -155,12 +155,12 @@ struct Writer {
     Obj* o = obj(v);
     if (auto it = seen.find(o); it != seen.end()) return m.b += 'r', raw(it->second);
     if (o->kind == K::Fn || o->kind == K::Class || (o->kind == K::Str && gcInImage(o))) {
-      if (!WASM && !gcInImage(o)) ERR("cannot send %s: it is not compiled code's", typeName(v));
+      if (!WASM && !gcInImage(o)) ERR("@send cannot send %s: it is not compiled code's", typeName(v));
       return m.b += 'v', raw(v);
     }
-    if (o->kind == K::Fiber) ERR("cannot send a fiber: it runs on its own isolate's stacks");
-    if (o->kind == K::Ref) ERR("cannot send a js value");
-    if (++depth > MAX_DEPTH) ERR("cannot send a value nested more than %d deep", MAX_DEPTH);
+    if (o->kind == K::Fiber) ERR("@send cannot send a fiber: it runs on its own isolate's stacks");
+    if (o->kind == K::Ref) ERR("@send cannot send a js value");
+    if (++depth > MAX_DEPTH) ERR("@send cannot send a value nested more than %d deep", MAX_DEPTH);
     seen[o] = n++;
     switch (o->kind) {
       case K::Str: m.b += 's', raw(((Str*)o)->len), m.b.append(((Str*)o)->sv()); break;
@@ -184,7 +184,7 @@ struct Writer {
       }
       case K::Clo: {
         Clo* c = (Clo*)o;
-        if (!WASM && !gcInImage(c->fn)) ERR("cannot send this function");
+        if (!WASM && !gcInImage(c->fn)) ERR("@send cannot send this function");
         m.b += 'c', raw(c->fn), raw(c->n);
         for (u32 k = 0; k < c->n; k++) put(c->env()[k]);
         break;
@@ -195,7 +195,7 @@ struct Writer {
         m.b += o->kind == K::Chan ? 'C' : 'T', raw((u32)m.refs.size() - 1);
         break;
       }
-      default: ERR("cannot send %s", typeName(v));
+      default: ERR("@send cannot send %s", typeName(v));
     }
     depth--;
   }
@@ -307,7 +307,7 @@ V c_send(V ch, V v) {
 }
 void noWaitInTxn(const char* what, void* ra) {
   if (vm->txn)
-    rtError(ra, "%s inside atomic { }: waiting for another isolate would hold the block open (do it before or after the block)", what);
+    rtError(ra, "@atomic %s inside atomic { }: waiting for another isolate would hold the block open (do it before or after the block)", what);
 }
 // The next message (waiting for one unless `wait` is false), or END once the channel is closed and drained.
 V take(V ch, bool wait, const char* what, void* ra) {
@@ -331,7 +331,7 @@ V take(V ch, bool wait, const char* what, void* ra) {
 }
 V c_recv(V ch) {
   V v = take(ch, true, "recv()", RA());
-  if (v == END) ERR("recv() on a closed channel, and nothing is left in it");
+  if (v == END) ERR("@channel recv() on a closed channel, and nothing is left in it");
   return v;
 }
 V c_tryRecv(V ch) { V v = take(ch, false, "tryRecv()", RA()); return v == END ? NIL : v; }
@@ -343,12 +343,12 @@ V c_close(V ch) {
     Locked l(chanMu);
     if (!(was = c->closed)) c->closed = true, wakeAll(c->recvq), wakeAll(c->sendq);
   }
-  if (was) ERR("close() of a channel already closed");
+  if (was) ERR("@channel close() of a channel already closed");
   return NIL;
 }
 V n_channel(V n) {
   if (!isNum(n) || num(n) < 0 || num(n) > 1e9 || num(n) != (double)(int64_t)num(n))
-    ERR("channel(n) expects how many values it may hold: a whole number, 0 or more (0: each send waits for a receiver)");
+    ERR("@argument channel(n) expects how many values it may hold: a whole number, 0 or more (0: each send waits for a receiver)");
   ChanState* c = new ChanState;
   c->cap = (size_t)num(n);
   V h = handle(c, K::Chan);
@@ -424,15 +424,15 @@ V n_spawn(V f, V args) {
   void* ra = RA();
   effRequire(EFF_SPAWN, "spawn", ra);
   if (traceOn) traceImpure();  // how isolates interleave isn't deterministic: fut test --changed always reruns the test
-  if (vm->txn) rtError(ra, "spawn inside atomic { }: an isolate, once started, can't be taken back (spawn after the block)");
-  if (WASM) rtError(ra, "spawn needs the native build for now (in wasm, isolates will be web workers)");
+  if (vm->txn) rtError(ra, "@atomic spawn inside atomic { }: an isolate, once started, can't be taken back (spawn after the block)");
+  if (WASM) rtError(ra, "@spawn spawn needs the native build for now (in wasm, isolates will be web workers)");
   Fn* fn = is(f, K::Clo) ? as<Clo>(f)->fn : is(f, K::Fn) ? as<Fn>(f) : nullptr;
-  if (!fn) rtError(ra, "spawn expects a function to call, got %s", typeName(f));
-  if (fn->op || !fn->code) rtError(ra, "spawn: %s is a builtin; spawn a function that calls it", symName(fn->name).c_str());
+  if (!fn) rtError(ra, "@spawn spawn expects a function to call, got %s", typeName(f));
+  if (fn->op || !fn->code) rtError(ra, "@spawn spawn: %s is a builtin; spawn a function that calls it", symName(fn->name).c_str());
   size_t n = as<List>(args)->v.size();
   int want = fn->arity - is(f, K::Clo);
-  if (want != (int)n) rtError(ra, "%s expects %d arguments, got %d", symName(fn->name).c_str(), want, (int)n);
-  if (n > 7) rtError(ra, "spawn passes at most 7 arguments (put more in a list)");
+  if (want != (int)n) rtError(ra, "@arity %s expects %d arguments, got %d", symName(fn->name).c_str(), want, (int)n);
+  if (n > 7) rtError(ra, "@limit spawn passes at most 7 arguments (put more in a list)");
   Writer w;  // one message, so values the arguments and globals share stay shared
   w.put(f), w.put(args);
   int ng = globalCount();
@@ -458,7 +458,7 @@ V n_spawn(V f, V args) {
   if (e) {
     { Locked l(chanMu); r->live--, std::erase(isos, c); }
     isolates--, delete c, release(t);
-    rtError(ra, "spawn: could not start a thread (%s)", strerror(e));
+    rtError(ra, "@host spawn: could not start a thread (%s)", strerror(e));
   }
 #endif
   return h;

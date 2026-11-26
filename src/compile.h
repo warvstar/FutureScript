@@ -144,6 +144,7 @@ struct CState {
   int line() const { return pinLine ? pinLine : prev.line; }
 
   [[noreturn]] void failAt(const char* pos, int line, const char* fmt, ...) {  // file:line:col, the line, a caret
+    const char* code = takeCode(fmt);
     char b[256];
     va_list ap;
     va_start(ap, fmt);
@@ -154,7 +155,8 @@ struct CState {
     while (*le && *le != '\n') le++;
     std::string caret;
     for (const char* c = ls; c < pos; c++) caret += *c == '\t' ? '\t' : ' ';
-    compileFail(file + ":" + std::to_string(line) + ":" + std::to_string(pos - ls + 1) + ": error: " + b + "\n  " +
+    compileFail(file + ":" + std::to_string(line) + ":" + std::to_string(pos - ls + 1) + ": error: " + b +
+                    (code ? " [" + std::string(code) + "]" : "") + "\n  " +
                     std::string(ls, le) + "\n  " + caret + "^", !*pos || lexAtEnd);
   }
   template <class... A> [[noreturn]] void fail(const char* fmt, A... a) { failAt(cur.p, cur.line, fmt, a...); }

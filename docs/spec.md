@@ -6,9 +6,12 @@ Everything needed to write fut. ```fut blocks run as tests (a top-level `expect`
 fut f.fut                      run: top level, then main() if defined
 fut test f.fut                 test blocks + contract property tests + .api check. exit 0 pass, 1 fail/pending, 2 compile error
   --json                       one object per line: {type: "test", name, file, line, status: ok|FAIL|ERROR|pending, ms,
-                               output, expect?: {expr, left, right, diff}, message?, trace?}, then {type: "summary", ...}
+                               output, expect?: {expr, left, right, diff}, message?, code?, trace?}, then {type: "summary", ...};
+                               a compile error: {type: "compile_error", file, line, col, message, code}
   --filter text  --changed     only tests named text / only tests whose inputs changed since the last run
 fut map f.fut [--pub] [pkg]    where everything is: packages, files, declarations, line ranges
+  --json                       one declaration per line, with "hash": its text's; unchanged hash = nobody edited it
+fut explain [code]             an error code's rule and fix (no code: all codes)
 fut api f.fut                  rewrite the .api files after an interface change
 fut -w f.fut                   run, hot-reload on save; stdin lines run inside the program
 node web/run.mjs ...           the same CLI on WebAssembly
@@ -170,4 +173,6 @@ expect strings.replace("a-b", "-", "+") == "a+b"
 - Find code with `fut map --pub`; read a package's `.api`, not its source, to use it.
 - Type and declare effects on `pub` functions; keep `pub` small (private code is free to change).
 - Contract first: signature, `requires`/`ensures` (one per line), `todo()` body; then tests; then the body.
+- Errors end with a stable code (`index 3 out of range (len 1) [index]`); key on the code, not the wording. A caught error is the message alone.
+- Before editing a declaration you read earlier, check its `fut map --json` hash is unchanged.
 - Before finishing: `fut test` passes. If an `.api` changed, you changed an interface: `fut api`, commit the `.api`, bump the version if something was removed or changed.

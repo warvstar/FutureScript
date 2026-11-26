@@ -133,7 +133,7 @@ struct Gen : CState {
     op(ENDOP);                             // the body block
     if (F->retTy) typeCheck(F->retTy, F->retSite, F->retTy == TY_NUM);  // the result, outside every try: see Fun::retTy
     if (F->exit) F->live = true, F->facts.reset(), F->exit();          // its spec's exit checks (they may use the frame)
-    if (F->maxd > 4000) fail("function too large");
+    if (F->maxd > 4000) fail("@limit function too large");
     u32 size = ((F->maxd - F->npar) * 8 + 15) & ~15u;
     if (!size && F->calls) size = 16;      // keeps the stack check for recursion
     if (F->effHome >= 0) {  // the caller's effects
