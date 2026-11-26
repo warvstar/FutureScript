@@ -37,7 +37,7 @@ test "failures say how it grows, with the measurements" {
   var r = run({file: "progs/measure_fail.fut", args: ["test"]})
   expect r.code == 1
   expect r.out.has("allocs \{ ... } is 101\n")
-  // under build.py tsan (FUT_UNTIMED) time isn't measured, and the summary says so instead
-  expect r.out.has("expect grows \{ ... } like \"n\"\n    it grows like n^2, not n (n = ") || r.out.has("FUT_UNTIMED: expect grows by time not measured")
+  // under build.py tsan (FUT_UNTIMED), or where the clock stands still, time isn't measured, and the summary says so
+  expect r.out.has("expect grows \{ ... } like \"n\"\n    it grows like n^2, not n (n = ") || r.out.has("expect grows by time not measured")
   expect r.out.has("its allocations grow like n, not 1 (n = 64: 65, 128: 129, 256: 257, 512: 513, 1024: 1025, 2048: 2049)")
 }

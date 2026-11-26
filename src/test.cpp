@@ -135,7 +135,9 @@ static V allocsEnd(V start) { return box((double)gcAllocations() - num(start)); 
 // (slope over tolerance). Time is the best of 3 runs of a batch lasting 2 ms or more, from the n at which one call
 // takes 50 us, measured afresh up to twice before it fails; allocations are counted for n = 64..2048 (exact, so their tolerance is tight).
 // With FUT_UNTIMED set (build.py tsan, where the sanitizer and N isolates per core bend every timing), time isn't
-// measured: those checks pass, and the summary says they weren't measured. Allocation checks still run.
+// measured: those checks pass, and the summary says they weren't measured. Allocation checks still run. The same
+// goes where the clock stands still while code runs (a Cloudflare Worker's moves only across I/O): the host says so
+// (fut_untimed: web/worker-runtime.js), and a clock that doesn't move across 65536 calls is taken to have stopped.
 namespace {
 struct Growth { double k = 0; bool lg = false; };
 bool parseGrowth(std::string_view m, Growth& g) {
@@ -168,10 +170,12 @@ double slope(const std::vector<std::pair<double, double>>& p, Growth g) {  // of
   return (n * sxy - sx * sy) / (n * sxx - sx * sx);
 }
 }  // namespace
+static bool clockStopped = false;
+void setUntimed(bool on) { clockStopped = on; }
 #if __wasm__
-static bool untimed() { return false; }  // no environment there (the host gives the module none)
+static bool untimed() { return clockStopped; }  // no environment there (the host gives the module none)
 #else
-static bool untimed() { static bool u = getenv("FUT_UNTIMED"); return u; }
+static bool untimed() { static bool u = getenv("FUT_UNTIMED"); return u || clockStopped; }
 #endif
 static V growsAt(V site, V clo, V growth, V byAllocs) {
   const ExpectSite& s = sites.at((size_t)num(site));
@@ -199,16 +203,18 @@ static V growsAt(V site, V clo, V growth, V byAllocs) {
         for (int reps = 1;; reps *= 2) {
           double t0 = now();
           for (int i = 0; i < reps; i++) call(n);
-          if (double dt = now() - t0; dt >= 0.002 || reps >= 1 << 20) { best = std::min(best, dt / reps); break; }
+          double dt = now() - t0;
+          if (dt == 0 && reps >= 1 << 16) return clockStopped = true, 0.0;
+          if (dt >= 0.002 || reps >= 1 << 20) { best = std::min(best, dt / reps); break; }
         }
       return best;
     };
     for (int attempt = 0; attempt < 3; attempt++) {  // a machine under load can bend one fit; a wrong growth bends every one
       pts.clear();
       double n = 16, t = measure(n), start = now();
-      while (t < 50e-6 && n < (1 << 20)) t = measure(n *= 2);
-      for (pts.push_back({n, t}); pts.size() < 5 && t < 0.25 && now() - start < 3; pts.push_back({n, t})) t = measure(n *= 2);
-      if (pts.size() < 3 || slope(pts, want) <= 0.4) return NIL;
+      while (!clockStopped && t < 50e-6 && n < (1 << 20)) t = measure(n *= 2);
+      for (pts.push_back({n, t}); !clockStopped && pts.size() < 5 && t < 0.25 && now() - start < 3; pts.push_back({n, t})) t = measure(n *= 2);
+      if (clockStopped || pts.size() < 3 || slope(pts, want) <= 0.4) return NIL;
     }
   }
   double tol = allocs ? 0.1 : 0.4;
@@ -624,15 +630,16 @@ int testsEnd() {
     emit(b + later);
     return failed || errored || pending ? 1 : 0;
   }
-  if (opts.json) snprintf(b, sizeof b, "{\"type\":\"summary\",\"passed\":%d,\"failed\":%d,\"errors\":%d,\"pending\":%d,\"ms\":%.3f}\n",
-                          passed, failed, errored, pending, ms);
+  if (opts.json) snprintf(b, sizeof b, "{\"type\":\"summary\",\"passed\":%d,\"failed\":%d,\"errors\":%d,\"pending\":%d,\"ms\":%.3f%s}\n",
+                          passed, failed, errored, pending, ms, untimed() ? ",\"untimed\":true" : "");
   else {
     std::string parts;
     for (auto [n, w] : {std::pair{failed, "failed"}, {errored, errored == 1 ? "error" : "errors"}, {pending, "pending"}})
       if (n) parts += ", " + std::to_string(n) + " " + w;
     int total = passed + failed + errored + pending;
     snprintf(b, sizeof b, "%d test%s: %d passed%s (%.1f ms%s)\n", total, total == 1 ? "" : "s", passed, parts.c_str(), ms,
-             untimed() ? "; FUT_UNTIMED: expect grows by time not measured" : "");
+             !untimed() ? "" : clockStopped ? "; expect grows by time not measured: the clock stands still while code runs here"
+                                            : "; FUT_UNTIMED: expect grows by time not measured");
   }
   emit(b);
   return failed || errored || pending ? 1 : 0;

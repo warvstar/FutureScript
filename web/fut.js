@@ -427,6 +427,7 @@ export async function createFut(opts) {
     ex.fut_set_trycall(table.grow(1, new WebAssembly.Instance(tm, { env }).exports.try_call));
   }
   ex._initialize();
+  if (opts.untimed) ex.fut_untimed(1);  // a Worker's clock moves only across I/O: expect grows can't time code there
   if (opts.heapMB) ex.fut_heap(opts.heapMB);  // the heap's size (default 256 MB): a Cloudflare Worker has 128 MB in all
   ex.fut_init((opts.verbose ? 1 : 0) | (opts.noTier ? 2 : 0) | (opts.interp ? 4 : 0)), (pollAt = ex.fut_poll());
   if (opts.std) withStr(opts.std, (p) => ex.fut_std(p));  // where the standard library's packages are

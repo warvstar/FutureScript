@@ -21,8 +21,13 @@ export function moduleKey(b) {  // length and FNV-1a: install() is synchronous, 
 const enc = new TextEncoder(), dec = new TextDecoder();
 
 // The options both sides give createFut: whatever could change the heap before or during a compile must match.
+// The wasm heap: a Worker has 128 MB in all. Code compiled ahead of time is compiled for one heap size, so a bundle
+// records the size it was built with (worker.mjs build --heap-mb) and runs with it.
+let heapMB = 32;
+export const setHeapMB = (mb) => { heapMB = mb || 32; };
+// untimed: a Worker's clock moves only across I/O, so `expect grows` can't time code there (its summary says so).
 export function futOptions({ wasm, read, module, write, fetch, run, interp, tryModule }) {
-  return { wasm, read, module, write, fetch, run, interp, tryModule, verbose: false, noTier: true, heapMB: 32 };  // 128 MB per isolate
+  return { wasm, read, module, write, fetch, run, interp, tryModule, verbose: false, noTier: true, heapMB, untimed: true };
 }
 
 // run(): a child program, in a fresh instance. A Worker has no processes, and can't compile, so the build runs the
@@ -74,6 +79,7 @@ function lineWriter(log) {  // write(fd, bytes) -> console, a line at a time
 const logLine = (fd, l) => (fd == 2 ? console.error(l) : console.log(l));
 
 export function createWorker(bundle) {
+  setHeapMB(bundle.heapMB);
   const read = (p) => (p in bundle.files ? enc.encode(bundle.files[p]) : null);
   let served = null;  // the serve program's instance, created by the first request: { fut, failed }
 
@@ -127,8 +133,11 @@ export function createWorker(bundle) {
   }
 
   return {
-    async fetch(request) {
+    async fetch(request, env) {
       const path = new URL(request.url).pathname;
+      // A deployed test bundle with the secret FUT_TOKEN answers only requests that carry it (each costs CPU time).
+      if (bundle.tests?.length && env?.FUT_TOKEN && !sameText(request.headers.get("authorization") ?? "", "Bearer " + env.FUT_TOKEN))
+        return new Response("unauthorized\n", { status: 401 });
       if (path == "/__fut/test" && bundle.tests?.length) return runTests(request);
       if (path == "/__fut/tests" && bundle.tests?.length)
         return Response.json(bundle.tests.map((t) => ({ file: t.main, tests: t.names })));
@@ -218,15 +227,21 @@ function sameText(a, b) {  // compares in time independent of where they differ
   return d == 0;
 }
 function summarize(lines, main, total) {  // a file's lines, its summary given "file"; totals counted
-  let body = "";
+  let body = "", summed = false, stderr = "";
   for (const line of lines) {
     let j;
     try { j = JSON.parse(line); } catch { j = { type: "output", text: line }; }
     if (j.type == "summary") {
       for (const k of ["passed", "failed", "errors", "pending"]) total[k] += j[k] ?? 0;
-      j.file = main;
-    } else if (j.type == "compile_error" || j.type == "error") total.errors++;  // the file's tests didn't run
+      if (j.untimed) total.untimed = true;
+      (j.file = main), (summed = true);
+    } else if (j.type == "compile_error" || j.type == "error") (total.errors++), (summed = true);  // the file's tests didn't run
+    else if (j.type == "stderr") stderr += j.text;
     body += JSON.stringify(j) + "\n";
+  }
+  if (!summed) {  // it stopped before its summary (out of memory, say): the tests after that point never ran
+    total.errors++;
+    body += JSON.stringify({ type: "error", file: main, message: "stopped before its tests finished" + (stderr ? ": " + stderr.trim() : "") }) + "\n";
   }
   return body;
 }

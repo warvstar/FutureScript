@@ -99,3 +99,33 @@ fsql's tests are CPU-heavy (B-tree and sort scale tests over thousands of keys),
 such suites, test locally, or use bundles compiled ahead of time; the interpreter suits small, quick test files. Two
 fixes this needed: the wasm heap was a fixed 256 MB reservation, over a Worker's 128 MB (now `heapMB`, 32 MB in
 Workers), and one request running every file hit the default 30 s CPU limit (`cpu_ms = 300000` in the generated config).
+
+## Deployed, compiled ahead of time vs interpreted vs local (the swarm's fsql), November 2026
+
+The swarm's fsql main at the time: 70 test files, 1231 tests (175 of them pending), 582 KB of sources. Sent from a
+laptop on a home uplink (about 1.5 Mbit/s up), load average 12-25.
+
+| | per code version | running every file | result |
+|---|---:|---:|---|
+| local, native, 12 cores (`fut test` per file, in parallel) | none | 5.1 s | all pass (one timing check flaky under load) |
+| AOT: one bundle (`build --tests --shards 1 --heap-mb 96`), deployed as one Worker | build 2-3 s, upload + deploy 48-59 s | 2.5-4.2 s (70 requests at once, median 1 s) | all pass but one hand-timed test (below) |
+| interp: `fut-interp`, sources sent with each request | none | 85 s, and 52 of 70 requests failed (connections dropped) | the 18 that came back passed |
+| interp, one file alone (types_test, 25 tests) | none | 14.8 s | pass |
+
+- The bundle is 6.9 MB (1.3 MB gzipped): 71 compiled modules, one per test file, each carrying the project's code it
+  imports. Wrangler uploads it uncompressed, so from here the upload dominates (37 s); the interpreting Worker's 1.1 MB
+  took 6 s.
+- A Worker's clock stands still while code runs (it moves only across I/O). Timing loops then never end: `expect grows`
+  doubled its repetitions toward 2^20 calls per size and pinned the isolate until the 300 s CPU limit, and every request
+  sharing that isolate queued behind it (the first deploy timed out 7-9 of 70 files, small ones included). Now the
+  Worker runtime tells fut (`fut_untimed`), and a clock that doesn't move across 65536 calls counts as stopped: those
+  checks pass unmeasured, and the summary says so (`"untimed": true`). A test that times itself with `clock()` still
+  can't work there (fsql's parse_scale compares two zero durations): such files belong on a real clock.
+- fsql's scale tests need more than the 32 MB default heap (`parse_scale` ran out of memory at 64 MB). AOT code is
+  compiled for one heap size, so `--heap-mb` is a build option, kept in the bundle. A file that dies before its summary
+  (out of memory) now counts as an error instead of silently dropping its tests.
+
+So for a swarm on this machine, local tests win: 5 s, against about 50 s for AOT (almost all of it the upload) and
+worse for the interpreter. AOT does scale out: 70 files took no longer than the slowest one, so with a fast uplink
+(or a remote builder near Cloudflare) a version would cost roughly 2 s build + a few seconds upload + 3 s run, and a
+suite far larger than one machine's cores would still finish in seconds. The interpreter suits a few small files.
