@@ -86,7 +86,7 @@ class Mage : Unit {
 
 ## Types
 
-Types are optional. Code without them is as dynamic as ever. Where one is written, on a parameter, a result or a declared field, it is checked at run time at that boundary.
+Types are optional. Code without them is as dynamic as ever. Where one is written, on a parameter, a result, a declared field or a var, it is checked at run time at that boundary.
 
 ```
 pub class Account {
@@ -96,20 +96,22 @@ pub class Account {
 }
 pub fn transfer(from: Account, to: Account, n: num) { from.withdraw(n) to.deposit(n) }
 fn find(items: list, f: fn): any { }
+var level: num = 1                   // a top-level var or a local
 ```
 
 ```
 transfer(a, "bob", 5)  // -> argument 'to' of transfer() must be Account, got the string "bob"
 a.balance = nil        // -> field 'balance' of Account must be num, got nil
+level = "two"          // -> var 'level' must be num, got the string "two"
 ```
 
 - **Types:** `num str bool list map fn any`, and class names, including a module's (`geom.Shape`). A class type accepts instances of its subclasses. `T?` also accepts nil. `any` documents a value that can be anything, nil included.
-- **When they are checked:** an argument when the function is entered, a result as it leaves the function, after the function's own `try` and `atomic` blocks have closed (falling off the end returns nil, which fails unless the type allows it), and a field on every store, from any code. A typed field's default must have its type. A typed field without a default starts as nil until it is set, and only stores are checked. When hot reload changes a field's type, values already stored are not checked again.
+- **When they are checked:** an argument when the function is entered, a result as it leaves the function, after the function's own `try` and `atomic` blocks have closed (falling off the end returns nil, which fails unless the type allows it), a field on every store, from any code, and a var on every store too: from closures (which keep the type on their copy), from functions above its declaration, from other modules and from the REPL. A typed parameter is checked again when the function assigns to it. A typed var needs an initial value unless its type allows nil. A typed field's default must have its type. A typed field without a default starts as nil until it is set, and only stores are checked. When hot reload changes a field's type, values already stored are not checked again.
 - **Why at run time:** with hot reload and many edits landing at once, a static guarantee would mean rechecking every caller whenever any function changed. Checking at the boundary keeps each change local. A caller compiled against an older version, a line typed at the REPL, or untyped code gets a clean error that names the boundary, rather than a wrong value that travels on.
-- **What the compiler uses:** a `num` parameter is known to be a number throughout the function body (until it is assigned), so arithmetic on it skips type checks. A direct call to a function declared `: num` gives a known number too. Changing a function's result type recompiles its callers on reload. A `num` check is three instructions. Other types call the runtime. A store to a `num` field stays on the inline cache's fast path, which checks the value inline (three more instructions), so it costs the same as an untyped store. Stores to fields of other types take the slow path, about 4 ns more (7 ns in wasm).
+- **What the compiler uses:** a `num` parameter is known to be a number throughout the function body (until it is assigned), so arithmetic on it skips type checks. So is a `num` var, which every store checks, and a `num` local can live in a floating-point register. A direct call to a function declared `: num` gives a known number too. Changing a function's result type recompiles its callers on reload, and changing a top-level var's type recompiles the code that stores to it (and resets the var, like any edit to its declaration). A `num` check is three instructions. Other types call the runtime. A store to a `num` field stays on the inline cache's fast path, which checks the value inline (three more instructions), so it costs the same as an untyped store. Stores to fields of other types take the slow path, about 4 ns more (7 ns in wasm).
 - **Overrides** declare exactly the parameter and result types of the method they replace. Code holding a base-class instance relies on those types.
 - **Interfaces:** types are part of a `.api` file, so changing `n: num` to `n: str` on a `pub` function is an interface change that `fut test` reports.
-- `num`, `str` and the other type names are ordinary names everywhere else. Locals and top-level vars can't have types yet.
+- `num`, `str` and the other type names are ordinary names everywhere else.
 
 ## Effects
 

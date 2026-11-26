@@ -2,7 +2,7 @@
 
 pub fn area(r)
 
-pub var calls
+pub var calls: num
 
 pub class Circle {
   fn area()

@@ -191,7 +191,7 @@ extern u32 icEpoch;  // bumped whenever method tables may have changed
 void clearICs();
 void reshape(Class*);  // after its layout grew: what JIT constructors allocate for it
 
-struct Global { int slot = -1; char kind = 'v'; u32* stub = nullptr; Obj* o = nullptr; bool inited = false; };  // kind: v f c n(ative)
+struct Global { int slot = -1; char kind = 'v'; u32* stub = nullptr; Obj* o = nullptr; bool inited = false; uint64_t type = 0; int typeSite = -1; };  // kind: v f c n(ative); type: a var's declared type
 extern std::deque<Global> globals;  // by symbol (slot -1: not declared); a deque, so references survive growth
 extern std::vector<V> consts;       // GC roots forever
 Global& global(int sym);

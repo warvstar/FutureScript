@@ -98,7 +98,7 @@ static void itemsOf(const std::string& text, std::vector<Item>& items) {
     std::string doc = docs(src, t.p, "");
     if (k.sym == K_var) {
       Tok n = next();
-      it = {symName(n.sym), "pub var " + symName(n.sym)};
+      it = {symName(n.sym), "pub " + squash(k.p, typed(L.p))};
     } else if (k.sym == K_fn) {
       Tok n = next(), p = next();
       const char* end = params(p);
