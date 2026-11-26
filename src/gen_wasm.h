@@ -316,24 +316,38 @@ struct Gen : CState {
 
   // ---- fields: an inline cache per site, in the VM block: key = the instance header, val = the slot ----
   // list[i] (r0 = the list, r1 = the index; r2 = the value to store): inline when r0 is a list and 0 <= i < len,
-  // which a NaN (any non-number) fails; a fraction truncates, as in rt_geti. Else, and for stores inside a
-  // transaction (which save the list first), the helper.
+  // which a NaN (any non-number) fails; a fraction truncates, as in rt_geti. An f32s too (a number stored; a NaN
+  // loaded goes to the helper, which boxes it). Else, and for stores inside a transaction (which save the list or
+  // buffer first), the helper.
   void index(bool store) {
     auto idx = [&] { get(R0 + 1), op(F64_REINTERPRET); };
     open(BLOCK), open(BLOCK);  // $done, $miss
-    isPtr(0, false), br(BR_IF, F->blocks, UNLIKELY);
-    addr(0), mem(store ? I32_LOAD16_U : I32_LOAD8_U, 0, 0), i32c((int)K::List), op(I32_NE), br(BR_IF, F->blocks, UNLIKELY);  // a store: not typed
-    if (store) txnDepth(), br(BR_IF, F->blocks, UNLIKELY);
-    idx(), op(F64_CONST), f64(0), op(F64_GE), op(I32_EQZ), br(BR_IF, F->blocks, UNLIKELY);
+    int done = F->blocks - 1, miss = F->blocks;
+    isPtr(0, false), br(BR_IF, miss, UNLIKELY);
+    if (store) txnDepth(), br(BR_IF, miss, UNLIKELY);
+    idx(), op(F64_CONST), f64(0), op(F64_GE), op(I32_EQZ), br(BR_IF, miss, UNLIKELY);
+    open(BLOCK);  // $notList
+    addr(0), mem(store ? I32_LOAD16_U : I32_LOAD8_U, 0, 0), i32c((int)K::List), op(I32_NE), br(BR_IF, F->blocks);  // a store: not typed
     addr(0), mem(I32_LOAD, 2, LIST_V), set(T2);  // T2 = begin
     idx(), addr(0), mem(I32_LOAD, 2, LIST_V + 4);  // the end or the length
     if (!vecCount) get(T2), op(I32_SUB), i32c(3), op(I32_SHR_U);
     op(F64_CONVERT_I32_U);
-    op(F64_LT), op(I32_EQZ), br(BR_IF, F->blocks, UNLIKELY);
+    op(F64_LT), op(I32_EQZ), br(BR_IF, miss, UNLIKELY);
     get(T2), idx(), op(I32_TRUNC_F64_U), i32c(3), op(I32_SHL), op(I32_ADD), set(T);
     if (store) get(T), get(R0 + 2), mem(I64_STORE, 3, 0), mv(0, 2);
     else get(T), mem(I64_LOAD, 3, 0), set(R0);
-    br(BR, F->blocks - 1), close();
+    br(BR, done), close();
+    addr(0), mem(I32_LOAD8_U, 0, 0), i32c((int)K::Buf), op(I32_NE), br(BR_IF, miss, UNLIKELY);
+    addr(0), mem(I32_LOAD8_U, 0, BUF_ET), i32c('f'), op(I32_NE), br(BR_IF, miss, UNLIKELY);
+    if (store) isNumber(2), op(I32_EQZ), br(BR_IF, miss, UNLIKELY);
+    idx(), addr(0), mem(I32_LOAD, 2, BUF_N), op(F64_CONVERT_I32_U), op(F64_LT), op(I32_EQZ), br(BR_IF, miss, UNLIKELY);
+    addr(0), mem(I32_LOAD, 2, BUF_P), idx(), op(I32_TRUNC_F64_U), i32c(2), op(I32_SHL), op(I32_ADD), set(T);
+    if (store) get(T), get(R0 + 2), op(F64_REINTERPRET), op(F32_DEMOTE_F64), mem(F32_STORE, 2, 0), mv(0, 2);
+    else {
+      get(T), mem(F32_LOAD, 2, 0), get(T), mem(F32_LOAD, 2, 0), op(F32_EQ), op(I32_EQZ), br(BR_IF, miss, UNLIKELY);  // a NaN: boxed by the helper
+      get(T), mem(F32_LOAD, 2, 0), op(F64_PROMOTE_F32), op(I64_REINTERPRET), set(R0);
+    }
+    br(BR, done), close();
     helper(store ? H_SETI : H_GETI), close();
   }
   // x.push(v), x in slot base, v in r0: appended inline when x is an untyped list with spare capacity and no transaction

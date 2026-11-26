@@ -672,7 +672,7 @@ extern fn memset(ptr, int, long): ptr
 memset(u8s(8), 0, 8)                 // a ptr parameter gets the buffer's bytes
 ```
 
-Their length is fixed. A store is checked: a non-number, or a number a whole-number buffer can't hold, is an error rather than a value wrapped or clipped. `==` is identity and `expect`'s compares the numbers, as for lists. They print as `f32s[1, 0.1]` (an f32 with the fewest digits that give it back). They are copied when sent to another isolate, become arrays of numbers in `json` and for JavaScript, and an `atomic` block that fails puts their contents back. Indexing goes through the runtime, not an inline fast path yet.
+Their length is fixed. A store is checked: a non-number, or a number a whole-number buffer can't hold, is an error rather than a value wrapped or clipped. `==` is identity and `expect`'s compares the numbers, as for lists. They print as `f32s[1, 0.1]` (an f32 with the fewest digits that give it back). They are copied when sent to another isolate, become arrays of numbers in `json` and for JavaScript, and an `atomic` block that fails puts their contents back. `b[i]` on an `f32s` is compiled inline, like a list's: about 3.7 ns for a load, add and store natively against 9 ns through the runtime (wasm: 10 ns against 37). The other kinds go through the runtime.
 
 ## GPU
 

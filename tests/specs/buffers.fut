@@ -63,3 +63,16 @@ test "sent between isolates, and to JSON, as copies of their numbers" {
   expect c.recv() == u8s([1, 2])
   expect json(f32s([1.5, 2])) == "[1.5,2]"
 }
+
+test "an f32s in a hot loop: compiled inline, with NaN and the edges still exact" {
+  var b = f32s(1000)
+  for r in 0..3 { for i in 0..1000 { b[i] = b[i] + i } }
+  expect b[999] == 2997 && b[0] == 0
+  b[1] = 0 / 0
+  expect b[1] != b[1]  // a NaN stays a NaN
+  b[2] = 1e40
+  expect b[2] == 1 / 0  // too big for an f32: infinity
+  expect throws { b[1000] }
+  expect throws { b[-1] = 1 }
+  expect throws { b[0] = nil }
+}

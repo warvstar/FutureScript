@@ -262,6 +262,7 @@ double now();  // seconds, monotonic
 // A list's std::vector, which JIT code reads and appends to: the elements, then the end and the capacity's end as
 // pointers (macOS's libc++) or as counts (wasm's). rtInit checks which.
 constexpr int LIST_V = offsetof(List, v);
+constexpr int BUF_ET = offsetof(Buf, et), BUF_N = offsetof(Buf, n), BUF_P = offsetof(Buf, p);
 inline bool vecCount;
 constexpr int INST_SLOTS = offsetof(Inst, slots), CLO_ENV = sizeof(Clo), CLS_IHDR = offsetof(Class, ihdr), CLS_IRUN = offsetof(Class, irun);
 
@@ -717,12 +718,17 @@ int explain(const char* code);        // fut explain [code]
 
 // ---- arm64 encoders (checked against the system assembler) ----
 namespace a64 {
-constexpr u32 SP = 31, EQ = 0, NE = 1, HS = 2, LO = 3, MI = 4, PL = 5, HI = 8, LS = 9, GE = 10, LT = 11, GT = 12;
+constexpr u32 SP = 31, EQ = 0, NE = 1, HS = 2, LO = 3, MI = 4, PL = 5, VS = 6, HI = 8, LS = 9, GE = 10, LT = 11, GT = 12;
 constexpr u32 ldr(u32 t, u32 n, u32 off) { return 0xf9400000 | (off / 8) << 10 | n << 5 | t; }
 constexpr u32 str(u32 t, u32 n, u32 off) { return 0xf9000000 | (off / 8) << 10 | n << 5 | t; }
 constexpr u32 ldrw(u32 t, u32 n, u32 off) { return 0xb9400000 | (off / 4) << 10 | n << 5 | t; }
 constexpr u32 ldrb(u32 t, u32 n) { return 0x39400000 | n << 5 | t; }
 constexpr u32 ldrh(u32 t, u32 n) { return 0x79400000 | n << 5 | t; }
+constexpr u32 ldrbo(u32 t, u32 n, u32 off) { return 0x39400000 | off << 10 | n << 5 | t; }  // ldrb t, [n, #off]
+constexpr u32 ldrsreg(u32 t, u32 n, u32 m) { return 0xbc607800 | m << 16 | n << 5 | t; }  // ldr s<t>, [n, m, lsl #2]
+constexpr u32 strsreg(u32 t, u32 n, u32 m) { return 0xbc207800 | m << 16 | n << 5 | t; }  // str s<t>, [n, m, lsl #2]
+constexpr u32 fcvtds(u32 d, u32 n) { return 0x1e22c000 | n << 5 | d; }  // d<d> = (double) s<n>
+constexpr u32 fcvtsd(u32 d, u32 n) { return 0x1e624000 | n << 5 | d; }  // s<d> = (float) d<n>
 constexpr u32 ldrreg(u32 t, u32 n, u32 m) { return 0xf8607800 | m << 16 | n << 5 | t; }  // ldr t, [n, m, lsl #3]
 constexpr u32 strreg(u32 t, u32 n, u32 m) { return 0xf8207800 | m << 16 | n << 5 | t; }
 constexpr u32 strregw(u32 t, u32 n, u32 m) { return 0xf8205800 | m << 16 | n << 5 | t; }  // str t, [n, w(m), uxtw #3]

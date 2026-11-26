@@ -297,12 +297,14 @@ struct Gen : CState {
   }
   void isObject(Jumps& miss) { E(mvn(9, 0)), E(tstptr(9)), miss.push_back(E(bcond(NE))), E(andaddr(9, 0)); }  // x9 = address
   // list[i] (x0 = the list, x1 = the index; x2 = the value to store): inline when x0 is a list and 0 <= i < len,
-  // which a NaN (any non-number) fails; a fraction truncates, as in rt_geti. Else, and for stores inside a
-  // transaction (which save the list first), the helper.
+  // which a NaN (any non-number) fails; a fraction truncates, as in rt_geti. An f32s too (a number stored; a NaN
+  // loaded goes to the helper, which boxes it). Else, and for stores inside a transaction (which save the list or
+  // buffer first), the helper.
   void index(bool set) {
     Jumps miss;
     isObject(miss);
-    E(set ? ldrh(10, 9) : ldrb(10, 9)), E(cmpwi(10, (u32)K::List)), miss.push_back(E(bcond(NE)));  // a store: not typed
+    E(set ? ldrh(10, 9) : ldrb(10, 9)), E(cmpwi(10, (u32)K::List));  // a store: not typed
+    int notList = E(bcond(NE));
     if (set) E(ldrw(10, 28, 4)), E(cmpwi(10, 0)), miss.push_back(E(bcond(NE)));
     E(fmovdx(16, 1)), E(fcmpz(16)), miss.push_back(E(bcond(LT)));
     E(ldr(11, 9, LIST_V)), E(ldr(12, 9, LIST_V + 8));  // the elements; the end or the length
@@ -313,8 +315,19 @@ struct Gen : CState {
     if (set) E(strreg(2, 11, 10)), E(mov(0, 2));
     else E(ldrreg(0, 11, 10));
     int done = E(B);
+    patch(notList);
+    E(cmpwi(10, (u32)K::Buf)), miss.push_back(E(bcond(NE)));
+    E(ldrbo(10, 9, BUF_ET)), E(cmpwi(10, 'f')), miss.push_back(E(bcond(NE)));
+    if (set) E(ldrw(10, 28, 4)), E(cmpwi(10, 0)), miss.push_back(E(bcond(NE)));
+    if (set) E(mvn(12, 2)), E(tstq(12)), miss.push_back(E(bcond(EQ)));  // not a number
+    E(fmovdx(16, 1)), E(fcmpz(16)), miss.push_back(E(bcond(LT)));
+    E(ldr(12, 9, BUF_N)), E(ucvtf(17, 12)), E(fcmp(16, 17)), miss.push_back(E(bcond(PL)));
+    E(fcvtzu(10, 16)), E(ldr(11, 9, BUF_P));
+    if (set) E(fmovdx(18, 2)), E(fcvtsd(18, 18)), E(strsreg(18, 11, 10)), E(mov(0, 2));
+    else E(ldrsreg(16, 11, 10)), E(fcvtds(16, 16)), E(fcmp(16, 16)), miss.push_back(E(bcond(VS))), E(fmovxd(0, 16));
+    int done2 = E(B);
     for (int m : miss) patch(m);
-    helper(set ? H_SETI : H_GETI), patch(done);
+    helper(set ? H_SETI : H_GETI), patch(done), patch(done2);
   }
   // x.push(v), x in slot base, v in x0: appended inline when x is an untyped list with spare capacity and no transaction
   // is open (l_push saves the list first); the result is x. Else the method call.
