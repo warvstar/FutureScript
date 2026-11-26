@@ -170,3 +170,92 @@ pub fn style(sheet: str) { css(sheet) }
 pub fn htmlOf(n): str { return html(n) }
 pub fn find(selector: str): any { return query(selector) }
 pub fn trigger(n, event: str, data) { fire(n, event, data) }
+
+// ---- for views (src/views.cpp rewrites `view` and `state` into these) ----
+
+// The list f fills: a view's block of children.
+pub fn kids(f: fn): any {
+  var k = []
+  f(k)
+  return k
+}
+
+// Class names from [name, on, name, on, ...]: the names whose on is true.
+pub fn classes(parts): str {
+  var out = ""
+  var i = 0
+  while i < parts.len() {
+    if parts[i + 1] && parts[i] != "" {
+      if out != "" { out += " " }
+      out += parts[i]
+    }
+    i += 2
+  }
+  return out
+}
+
+fn withClass(props, base: str) {
+  var c = props["class"]
+  if c == nil { props["class"] = base }
+  else if kindOf(c) == "fn" { props["class"] = fn() { return base + " " + c() } }
+  else { props["class"] = base + " " + c }
+  return props
+}
+
+// An element of a view: an HTML tag, or one of fut's own (row, column, text, field, check), with props (bind: a
+// signal the element shows and sets) and children.
+pub fn make(tag: str, props, kids): any {
+  var bound = nil
+  if props.has("bind") { bound = props.remove("bind") }
+  if tag == "row" || tag == "column" || tag == "text" { return el("div", withClass(props, tag), kids) }
+  if tag == "field" {
+    var input = field(bound, nil)
+    if props.has("id") { setProp(input, "id", props.remove("id")) }
+    if props.has("placeholder") { setProp(input, "placeholder", props.remove("placeholder")) }
+    return el("label", withClass(props, "field"), [el("span", nil, kids), input])
+  }
+  if tag == "check" {
+    var box = el("input", nil, nil)
+    setProp(box, "type", "checkbox")
+    if props.has("id") { setProp(box, "id", props.remove("id")) }
+    r.effect(fn() { setProp(box, "checked", bound.get()) })
+    listen(box, "change", fn(e) { bound.set(e.checked) })
+    return el("label", withClass(props, "check"), [box, el("span", nil, kids)])
+  }
+  if tag == "input" && bound != nil { return field(bound, props) }
+  return el(tag, props, kids)
+}
+
+var themed = false
+// Show view() on the page (web/index.html's #ui, else the body), with fut's theme under the page's own styles.
+pub fn show(view: fn): fn {
+  if !themed { themed = true css(THEME) }
+  var target = query("#ui")
+  if target == nil { target = "body" }
+  return mount(target, view)
+}
+
+var THEME = "
+:root \{ --bg: #fbfbfa; --fg: #1d1d1f; --muted: #6e6e73; --line: #e3e3e0; --accent: #3a5bd9; --accent-fg: #fff; --field: #fff;
+  --radius: 8px; color-scheme: light dark; font: 15px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif; }
+@media (prefers-color-scheme: dark) \{ :root \{ --bg: #161618; --fg: #ececee; --muted: #9a9aa0; --line: #2e2e32; --accent: #7d95f5;
+  --accent-fg: #0d0d10; --field: #1f1f22; } }
+body \{ margin: 0; background: var(--bg); color: var(--fg); }
+.column \{ display: flex; flex-direction: column; gap: 12px; }
+.row \{ display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.text \{ margin: 0; }
+.title \{ font-size: 28px; font-weight: 650; letter-spacing: -0.01em; }
+.muted \{ color: var(--muted); }
+button \{ font: inherit; padding: 6px 14px; border-radius: var(--radius); border: 1px solid var(--line); background: var(--field);
+  color: var(--fg); cursor: pointer; transition: background .12s, border-color .12s; }
+button:hover \{ border-color: var(--accent); }
+button:active \{ background: var(--line); }
+button.primary \{ background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+input:not([type]), input[type=text], textarea, select \{ font: inherit; color: inherit; background: var(--field);
+  padding: 6px 10px; border: 1px solid var(--line); border-radius: var(--radius); outline: none; }
+input:focus-visible, textarea:focus-visible, button:focus-visible \{ outline: 2px solid var(--accent); outline-offset: 1px; }
+.field \{ display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+.field input \{ font-size: 15px; color: var(--fg); }
+.check \{ display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+input[type=checkbox] \{ accent-color: var(--accent); width: 16px; height: 16px; margin: 0; }
+"

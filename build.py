@@ -21,7 +21,7 @@ WASM_MT_FLAGS = ["--target=wasm32-wasip1-threads", "-pthread", *WASM_FLAGS[1:]]
 WASM_MT_LINK = [*WASM_LINK, "-Wl,--import-memory,--shared-memory,--max-memory=4294967296", "-Wl,--initial-memory=805306368"]
 NATIVE_ONLY, WASM_ONLY = {"main.cpp", "jit.cpp", "sys.cpp"}, {"wasm.cpp", "interp.cpp"}
 NATIVE_SPECS = set()  # specs only the native build runs
-WASM_SPECS = {"hello_ui.fut", "ui_test.fut"}  # std/ui is the DOM's (a JavaScript module): the wasm build only
+WASM_SPECS = {"hello_ui.fut", "ui_test.fut", "views_blocks.fut", "views_markup.fut"}  # std/ui is the DOM's (a JavaScript module): the wasm build only
 
 
 def build(debug=False, wasm=False, tsan=False, threads=False):

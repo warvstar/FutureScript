@@ -6,6 +6,9 @@ pub fn button(label, onclick: fn): any
 // A checkbox showing s (a signal of true or false), which ticking sets, with its label (props: the box's).
 pub fn check(s: r.Signal, label, props): any
 
+// Class names from [name, on, name, on, ...]: the names whose on is true.
+pub fn classes(parts): str
+
 // A list kept in step with items() (a list), one view per item, reused while the item's key(item) and value stay the
 // same: changing one item redraws that item, and reordering moves nodes rather than redrawing them.
 pub fn each(items: fn, key: fn, view: fn): fn
@@ -21,9 +24,19 @@ pub fn find(selector: str): any
 // The HTML a node is now, and an event on it as a user would cause it ({value} typed, {checked} ticked): for tests.
 pub fn htmlOf(n): str
 
+// The list f fills: a view's block of children.
+pub fn kids(f: fn): any
+
+// An element of a view: an HTML tag, or one of fut's own (row, column, text, field, check), with props (bind: a
+// signal the element shows and sets) and children.
+pub fn make(tag: str, props, kids): any
+
 // Show view() in target (a selector or a node), replacing what was there. The returned function takes it down: its
 // effects stop.
 pub fn mount(target, view: fn): fn
+
+// Show view() on the page (web/index.html's #ui, else the body), with fut's theme under the page's own styles.
+pub fn show(view: fn): fn
 
 // A style sheet for the page.
 pub fn style(sheet: str)

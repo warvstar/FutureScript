@@ -106,8 +106,13 @@ static bool prefixTaken(const std::string& p, const std::string& self) {  // a f
 using Sources = std::vector<std::pair<std::string, std::string>>;
 static Sources installed, replaced;
 static const Sources* overlay;
+void viewsRewrite(std::string& src, const std::string& path);  // views.cpp
 static bool readSource(const std::string& path, std::string& out) {
-  if (!overlay) return readFile(path, out);
+  if (!overlay) {
+    if (!readFile(path, out)) return false;
+    viewsRewrite(out, path);
+    return true;
+  }
   for (auto& [f, text] : *overlay) if (f == path) return out = text, true;
   return false;
 }
@@ -2858,8 +2863,10 @@ Compiled compile(const std::string& path, bool reload, bool echo, const std::str
     entryDir = p ? p->dir : "";
   }
   std::string& src = c.sources[path].text;
-  if (text) src = *text;
-  else if (!readSource(path, src)) compileFail("cannot read " + path, false);
+  if (text) {
+    src = *text;
+    viewsRewrite(src, path);
+  } else if (!readSource(path, src)) compileFail("cannot read " + path, false);
   Compiled out = c.run(path, src.c_str());
   delete active, active = nullptr;
   return out;
