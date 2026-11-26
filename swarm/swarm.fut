@@ -414,7 +414,7 @@ fn setup() {
   if readFile(WORK + "/README.md") == nil {
     writeFile(WORK + "/README.md", readFile(ROOT + "/swarm/target.md"))
     writeFile(WORK + "/all.fut", "// imports every module, so `fut map all.fut` shows the project\n")
-    writeFile(WORK + "/.gitignore", "*.api\n")
+    writeFile(WORK + "/.gitignore", "*.api\n.fut-cache/\n")
     sh("git init -q -b main && git config user.name swarm && git config user.email swarm@localhost && git add -A && git commit -qm 'project start'", WORK)
   }
   for i in 0..NWORKERS {
