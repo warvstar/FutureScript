@@ -910,6 +910,78 @@ def runner_fetch_idle(exe):
     return ok, f"want: {want}\n  got: {r.stdout.splitlines()}\n  stderr: {r.stderr[-800:]!r}\n  bad: {bad.returncode} {bad.stderr[-300:]!r}"
 
 
+def runner_fmt(exe):
+    """fut fmt: formatting, lexical guard, idempotence on the corpus, stdin, directory and check modes."""
+    if exe.suffix == ".wasm":
+        return True, ""  # the command is in the native driver
+
+    def run(*args, source=None):
+        return subprocess.run([str(exe), "fmt", *args], input=source, capture_output=True, timeout=10)
+
+    cases = [
+        (b'  fn  add( x,y ){\n\tvar m={x:x,y:y}// keep  this  \n return m.x+m.y\n }\n',
+         b'fn add(x, y) {\n  var m = {x: x, y: y}  // keep  this  \n  return m.x + m.y\n}\n'),
+        (b'var xs=[\r\n 1,2,\r\n      3\r\n  ]\r\nvar s="line\r\n{xs.join(", ")} {xs[ 0 ]=}"\r\n',
+         b'var xs = [\r\n  1, 2,\r\n  3\r\n]\r\nvar s = "line\r\n{xs.join(", ")} {xs[ 0 ]=}"\r\n'),
+        (b'fn f(xs:list< num >):num?{\nreturn xs[- 1: 2][ 0 ]?1:2\n}\n',
+         b'fn f(xs: list<num>): num? {\n  return xs[-1:2][0] ? 1 : 2\n}\n'),
+        (b'import "std/ui"\nview V{\nbutton .some-name.col-md-1 id:"v" on click {n+=1}\ntext 1+n\n}\n',
+         b'import "std/ui"\nview V {\n  button .some-name.col-md-1 id: "v" on click { n += 1 }\n  text 1+n\n}\n'),
+        (b'fn f(){\nreturn\n( 1 )\n}\n\n\nvar xs=[1,2]\n',
+         b'fn f() {\n  return\n  (1)\n}\n\nvar xs = [1, 2]\n'),
+    ]
+    for src, want in cases:
+        r = run("--stdin", source=src)
+        if r.returncode or r.stdout != want:
+            return False, f"source {src!r}\n  want {want!r}\n  got {r.stdout!r} {r.stderr!r}"
+        again = run("--stdin", source=r.stdout)
+        if again.returncode or again.stdout != r.stdout:
+            return False, f"second pass for {src!r}: {again.stdout!r} {again.stderr!r}"
+
+    for path, dirs, files in os.walk(ROOT):
+        dirs[:] = [d for d in dirs if d not in {".git", "build", "node_modules"}]
+        for name in sorted(files):
+            if not name.endswith(".fut"):
+                continue
+            f = Path(path) / name
+            src = f.read_bytes()
+            a = run("--stdin", source=src)  # each pass verifies the compiler's tokens, comments and line boundaries
+            if f == ROOT / "tests" / "err_char.fut":
+                if a.returncode != 2 or a.stdout or b"line 1" not in a.stderr:
+                    return False, f"{f}: expected a lexical error, got {a.stdout!r} {a.stderr!r}"
+                continue
+            if a.returncode:
+                return False, f"{f}: {a.stderr!r}"
+            b = run("--stdin", source=a.stdout)
+            if b.returncode or a.stdout != b.stdout:
+                return False, f"{f}: second pass differs {b.stderr!r}"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        (d / "nested").mkdir()
+        f, other = d / "nested" / "x.fut", d / "x.txt"
+        src, want = cases[0]
+        f.write_bytes(src)
+        f.chmod(0o640)
+        other.write_bytes(src)
+        check = run("--check", tmp, str(f))
+        if check.returncode != 1 or check.stdout != os.fsencode(f) + b"\n" or f.read_bytes() != src:
+            return False, f"--check: {check.returncode}, {check.stdout!r} {check.stderr!r}"
+        rewrite = run(tmp)
+        if rewrite.returncode or f.read_bytes() != want or f.stat().st_mode & 0o777 != 0o640 or other.read_bytes() != src:
+            return False, f"directory rewrite: {rewrite.returncode}, {rewrite.stderr!r}"
+        clean = run("--check", tmp)
+        if clean.returncode or clean.stdout:
+            return False, f"clean --check: {clean.returncode}, {clean.stdout!r} {clean.stderr!r}"
+        for bad, message in [(b'var x = "unclosed', b"unterminated string"),
+                             (b'var x = 1 . 2\n', b"would change the token stream")]:
+            f.write_bytes(bad)
+            reject = run(str(f))
+            if reject.returncode != 2 or message not in reject.stderr or f.read_bytes() != bad:
+                return False, f"expected refusal for {bad!r}: {reject.returncode}, {reject.stderr!r}"
+    return True, ""
+
+
 RUNNER_TESTS = [("std/math: within 1 ulp of libm, exact cases exact", runner_fmath),
                 ("fetch idleTimeout: a silent server fails fast, a trickling one doesn't", runner_fetch_idle),
                 ("fut --record / --replay: the same run again, sleeps skipped", runner_replay),
@@ -920,6 +992,7 @@ RUNNER_TESTS = [("std/math: within 1 ulp of libm, exact cases exact", runner_fma
                 ("fut test: tests first, filter, compile error, todo()", runner_text),
                 ("fut api: interfaces written, checked by fut test", runner_api),
                 ("fut init: a new package that runs and passes its test", runner_init),
+                ("fut fmt: tokens, idempotence, file and stdin modes", runner_fmt),
                 ("docs/spec.md: every fut block passes", runner_spec),
                 ("error codes: registered, used, raised, explained", runner_codes),
                 ("fut test --changed: reruns what an edit affects", runner_changed),

@@ -1,5 +1,6 @@
 // Driver: run a file, hot-patch it on save (-w), dump its machine code (--asm), or start a REPL.
 #include "fut.h"
+#include "fmt.h"
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -441,7 +442,9 @@ int main(int argc, char** argv) {
   const char* usage = "usage: fut [-w | -v | --asm | --isolates n | --seed n | --threads n | --record log | --replay log] [file.fut]   (no file: REPL)\n"
                       "       fut test [--changed] [--json] [--filter text] [--timeout s] [--isolates n] [--seed n] file.fut...\n"
                       "       fut init [dir]   (a new package)\n       fut api [--check] file.fut\n       fut map [--pub] [--json] file.fut [package | file]\n       fut explain [code]\n"
+                      "       fut fmt [--check] [--stdin] [file.fut | dir ...]\n"
                       "       fut worker build ...   (Cloudflare Workers: node web/worker.mjs)\n";
+  if (argc > 1 && std::string_view(argv[1]) == "fmt") return fmtCommand(argc - 2, argv + 2);
   for (int i = 1 + (testMode || apiMode || mapMode); i < argc; i++) {
     std::string a = argv[i];
     if (mapMode) {

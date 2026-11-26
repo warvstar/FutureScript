@@ -40,7 +40,7 @@ struct Lexer {
   bool internal = false;  // code the compiler writes: names may contain '@' (the runtime's prop@gen), which users' can't
   const char* err = nullptr;  // a T_ERR token's message
   const char* end = nullptr;  // outer string's closing quote, while reading an interpolation
-  Tok next() {
+  Tok next(bool symbols = true) {
     Tok k;
     for (;; p++) {
       if (*p == '\n') k.nl = true, line++;
@@ -59,7 +59,8 @@ struct Lexer {
     }
     if (idc(*p)) {
       while (idc(*p) || dig(*p) || (internal && *p == '@')) p++;
-      return k.t = T_ID, k.sym = intern({k.p, size_t(p - k.p)}), k;
+      if (symbols) k.sym = intern({k.p, size_t(p - k.p)});
+      return k.t = T_ID, k;
     }
     if (*p == '"') {
       int at = line;

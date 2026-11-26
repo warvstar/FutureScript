@@ -19,6 +19,7 @@ build/fut -w file.fut          # run and hot-reload on save (file and its import
 build/fut init [dir]           # a new package: fut.pkg, <dir>.fut (main and a test), its .api, .gitignore
 build/fut api file.fut         # write each imported file's .api (its pub declarations); `fut test` checks them
 build/fut map file.fut         # every package, file and declaration the program uses, with line ranges
+build/fut fmt file.fut         # format files in place (directories recurse); --check lists files that need formatting
 build/fut explain [code]       # an error code's rule and fix ([index], [requires], ...; no code: all of them)
 build/fut --record log f.fut   # run, writing down what clock, random, input, files... returned; --replay log: run it again from that
 build/fut --asm file.fut       # disassemble the generated code (uses clang + otool)
@@ -30,6 +31,9 @@ node web/serve.mjs             # browser: http://localhost:8000/?file=examples/p
 ```
 
 Requires macOS on Apple silicon (arm64, `MAP_JIT`).
+
+`fut fmt` defaults to the current directory. Use `fut fmt --stdin` to format text on standard input and print the result.
+The formatter normalizes spacing and two-space indentation while preserving line breaks between tokens, comments, and string literals.
 
 Agents: [docs/spec.md](docs/spec.md) is the whole language in about 6 KB; every example in it runs as a test.
 
