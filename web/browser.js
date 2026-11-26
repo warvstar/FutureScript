@@ -8,9 +8,10 @@
 // JSPI.
 //
 // startFut(o): o = {wasm (fut-mt.wasm's bytes), std, verbose, serve, proxy, poolSize, seed, write(fd, bytes),
-// files(paths), window(w, h), present(rgba, w, h): Promise} -> {run(file, watch), line(l), type(l), changed(path),
-// key(code, down), mouse(x, y, down)}, each sent to the root.
-import { CH, FUT, chanGet, chanPut, jsonCodec } from "./fut.js";
+// files(paths), window(w, h), present(rgba, w, h): Promise, screen (see fut.js)} -> {run(file, watch), test(file),
+// line(l), type(l), changed(path), key(code, down), mouse(x, y, down)}, each sent to the root. A module the page loads
+// gets fut's memory (shared, so it reads and writes what the threads see) and the screen (see giveHost).
+import { CH, FUT, chanGet, chanPut, giveHost, jsonCodec } from "./fut.js";
 
 const FRESH = 2 ** 31 + 2 ** 30;  // the root's own ids for the page's objects (fresh calls); the page's are below
 
@@ -76,6 +77,7 @@ export async function startFut(o) {
     if (q.op == "load") {
       const file = q.lib.slice(q.lib.indexOf(":") + 1);
       return import(file + "?v=" + (q.stamp ?? 0)).then((m) => {
+        giveHost(m, { memory, screen: o.screen });
         modules.set(q.lib, m);
         const names = Object.keys(m).filter((k) => typeof m[k] == "function");
         return { names, fresh: names.filter((k) => m[k].fresh), lists: names.filter((k) => m[k].freshList) };
@@ -177,6 +179,7 @@ export async function startFut(o) {
   await readyP;
   return {
     run: (file, watch) => Promise.race([ask({ run: [file, watch] }), exitP]),
+    test: (file) => Promise.race([ask({ test: file }), exitP]),
     line: (l) => ask({ line: l }),
     type: (l) => tell({ type: l }),
     changed: (p) => tell({ changed: p }),

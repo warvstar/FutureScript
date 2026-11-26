@@ -34,6 +34,9 @@
 //     main thread has (document, alert); "all": every js module and global function too; "none": nothing.
 //     A small libc and Math always run where they are called.
 //   pending: (with main) an Int32Array the page counts the messages it sent this thread in, unread
+//   screen: (a page) its window, for a JS module that draws it itself (std/gpu, with WebGPU): {take(present): a canvas
+//     in the window's place (null before window()), present() then calling present() instead of showing the pixel
+//     buffer; give(): the window back}. See giveHost.
 // The interpreter's try_call(cb, ctx): runs the C++ callback cb(ctx) (a try_table's body) and returns its result, or
 // catches a fut exception, stores its payload (i64) at ctx, puts the stack pointer back and returns -1. Static, so a
 // Worker can upload it compiled.
@@ -85,6 +88,12 @@ export function jsonCodec(fnOf, refOf, refGet) {
 //   IDLE -> REQ (worker: a call) -> TAKEN (page) -> REPLY (page: its result) -> IDLE (worker)
 //   while TAKEN: CB (page: call fut function) -> CBREPLY (worker: its result) -> TAKEN (page); a REQ may come
 //   meanwhile (that fut function calls the page too)
+// A JS module that exports `fut` (an object) gets what its host can give it there (by whoever loads it: this thread's
+// host, or the page's, browser.js): memory, fut's WebAssembly.Memory, in which a ptr argument is an address (good
+// during the call; shared in fut-mt.wasm, so the page sees it too), and screen (opts.screen).
+export function giveHost(m, host) {
+  if (m?.fut && typeof m.fut == "object") Object.assign(m.fut, host);
+}
 export const CH = { IDLE: 0, REQ: 1, TAKEN: 2, REPLY: 3, CB: 4, CBREPLY: 5 };
 export function channel() {
   return { ctl: new Int32Array(new SharedArrayBuffer(8)), data: new SharedArrayBuffer(1 << 16, { maxByteLength: 1 << 30 }) };
@@ -265,6 +274,7 @@ export async function createFut(opts) {
       } else if (kind.startsWith("js")) {
         if (!opts.importModule) throw new Error("this host cannot load JavaScript modules");
         exports = await opts.importModule(file, stamp);
+        giveHost(exports, { memory: mem, screen: opts.screen });
       } else {
         const bytes = opts.read(file);
         if (!bytes) throw new Error("cannot read it");
@@ -412,7 +422,8 @@ export async function createFut(opts) {
     const f = externs[fn];
     if (typeof f != "function") {  // the main thread's (proxied): it reads the arguments, and gives the result, as text
       const fresh = (f.fresh || f.freshList) && ret == 97 /* a */ && freshNext < 2 ** 30;
-      if (opts.freshBase && (ret == 118 /* v */ || fresh)) {  // nothing to wait for: queued (the root's only: see flush)
+      // nothing to wait for: queued (the root's only: see flush). Not a call given a ptr: its memory is the call's.
+      if (opts.freshBase && (ret == 118 /* v */ || fresh) && !sig.includes("p")) {
         const c = { lib: f.lib, name: f.name, sig, ret, args: rawArgs(sig, args) };
         if (fresh && f.freshList) c.ids = Array.from({ length: c.args.at(-1) }, () => opts.freshBase + freshNext++);
         else if (fresh) c.id = opts.freshBase + freshNext++;
@@ -699,6 +710,7 @@ export async function createFut(opts) {
     }),
     window: (w, h) => (opts.window?.(w, h) ? 1 : 0),
     present: S(async (px, w, h) => {
+      flush();  // what the program did on the page (a GPU frame drawn there) comes first
       const src = new Uint8Array(mem.buffer, px, w * h * 4), rgba = new Uint8ClampedArray(w * h * 4);
       for (let i = 0; i < src.length; i += 4) (rgba[i] = src[i + 2]), (rgba[i + 1] = src[i + 1]), (rgba[i + 2] = src[i]), (rgba[i + 3] = 255);
       return (await opts.present(rgba, w, h)) ? 1 : 0;
