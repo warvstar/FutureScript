@@ -3,7 +3,7 @@
 // Files are served from the repository root (fut reads them with synchronous requests); /events streams the paths of
 // changed files (server-sent events) so the page hot-reloads them (fut files, fut.pkg manifests, js and wasm modules).
 import { createServer } from "node:http";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { watch } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,8 +28,12 @@ createServer(async (req, res) => {
   const p = url.pathname == "/" ? "/web/index.html" : decodeURIComponent(url.pathname);
   const file = join(root, normalize(p));
   if (!file.startsWith(root)) return res.writeHead(403).end();
+  // The browser may keep a file but asks each time whether it changed (an edit shows at once): a copy it has is
+  // answered 304, so a page loaded again doesn't download fut.wasm again (on a slow link, most of its start)
   try {
-    const body = await readFile(file);
-    res.writeHead(200, { "content-type": types[extname(file)] ?? "text/plain; charset=utf-8", "cache-control": "no-store", ...isolated }).end(body);
+    const st = await stat(file), tag = `"${st.size}-${st.mtimeMs}"`;
+    const head = { "content-type": types[extname(file)] ?? "text/plain; charset=utf-8", "cache-control": "no-cache", etag: tag, ...isolated };
+    if (req.headers["if-none-match"] == tag) return res.writeHead(304, head).end();
+    res.writeHead(200, head).end(await readFile(file));
   } catch { res.writeHead(404).end(); }
 }).listen(port, "127.0.0.1", () => console.log(`fut: http://localhost:${port}/?file=examples/paddle.fut`));
