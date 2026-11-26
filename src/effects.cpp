@@ -93,11 +93,11 @@ uint64_t effOpEffect(int op) { return ops[op].effect; }
 const std::string& effOpName(int op) { return ops[op].name; }
 int effBuiltinOp(int sym) { auto it = builtinOps.find(sym); return it == builtinOps.end() ? 0 : it->second; }
 
-EffState effSave() { return {vm.allowed, vm.hstack, vm.who}; }
-void effLoad(const EffState& s) { vm.allowed = s.allowed, vm.hstack = s.hstack, vm.who = s.who; }
+EffState effSave() { return {vm.allowed, vm.hstack, vm.who, vm.inv}; }
+void effLoad(const EffState& s) { vm.allowed = s.allowed, vm.hstack = s.hstack, vm.who = s.who, vm.inv = s.inv; }
 u32 effEnter() {
   saved.push_back(effSave());
-  vm.allowed = EFF_BITS, vm.hstack = NIL, vm.who = 0;
+  vm.allowed = EFF_BITS, vm.hstack = NIL, vm.who = 0, vm.inv = 0;
   return (u32)saved.size() - 1;
 }
 void effLeave(u32 depth) {
@@ -228,26 +228,16 @@ static V handleEnd(V v) {
   return v;
 }
 
-// inv@enter(self) / inv@leave(): around a method of a class whose spec has invariants. The invariant is checked when
-// an outside call ends, not when a method calls its own object's methods partway through a change: inv@enter answers
-// whether a call on self is already running, and records this one as a handler record that answers nothing
-// ([previous, allowed, allowed, who, -1, self]), so a throw that unwinds the call drops it with the handlers.
-static V invEnter(V self) {
+// Around a method of a class with invariants (its own, a superclass's or a subclass's). The invariant is checked when
+// an outside call ends, not when a method calls its own object's methods partway through a change: rt_inventer
+// answers whether a call on self is already running, and links this one's record (two slots in its frame: the
+// previous record, self) into vm.inv; the method unlinks it as it returns. A throw unlinks it with the frame: try
+// records and fibers save and restore vm.inv with the rest of the effect state. Nothing is allocated.
+static V rt_inventer(V self, uint64_t* rec) {
   bool outer = true;
-  for (V h = vm.hstack; h != NIL && outer; h = as<List>(h)->v[0]) {
-    auto& v = as<List>(h)->v;
-    outer = !(v.size() == 6 && v[4] == box(-1.0) && v[5] == self);
-  }
-  uint64_t a = vm.allowed;
-  List* r = make<List>();
-  gcUncounted++;  // bookkeeping: `expect allocs` counts the program's objects
-  r->v = {vm.hstack, box((double)(a & 0xffffffff)), box((double)(a >> 32)), box((double)vm.who), box(-1.0), self};
-  vm.hstack = box(r);
+  for (auto* r = (uint64_t*)vm.inv; r && outer; r = (uint64_t*)r[0]) outer = r[1] != self;
+  rec[0] = vm.inv, rec[1] = self, vm.inv = (uint64_t)(uintptr_t)rec;
   return boxb(outer);
-}
-static V invLeave() {
-  if (vm.hstack != NIL) vm.hstack = as<List>(vm.hstack)->v[0];
-  return NIL;
 }
 
 static uint64_t rng;
@@ -258,14 +248,14 @@ static V n_random() {  // xorshift64*, seeded from the clock: [0, 1)
 }
 
 void effectsInit() {
-  vm.allowed = EFF_BITS, vm.hstack = NIL, vm.who = 0;
+  vm.allowed = EFF_BITS, vm.hstack = NIL, vm.who = 0, vm.inv = 0, vm.invObj = 0;
   effName[0] = "io", effName[1] = "clock", effName[2] = "random", effName[3] = "yield";
   ops[OP_YIELD] = {"yield", EFF_YIELD, 1}, ops[OP_EXTERN] = {"extern", EFF_IO, -1};
   effOps[3] = {OP_YIELD}, effOps[0] = {OP_EXTERN};  // externs can't be handled, so no handle allows io as a whole
   vm.helpers[H_EFFECT] = (void*)rt_effect;
   native<n_random>("random");
   native<handleBegin>("handle@begin"), native<handleEnd>("handle@end");
-  native<invEnter>("inv@enter"), native<invLeave>("inv@leave");
+  vm.helpers[H_INVENTER] = (void*)rt_inventer;
   invokeCode = callable<invokeHandler>();
   for (auto [name, e] : std::initializer_list<std::pair<const char*, uint64_t>>{
            {"print", EFF_IO}, {"run", EFF_IO}, {"window", EFF_IO}, {"present", EFF_IO}, {"clear", EFF_IO}, {"rect", EFF_IO},

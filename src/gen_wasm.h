@@ -244,15 +244,16 @@ struct Gen : CState {
   void jump(Loop& lp, bool brk) { br(BR, brk ? lp.depth : lp.depth + 2); }
   void leaveTries(size_t) {}  // wasm try blocks are structured: leaving one needs nothing
   // block $done { block $catch (result i64) { try_table (catch $fut -> $catch) { body } br $done } e = it; reset sp; ... }
-  // A frame slot keeps vm.txn at entry: the handler rolls back the transactions opened since (rt_txunwind). Three
-  // more keep the effect state (vm.allowed, vm.hstack, vm.who), which the handler puts back.
+  // A frame slot keeps vm.txn at entry: the handler rolls back the transactions opened since (rt_txunwind). Four
+  // more keep the effect state (vm.allowed, vm.hstack, vm.who, vm.inv), which the handler puts back.
   void effSlot(int s, u32 at, bool w32) { base(s), i32c(0), mem(w32 ? I32_LOAD : I64_LOAD, w32 ? 2 : 3, at), w32 ? op(I64_EXTEND_U) : void(), mem(I64_STORE, 3, off(s)); }
   void effBack(int s, u32 at, bool w32) { i32c(0), base(s), mem(I64_LOAD, 3, off(s)), w32 ? op(I32_WRAP) : void(), mem(w32 ? I32_STORE : I64_STORE, w32 ? 2 : 3, at); }
   TryAt tryBegin() {
     TryAt t{F->depth};
     slot(), base(t.r), txnDepth(), op(I64_EXTEND_U), mem(I64_STORE, 3, off(t.r));
-    slot(), slot(), slot();
+    slot(), slot(), slot(), slot();
     effSlot(t.r + 1, slotOf(&vm.allowed), false), effSlot(t.r + 2, slotOf(&vm.hstack), false), effSlot(t.r + 3, slotOf(&vm.who), true);
+    effSlot(t.r + 4, slotOf(&vm.inv), false);
     open(BLOCK), open(BLOCK, I64), open(TRY_TABLE), u(1), b(0), u(0), u(0);  // one catch: tag 0, label 0
     return t;
   }
@@ -260,6 +261,7 @@ struct Gen : CState {
   void tryCatch(TryAt& t) {
     close(), br(BR, F->blocks - 1), close(), set(R0);
     effBack(t.r + 1, slotOf(&vm.allowed), false), effBack(t.r + 2, slotOf(&vm.hstack), false), effBack(t.r + 3, slotOf(&vm.who), true);
+    effBack(t.r + 4, slotOf(&vm.inv), false);
     txnDepth(), base(t.r), mem(I64_LOAD, 3, off(t.r)), op(I32_WRAP), op(I32_GT_U), open(IF, VOID, UNLIKELY);
     ld(1, t.r), helper(H_TXUNWIND), close();
   }
@@ -319,18 +321,33 @@ struct Gen : CState {
     br(BR, F->blocks - 1), close();
     st(0, slot()), callWindow(base, 1, S_push, false), close();
   }
-  void field(int sym, bool store) {  // r0 = object (r2 = value to store); result in r0
+  void field(int64_t sym, bool store) {  // r0 = object (r2 = value to store); result in r0
     u32 ic = slotOf(&vm.ics[newIC(store)]);
     open(BLOCK), open(BLOCK);  // $done, $miss
     isPtr(0, false), br(BR_IF, F->blocks, UNLIKELY);
     addr(0), mem(I64_LOAD, 3, 0), i32c(0), mem(I64_LOAD, 3, ic), op(I64_NE), br(BR_IF, F->blocks, UNLIKELY);
-    if (store) i32c(0), mem(I32_LOAD, 2, ic + 12), isNumber(2), op(I32_EQZ), op(I32_AND), br(BR_IF, F->blocks, UNLIKELY);  // a `num` field (high half)
+    if (store) {  // the high half: 1, a `num` field; 2, a store from outside to a class with invariants (vm.invObj)
+      i32c(0), mem(I32_LOAD, 2, ic + 12), i32c(1), op(I32_AND), isNumber(2), op(I32_EQZ), op(I32_AND), br(BR_IF, F->blocks, UNLIKELY);
+      i32c(0), mem(I32_LOAD, 2, ic + 12), i32c(2), op(I32_AND), open(IF, VOID, UNLIKELY), i32c(0), get(R0), mem(I64_STORE, 3, slotOf(&vm.invObj)), close();
+    }
     addr(0), mem(I32_LOAD, 2, INST_SLOTS), i32c(0), mem(I32_LOAD, 2, ic + 8), i32c(3), op(I32_SHL), op(I32_ADD), set(T);  // the slot (low half)
     if (store) get(T), get(R0 + 2), mem(I64_STORE, 3, 0), mv(0, 2);
     else get(T), mem(I64_LOAD, 3, 0), op(LOCAL_TEE), u(R0 + 3), i64c(ABSENT), op(I64_EQ), br(BR_IF, F->blocks, UNLIKELY), mv(0, 3);  // ABSENT: slow
     br(BR, F->blocks - 1), close();
     karg(1, sym), karg(store ? 3 : 2, ic), helper(store ? H_SETF : H_GETF), close();
   }
+  // A method of a class with invariants: link its record (slots rec, rec + 1) into vm.inv; r0 = self, and then
+  // whether this is an outside call. invLeave unlinks it.
+  void invEnter(int rec) { addsp(1, rec), helper(H_INVENTER); }
+  void invLeave(int rec) { i32c(0), base(rec), mem(I64_LOAD, 3, off(rec)), mem(I64_STORE, 3, slotOf(&vm.inv)); }
+  // After a store from outside an object: r1 = vm.invObj (rt_setf: the object, whose invariants must hold now), which
+  // is cleared; nothing (0): skip to invPendingEnd.
+  int invPendingBegin() {
+    i32c(0), mem(I64_LOAD, 3, slotOf(&vm.invObj)), set(R0 + 1), get(R0 + 1), i64c(0), op(I64_NE), open(IF, VOID, UNLIKELY);
+    i32c(0), i64c(0), mem(I64_STORE, 3, slotOf(&vm.invObj));
+    return 0;
+  }
+  void invPendingEnd(int) { close(); }
   void typeCheck(uint64_t t, int site, bool numFast) {  // r0 must have type t (a number: no call when numFast)
     if (numFast) isNumber(0), op(I32_EQZ), open(IF, VOID, UNLIKELY);
     karg(1, (int64_t)t), karg(2, site), helper(H_TYPECHK);

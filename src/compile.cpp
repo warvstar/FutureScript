@@ -61,10 +61,6 @@ static std::unordered_map<std::string, std::string> nsOf;                       
 static std::unordered_map<std::string, bool> isModule;                                // imported file -> imported `as`
 static std::unordered_map<std::string, std::unordered_map<int, std::string>> aliases;  // file -> its `as` names
 static std::string base(const std::string& path) { return path.substr(path.rfind('/') + 1); }
-// Has the program declared an invariant? Then a store to a field of an object other than self checks the object's
-// invariants. Once true it stays true (part of every package's environment), so code compiled without that check
-// is compiled again with it.
-static bool invariantsOn;
 static std::unordered_map<std::string, u32*> invBodies;  // each class's hidden invariant method, installed
 // Packages (pkg.cpp). The program's own package (entryDir) has no prefix, like a program without one. Every other
 // package has a prefix (its name, made unique), and the `pub` names of its plainly imported files are
@@ -985,10 +981,13 @@ struct Compiler : Gen {
       int o = slot();
       st(0, o);
       if (op >= 0) field(v.b, false);
-      value(), mv(2, 0), ld(0, o), field(v.b, true);
-      if (invariantsOn && !v.own) {  // from outside the object: then its invariants must hold
-        int b = slot(), w = slot();
-        ld(0, o), st(0, b), konst("storing to field '" + symName(v.b) + "'"), st(0, w), callWindow(b, 1, invariantSym(), false), F->depth = b;
+      value(), mv(2, 0), ld(0, o), field(v.own ? v.b : int64_t(v.b | SETF_OUTSIDE), true);
+      if (!v.own) {  // from outside the object: if its class has invariants (rt_setf says so), they must hold now
+        int keep = slot();
+        st(0, keep);
+        int j = invPendingBegin(), b = slot(), w = slot();
+        mv(0, 1), st(0, b), konst("storing to field '" + symName(v.b) + "'"), st(0, w), callWindow(b, 1, invariantSym(), false);
+        invPendingEnd(j), ld(0, keep), F->depth = keep;
       }
       F->depth--;
     } else {  // object in slot v.a, index in x0
@@ -1159,7 +1158,7 @@ struct Compiler : Gen {
   }
   // A function with a contract: requires, then each old(...) into a home, on entry; ensures where every return
   // arrives (Fun::exit). A method of a class with invariants (its own, a superclass's or a subclass's) checks them
-  // when an outside call ends, by calling the object's hidden invariant method: inv@enter tells whether this is one
+  // when an outside call ends, by calling the object's hidden invariant method: invEnter tells whether this is one
   // (no call on the same object is running), so a method calling its own object's methods mid-change is not.
   void contract(Fun& f, const std::string& nm, int line, const SpecFn* spec, bool inv,
                 const std::vector<std::pair<int, Ty>>& ptys, const std::vector<int>& homes, int first) {
@@ -1194,8 +1193,8 @@ struct Compiler : Gen {
       });
       pubContract = nullptr, end();
     }
-    int outer = -1;  // inv@enter's answer: an outside call
-    if (inv) ldl(0, f.selfHome), callNative("inv@enter", true), stl(0, outer = home());
+    int outer = -1, rec = -1;  // invEnter's answer (an outside call), and its record's two frame slots
+    if (inv) rec = slot(), slot(), ldl(0, f.selfHome), invEnter(rec), stl(0, outer = home());
     if ((!spec || spec->post.empty()) && !inv) return;
     f.exit = [=, this] {
       int rh = home();
@@ -1214,7 +1213,7 @@ struct Compiler : Gen {
         int b = slot(), w = slot();
         ldl(0, f.selfHome), st(0, b), konst(fn), st(0, w), callWindow(b, 1, invariantSym(), false), F->depth = b;
         ifEnd(elseBegin(no, false));
-        callNative("inv@leave", false);
+        invLeave(rec);
       }
       ldl(0, rh);
     };
@@ -1664,7 +1663,7 @@ struct Compiler : Gen {
       } else if (depth == 1 && cls >= 0 && t.t == T_ID && t.sym == S_invariant && (t.nl || p.t == '{') && [&] { Lexer s = L; return !lex(s).nl; }()) {
         Clause c;
         const char* from = L.p;
-        clauseScan(L, c, nullptr), classSpec(cls).invariants.push_back(c), invariantsOn = true;
+        clauseScan(L, c, nullptr), classSpec(cls).invariants.push_back(c);
         mixEnv(fnv(from, L.p) ^ uint64_t(cls) << 32, -1);  // editing one recompiles the class's methods
       } else if (depth == 1 && cls >= 0 && afterKw && p.sym == K_var) {  // a declared field: methods compile against them
         mixEnv(uint64_t(cls) << 32 | uint64_t(t.sym) << 2 | 1, -2);
@@ -1765,8 +1764,6 @@ struct Compiler : Gen {
       surfEnv[P] = h;
     }
     for (auto& [P, _] : pkgImports) envOf.try_emplace(P, 1469598103934665603ull);
-    if (invariantsOn)  // every store to a field, in every package, checks them
-      for (auto& [P, h] : envOf) h = (h ^ 0x1a7a) * 1099511628211ull;
     for (auto& [P, h] : envOf) {
       uint64_t e = h;
       for (auto& D : pkgImports[P]) e = (e ^ surfEnv[D]) * 1099511628211ull;

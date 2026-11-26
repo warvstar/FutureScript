@@ -244,15 +244,15 @@ struct Gen : CState {
   void jump(Loop& lp, bool brk) { (brk ? lp.brk : lp.cont).push_back(E(B)); }
   void leaveTries(size_t k) { if (F->tries.size() > k) ld(9, F->tries[k]), E(str(9, 28, VM_HANDLER)); }  // unlink tries k..
   // try { } catch e { }: the record (prev, sp, fp, x26, handler pc, vm.txn, then the effect state: vm.allowed,
-  // vm.hstack, vm.who) lives in nine frame slots and is linked into vm.handler; a throw (or runtime error) unlinks
+  // vm.hstack, vm.who, vm.inv) lives in ten frame slots and is linked into vm.handler; a throw (or runtime error) unlinks
   // it, rolls back the transactions opened since, puts the effect state back, and jumps to the handler with x0 = the value.
   TryAt tryBegin() {
     if (!F->noRegs) fail("internal: try in a function not prepared for it");
     TryAt t{F->depth};
-    for (int i = 0; i < 9; i++) slot();
+    for (int i = 0; i < 10; i++) slot();
     addsp(9, t.r), E(ldr(10, 28, VM_HANDLER)), E(str(10, 9, 0)), E(addi(10, SP, 0)), E(str(10, 9, 8));
     E(str(29, 9, 16)), E(str(26, 9, 24)), E(ldrw(10, 28, 4)), E(str(10, 9, 40));
-    E(ldr(10, 28, EOFF)), E(str(10, 9, 48)), E(ldr(10, 28, EOFF + 8)), E(str(10, 9, 56)), E(ldrw(10, 28, EOFF + 16)), E(str(10, 9, 64));
+    E(ldr(10, 28, EOFF)), E(str(10, 9, 48)), E(ldr(10, 28, EOFF + 8)), E(str(10, 9, 56)), E(ldrw(10, 28, EOFF + 16)), E(str(10, 9, 64)), E(ldr(10, 28, EOFF + 24)), E(str(10, 9, 72));
     t.pc = E(ADR | 10);
     E(str(10, 9, 32)), E(str(9, 28, VM_HANDLER));
     return t;
@@ -326,7 +326,7 @@ struct Gen : CState {
     for (int m : miss) patch(m);
     st(0, slot()), callWindow(base, 1, S_push, false), patch(done);
   }
-  void field(int sym, bool set) {  // x0 = object (x2 = value to store); result in x0
+  void field(int64_t sym, bool set) {  // x0 = object (x2 = value to store); result in x0
     Jumps miss;
     u32 ic = set ? 3 : 2, lo = icAt(ic, set);
     isObject(miss);
@@ -334,6 +334,7 @@ struct Gen : CState {
     E(ldr(11, ic, lo + 8)), E(ldr(10, 9, INST_SLOTS));
     if (set) {  // bit 32 of the slot: a `num` field (rt_setf), so the value must be a number
       E(tbz32(11, 4)), E(mvn(12, 2)), E(tstq(12)), miss.push_back(E(bcond(EQ)));
+      E(tbz33(11, 2)), E(str(0, 28, EOFF + 32));  // bit 33: a store from outside to a class with invariants (vm.invObj)
       E(strregw(2, 10, 11)), E(mov(0, 2));
     }
     else E(ldrreg(10, 10, 11)), E(addi(12, 27, 4)), E(cmp(10, 12)), miss.push_back(E(bcond(EQ))), E(mov(0, 10));  // ABSENT: slow
@@ -342,6 +343,14 @@ struct Gen : CState {
     if (lo) E(addi(ic, ic, lo));
     imm(1, sym), helper(set ? H_SETF : H_GETF), patch(done);
   }
+  // A method of a class with invariants: link its record (slots rec, rec + 1) into vm.inv; x0 = self, and then
+  // whether this is an outside call. invLeave unlinks it.
+  void invEnter(int rec) { addsp(1, rec), helper(H_INVENTER); }
+  void invLeave(int rec) { ld(9, rec), E(str(9, 28, EOFF + 24)); }
+  // After a store from outside an object: x1 = vm.invObj (rt_setf: the object, whose invariants must hold now), which
+  // is cleared; nothing (0): jump to invPendingEnd.
+  int invPendingBegin() { E(ldr(1, 28, EOFF + 32)); int j = E(cbzx(1)); E(str(31, 28, EOFF + 32)); return j; }
+  void invPendingEnd(int j) { patch(j); }
   void typeCheck(uint64_t t, int site, bool numFast) {  // x0 must have type t (a number: no call when numFast)
     int skip = numFast ? (E(mvn(9, 0)), E(tstq(9)), E(bcond(NE))) : -1;
     imm(1, t), imm(2, (V)site), helper(H_TYPECHK);

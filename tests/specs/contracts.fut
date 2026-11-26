@@ -188,3 +188,54 @@ test "a pub declaration's contract may use only pub names (the .api shows it)" {
   expect r.code == 1
   expect r.err.has("contract_private.fut:4:11: error: the contract of spread(), a pub function, can only use what its readers can see, and 'total' is private")
 }
+
+fn fill(p, amounts) { for n in amounts { p.cash = n } }   // one store site: its cache fills on the first store
+fn setX(o, v) { o.x = v }
+class Boxed {
+  var x = 0
+  invariant self.x >= 0
+}
+
+test "invariants: an outside store is checked on the cache's fast path too, and only for classes that have them" {
+  var p = Purse()
+  expect throws { fill(p, [1, 2, 3, 500]) } == "storing to field 'cash' broke Purse's invariant: self.cash <= self.limit (self.cash is 500, self.limit is 100)"
+  var q = Plain()
+  var b = Boxed()
+  for i in 0..3 { setX(q, i) setX(b, i) }   // the same site, a class without invariants and one with
+  expect q.x == 2
+  expect throws { setX(b, -1) } == "storing to field 'x' broke Boxed's invariant: self.x >= 0 (self.x is -1)"
+  setX(q, -1)
+  expect q.x == -1
+}
+
+class Guarded {
+  var n = 0
+  invariant self.n >= 0
+  fn bad(why) { self.n = -1 throw why }
+  fn recover(why) {        // catches a throw from its own call: it is still the outside call, so it is checked as it ends
+    try { self.bad(why) } catch e { }
+  }
+  fn fix() { self.n = 0 }
+  fn pause(v) {            // mid-change while its fiber is paused (untyped parameters: random calls leave these out)
+    self.n = -1
+    yield v
+    self.n = 0
+  }
+  fn peek() { return self.n }
+}
+
+test "invariants: a caught throw inside a method leaves it the outside call" {
+  var g = Guarded()
+  expect throws { g.recover("bad") } == "Guarded.recover() broke Guarded's invariant: self.n >= 0 (self.n is -1)"
+  g.fix()
+  expect g.peek() == 0
+}
+
+test "invariants: a fiber paused inside a method doesn't make other callers inner" {
+  var g = Guarded()
+  var f = fiber(fn() { g.pause(1) })
+  f.resume()
+  expect throws { g.peek() } == "Guarded.peek() broke Guarded's invariant: self.n >= 0 (self.n is -1)"
+  f.resume()
+  expect g.peek() == 0
+}

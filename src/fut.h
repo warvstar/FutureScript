@@ -105,6 +105,7 @@ struct Fiber : Obj {
   uint64_t allowed;  // its effect state while switched out (effects.cpp): what it may perform, who narrowed it,
   V hstack;          // and its innermost handler
   u32 who;
+  uint64_t inv;      // and its innermost running method of a class with invariants (vm.inv)
   int state, fail, idx;  // fail: an error ended it (its resumer re-raises it); idx: in the live-fiber list
 };
 enum { FIB_NEW, FIB_SUSPENDED, FIB_RUNNING, FIB_DONE };
@@ -163,7 +164,7 @@ const std::string& symName(int);
 
 // ---- the VM block pinned in x28; JIT code reaches helpers and globals with one ldr ----
 enum Helper { H_POLL, H_STACK, H_BINOP, H_GETF, H_SETF, H_GETI, H_SETI, H_PREP, H_LIST, H_ITER, H_NUMCHK, H_UNDEF,
-              H_MAP, H_CLOSURE, H_STALE, H_ECHO, H_FFI, H_YIELD, H_HOT, H_THROW, H_CAPSET, H_TXUNWIND, H_TYPECHK, H_EFFECT, NH };
+              H_MAP, H_CLOSURE, H_STALE, H_ECHO, H_FFI, H_YIELD, H_HOT, H_THROW, H_CAPSET, H_TXUNWIND, H_TYPECHK, H_EFFECT, H_INVENTER, NH };
 enum Op { O_ADD, O_SUB, O_MUL, O_DIV, O_MOD, O_EQ, O_NE, O_LT, O_LE, O_GT, O_GE, O_BAND, O_BOR, O_BXOR, O_SHL, O_SHR };
 constexpr int MAXG = 1 << 16;
 // Per-site inline cache. key: the receiver's header word (methods compare only its class id); val: slot or code.
@@ -175,17 +176,19 @@ struct Run { uintptr_t cur, end; };
 // handler: the innermost active `try` (a record in its JIT frame: prev, sp, fp, x26, handler pc, txn at entry).
 // txn: how many transactions are open (see txn.cpp); JIT code reads it (arm64: at +4).
 // allowed, who, hstack: the effects code may perform now, the declaration that narrowed them, the innermost
-// handler (effects.cpp). Functions that declare effects read and write the first two; try records save all three.
+// handler (effects.cpp). Functions that declare effects read and write the first two; try records save all three,
+// and inv: the innermost running method of a class with invariants, as a record in its frame (rt_inventer).
+// invObj: an instance an outside store just changed, whose invariants the store site then checks (rt_setf).
 #ifdef __wasm__  // limit, then poll: one i64 load at &limit tests both on a function's entry (gen_wasm.h)
-struct VM { void* limit; u32 poll; void* handler; u32 txn; void* helpers[NH]; Run runs[NCLS + 1]; uint64_t allowed; V hstack; u32 who, pad; V globals[MAXG]; IC ics[MAXIC]; };
+struct VM { void* limit; u32 poll; void* handler; u32 txn; Run runs[NCLS + 1]; void* helpers[NH]; uint64_t allowed; V hstack; u32 who, pad; uint64_t inv; V invObj; V globals[MAXG]; IC ics[MAXIC]; };
 #else
-struct VM { u32 poll, txn; void* limit; void* handler; void* helpers[NH]; Run runs[NCLS + 1]; uint64_t allowed; V hstack; u32 who, pad; V globals[MAXG]; IC ics[MAXIC]; };
+struct VM { u32 poll, txn; void* limit; void* handler; Run runs[NCLS + 1]; void* helpers[NH]; uint64_t allowed; V hstack; u32 who, pad; uint64_t inv; V invObj; V globals[MAXG]; IC ics[MAXIC]; };
 #endif
 extern VM vm;
-constexpr int HOFF(int h) { return 24 + 8 * h; }
-constexpr int ROFF(int c) { return 24 + 8 * NH + 16 * c; }
-constexpr int EOFF = ROFF(NCLS + 1);  // vm.allowed; vm.hstack at +8, vm.who at +16
-constexpr int GOFF(int g) { return EOFF + 24 + 8 * g; }
+constexpr int ROFF(int c) { return 24 + 16 * c; }  // first, so ldp reaches every run from x28
+constexpr int HOFF(int h) { return ROFF(NCLS + 1) + 8 * h; }
+constexpr int EOFF = HOFF(NH);  // vm.allowed; vm.hstack at +8, vm.who at +16, vm.inv at +24, vm.invObj at +32
+constexpr int GOFF(int g) { return EOFF + 40 + 8 * g; }
 constexpr u32 VM_HANDLER = 16;
 constexpr u32 IOFF(int i) { return (GOFF(MAXG) + 15) / 16 * 16 + 16 * i; }
 int newIC(bool set = false);  // set: a field store's, which must miss while a transaction is open
@@ -327,6 +330,7 @@ int globalCount();              // global slots in use
 // ---- contracts: a class's invariants compile to a hidden method inv@(who); calling it on anything without one
 // returns the receiver (rt_prep) ----
 int invariantSym();
+constexpr uint64_t SETF_OUTSIDE = 1ull << 40;  // with a field's symbol (rt_setf): the store is not on self
 
 // ---- types (types.cpp): optional annotations, checked at run time where they are written ----
 // A type is a kind, TY_OPT if nil is allowed too (`str?`), and for a class its symbol (bits 8..).
@@ -356,7 +360,7 @@ const std::string& effOpName(int op);
 int effBuiltinOp(int sym);                    // print, clock, ...: the builtin's operation id, else 0
 void* effPrep(Fn* f, V* w, uint64_t n);       // rt_prep, calling an operation: a handler, the builtin, or an error
 V effYield(V v, bool* handled);               // `yield`: a handler's answer (handled), else checks it may yield
-struct EffState { uint64_t allowed; V hstack; u32 who; };
+struct EffState { uint64_t allowed; V hstack; u32 who; uint64_t inv = 0; };
 EffState effSave();
 void effLoad(const EffState&);
 u32 effEnter();             // a driver runs code (top level, main, REPL line, reload): unchecked, no handlers
@@ -423,7 +427,8 @@ constexpr u32 ldrb(u32 t, u32 n) { return 0x39400000 | n << 5 | t; }
 constexpr u32 ldrreg(u32 t, u32 n, u32 m) { return 0xf8607800 | m << 16 | n << 5 | t; }  // ldr t, [n, m, lsl #3]
 constexpr u32 strreg(u32 t, u32 n, u32 m) { return 0xf8207800 | m << 16 | n << 5 | t; }
 constexpr u32 strregw(u32 t, u32 n, u32 m) { return 0xf8205800 | m << 16 | n << 5 | t; }  // str t, [n, w(m), uxtw #3]
-constexpr u32 tbz32(u32 t, u32 skip) { return 0xb6000000 | skip << 5 | t; }              // tbz t, #32, +skip instructions
+constexpr u32 tbz32(u32 t, u32 skip) { return 0xb6000000 | skip << 5 | t; }  // tbz x<t>, #32
+constexpr u32 tbz33(u32 t, u32 skip) { return 0xb6080000 | skip << 5 | t; }  // tbz x<t>, #33              // tbz t, #32, +skip instructions
 constexpr u32 strpost(u32 t, u32 n, u32 imm) { return 0xf8000400 | (imm & 0x1ff) << 12 | n << 5 | t; }  // str t, [n], #imm
 constexpr u32 addxw(u32 d, u32 n, u32 m) { return 0x8b204000 | m << 16 | n << 5 | d; }                 // add d, n, w(m), uxtw
 constexpr u32 addlsr(u32 d, u32 n, u32 m, u32 sh) { return 0x8b400000 | m << 16 | sh << 10 | n << 5 | d; }  // add d, n, m, lsr #sh
@@ -445,6 +450,7 @@ constexpr u32 br(u32 n) { return 0xd61f0000 | n << 5; }
 constexpr u32 RET = 0xd65f03c0, B = 0x14000000, BL = 0x94000000, BRK = 0xd4200000;
 constexpr u32 bcond(u32 c) { return 0x54000000 | c; }
 constexpr u32 cbzw(u32 t) { return 0x34000000 | t; }
+constexpr u32 cbzx(u32 t) { return 0xb4000000 | t; }
 constexpr u32 cmp(u32 n, u32 m) { return 0xeb00001f | m << 16 | n << 5; }
 constexpr u32 cmpw(u32 n, u32 m) { return 0x6b00001f | m << 16 | n << 5; }
 constexpr u32 cmpi(u32 n, u32 imm) { return 0xf100001f | imm << 10 | n << 5; }

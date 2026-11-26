@@ -186,6 +186,8 @@ void reshape(Class* c) {
   c->irun = u32((char*)&vm.runs[k] - (char*)&vm), c->isize = k < NCLS ? sizeClasses[k] : 16;  // too big: runs[NCLS] is empty, so 16 never fits
 }
 static V rt_setf(V o, uint64_t s, V v, IC* ic) {
+  bool outside = s & SETF_OUTSIDE;
+  s &= ~SETF_OUTSIDE;
   if (is(o, K::Map)) return rt_seti(o, mapKey(s), v);
   if (!is(o, K::Inst)) ERR("cannot set field '%s' on %s", symName(s).c_str(), typeName(o));
   Inst* in = as<Inst>(o);
@@ -206,8 +208,12 @@ static V rt_setf(V o, uint64_t s, V v, IC* ic) {
   }
   const Class::FieldType* ty = in->cls->typed((int)s);
   if (ty && !typeAccepts(ty->type, v)) typeFail(ty->site, v, RA());
+  // A store from outside an instance whose class has invariants: the site checks them next (bit 33 of the cached slot
+  // tells its fast path to ask the same, through vm.invObj).
+  bool inv = outside && in->cls->find(invariantSym());
+  if (inv) vm.invObj = o;
   // A `num` field's store sites check inline (bit 32 of the slot tells them to); other typed fields' stores come here.
-  if (ic && !vm.txn && (!ty || ty->type == TY_NUM)) *ic = {header(in), i | (ty ? 1ull << 32 : 0)};
+  if (ic && !vm.txn && (!ty || ty->type == TY_NUM)) *ic = {header(in), i | (ty ? 1ull << 32 : 0) | (inv ? 1ull << 33 : 0)};
   return in->slots[i] = v;
 }
 #define INDEX(i, n) (isNum(i) && num(i) >= 0 && num(i) < (n) ? (size_t)num(i) : (ERR("index %s out of range (len %zu)", toStr(i).c_str(), (size_t)(n)), 0))
@@ -349,7 +355,7 @@ V newFiber(V fn) {
   if (f->arity - is(fn, K::Clo) > 1) ERR("a fiber's function takes at most one parameter (the first value sent)");
   Fiber* b = make<Fiber>();
   b->fn = fn, b->val = NIL, fiberStack(b);
-  b->allowed = vm.allowed, b->who = vm.who, b->hstack = NIL;  // it may do what its creator may, and has its own handlers
+  b->allowed = vm.allowed, b->who = vm.who, b->hstack = NIL, b->inv = 0;  // it may do what its creator may, and has its own handlers
   return box(b);
 }
 V fiberResume(V fv, V v) {  // run fv until it yields (giving the yielded value) or returns (its result)
@@ -361,9 +367,9 @@ V fiberResume(V fv, V v) {  // run fv until it yields (giving the yielded value)
   EffState mine = effSave();  // each fiber has its own effect state (allowed effects, handlers)
   volatile V keep = mine.hstack;
   (void)keep;
-  effLoad({f->allowed, f->hstack, f->who});
+  effLoad({f->allowed, f->hstack, f->who, f->inv});
   fiberRun(f, start);
-  f->allowed = vm.allowed, f->hstack = vm.hstack, f->who = vm.who;
+  f->allowed = vm.allowed, f->hstack = vm.hstack, f->who = vm.who, f->inv = vm.inv;
   effLoad(mine);
   if (f->state == FIB_DONE) {
     fiberFree(f);
