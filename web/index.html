@@ -138,6 +138,8 @@ if (threads) {
     changed: (p) => (stamps.set(p, (stamps.get(p) ?? 0) + 1), f.changed()),
     key: (c, down) => f.exports.fut_key(c, down),
     mouse: (x, y, down) => f.exports.fut_mouse(x, y, down),
+    touch: (id, x, y, down) => f.exports.fut_touch(id, x, y, down),
+    screen: (w, h) => f.exports.fut_screen(w, h),
   };
 }
 function read(p) {  // fut reads files synchronously
@@ -164,6 +166,18 @@ for (const c of [canvas, gpuCanvas]) {  // the window: the pixel buffer's canvas
   c.addEventListener("mousedown", (e) => ((mouseDown = 1), mouse(e)));
 }
 addEventListener("mouseup", (e) => ((mouseDown = 0), mouse(e)));
+// fingers: touches() (a touch also moves the mouse, as browsers do); the viewport: screensize()
+const touch = (e, down) => {
+  const c = gpuPresent ? gpuCanvas : canvas, r = c.getBoundingClientRect();
+  for (const t of e.changedTouches) fut.touch(t.identifier, (t.clientX - r.left) * c.width / r.width, (t.clientY - r.top) * c.height / r.height, down);
+};
+for (const c of [canvas, gpuCanvas]) {
+  c.addEventListener("touchstart", (e) => touch(e, 1), { passive: true });
+  c.addEventListener("touchmove", (e) => touch(e, 1), { passive: true });
+  for (const t of ["touchend", "touchcancel"]) c.addEventListener(t, (e) => touch(e, 0), { passive: true });
+}
+const sized = () => fut.screen(innerWidth, innerHeight);
+addEventListener("resize", sized), sized();
 
 let running = !!file, prompt = "> ";
 $("form").addEventListener("submit", async (e) => {

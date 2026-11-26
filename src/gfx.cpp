@@ -8,6 +8,8 @@ static std::vector<u32> px;  // 0x00RRGGBB, top row first
 static int W, H;
 static bool down[0x10000], mouseDown;  // keys by (lowercased) character; arrows are 0xF700..0xF703
 static Pt mouse;
+struct Touch { double id, x, y; };
+static std::vector<Touch> fingers;  // touches(): the fingers down, in the order they went down (a page's; none natively)
 #define NUM(v, f) (isNum(v) ? num(v) : (ERR(f "@argument () expects numbers"), 0.0))
 static int clip(double v, int hi) { return v > 0 ? (v < hi ? (int)v : hi) : 0; }  // NaN -> 0
 #define COLOR(c, f) (isNum(c) ? clip(num(c), 0xffffff) : (ERR(f "@argument () expects a 0xRRGGBB color"), 0))
@@ -18,6 +20,15 @@ extern "C" __attribute__((import_module("host"), import_name("window"))) int hos
 extern "C" __attribute__((import_module("host"), import_name("present"))) int host_present(const u32* px, int w, int h);  // suspends a frame
 extern "C" __attribute__((export_name("fut_key"))) void futKey(int c, int isDown) { down[lower(c) & 0xffff] = isDown; }
 extern "C" __attribute__((export_name("fut_mouse"))) void futMouse(double x, double y, int isDown) { mouse = {x, y}, mouseDown = isDown; }
+extern "C" __attribute__((export_name("fut_touch"))) void futTouch(double id, double x, double y, int isDown) {
+  auto f = std::find_if(fingers.begin(), fingers.end(), [&](const Touch& t) { return t.id == id; });
+  if (!isDown) { if (f != fingers.end()) fingers.erase(f); }
+  else if (f != fingers.end()) f->x = x, f->y = y;
+  else fingers.push_back({id, x, y});
+}
+static Pt screen;  // screensize(): what a window could fill (the page's viewport, as the host last said)
+extern "C" __attribute__((export_name("fut_screen"))) void futScreen(double w, double h) { screen = {w, h}; }
+static Pt screenSize() { return screen.x > 0 ? screen : Pt{(double)W, (double)H}; }  // (a host that never said: the window)
 static V n_window(V w, V h) {
   W = clip(NUM(w, "window"), 4096), H = clip(NUM(h, "window"), 4096);
   if (!host_window(W, H)) ERR("@host window() needs a display: run this in a browser (node web/serve.mjs)");
@@ -80,6 +91,11 @@ void gfxPump() {  // handle pending window events (also called while a stopped p
   }
   mouse = msg<Pt>(win, "mouseLocationOutsideOfEventStream"), mouse.y = H - mouse.y;
 }
+static Pt screenSize() {  // the main screen's visible part (no menu bar or dock), in points
+  if (!app) dlopen("/System/Library/Frameworks/AppKit.framework/AppKit", RTLD_LAZY);
+  id s = msg(cls("NSScreen"), "mainScreen");
+  return s ? msg<Rect>(s, "visibleFrame").s : Pt{(double)W, (double)H};
+}
 static V n_present() {  // show the frame, handle events, wait for the next 1/60 s tick; false once the window is closed
   if (!win) ERR("@host present() before window()");
   if (presentHook) presentHook(presentArg);
@@ -120,9 +136,27 @@ static V n_key(V k) {
   return boxb(c >= 0 && down[c]);
 }
 
+static V n_touches() {  // [{id, x, y}], in the window's pixels
+  List* l = make<List>();
+  volatile V keep = box(l);
+  (void)keep;
+  for (const Touch& t : fingers) {
+    Map* m = make<Map>();
+    l->v.push_back(box(m));
+    mapPut(m, "id", box(t.id)), mapPut(m, "x", box(t.x)), mapPut(m, "y", box(t.y));
+  }
+  return box(l);
+}
+static V n_screensize() {
+  Pt s = screenSize();
+  List* l = make<List>();
+  return l->v = {box(s.x), box(s.y)}, box(l);
+}
+
 void gfxInit() {
   native<n_window>("window"), native<n_present>("present"), native<n_clear>("clear");
   native<n_rect>("rect"), native<n_circle>("circle"), native<n_key>("key");
   native<+[] { return box(mouse.x); }>("mousex"), native<+[] { return box(mouse.y); }>("mousey");
   native<+[] { return boxb(mouseDown); }>("mousedown");
+  native<n_touches>("touches"), native<n_screensize>("screensize");
 }

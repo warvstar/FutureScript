@@ -704,8 +704,11 @@ while present() {                    // show the frame, handle input, wait for t
   circle(x, y, r, 0xffcc00)
   if key("left") { }                 // held keys: "a".."z", "0".."9", "space", "enter", "escape", "tab", arrows
   if mousedown() { print("{mousex()},{mousey()}") }
+  for t in touches() { circle(t.x, t.y, 20, 0xffffff) }  // fingers down, in a page ({id, x, y}; none natively)
 }
 ```
+
+`screensize()` is `[w, h]`, what a window could fill: in a page its viewport, natively the screen less its menu bar and dock. A game that fits the screen checks it each frame and calls `window()` again when it changes (a phone turned sideways); std/gpu follows the new size.
 
 `build/fut -w examples/paddle.fut` is a small game to live-code.
 `build/fut examples/flock.fut` is a simulation that runs the same everywhere. Its boids' behaviours are ordinary functions, each run under a step budget, so a behaviour that loops forever (hold space) is cut off on the same tick everywhere. Its test blocks (`fut test examples/flock.fut`, run by both suites) check that a seeded run's state matches a fingerprint, every bit, natively and in wasm.

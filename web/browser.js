@@ -9,7 +9,7 @@
 //
 // startFut(o): o = {wasm (fut-mt.wasm's bytes), std, verbose, serve, proxy, poolSize, seed, write(fd, bytes),
 // files(paths), window(w, h), present(rgba, w, h): Promise, screen (see fut.js)} -> {run(file, watch), test(file),
-// line(l), type(l), changed(path), key(code, down), mouse(x, y, down)}, each sent to the root. A module the page loads
+// line(l), type(l), changed(path), key(code, down), mouse(x, y, down), touch(id, x, y, down), screen(w, h)}, each sent to the root. A module the page loads
 // gets fut's memory (shared, so it reads and writes what the threads see) and the screen (see giveHost).
 import { CH, FUT, chanGet, chanPut, giveHost, jsonCodec } from "./fut.js";
 
@@ -186,5 +186,7 @@ export async function startFut(o) {
     changed: (p) => tell({ changed: p }),
     key: (c, down) => root.postMessage({ key: [c, down] }),
     mouse: (x, y, down) => root.postMessage({ mouse: [x, y, down] }),
+    touch: (id, x, y, down) => root.postMessage({ touch: [id, x, y, down] }),
+    screen: (w, h) => root.postMessage({ screen: [w, h] }),
   };
 }

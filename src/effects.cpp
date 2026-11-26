@@ -284,7 +284,7 @@ void effectsInit() {
   invokeCode = callable<invokeHandler>();
   for (auto [name, e] : std::initializer_list<std::pair<const char*, uint64_t>>{
            {"print", EFF_IO}, {"run", EFF_IO}, {"window", EFF_IO}, {"present", EFF_IO}, {"clear", EFF_IO}, {"rect", EFF_IO},
-           {"circle", EFF_IO}, {"key", EFF_IO}, {"mousex", EFF_IO}, {"mousey", EFF_IO}, {"mousedown", EFF_IO},
+           {"circle", EFF_IO}, {"key", EFF_IO}, {"mousex", EFF_IO}, {"mousey", EFF_IO}, {"mousedown", EFF_IO}, {"touches", EFF_IO}, {"screensize", EFF_IO},
            {"fetch", EFF_IO}, {"fetchAll", EFF_IO}, {"exec", EFF_IO}, {"execAll", EFF_IO}, {"readFile", EFF_IO},
            {"writeFile", EFF_IO}, {"env", EFF_IO}, {"time", EFF_CLOCK}, {"clock", EFF_CLOCK}, {"sleep", EFF_CLOCK}, {"random", EFF_RANDOM}, {"seed", EFF_RANDOM}}) {
     int sym = intern(name);
