@@ -66,6 +66,44 @@ struct Lexer {
   }
 };
 
+// A type's tokens (see type()), from L: atoms joined by |, each maybe followed by ?. Leaves L after it.
+template <class Next> void skipType(Lexer& L, Next next) {
+  for (;;) {
+    Lexer s = L;
+    Tok t = next(s);
+    auto balanced = [&](int open, int close) {
+      for (int d = 1; d > 0;) {
+        Tok x = next(L);
+        if (x.t == T_EOF) return;
+        d += (x.t == open) - (x.t == close) - (close == '>' && x.t == T_SHR ? 2 : 0);
+      }
+    };
+    if (t.t == '{') L = s, balanced('{', '}');
+    else if (t.t == '(') L = s, balanced('(', ')');
+    else if (t.t == T_STR || t.t == T_NUM) L = s;
+    else if (t.t == '-') L = s, next(L);
+    else if (t.t == T_ID) {
+      L = s;
+      if (Lexer d = L; next(d).t == '.' && next(d).t == T_ID) L = d;
+      if (Lexer a = L; [&] { Tok o = next(a); return o.t == '<' && !o.nl; }()) L = a, balanced('<', '>');
+    } else return;
+    if (Lexer q = L; [&] { Tok o = next(q); return o.t == '?' && !o.nl; }()) L = q;
+    if (Lexer u = L; [&] { Tok o = next(u); return o.t != '|' || o.nl; }()) return;
+    else L = u;
+  }
+}
+
+inline bool pubDecl(const Tok& t) {
+  return t.t == T_ID && !t.nl && (t.sym == K_fn || t.sym == K_class || t.sym == K_var || t.sym == K_extern ||
+                                 t.sym == S_effect || t.sym == K_import || t.sym == S_type);
+}
+inline bool clauseEnds(int depth, const Tok& prev, const Tok& t) {
+  return depth == 0 && prev.t && (t.t == '{' || t.t == '}' || t.nl || t.t == T_EOF);
+}
+inline int nesting(const Tok& t) {
+  return (t.t == '(' || t.t == '[' || t.t == '{') - (t.t == ')' || t.t == ']' || t.t == '}');
+}
+
 // Binary operators: token -> (precedence, Op). Precedence 0 means "not a binary operator".
 inline const auto BIN = [] {
   std::array<std::pair<int, int>, T_SHR + 1> b{};

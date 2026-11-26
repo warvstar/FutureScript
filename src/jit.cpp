@@ -1,12 +1,9 @@
-// The arm64 half of the runtime: executable memory, stack traces and try, fibers, C calls, process setup.
+// The arm64 half of the runtime: executable memory, stack traces and try, fibers, C calls and process reaping.
 #include "fut.h"
 #include <cmath>
 #include <dlfcn.h>
-#include <fcntl.h>
-#include <mach-o/dyld.h>
 #include <poll.h>
 #include <signal.h>
-#include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <map>
@@ -384,41 +381,4 @@ int reap(int pid, std::vector<std::pair<int, std::string*>> pipes, double timeou
   for (auto& p : pipes) if (p.first >= 0) close(p.first);
   int st = 0;
   return waitpid(pid, &st, 0), st;
-}
-extern char** environ;
-bool runProcess(const std::vector<std::string>& args, const std::string& file, const std::string* source, double timeout, ProcResult& r) {
-  char exe[4096];
-  uint32_t n = sizeof exe;
-  if (_NSGetExecutablePath(exe, &n)) return false;
-  std::string path = file, tmp;
-  if (source) {
-    char t[] = "/tmp/fut-run-XXXXXX.fut";
-    int fd = mkstemps(t, 4);
-    if (fd < 0) return false;
-    bool ok = write(fd, source->data(), source->size()) == (ssize_t)source->size();
-    close(fd), path = tmp = t;
-    if (!ok) return unlink(t), false;
-  }
-  std::vector<std::string> a{exe};
-  a.insert(a.end(), args.begin(), args.end()), a.push_back(path);
-  std::vector<char*> av;
-  for (auto& s : a) av.push_back(s.data());
-  av.push_back(nullptr);
-  int po[2], pe[2];
-  if (pipe(po)) return false;
-  if (pipe(pe)) return close(po[0]), close(po[1]), false;
-  posix_spawn_file_actions_t fa;
-  posix_spawn_file_actions_init(&fa);
-  posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
-  posix_spawn_file_actions_adddup2(&fa, po[1], 1), posix_spawn_file_actions_adddup2(&fa, pe[1], 2);
-  for (int fd : {po[0], po[1], pe[0], pe[1]}) posix_spawn_file_actions_addclose(&fa, fd);
-  pid_t pid;
-  int rc = posix_spawn(&pid, exe, &fa, nullptr, av.data(), environ);
-  posix_spawn_file_actions_destroy(&fa);
-  close(po[1]), close(pe[1]);
-  if (rc) return close(po[0]), close(pe[0]), tmp.empty() || unlink(tmp.c_str()), false;
-  int st = reap(pid, {{po[0], &r.out}, {pe[0], &r.err}}, timeout, r.timedOut);
-  r.code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
-  if (!tmp.empty()) unlink(tmp.c_str());
-  return true;
 }

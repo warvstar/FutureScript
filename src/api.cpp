@@ -58,31 +58,12 @@ struct Scan {
     if (s.next().t != ':') return end;
     return L = s, type();
   }
-  // A type at L (see Compiler::type): atoms joined by |, each maybe followed by ?. Returns just past it.
   const char* type() {
-    for (;;) {
-      Lexer s = L;
-      Tok t = s.next();
-      auto balanced = [&](int open, int close) {
-        for (int d = 1; d > 0;) {
-          Tok x = next();
-          if (x.t == T_EOF) return;
-          d += (x.t == open) - (x.t == close) - (close == '>' && x.t == T_SHR ? 2 : 0);  // list<list<num>>
-        }
-      };
-      if (t.t == '{') L = s, balanced('{', '}');
-      else if (t.t == '(') L = s, balanced('(', ')');
-      else if (t.t == T_STR || t.t == T_NUM) L = s;
-      else if (t.t == '-') L = s, next();
-      else if (t.t == T_ID) {
-        L = s;
-        if (Lexer d = L; d.next().t == '.' && d.next().t == T_ID) L = d;
-        if (Lexer a = L; [&] { Tok o = a.next(); return o.t == '<' && !o.nl; }()) L = a, balanced('<', '>');
-      } else return L.p;
-      if (Lexer q = L; [&] { Tok o = q.next(); return o.t == '?' && !o.nl; }()) L = q;
-      if (Lexer u = L; [&] { Tok o = u.next(); return o.t != '|' || o.nl; }()) return L.p;
-      else L = u;
-    }
+    skipType(L, [](Lexer& at) {
+      Tok t = at.next();
+      return t.t == T_ERR ? Tok{T_EOF} : t;
+    });
+    return L.p;
   }
   const char* effects(const char* end) {  // `! io, geom.Log` next (or a bare `!`): through it
     Lexer s = L;
@@ -95,17 +76,24 @@ struct Scan {
       L = d, end = d.p;
     }
   }
-  void skipBody(Tok& t) {  // t is '{': through the matching '}'
-    for (int d = 0; t.t != T_EOF; t = next()) if ((d += (t.t == '{') - (t.t == '}')) == 0) return;
+  int bodyEnd() {
+    Tok t = next();
+    if (t.t == '{') for (int depth = 1; depth > 0;) {
+      t = next();
+      if (t.t == T_EOF) break;
+      depth += (t.t == '{') - (t.t == '}');
+    }
+    return t.line;
   }
   const char* clauseEnd() {  // after a clause's keyword: through its condition (the rest of the line, up to a '{' or '}')
     const char* e = L.p;
-    for (int d = 0, any = 0;; any = 1) {
+    Tok prev;
+    for (int d = 0;;) {
       Lexer r = L;
       Tok t = r.next();
-      if (t.t == T_EOF || t.t == T_ERR || (d == 0 && (t.nl || (any && (t.t == '{' || t.t == '}'))))) return e;
-      d += (t.t == '(' || t.t == '[' || t.t == '{') - (t.t == ')' || t.t == ']' || t.t == '}');
-      L = r, e = r.p;
+      if (t.t == T_EOF || t.t == T_ERR || (d == 0 && t.nl) || clauseEnds(d, prev, t)) return e;
+      d += nesting(t);
+      prev = t, L = r, e = r.p;
     }
   }
   std::vector<std::string> clauses() {  // a function's requires and ensures clauses next, each on one line
@@ -144,7 +132,7 @@ static std::vector<Decl> declsOf(const std::string& text) {
     if (isKw(t, S_pub)) {
       Lexer save = L;
       Tok n = S.next();
-      if (n.t != T_ID || n.nl || !(n.sym == K_fn || n.sym == K_class || n.sym == K_var || n.sym == K_extern || n.sym == S_effect || n.sym == K_import || n.sym == S_type)) { L = save; continue; }
+      if (!pubDecl(n)) { L = save; continue; }
       pub = true, k = n;
     }
     const char* from = pub ? t.p : k.p;
@@ -154,9 +142,7 @@ static std::vector<Decl> declsOf(const std::string& text) {
       if (n.t != T_ID || p.t != '(') continue;
       const char* e = S.effects(S.typed(S.params(p)));
       auto cl = S.clauses();
-      Tok b = S.next();
-      int end = b.line;
-      if (b.t == '{') S.skipBody(b), end = b.line;
+      int end = S.bodyEnd();
       out.push_back({"fn", symName(n.sym), squash(from, e), "", "", pub, k.line, end, doc, cl});
     } else if (isKw(k, S_type)) {  // type Name = <type>
       Lexer save = L;
@@ -218,8 +204,7 @@ static std::vector<Decl> declsOf(const std::string& text) {
         int end = m.line;
         if (!eff) {
           cl = S.clauses();
-          Tok body = S.next();
-          if (body.t == '{') S.skipBody(body), end = body.line;
+          end = S.bodyEnd();
         }
         out.push_back({eff ? "op" : "method", symName(nm.sym), squash(first.p, e), owner, "", pub, first.line, end, md, cl});
       }
@@ -228,9 +213,7 @@ static std::vector<Decl> declsOf(const std::string& text) {
       Lexer save = L;
       Tok n = S.next();
       if (n.t != T_STR) { L = save; continue; }
-      Tok b = S.next();
-      int end = b.line;
-      if (b.t == '{') S.skipBody(b), end = b.line;
+      int end = S.bodyEnd();
       out.push_back({"test", std::string(n.p, n.len), squash(k.p, n.p + n.len + 1), "", "", false, k.line, end, doc, {}});
     }
   }
@@ -401,25 +384,15 @@ static std::string spanHash(const std::string& src, int line, int end) {
   snprintf(o, sizeof o, "%016llx", (unsigned long long)h);
   return std::string(o, 12);
 }
-static std::string json(const std::string& s) {
-  std::string o = "\"";
-  for (unsigned char c : s) {
-    if (c == '"' || c == '\\') o += '\\', o += (char)c;
-    else if (c == '\n') o += "\\n";
-    else if (c < 0x20) { char b[8]; snprintf(b, sizeof b, "\\u%04x", c); o += b; }
-    else o += (char)c;
-  }
-  return o + "\"";
-}
 int reportInterfaces(const std::vector<ApiIssue>& issues, bool asJson, const std::string& program) {
   for (auto& is : issues) {
     std::string s;
     if (asJson) {
-      s = "{\"type\":\"api\",\"file\":" + json(is.file) + ",\"interface\":" + json(is.api) + ",\"status\":\"" + is.status + "\"";
-      if (is.status == "breaking") s += ",\"version\":" + json(is.version) + ",\"needs\":" + json(is.needs);
+      s = "{\"type\":\"api\",\"file\":" + quoteJson(is.file) + ",\"interface\":" + quoteJson(is.api) + ",\"status\":\"" + is.status + "\"";
+      if (is.status == "breaking") s += ",\"version\":" + quoteJson(is.version) + ",\"needs\":" + quoteJson(is.needs);
       for (auto [key, list] : {std::pair{"removed", &is.removed}, {"added", &is.added}}) {
         s += std::string(",\"") + key + "\":[";
-        for (size_t i = 0; i < list->size(); i++) s += (i ? "," : "") + json((*list)[i]);
+        for (size_t i = 0; i < list->size(); i++) s += (i ? "," : "") + quoteJson((*list)[i]);
         s += "]";
       }
       s += "}\n";
@@ -499,14 +472,14 @@ int printMap(const Compiled& c, bool pubOnly, bool asJson, const std::string& on
       for (auto& d : decls.back()) if (d.kind == "extern" && !d.mod.empty()) binds[d.mod].push_back(d.name);
     }
     if (p) {
-      if (asJson) o += "{\"type\":\"package\",\"name\":" + json(p->name) + ",\"version\":" + json(p->version) + ",\"dir\":" + json(shown(p->dir, program)) +
-                       ",\"root\":" + json(shown(p->root, program)) + "}\n";
+      if (asJson) o += "{\"type\":\"package\",\"name\":" + quoteJson(p->name) + ",\"version\":" + quoteJson(p->version) + ",\"dir\":" + quoteJson(shown(p->dir, program)) +
+                       ",\"root\":" + quoteJson(shown(p->root, program)) + "}\n";
       else o += "pkg " + p->name + " " + p->version + "  // " + shown(p->manifest, program) + "\n";
       for (auto& m : p->mods) {
         std::string t = m.kind == "c" && m.target.find('/') == std::string::npos ? m.target : rel(m.target), b;
         if (asJson) {
-          for (auto& x : binds[m.name]) b += (b.empty() ? "" : ",") + json(x);
-          o += "{\"type\":\"module\",\"package\":" + json(p->name) + ",\"kind\":\"" + m.kind + "\",\"name\":" + json(m.name) + ",\"target\":" + json(t) + ",\"binds\":[" + b + "]}\n";
+          for (auto& x : binds[m.name]) b += (b.empty() ? "" : ",") + quoteJson(x);
+          o += "{\"type\":\"module\",\"package\":" + quoteJson(p->name) + ",\"kind\":\"" + m.kind + "\",\"name\":" + quoteJson(m.name) + ",\"target\":" + quoteJson(t) + ",\"binds\":[" + b + "]}\n";
         } else {
           for (auto& x : binds[m.name]) b += (b.empty() ? "" : ", ") + x;
           o += "  " + m.kind + " " + m.name + " " + t + (b.empty() ? "" : "  // " + b) + "\n";
@@ -519,12 +492,12 @@ int printMap(const Compiled& c, bool pubOnly, bool asJson, const std::string& on
       std::vector<const Decl*> shownDecls;  // (declarations only: contracts are in the source and the .api)
       for (auto& d : decls[i]) if ((!pubOnly || d.pub) && d.kind != "invariant") shownDecls.push_back(&d);
       if (asJson) {
-        o += "{\"type\":\"file\"" + (p ? ",\"package\":" + json(p->name) : "") + ",\"file\":" + json(shown(f, program)) + "}\n";
+        o += "{\"type\":\"file\"" + (p ? ",\"package\":" + quoteJson(p->name) : "") + ",\"file\":" + quoteJson(shown(f, program)) + "}\n";
         for (auto* d : shownDecls) {
-          o += "{\"type\":\"" + d->kind + "\"" + (p ? ",\"package\":" + json(p->name) : "") + ",\"file\":" + json(shown(f, program)) + ",\"name\":" + json(d->name);
-          if (!d->owner.empty()) o += ",\"in\":" + json(d->owner);
-          if (!d->mod.empty()) o += ",\"module\":" + json(d->mod);
-          o += std::string(",\"pub\":") + (d->pub ? "true" : "false") + ",\"sig\":" + json(d->sig) + ",\"line\":" + std::to_string(d->line) + ",\"end\":" + std::to_string(d->end) +
+          o += "{\"type\":\"" + d->kind + "\"" + (p ? ",\"package\":" + quoteJson(p->name) : "") + ",\"file\":" + quoteJson(shown(f, program)) + ",\"name\":" + quoteJson(d->name);
+          if (!d->owner.empty()) o += ",\"in\":" + quoteJson(d->owner);
+          if (!d->mod.empty()) o += ",\"module\":" + quoteJson(d->mod);
+          o += std::string(",\"pub\":") + (d->pub ? "true" : "false") + ",\"sig\":" + quoteJson(d->sig) + ",\"line\":" + std::to_string(d->line) + ",\"end\":" + std::to_string(d->end) +
                ",\"hash\":\"" + spanHash(files[i]->second, d->line, d->end) + "\"}\n";
           n++;
         }

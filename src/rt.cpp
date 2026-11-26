@@ -63,6 +63,10 @@ Global& global(int sym) {
   return globals[sym];
 }
 Global* findGlobal(int sym) { return (size_t)sym < globals.size() && globals[sym].slot >= 0 ? &globals[sym] : nullptr; }
+Global* fnNamed(int sym) {
+  Global* g = findGlobal(sym);
+  return g && g->kind == 'f' && g->o ? g : nullptr;
+}
 static Fn* builtin(K k, uint64_t s) { return s < builtins[(int)k].size() ? builtins[(int)k][s] : nullptr; }
 // Inline caches live in each isolate's VM block, at the same index in all of them. A new one is made empty in
 // every block (no isolate runs the code using it yet); filling and clearing touch only the running isolate's.
@@ -825,6 +829,33 @@ static V n_parseNum(V s) {  // the number a string spells (surrounding spaces al
   if (end == p) return NIL;
   while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r') end++;
   return *end ? NIL : box(d);
+}
+std::string_view strViewArg(V v, const char* fn, const char* what) {
+  if (!is(v, K::Str)) ERR("@argument %s(): %s must be a string, got %s", fn, what, typeName(v));
+  return as<Str>(v)->sv();
+}
+double numArg(V v, const char* fn, const char* what) {
+  if (!isNum(v) || num(v) <= 0) ERR("@argument %s(): %s must be a positive number", fn, what);
+  return num(v);
+}
+FetchRequest fetchRequest(V v, const char* fn) {
+  FetchRequest r;
+  if (is(v, K::Str)) return r.url = strViewArg(v, fn, "the url"), r;
+  if (!is(v, K::Map)) ERR("@argument %s() expects a url or {url, method, headers, body, timeout}, got %s", fn, typeName(v));
+  for (auto& [k, x] : as<Map>(v)->e) {
+    std::string_view key = strViewArg(k, fn, "an option name");
+    if (key == "url") r.url = strViewArg(x, fn, "url");
+    else if (key == "method") r.method = strViewArg(x, fn, "method");
+    else if (key == "body") r.body = strViewArg(x, fn, "body");
+    else if (key == "timeout") r.timeout = numArg(x, fn, "timeout");
+    else if (key == "headers") {
+      if (!is(x, K::Map)) ERR("@argument %s(): headers must be a map of strings", fn);
+      r.headers = as<Map>(x);
+      for (auto& [hk, hv] : r.headers->e) strViewArg(hk, fn, "a header name"), strViewArg(hv, fn, "a header value");
+    } else ERR("@argument %s(): unknown option '%s' (url, method, headers, body, timeout)", fn, key.data());
+  }
+  if (r.url.empty()) ERR("@argument %s(): no url", fn);
+  return r;
 }
 static V n_time() {  // seconds since 1970
   timespec t;

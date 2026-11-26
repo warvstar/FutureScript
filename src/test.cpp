@@ -523,17 +523,7 @@ static int passed, failed, errored, pending, cachedPasses;
 static std::string later;  // --changed, text: failures and pending tests, shown after the summary line
 static std::string out;  // the running test's print() output
 static double t0, tAll;
-static std::string json(const std::string& s) {
-  std::string o = "\"";
-  for (unsigned char c : s) {
-    if (c == '"' || c == '\\') o += '\\', o += (char)c;
-    else if (c == '\n') o += "\\n";
-    else if (c == '\t') o += "\\t";
-    else if (c < 0x20) { char b[8]; snprintf(b, sizeof b, "\\u%04x", c); o += b; }
-    else o += (char)c;
-  }
-  return o + "\"";
-}
+static std::string json(std::string_view s) { return quoteJson(s, true); }
 static std::string indent(const std::string& s, const char* pre) {
   std::string o;
   for (size_t i = 0; i < s.size();) {
@@ -569,7 +559,8 @@ void* testStart(const TestCase& t) {
   return t.code;
 }
 
-std::string testReport(const TestCase& t, bool err, const std::string& e, char& code) {
+std::string testReport(const TestCase& t, bool err, const std::string& e, char& code, const std::string* output) {
+  const std::string& printed = output ? *output : out;
   outSink = nullptr, endCaptures();
   double ms = (now() - t0) * 1e3;
   const char* status = failure.set ? "fail" : err ? "error" : "pass";
@@ -593,7 +584,7 @@ std::string testReport(const TestCase& t, bool err, const std::string& e, char& 
       j += ",\"message\":" + json(msg) + (c.empty() ? "" : ",\"code\":" + json(c)) + ",\"trace\":" + json(nl == std::string::npos ? "" : e.substr(nl + 1));
     }
     if ((failure.set || err) && !isolateSeedNote().empty()) j += ",\"seed\":" + std::to_string(isolateSeed);
-    return j + ",\"output\":" + json(out) + "}\n" + traceReport(t);
+    return j + ",\"output\":" + json(printed) + "}\n" + traceReport(t);
   }
   std::string s = std::string(failure.set ? "FAIL    " : err ? "ERROR   " : "ok      ") + t.name;
   if (failure.set) {
@@ -602,7 +593,7 @@ std::string testReport(const TestCase& t, bool err, const std::string& e, char& 
     for (auto& d : details(x, failure)) s += "    " + d + "\n";
   } else if (err) s += " (" + where(t) + ")\n" + indent("runtime error: " + e.substr(0, e.find_last_not_of('\n') + 1), "  ");
   else s += "\n";
-  if ((failure.set || err) && !out.empty()) s += "  output:\n" + indent(out.substr(0, out.size() - (out.back() == '\n')), "    ");
+  if ((failure.set || err) && !printed.empty()) s += "  output:\n" + indent(printed.substr(0, printed.size() - (printed.back() == '\n')), "    ");
   if (failure.set || err) s += indent(isolateSeedNote(), "  ");
   return s + traceReport(t);
 }

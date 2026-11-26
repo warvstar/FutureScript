@@ -82,25 +82,6 @@ u32* jitInstall(Code& k) {
 }
 // fetch and fetchAll, as in sys.cpp, but the host makes the requests (its fetch(), all at once); exec and files:
 // not in this build yet.
-static void checkReq(V v, const char* fn) {
-  auto str = [&](V x, const char* what) { if (!is(x, K::Str)) ERR("@argument %s(): %s must be a string, got %s", fn, what, typeName(x)); };
-  if (is(v, K::Str)) return str(v, "the url");
-  if (!is(v, K::Map)) ERR("@argument %s() expects a url or {url, method, headers, body, timeout}, got %s", fn, typeName(v));
-  bool url = false;
-  for (auto& [k, x] : as<Map>(v)->e) {
-    str(k, "an option name");
-    std::string_view key = as<Str>(k)->sv();
-    if (key == "url") str(x, "url"), url = as<Str>(x)->sv().size();
-    else if (key == "method") str(x, "method");
-    else if (key == "body") str(x, "body");
-    else if (key == "timeout") { if (!isNum(x) || num(x) <= 0) ERR("@argument %s(): timeout must be a positive number", fn); }
-    else if (key == "headers") {
-      if (!is(x, K::Map)) ERR("@argument %s(): headers must be a map of strings", fn);
-      for (auto& [hk, hv] : as<Map>(x)->e) str(hk, "a header name"), str(hv, "a header value");
-    } else ERR("@argument %s(): unknown option '%s' (url, method, headers, body, timeout)", fn, std::string(key).c_str());
-  }
-  if (!url) ERR("@argument %s(): no url", fn);
-}
 static V fetchList(const std::string& json, const char* fn) {  // -> the list of results
   int n = host_fetch(json.c_str());
   if (n < 0) ERR("@host %s(): this host cannot make HTTP requests", fn);
@@ -109,12 +90,12 @@ static V fetchList(const std::string& json, const char* fn) {  // -> the list of
   return fromJs(r);
 }
 static V n_fetch(V req) {
-  checkReq(req, "fetch");
+  fetchRequest(req, "fetch");
   return as<List>(fetchList("[" + toJs(req) + "]", "fetch"))->v.at(0);
 }
 static V n_fetchAll(V reqs) {
   if (!is(reqs, K::List)) ERR("@argument fetchAll() expects a list, got %s", typeName(reqs));
-  for (V v : as<List>(reqs)->v) checkReq(v, "fetchAll");
+  for (V v : as<List>(reqs)->v) fetchRequest(v, "fetchAll");
   return fetchList(toJs(reqs), "fetchAll");
 }
 void sysInit() { native<n_fetch>("fetch"), native<n_fetchAll>("fetchAll"); }
@@ -515,12 +496,12 @@ EXPORT(fut_info) const char* futInfo(int what) {
 }
 EXPORT(fut_main_changed) int futMainChanged() { return last.mainChanged; }
 EXPORT(fut_fn) int futFn(const char* nm) {  // a top-level fn of no arguments: its stub, else 0
-  Global* g = findGlobal(intern(nm));
-  return g && g->kind == 'f' && g->o && ((Fn*)g->o)->arity == 0 ? (int)wa::slotOf(g->stub) : 0;
+  Global* g = fnNamed(intern(nm));
+  return g && ((Fn*)g->o)->arity == 0 ? (int)wa::slotOf(g->stub) : 0;
 }
 EXPORT(fut_pin_fn) int futPinFn(const char* nm) {  // a top-level fn, pinned for fut_apply: its id, else -1
-  Global* g = findGlobal(intern(nm));
-  return g && g->kind == 'f' && g->o ? jsPin(box(g->o)) : -1;
+  Global* g = fnNamed(intern(nm));
+  return g ? jsPin(box(g->o)) : -1;
 }
 EXPORT(fut_call) V futCall(int slot) { return vmCall((void*)(uintptr_t)slot); }
 EXPORT(fut_retire) void futRetire(int slot) { jitRetire((u32*)(uintptr_t)slot); }
@@ -591,9 +572,4 @@ EXPORT(fut_eff_leave) void futEffLeave(u32 depth) { effLeave(depth); }
 EXPORT(fut_txn_begin) void futTxnBegin() { txnBegin(); }
 EXPORT(fut_txn_commit) void futTxnCommit() { txnCommit(); }
 EXPORT(fut_txn_unwind) void futTxnUnwind(u32 depth) { txnUnwind(depth); }
-EXPORT(fut_reload_failed) void futReloadFailed() {  // roll back the reload's transaction, then its code
-  txnAbort();
-  std::string err;
-  if (revertReload(last.newVars, &err)) fputs("[fut] reload rolled back: the program's data and code are as they were before it\n", stderr);
-  else fprintf(stderr, "[fut] reload rolled back its data, but the previous code did not compile again: %s\n", err.c_str());
-}
+EXPORT(fut_reload_failed) void futReloadFailed() { rollbackReload(last.newVars); }

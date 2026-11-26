@@ -59,10 +59,6 @@ static int run(void* code) {  // 0 ok, 1 runtime error, 2 restart requested
   errJmp = outer, vm->handler = handler, effLeave(eff);
   return st;
 }
-static Global* fnNamed(int sym) {
-  Global* g = findGlobal(sym);
-  return g && g->kind == 'f' && g->o ? g : nullptr;
-}
 // The program ended (st: 0, or 1 after an uncaught error): wait for the isolates it started, stopping them if it
 // failed. A deadlock among them, or one that failed with nothing joining it, fails the program.
 static int finish(int st, std::string* to = nullptr) {
@@ -81,7 +77,7 @@ static int start(Compiled& c) {  // run the top level, then main() (rerun when a
 }
 // ---- --isolates N: the same code in N isolates at once, each on a thread of its own ----
 // Isolates share no mutable state, so each must behave exactly as it would alone: the same output, the same end.
-struct IsoJob { std::vector<void*> code; std::string out, err; int st = 0; };
+struct IsoJob { std::vector<void*> code; std::string out, err; int st = 0; const TestCase* test = nullptr; char status; std::string report; };
 static void* isolateMain(void* p) {
   IsoJob& j = *(IsoJob*)p;
   vm = vmNew();
@@ -91,12 +87,14 @@ static void* isolateMain(void* p) {
   outSink = &j.out, errSink = &j.err;
   for (void* c : j.code) if ((j.st = run(c))) break;
   j.st = finish(j.st, &j.err);
+  if (j.test) j.report = testReport(*j.test, j.st, j.err, j.status, &j.out);
   outSink = errSink = nullptr;
   heapFree(h), vmFree(vm), vm = nullptr;
   return nullptr;
 }
-static std::vector<IsoJob> inIsolates(int n, const std::vector<void*>& code) {
+static std::vector<IsoJob> inIsolates(int n, const std::vector<void*>& code, const TestCase* test = nullptr) {
   std::vector<IsoJob> jobs(n, IsoJob{code});
+  jobs.front().test = test;
   std::vector<pthread_t> th(n);
   pthread_attr_t a;
   pthread_attr_init(&a), pthread_attr_setstacksize(&a, 64 << 20);
@@ -181,13 +179,9 @@ static void hotReload() {
   if (!st && stopped) failed = isolatesParts(c.chunk, hook);
   jitRetire((u32*)c.chunk);
   if (st || !failed.empty()) {
-    txnAbort();
     if (!failed.empty()) fprintf(stderr, "[fut] reload failed in %s\n", failed.c_str());
-    std::string err;
-    bool back = revertReload(c.newVars, &err);
+    rollbackReload(c.newVars);  // aborts the transaction, reverts the code, says how it went
     if (stopped) isolatesSync(), isolatesVerdict(false);
-    if (back) fputs("[fut] reload rolled back: the program's data and code are as they were before it\n", stderr);
-    else fprintf(stderr, "[fut] reload rolled back its data, but the previous code did not compile again: %s\n", err.c_str());
     return;
   }
   txnCommit();
@@ -250,17 +244,14 @@ static int runTests(const TestRun& o) {
     c = compile(path, false, false, nullptr, true);
   } catch (std::exception& e) { return reportCompileError(e.what()), 2; }
   if (o.isolates) {  // each test in o.isolates isolates at once, each running the top level first
-    int bad = 0;
     for (auto& t : c.tests) {
-      if (!t.pending.empty() || (!o.filter.empty() && t.name.find(o.filter) == std::string::npos)) continue;
-      auto jobs = inIsolates(o.isolates, {c.chunk, t.code});
-      std::string why = jobs[0].st ? "error: " + firstLine(jobs[0].err) : differs(jobs);
-      printf("%s%s%s%s\n", why.empty() ? "ok      " : "FAIL    ", t.name.c_str(), why.empty() ? "" : "\n  ", why.c_str());
-      bad += !why.empty();
+      if (!testStart(t)) continue;
+      auto jobs = inIsolates(o.isolates, {c.chunk, t.code}, &t);
+      if (std::string why = differs(jobs); !why.empty()) testFinish(t, true, why);
+      else testRecord(jobs[0].status, jobs[0].report);
     }
     jitRetire((u32*)c.chunk);
-    printf("%s (%d isolates each)\n", bad ? (std::to_string(bad) + " failed").c_str() : "all passed", o.isolates);
-    return bad ? 1 : 0;
+    return std::max(testsEnd(), reportInterfaces(checkInterfaces(c), o.json, path) ? 1 : 0);
   }
   std::string err;
   errSink = &err;
@@ -355,8 +346,9 @@ int main(int argc, char** argv) {
   bool mapMode = argc > 1 && std::string(argv[1]) == "map", mapPub = false, mapJson = false;
   std::string mapOnly;
   TestRun topts;
+  std::vector<std::string> testFiles;
   const char* usage = "usage: fut [-w | -v | --asm | --isolates n | --seed n | --threads n] [file.fut]   (no file: REPL)\n"
-                      "       fut test [--changed] [--json] [--filter text] [--timeout s] [--isolates n] [--seed n] file.fut\n"
+                      "       fut test [--changed] [--json] [--filter text] [--timeout s] [--isolates n] [--seed n] file.fut...\n"
                       "       fut api [--check] file.fut\n       fut map [--pub] [--json] file.fut [package | file]\n       fut explain [code]\n"
                       "       fut worker build ...   (Cloudflare Workers: node web/worker.mjs)\n";
   for (int i = 1 + (testMode || apiMode || mapMode); i < argc; i++) {
@@ -381,7 +373,30 @@ int main(int argc, char** argv) {
     else if (a == "-v") verbose = true;
     else if (a == "--asm") asmMode = true;
     else if (a[0] == '-') return fputs(usage, stderr), 2;
-    else path = a;
+    else {
+      path = a;
+      if (testMode) testFiles.push_back(path);
+    }
+  }
+  if (testFiles.size() > 1) {
+    int result = 0;
+    for (auto& file : testFiles) {
+      fflush(nullptr);
+      pid_t child = fork();
+      if (child < 0) return perror("fut test: fork"), 2;
+      if (!child) {
+        path = file;
+        rtInit();
+        int status = runTests(topts);
+        fflush(nullptr);
+        _exit(status);
+      }
+      int status;
+      while (waitpid(child, &status, 0) < 0)
+        if (errno != EINTR) return perror("fut test: waitpid"), 2;
+      result = std::max(result, WIFEXITED(status) ? WEXITSTATUS(status) : 2);
+    }
+    return result;
   }
   if (testMode && !isolateSeed) isolateSeed = 1;
   if (watch) isolateSeed = 0;  // -w: a reload stops pool isolates at their polls (seeded ones share the main thread)  // a test's isolates interleave the same way every run

@@ -9,6 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { createFut } from "./fut.js";
 
 let file = "", watch = false, verbose = false, json = false, filter = "", check = false, pub = false, only = "";
+const testFiles = [];
 const argv = process.argv.slice(2), testing = argv[0] == "test", api = argv[0] == "api", map = argv[0] == "map", explain = argv[0] == "explain";
 const usage = "usage: node web/run.mjs [-w | -v] [--seed n] [file.fut]   (no file: REPL)\n       node web/run.mjs test [--json] [--filter text] file.fut\n       node web/run.mjs api [--check] file.fut\n       node web/run.mjs map [--pub] [--json] file.fut [package | file]\n       node web/run.mjs explain [code]\n";
 let seed = 0;  // --seed n: which interleaving of a program's isolates (they take turns on the one thread)
@@ -27,7 +28,16 @@ for (let i = testing || api || map ? 1 : 0; i < argv.length && !explain; i++) {
   else if (a == "-w" && !testing) watch = verbose = true;
   else if (a == "-v") verbose = true;
   else if (a[0] == "-") process.stderr.write(usage), process.exit(2);
-  else file = resolve(a);
+  else { file = resolve(a); if (testing) testFiles.push(file); }
+}
+if (testFiles.length > 1) {
+  let status = 0;
+  for (const path of testFiles) {
+    const args = ["test", ...(json ? ["--json"] : []), "--filter", filter, path];
+    const child = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...args], { stdio: "inherit" });
+    status = Math.max(status, child.status ?? 2);
+  }
+  process.exit(status);
 }
 function writeAll(fd, b) {  // stdout may be a non-blocking pipe
   for (let o = 0; o < b.length;) {

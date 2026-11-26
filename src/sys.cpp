@@ -10,6 +10,7 @@
 #include "fut.h"
 #include <curl/curl.h>
 #include <fcntl.h>
+#include <mach-o/dyld.h>
 #include <spawn.h>
 #include <sys/stat.h>
 #include <thread>
@@ -19,38 +20,12 @@ extern char** environ;
 int reap(int pid, std::vector<std::pair<int, std::string*>> pipes, double timeout, bool& timedOut);
 
 namespace {
-std::string strArg(V v, const char* fn, const char* what) {
-  if (!is(v, K::Str)) ERR("@argument %s(): %s must be a string, got %s", fn, what, typeName(v));
-  return std::string(as<Str>(v)->sv());
-}
-double numArg(V v, const char* fn, const char* what) {
-  if (!isNum(v) || num(v) <= 0) ERR("@argument %s(): %s must be a positive number", fn, what);
-  return num(v);
-}
+std::string strArg(V v, const char* fn, const char* what) { return std::string(strViewArg(v, fn, what)); }
 V str(std::string_view s) { return box(newStr(s)); }
 
 // ---- fetch ----
-struct Req { std::string url, method = "GET", body; std::vector<std::string> headers; double timeout = 60; bool hasBody = false; };
 struct Res { long status = 0; std::string body, error; std::vector<std::pair<std::string, std::string>> headers; };
 
-Req reqOf(V v, const char* fn) {
-  Req r;
-  if (is(v, K::Str)) return r.url = strArg(v, fn, "the url"), r;
-  if (!is(v, K::Map)) ERR("@argument %s() expects a url or {url, method, headers, body, timeout}, got %s", fn, typeName(v));
-  for (auto& [k, x] : as<Map>(v)->e) {
-    std::string key = strArg(k, fn, "an option name");
-    if (key == "url") r.url = strArg(x, fn, "url");
-    else if (key == "method") r.method = strArg(x, fn, "method");
-    else if (key == "body") r.body = strArg(x, fn, "body"), r.hasBody = true;
-    else if (key == "timeout") r.timeout = numArg(x, fn, "timeout");
-    else if (key == "headers") {
-      if (!is(x, K::Map)) ERR("@argument %s(): headers must be a map of strings", fn);
-      for (auto& [hk, hv] : as<Map>(x)->e) r.headers.push_back(strArg(hk, fn, "a header name") + ": " + strArg(hv, fn, "a header value"));
-    } else ERR("@argument %s(): unknown option '%s' (url, method, headers, body, timeout)", fn, key.c_str());
-  }
-  if (r.url.empty()) ERR("@argument %s(): no url", fn);
-  return r;
-}
 size_t onBody(char* p, size_t n, size_t k, void* s) { return ((std::string*)s)->append(p, n * k), n * k; }
 size_t onHeader(char* p, size_t n, size_t k, void* s) {
   std::string_view h(p, n * k);
@@ -64,15 +39,19 @@ size_t onHeader(char* p, size_t n, size_t k, void* s) {
   }
   return n * k;
 }
-void perform(const Req& q, Res& r) {  // on any thread: touches no fut values
+void perform(const FetchRequest& q, Res& r) {  // on any thread: reads the calling isolate's request while it waits
   CURL* c = curl_easy_init();
   if (!c) return void(r.error = "could not start a request");
   curl_slist* hs = nullptr;
-  for (auto& h : q.headers) hs = curl_slist_append(hs, h.c_str());
+  if (q.headers) for (const auto& [k, v] : q.headers->e) {
+    std::string h = std::string(as<Str>(k)->sv()) + ": ";
+    h += as<Str>(v)->sv();
+    hs = curl_slist_append(hs, h.c_str());
+  }
   char err[CURL_ERROR_SIZE] = {0};
-  curl_easy_setopt(c, CURLOPT_URL, q.url.c_str());
-  curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, q.method.c_str());
-  if (q.hasBody) curl_easy_setopt(c, CURLOPT_POSTFIELDS, q.body.data()), curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)q.body.size());
+  curl_easy_setopt(c, CURLOPT_URL, q.url.data());
+  curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, q.method.data());
+  if (q.body.data()) curl_easy_setopt(c, CURLOPT_POSTFIELDS, q.body.data()), curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)q.body.size());
   if (q.method == "HEAD") curl_easy_setopt(c, CURLOPT_NOBODY, 1L);
   curl_easy_setopt(c, CURLOPT_HTTPHEADER, hs);
   curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, onBody), curl_easy_setopt(c, CURLOPT_WRITEDATA, &r.body);
@@ -99,6 +78,8 @@ V resultOf(const Res& r) {
 template <class Q, class R, class Parse, class Run, class Out>
 V batch(V list, const char* fn, Parse parse, Run run, Out out) {  // each at once, on its own thread
   if (!is(list, K::List)) ERR("@argument %s() expects a list, got %s", fn, typeName(list));
+  volatile V requests = list;  // parsed requests can borrow strings from the list
+  (void)requests;
   std::vector<Q> qs;
   for (V v : as<List>(list)->v) qs.push_back(parse(v, fn));
   std::vector<R> rs(qs.size());
@@ -111,12 +92,15 @@ V batch(V list, const char* fn, Parse parse, Run run, Out out) {  // each at onc
   for (auto& r : rs) { V x = out(r); l->v.push_back(x); }
   return box(l);
 }
-V n_fetch(V req) { Res r; perform(reqOf(req, "fetch"), r); return resultOf(r); }
-V n_fetchAll(V reqs) { return batch<Req, Res>(reqs, "fetchAll", reqOf, perform, resultOf); }
+V n_fetch(V req) {
+  Res r;
+  perform(fetchRequest(req, "fetch"), r);
+  return resultOf(r);
+}
+V n_fetchAll(V reqs) { return batch<FetchRequest, Res>(reqs, "fetchAll", fetchRequest, perform, resultOf); }
 
 // ---- exec ----
 struct Cmd { std::vector<std::string> argv; std::string cwd, input; double timeout = 600; bool hasInput = false; };
-struct Out { int code = -1; std::string out, err; bool timedOut = false; };
 
 Cmd cmdOf(V v, const char* fn) {
   Cmd c;
@@ -137,19 +121,26 @@ Cmd cmdOf(V v, const char* fn) {
   if (c.argv.empty()) ERR("@argument %s(): no cmd", fn);
   return c;
 }
-void spawnOne(const Cmd& c, Out& o) {  // on any thread
+bool spawnOne(const Cmd& c, ProcResult& o, bool searchPath = true) {  // on any thread
+  o.code = -1;
   std::string in = "/dev/null", tmp;
   if (c.hasInput) {
     char t[] = "/tmp/fut-exec-XXXXXX";
     int fd = mkstemp(t);
-    if (fd < 0) return void(o.err = "could not write the input");
+    if (fd < 0) return o.err = "could not write the input", false;
     bool ok = write(fd, c.input.data(), c.input.size()) == (ssize_t)c.input.size();
     close(fd), in = tmp = t;
-    if (!ok) return unlink(t), void(o.err = "could not write the input");
+    if (!ok) return unlink(t), o.err = "could not write the input", false;
   }
   int po[2], pe[2];
-  if (pipe(po)) return void(o.err = "no pipe");
-  if (pipe(pe)) return close(po[0]), close(po[1]), void(o.err = "no pipe");
+  if (pipe(po)) {
+    if (!tmp.empty()) unlink(tmp.c_str());
+    return o.err = "no pipe", false;
+  }
+  if (pipe(pe)) {
+    if (!tmp.empty()) unlink(tmp.c_str());
+    return close(po[0]), close(po[1]), o.err = "no pipe", false;
+  }
   posix_spawn_file_actions_t fa;
   posix_spawn_file_actions_init(&fa);
   posix_spawn_file_actions_addopen(&fa, 0, in.c_str(), O_RDONLY, 0);
@@ -160,7 +151,8 @@ void spawnOne(const Cmd& c, Out& o) {  // on any thread
   for (auto& s : c.argv) av.push_back(const_cast<char*>(s.c_str()));
   av.push_back(nullptr);
   pid_t pid;
-  int rc = posix_spawnp(&pid, av[0], &fa, nullptr, av.data(), environ);
+  auto spawn = searchPath ? posix_spawnp : posix_spawn;
+  int rc = spawn(&pid, av[0], &fa, nullptr, av.data(), environ);
   posix_spawn_file_actions_destroy(&fa);
   close(po[1]), close(pe[1]);
   if (rc) {
@@ -170,8 +162,9 @@ void spawnOne(const Cmd& c, Out& o) {  // on any thread
     o.code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
   }
   if (!tmp.empty()) unlink(tmp.c_str());
+  return rc == 0;
 }
-V outOf(const Out& o) {
+V outOf(const ProcResult& o) {
   Map* m = make<Map>();
   volatile V keep = box(m);
   (void)keep;
@@ -179,8 +172,8 @@ V outOf(const Out& o) {
   mapPut(m, "timedOut", boxb(o.timedOut));
   return box(m);
 }
-V n_exec(V cmd) { Out o; spawnOne(cmdOf(cmd, "exec"), o); return outOf(o); }
-V n_execAll(V cmds) { return batch<Cmd, Out>(cmds, "execAll", cmdOf, spawnOne, outOf); }
+V n_exec(V cmd) { ProcResult o; spawnOne(cmdOf(cmd, "exec"), o); return outOf(o); }
+V n_execAll(V cmds) { return batch<Cmd, ProcResult>(cmds, "execAll", cmdOf, [](const Cmd& c, ProcResult& o) { spawnOne(c, o); }, outOf); }
 
 // ---- files, environment ----
 V n_readFile(V path) {
@@ -208,6 +201,27 @@ V n_env(V name) {
   return v ? str(v) : NIL;
 }
 }  // namespace
+
+bool runProcess(const std::vector<std::string>& args, const std::string& file, const std::string* source, double timeout, ProcResult& r) {
+  char exe[4096];
+  u32 n = sizeof exe;
+  if (_NSGetExecutablePath(exe, &n)) return false;
+  std::string path = file, tmp;
+  if (source) {
+    char t[] = "/tmp/fut-run-XXXXXX.fut";
+    int fd = mkstemps(t, 4);
+    if (fd < 0) return false;
+    bool ok = write(fd, source->data(), source->size()) == (ssize_t)source->size();
+    close(fd), path = tmp = t;
+    if (!ok) return unlink(t), false;
+  }
+  Cmd cmd{{exe}, {}, {}, timeout};
+  cmd.argv.insert(cmd.argv.end(), args.begin(), args.end());
+  cmd.argv.push_back(path);
+  bool ok = spawnOne(cmd, r, false);
+  if (!tmp.empty()) unlink(tmp.c_str());
+  return ok;
+}
 
 void sysInit() {
   curl_global_init(CURL_GLOBAL_DEFAULT);

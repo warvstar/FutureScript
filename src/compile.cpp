@@ -94,7 +94,7 @@ static bool prefixTaken(const std::string& p, const std::string& self) {  // a f
   return false;
 }
 // The sources of the code running now, and of the code the last compile replaced (what a failed reload goes back
-// to); while revertReload compiles, files are read from `overlay` rather than from disk.
+// to); while the previous code is restored, files are read from `overlay` rather than from disk.
 using Sources = std::vector<std::pair<std::string, std::string>>;
 static Sources installed, replaced;
 static const Sources* overlay;
@@ -1431,8 +1431,6 @@ struct Compiler : Gen {
   }
   // ---- contracts: requires and ensures on a function, invariant in a class ----
   // A clause's condition is the rest of its line, up to a '{' or '}' there (a function's body, the class's end).
-  static bool clauseEnds(int d, const Tok& p, const Tok& t) { return d == 0 && p.t && (t.t == '{' || t.t == '}' || t.nl || t.t == T_EOF); }
-  static int nesting(const Tok& t) { return (t.t == '(' || t.t == '[' || t.t == '{') - (t.t == ')' || t.t == ']' || t.t == '}'); }
   bool wholeClause() {  // does an outer || or ternary prevent checking each && part on its own?
     Lexer s = lx;
     Tok p, t = cur;
@@ -1908,49 +1906,16 @@ struct Compiler : Gen {
     }
     L = b;
   }
-  // After a function's name: its parameters, result type and effects, then its contract (requires and ensures
-  // clauses, one per line) before its body. L is left after the clauses, so a lambda's braces in one aren't taken for
-  // the body's. A body that is just todo() is noted: under fut test the function is pending.
+  void skipType(Lexer& at) { ::skipType(at, [&](Lexer& s) { return lex(s); }); }
   bool isTypeDecl(const Lexer& at) {  // `type Name =` next (after `type`)? Otherwise `type` is an ordinary name
     Lexer s = at;
     Tok n = lex(s), e = lex(s);
     return n.t == T_ID && n.sym >= NKW && !n.nl && e.t == '=' && !e.nl;
   }
-  // A type's tokens (see type()), from L: atoms joined by |, each maybe followed by ?. Leaves L after it.
-  void skipType(Lexer& L) {
-    for (;;) {
-      Lexer s = L;
-      Tok t = lex(s);
-      auto balanced = [&](int open, int close) {
-        for (int d = 1; d > 0;) {
-          Tok x = lex(L);
-          if (x.t == T_EOF) return;
-          d += (x.t == open) - (x.t == close) - (close == '>' && x.t == T_SHR ? 2 : 0);
-        }
-      };
-      if (t.t == '{') L = s, balanced('{', '}');
-      else if (t.t == '(') L = s, balanced('(', ')');
-      else if (t.t == T_STR || t.t == T_NUM) L = s;
-      else if (t.t == '-') L = s, lex(L);
-      else if (t.t == T_ID) {
-        L = s;
-        if (Lexer d = L; lex(d).t == '.' && lex(d).t == T_ID) L = d;
-        if (Lexer a = L; [&] { Tok o = lex(a); return o.t == '<' && !o.nl; }()) L = a, balanced('<', '>');
-      } else return;
-      if (Lexer q = L; [&] { Tok o = lex(q); return o.t == '?' && !o.nl; }()) L = q;
-      if (Lexer u = L; [&] { Tok o = lex(u); return o.t != '|' || o.nl; }()) return;
-      else L = u;
-    }
-  }
-  // After a function's name: its parameters, result type and effects, then its contract (requires and ensures
-  // clauses, one per line) before its body. L is left before the body, so braces in a type ({name: str}) or in a
-  // clause (a lambda) aren't taken for the body's.
+  // After the parameters, scan the result type, effects and contract. Leave L before the body, so braces in
+  // a type or a clause aren't taken for the body's.
   void declScan(Lexer& L, const std::string& qn, const Tok& fnTok, int cls, int m) {
     Lexer s = L;
-    Tok t = lex(s);
-    if (t.t != '(') return;
-    for (int d = 1; d > 0;) if ((t = lex(s)).t == T_EOF) return; else d += nesting(t);
-    L = s;
     SpecFn f;
     f.fn = {fnTok.p, fnTok.line, file, srcStart}, f.name = symName(m);
     for (;;) {
@@ -1999,17 +1964,18 @@ struct Compiler : Gen {
     bool ext = false;  // after `extern` (a C function: no body)
     // The parameters after a declaration's name: how many (a name after `(` or `,`; one after `:` is a type), and
     // whether its result is declared `: num` (and nothing else: `: num?` may be nil).
-    auto params = [&](bool* retNum = nullptr) {
+    auto params = [&](bool* retNum = nullptr, Lexer* after = nullptr) {
       Lexer s = L;
       int n = 0, last = '(';
       if (lex(s).t != '(') return 0;
       for (int d = 1; d > 0; ) {  // a name after `(` or `,` at the parameters' own level (not inside a {shape})
         Tok a = lex(s);
-        if (a.t == T_EOF) break;
+        if (a.t == T_EOF) return n;
         if (d == 1 && a.t == '=') defaultArgument(a);
         if ((d += nesting(a) + (a.t == '<') - (a.t == '>') - 2 * (a.t == T_SHR)) == 1) n += a.t == T_ID && (last == '(' || last == ',');
         last = a.t;
       }
+      if (after) *after = s;
       if (Lexer r = s; retNum && lex(r).t == ':') {
         Tok a = lex(r), b = lex(r);
         *retNum = a.t == T_ID && symName(a.sym) == "num" && !((b.t == '?' || b.t == '|') && !b.nl);
@@ -2022,7 +1988,7 @@ struct Compiler : Gen {
       if (t.t == T_ID && t.sym == S_pub && !depth) {
         Lexer s = L;
         Tok n = lex(s);
-        pubNext = n.t == T_ID && !n.nl && (n.sym == K_fn || n.sym == K_class || n.sym == K_var || n.sym == K_extern || n.sym == S_effect || n.sym == K_import || n.sym == S_type);
+        pubNext = pubDecl(n);
       } else if (t.t == T_ID && t.sym == K_extern && !depth) ext = true;
       else if (ext && afterKw && p.sym == K_fn) declare(q(t), 'x', params()), ext = false; else if (t.t == '{') depth++;
       else if (t.t == '}') {
@@ -2045,10 +2011,14 @@ struct Compiler : Gen {
         std::string qn = depth ? symName(cls) + "." + symName(t.sym) : symName(d.sym);
         if (spans.count(qn)) failAt(t.p, t.line, "@duplicate '%s' is already defined", qn.c_str());
         Span& sp = spans[qn];
-        int n = sp.arity = params(&sp.retNum);
+        Lexer after = L;
+        int n = sp.arity = params(&sp.retNum, &after);
         open.push_back({qn, p.p, p.line, depth});
         if (!depth) declare(d, 'f', n | (sp.retNum ? 128 : 0));  // callers rely on a `: num` result
-        declScan(L, qn, p, depth ? cls : -1, t.sym);
+        if (after.p != L.p) {
+          L = after;
+          declScan(L, qn, p, depth ? cls : -1, t.sym);
+        }
       } else if (depth == 0 && t.t == T_ID && t.sym == S_type && isTypeDecl(L)) {  // type Name = <type>
         Tok n = lex(L);
         lex(L);  // =
@@ -2360,9 +2330,9 @@ struct Compiler : Gen {
       std::string& src = synth.emplace_back(
           "test \"contract " + n + (d.isFn ? "() on random inputs" : " on random calls") + "\" { var S@ = " + std::to_string(propSite(ps)) +
           "; var f@ = fn(a@) { " + call + " }; var ok@ = 0; var n@ = 0; while ok@ < 100 && n@ < 1000 { var in@ = prop@gen(S@, n@); n@ += 1; "
-          "var e@ = nil; try { f@(in@) } catch x@ { e@ = x@ }; if e@ == nil { ok@ += 1 } else if !prop@discard(S@, e@) { var k@ = 0; var steps@ = 0; "
-          "while steps@ < 2000 { var c@ = prop@shrink(S@, in@, k@); if c@ == nil { break }; steps@ += 1; var e2@ = nil; "
-          "try { f@(c@) } catch x@ { e2@ = x@ }; if e2@ != nil && !prop@discard(S@, e2@) { in@ = c@; e@ = e2@; k@ = 0 } else { k@ += 1 } }; "
+          "var threw@ = false; var e@ = nil; try { f@(in@) } catch x@ { threw@ = true; e@ = x@ }; if !threw@ { ok@ += 1 } else if !prop@discard(S@, e@) { var k@ = 0; var steps@ = 0; "
+          "while steps@ < 2000 { var c@ = prop@shrink(S@, in@, k@); if c@ == nil { break }; steps@ += 1; var threw2@ = false; var e2@ = nil; "
+          "try { f@(c@) } catch x@ { threw2@ = true; e2@ = x@ }; if threw2@ && !prop@discard(S@, e2@) { in@ = c@; e@ = e2@; k@ = 0 } else { k@ += 1 } }; "
           "prop@fail(S@, in@, e@, n@) } }; prop@done(S@, ok@, n@) }");
       Mark m = mark();
       file = d.at.file, srcStart = src.c_str(), lx = Lexer{srcStart, ps.line, true}, next(), next();
@@ -2631,7 +2601,7 @@ Compiled compile(const std::string& path, bool reload, bool echo, const std::str
   delete active, active = nullptr;
   return out;
 }
-bool revertReload(const std::vector<int>& newVars, std::string* err) {
+static bool revertReload(const std::vector<int>& newVars, std::string* err) {
   for (int v : newVars) global(v).inited = false;  // if they come back, they are initialized then
   Sources to = replaced;
   if (to.empty()) return *err = "nothing to go back to", false;
@@ -2643,4 +2613,11 @@ bool revertReload(const std::vector<int>& newVars, std::string* err) {
   overlay = nullptr;
   if (ok) jitRetire((u32*)c.chunk);  // the old top level does not run again: the data is as it was
   return ok;
+}
+
+void rollbackReload(const std::vector<int>& newVars) {
+  txnAbort();
+  std::string err;
+  if (revertReload(newVars, &err)) fputs("[fut] reload rolled back: the program's data and code are as they were before it\n", stderr);
+  else fprintf(stderr, "[fut] reload rolled back its data, but the previous code did not compile again: %s\n", err.c_str());
 }

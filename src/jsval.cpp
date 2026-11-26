@@ -35,17 +35,23 @@ void refFree(Ref* r) {
   if (refRelease) refRelease(r->id);
 }
 
-static void quote(std::string_view s, std::string& o) {
+enum class JsonShortEscapes { Newline, NewlineAndTab, All };
+static void quote(std::string_view s, std::string& o, JsonShortEscapes escapes = JsonShortEscapes::All) {
   o += '"';
   for (unsigned char c : s) {
     if (c == '"' || c == '\\') o += '\\', o += (char)c;
     else if (c == '\n') o += "\\n";
-    else if (c == '\t') o += "\\t";
-    else if (c == '\r') o += "\\r";
+    else if (c == '\t' && escapes != JsonShortEscapes::Newline) o += "\\t";
+    else if (c == '\r' && escapes == JsonShortEscapes::All) o += "\\r";
     else if (c < 0x20) { char b[8]; snprintf(b, sizeof b, "\\u%04x", c); o += b; }
     else o += (char)c;
   }
   o += '"';
+}
+std::string quoteJson(std::string_view s, bool shortTab) {
+  std::string o;
+  quote(s, o, shortTab ? JsonShortEscapes::NewlineAndTab : JsonShortEscapes::Newline);
+  return o;
 }
 static void enc(V v, std::string& o, int depth) {
   if (depth > 256) ERR("@js a value nested too deeply (or containing itself) to pass to JavaScript");

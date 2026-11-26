@@ -195,10 +195,7 @@ export async function createFut(opts) {
   async function runCallbacks() {
     for (const c of callbacks.splice(0)) {
       try {
-        const sp = spG.value, txn = ex.fut_txn_depth(), eff = ex.fut_eff_enter();
-        try { c.res(fromFut(cstr(await withStrAsync(c.json, (p) => applyP(c.id, p))))); }
-        catch (e) { spG.value = sp, ex.fut_txn_unwind(txn), opts.interp && ex.fut_interp_reset(); throw e; }
-        finally { ex.fut_eff_leave(eff); }
+        c.res(await applyFn(c.id, () => c.json));
       } catch (e) {
         if (e instanceof Restart || e instanceof Exit) throw e;
         report(e), c.rej(new Error(errorText(e).split("\n")[0]));
@@ -304,10 +301,17 @@ export async function createFut(opts) {
   let fileChanged = false, inbox = [], replBuf = "", inMain = false, wake = null, path = "", mainChanged = false;
   const poke = () => { if (ex) dv().setUint32(pollAt, dv().getUint32(pollAt, true) | 1, true); wake?.(), (wake = null); };
   let pollAt = 0;
-  async function call(slot) {  // run code; on an error the shadow stack pointer is put back, and transactions opened since roll back
-    const sp = spG.value, txn = ex.fut_txn_depth(), eff = ex.fut_eff_enter();  // unchecked, no handlers (effects.cpp)
-    try { return await callP(slot); } catch (e) { spG.value = sp, ex.fut_txn_unwind(txn), opts.interp && ex.fut_interp_reset(); throw e; } finally { ex.fut_eff_leave(eff); }
+  async function enter(f) {  // Keep the interrupted program's stack, effects, and transactions.
+    const sp = spG.value, txn = ex.fut_txn_depth(), eff = ex.fut_eff_enter();
+    try {
+      return await f();
+    } catch (e) {
+      spG.value = sp, ex.fut_txn_unwind(txn), opts.interp && ex.fut_interp_reset();
+      throw e;
+    } finally { ex.fut_eff_leave(eff); }
   }
+  const call = (slot) => enter(() => callP(slot));
+  const applyFn = (id, json) => enter(async () => fromFut(cstr(await withStrAsync(json(), (p) => applyP(id, p)))));
   async function evalRepl(more) {  // compile and run replBuf, unless it is unfinished and `more` may follow
     const s = await compileWith(() => withStr(replBuf, (p) => withStr("<repl>", (n) => ex.fut_compile(n, 0, 1, p))));
     if (s == -1 && more) return;
@@ -501,12 +505,8 @@ export async function createFut(opts) {
           if ((id = withStr(name, (p) => ex.fut_pin_fn(p))) < 0) throw new Error(`the program has no function ${name}()`);
           pinned.set(name, id);
         }
-        const sp = spG.value, txn = ex.fut_txn_depth(), eff = ex.fut_eff_enter();
-        try { return fromFut(cstr(await withStrAsync(toFut(args), (p) => applyP(id, p)))); }
-        catch (e) {
-          spG.value = sp, ex.fut_txn_unwind(txn), opts.interp && ex.fut_interp_reset();
-          throw e instanceof Restart || e instanceof Exit ? e : new FutError(errorText(e));
-        } finally { ex.fut_eff_leave(eff); }
+        try { return await applyFn(id, () => toFut(args)); }
+        catch (e) { throw e instanceof Restart || e instanceof Exit ? e : new FutError(errorText(e)); }
       };
       const r = applying.then(go, go);
       return (applying = r.catch(() => {})), r;

@@ -339,6 +339,7 @@ extern std::deque<Global> globals;  // by symbol (slot -1: not declared); a dequ
 extern std::vector<V> consts;       // GC roots forever
 Global& global(int sym);
 Global* findGlobal(int sym);
+Global* fnNamed(int sym);
 template <class C> auto& growAt(C& v, size_t i) { return v.size() <= i ? v.resize(i + 1), v[i] : v[i]; }  // v[i], growing v to fit
 
 // ---- JIT ----
@@ -393,9 +394,8 @@ struct CompileError : std::runtime_error {  // atEnd: the source ended too early
 // tests: compile `test` blocks into Compiled::tests (otherwise they are skipped)
 Compiled compile(const std::string& path, bool reload, bool echo, const std::string* text = nullptr, bool tests = false);
 bool guardCompile(void (*f)(void*), void* ctx, std::string* err = nullptr);  // f(ctx); false if it failed with a compile error (*err)
-// A hot reload whose top level or reload() failed: forget the vars it added and compile the sources it replaced
-// again, without running them (its data was rolled back already). False if that failed (*err).
-bool revertReload(const std::vector<int>& newVars, std::string* err);
+// Undo a failed reload's transaction and restore the previous code.
+void rollbackReload(const std::vector<int>& newVars);
 [[noreturn]] void compileFail(const std::string& msg, bool atEnd);  // natively throws CompileError; in wasm, longjmps
 bool readFile(const std::string& path, std::string& out);
 bool saveFile(const std::string& path, const std::string* text);  // null text: remove the file
@@ -471,7 +471,12 @@ int expectSite(ExpectSite);  // its number, passed to the expect@ native
 struct PropSite { std::string file, text, discard; int line = 0, expect = -1; bool cls = false; std::vector<std::string> names; std::vector<std::vector<uint64_t>> types; };
 int propSite(PropSite);
 void testInit();
-void sysInit();  // fetch, exec, files, env (native; the wasm build has fetch and fetchAll, through its host)
+// The strings and headers are borrowed from the request value.
+struct FetchRequest { std::string_view url, method = "GET", body; Map* headers = nullptr; double timeout = 60; };
+std::string_view strViewArg(V, const char* fn, const char* what);
+double numArg(V, const char* fn, const char* what);
+FetchRequest fetchRequest(V, const char* fn);
+void sysInit();  // fetch, exec, files, env (Wasm has fetch and fetchAll through its host)
 void gcRegion(size_t bytes);  // the heap's size, before the runtime starts (wasm reserves it all: a Worker has 128 MB)
 V binopValue(V a, V b, int op);  // a op b, as the language computes it (raises on bad operands)
 struct TestRun { bool json = false; std::string filter; double timeout = 10; int isolates = 0; bool changed = false; };
@@ -486,7 +491,7 @@ bool runProcess(const std::vector<std::string>& args, const std::string& file, c
 void testsBegin(const TestRun&);
 void* testStart(const TestCase&);                         // the code to call, or null (pending or filtered out: reported)
 void testFinish(const TestCase&, bool errored, const std::string& err);  // after a call: err = message + trace
-std::string testReport(const TestCase&, bool errored, const std::string& err, char& code);  // testFinish's two halves:
+std::string testReport(const TestCase&, bool errored, const std::string& err, char& code, const std::string* output = nullptr);  // testFinish's two halves:
 void testRecord(char code, const std::string& text);                                         // (an isolated test's child reports)
 int testsEnd();
 void reportCompileError(const std::string& msg);          // fut test: in the chosen format
@@ -623,6 +628,7 @@ int printMap(const Compiled&, bool pubOnly, bool json, const std::string& only, 
 
 // ---- values crossing into JavaScript (jsval.cpp): JSON text, lists and maps copied; a function fut code passes
 // is pinned (an id JavaScript calls it by); a JavaScript value that is not data comes back as a Ref (by its id) ----
+std::string quoteJson(std::string_view s, bool shortTab = false);
 std::string toJs(V v);                // raises for what can't cross (an instance, a map with non-string keys, ...)
 V fromJs(const std::string& json);
 V jsPinned(int id);                   // the function pinned as id (nil if none)
