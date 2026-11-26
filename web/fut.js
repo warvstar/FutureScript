@@ -19,6 +19,8 @@
 //   std: the directory of the standard library's packages (import "std/strings")
 //   exit(code): end the process (an isolate called exit(), or failed in the host); default: the error is thrown
 //   seed: the seed that picks how a program's isolates take turns (they share the one thread; default 1)
+//   serve: bool -- run(file, true) keeps going after the program finishes: events call the fut functions it gave
+//     JavaScript (a page std/ui built), and edits reload it, until the page closes
 // The interpreter's try_call(cb, ctx): runs the C++ callback cb(ctx) (a try_table's body) and returns its result, or
 // catches a fut exception, stores its payload (i64) at ctx, puts the stack pointer back and returns -1. Static, so a
 // Worker can upload it compiled.
@@ -189,7 +191,10 @@ export async function createFut(opts) {
   const callbacks = [];
   function callFut(id, args) {
     const json = toFut(args);
-    if (ffiDepth) return fromFut(cstr(withStr(json, (p) => ex.fut_apply(id, p))));
+    if (ffiDepth) {  // synchronously: nothing it calls may suspend (externs go through ffi_now; polls wait)
+      ex.fut_sync(1);
+      try { return fromFut(cstr(withStr(json, (p) => ex.fut_apply(id, p)))); } finally { ex.fut_sync(-1); }
+    }
     return new Promise((res, rej) => (callbacks.push({ id, json, res, rej }), poke()));
   }
   async function runCallbacks() {
@@ -209,7 +214,7 @@ export async function createFut(opts) {
   }
   // An extern call. A JS function that returns a Promise suspends the fut code calling it (that fiber, or the
   // program) until it settles, as sleep() does. A JS exception becomes a fut error (try catches it).
-  function ffi(fn, sigP, args, ret, failedP) {
+  function ffi(fn, sigP, args, ret, failedP, now) {
     const sig = cstr(sigP), d = dv(), a = [], big = externWasm[fn];
     for (let i = 0; i < sig.length; i++) {
       const x = d.getFloat64(args + i * 8, true), t = sig[i];
@@ -228,7 +233,10 @@ export async function createFut(opts) {
     let r;
     ffiDepth++;
     try { r = externs[fn](...a); } catch (e) { return failed(e); } finally { if (!--ffiDepth && pollLater) (pollLater = false), poke(); }
-    if (r && typeof r.then == "function") return Promise.resolve(r).then(done).catch(failed);
+    if (r && typeof r.then == "function") {
+      if (now) return failed(new Error("it returned a Promise, which fut code JavaScript called synchronously can't wait for"));
+      return Promise.resolve(r).then(done).catch(failed);
+    }
     try { return done(r); } catch (e) { return failed(e); }
   }
 
@@ -427,6 +435,7 @@ export async function createFut(opts) {
     save: (p, t) => (opts.save?.(cstr(p), t ? cstr(t) : null) ? 1 : 0),
     extern: (lib, name) => externLookup(cstr(lib), cstr(name)),
     ffi: S(ffi),
+    ffi_now: (...a) => ffi(...a, true),  // inside a synchronous callback (fut_sync): a Promise can't be waited for
     ref_gone(id) { refIds.delete(refs.get(id)), refs.delete(id); },
     resume: S(resume), yield: S(yieldTo), fiber_gone: (f) => fibers.delete(f),
     vm: (p) => void (vmG.value = p),
@@ -517,11 +526,16 @@ export async function createFut(opts) {
       path = file;
       try {
         let c = await load(false), loaded = !!c, st = loaded ? await start(c) : 1;
-        while (st && watch) {  // after an error: wait for a fix, patch it in, rerun main()
-          write(2, "[fut] waiting for changes...\n"), await waitChange();
-          if ((c = await load(loaded))) (loaded = true), (st = await start(c));
+        for (;;) {
+          while (st && watch) {  // after an error: wait for a fix, patch it in, rerun main()
+            write(2, "[fut] waiting for changes...\n"), await waitChange();
+            if ((c = await load(loaded))) (loaded = true), (st = await start(c));
+          }
+          if (!(watch && opts.serve)) return st ? 1 : 0;
+          // opts.serve (a page): the program has finished, but its page stays. Events call the fut functions it gave
+          // JavaScript (std/ui's handlers), and edits reload it (its top level runs again), until the page closes.
+          await event(), await hostPoll();
         }
-        return st ? 1 : 0;
       } catch (e) { if (e instanceof Exit) return e.code; throw e; }
     },
     async test(file, json, filter) {  // fut test: the top level, then each test block; exit status

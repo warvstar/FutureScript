@@ -23,6 +23,10 @@ HOST(take) void host_take(char* dst);                          // copy out what 
 HOST(save) int host_save(const char* path, const char* text);  // write a file (text null: remove it); 0 if it failed
 HOST(extern) int host_extern(const char* lib, const char* name);  // a host function's index, -1: none, -2: no such library
 HOST(ffi) double host_ffi(int fn, const char* sig, const double* args, int ret, int* failed);  // a string or any result:
+HOST(ffi_now) double host_ffi_now(int fn, const char* sig, const double* args, int ret, int* failed);  // the same, not
+// suspending: inside a callback JavaScript makes synchronously (fut_sync), where nothing can suspend
+static int syncDepth;   // fut code JavaScript called synchronously, from inside an extern call (fut_sync)
+static bool syncPoll;   // a host poll wanted meanwhile: it waits until that code returns
                                                                                               // its length (in take);
                                                                                               // failed: the message's
 HOST(ref_gone) void host_ref_gone(u32 id);                     // no fut code holds JavaScript value id any more
@@ -256,7 +260,7 @@ static V rt_ffi(V* w, Ext* e) {
     else a[i] = t == 's' ? (double)(uintptr_t)as<Str>(v)->s() : num(v);
   }
   int failed = 0;
-  double r = host_ffi((int)(uintptr_t)e->fn - 1, e->sig, a, e->ret, &failed);
+  double r = (syncDepth ? host_ffi_now : host_ffi)((int)(uintptr_t)e->fn - 1, e->sig, a, e->ret, &failed);
   if (failed) {  // it threw: a fut error here, which try can catch
     std::string m((size_t)r, 0);
     host_take(m.data());
@@ -432,7 +436,7 @@ static void safepoint() {  // rt_poll: a collection the allocator asked for, the
   u32 p = vm->poll;
   vm->poll = 0;
   if (gcWanted()) gcCollect();
-  if (p & 1) vm->txn ? void(txnPollLater = true) : host_poll();  // reloads and typed lines wait for transactions to end
+  if (p & 1) syncDepth ? void(syncPoll = true) : vm->txn ? void(txnPollLater = true) : host_poll();  // reloads and typed lines wait for transactions to end
 }
 static V undefFn() { ERR("@not-callable call to undefined function"); }
 static void rt_hot(void* t, V* args, int n) {  // a tier-1 body reached its call count
@@ -545,6 +549,10 @@ EXPORT(fut_map) int futMap(int pub, int json, const char* only, const char* prog
 // error in it propagates as a fut exception. Called directly while an extern call is in progress (a callback, as
 // Array.map makes), else at a safepoint, through a promising wrapper.
 static std::string applied;
+EXPORT(fut_sync) void futSync(int d) {  // the host calls fut code synchronously (1), and it returned (-1)
+  syncDepth += d;
+  if (!syncDepth && syncPoll) syncPoll = false, vm->poll |= 1;
+}
 EXPORT(fut_apply) const char* futApply(int id, const char* args) {
   V f = jsPinned(id);
   if (f == NIL) ERR("@js a fut function called from JavaScript after it was released");

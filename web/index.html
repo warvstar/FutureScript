@@ -10,6 +10,7 @@
   header { padding: 8px 16px; border-bottom: 1px solid var(--line); color: var(--dim); }
   header b { color: var(--fg); }
   main { flex: 1; display: flex; gap: 16px; padding: 16px; min-height: 0; flex-wrap: wrap; }
+  #ui { flex: 1; min-width: 280px; overflow: auto; font: 15px/1.5 system-ui, sans-serif; } #ui:empty { display: none; }
   canvas { image-rendering: pixelated; background: #000; display: none; align-self: flex-start; width: min(640px, 100%); outline: none; }
   #side { flex: 1; min-width: 280px; display: flex; flex-direction: column; min-height: 0; }
   #out { flex: 1; margin: 0; overflow: auto; white-space: pre-wrap; word-break: break-word; }
@@ -22,6 +23,7 @@
 <body>
 <header><b>fut</b> on WebAssembly · <span id="file"></span> · edits to the file hot-reload · type to poke the running program</header>
 <main>
+  <div id="ui"></div>
   <canvas id="screen" tabindex="0"></canvas>
   <div id="side">
     <pre id="out"></pre>
@@ -47,6 +49,7 @@ const fut = await createFut({
   wasm: await (await fetch("/build/fut.wasm")).arrayBuffer(),
   std: "/std",
   verbose: true,
+  serve: true,  // a program that builds a page (std/ui, into #ui) keeps handling its events after it finishes
   read(p) {  // fut reads files synchronously
     const x = new XMLHttpRequest();
     x.open("GET", p, false), x.overrideMimeType("text/plain; charset=x-user-defined"), x.send();
