@@ -570,8 +570,12 @@ fn runTool(w, name, inp) {
     t.waitFor = []
     for u in tasks { if u.status == "active" && u.id != t.id { t.waitFor.push(u.id) } }
     t.blocked = (t.blocked || 0) + 1
-    if t.blocked < 6 { t.attempts -= 1 }  // waiting on other work is not a failed attempt (up to 5 times)
+    t.attempts -= 1  // waiting on other work is not a failed attempt
     giveUp(w, "the worker says it is blocked: " + clip(inp.reason || "", 600))
+    if t.blocked >= 3 {  // the same wall each time: the planner re-plans it (prerequisites, or more files)
+      t.status = "failed"
+      rejections.push(t.title + ": blocked 3 times, so dropped; re-plan it from the reason: " + clip(inp.reason || "", 500))
+    }
     return {text: "task given back"}
   }
   if name == "read" {
