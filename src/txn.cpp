@@ -9,7 +9,7 @@
 #include <unordered_set>
 
 namespace {
-struct Saved { Obj* o; std::vector<V> v; std::vector<u32> idx; u32 used = 0; };  // a map's entries: key, value, ...
+struct Saved { Obj* o; std::vector<V> v; std::vector<u32> idx; u32 used = 0; std::string raw; };  // raw: a buffer's bytes  // a map's entries: key, value, ...
 struct Level {
   Fiber* owner;                  // the fiber that opened it (null: the main stack)
   bool atomic = false;           // an atomic block (not a reload): it takes io away; allowed/who as it found them
@@ -39,6 +39,7 @@ static Saved save(Obj* o) {
     }
     case K::Inst: s.v.assign(((Inst*)o)->slots, ((Inst*)o)->slots + o->nslots); break;
     case K::Clo: s.v.assign(((Clo*)o)->env(), ((Clo*)o)->env() + ((Clo*)o)->n); break;
+    case K::Buf: s.raw.assign((char*)((Buf*)o)->p, ((Buf*)o)->n * bufElem(((Buf*)o)->et)); break;
     default: break;
   }
   return s;
@@ -46,6 +47,7 @@ static Saved save(Obj* o) {
 static void restore(Saved& s) {
   switch (s.o->kind) {
     case K::List: ((List*)s.o)->v = std::move(s.v); break;
+    case K::Buf: memcpy(((Buf*)s.o)->p, s.raw.data(), s.raw.size()); break;
     case K::Map: {
       Map* m = (Map*)s.o;
       m->e.clear();

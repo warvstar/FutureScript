@@ -76,6 +76,8 @@ window(w, h)   present() -> false once closed (once per frame, waits 1/60 s)
 clear(rgb)   rect(x, y, w, h, rgb)   circle(x, y, r, rgb)     rgb = 0xRRGGBB, origin top-left
 key(name) -> bool   "a".."z" "0".."9" space enter escape tab up down left right
 mousex()   mousey()   mousedown() -> bool
+f32s(n | list | buf)  u32s  i32s  u8s   packed numbers (32-bit float / whole / byte), fixed length, also types: b[i] (each
+                         store checked; f32 rounds), for x in b, b.len(), b.slice(a, b), b.bytes(). An extern's ptr param gets the bytes
 ```
 
 ## Functions, classes
@@ -214,6 +216,7 @@ the isolates to end.
 - `std/math`: pow exp log log2 log10 cbrt hypot sin cos tan asin acos atan atan2 ceil trunc abs min max clamp sign round isNaN pi e
 - `std/reactive`: signal(v) (.get .set .update .peek) effect computed batch untrack onCleanup root — effects rerun when a signal read on their last run changes
 - `std/ui` (wasm): el(tag, props, kids) mount(sel|node, view) each(items, key, view) field(sig, props) check(sig, label, props) button(label, f) style(css) find htmlOf trigger; a fn child/prop stays current; `on<event>` props: handlers given {type, value, checked, key}; write `"class"`
+- `std/gpu` (native; `python3 build.py gpu` once): WebGPU over Dawn, WGSL shaders (in a "..." string: `\{` for `{`). `window(w, h)` then `g = gpu.open(nil)`, or `gpu.open({headless: true, width, height})`; `L = gpu.layout({pos: "vec2f", c: "f32"})` (f32 vec2f vec3f vec4f mat4x4f), `L.pack(maps, asStruct) -> f32s`; `g.vertices(buf)` `g.storage(buf)` `g.uniform(L).set(map)`; `g.render({shader, vertex: "vs", fragment: "fs", layout: L, bind: [bufs], draw: "points"})` `g.compute({shader, entry: "main", bind, size: 64})`; `g.run(p, n)`; `while present() { g.frame(0xRRGGBB).draw(p, buf | nil, count) }`; `buf.read(nil) -> f32s` `buf.write(b)` `g.pixels() -> u8s` (headless); `.free()`
 - `state x = v` (top level) / `state f` (class field): a signal read as `x`, set by `x = v`/`x += v`. `view V(a) { ... }`: fn returning nodes; body: `row .c .on: cond attr: v { text "x{y}" button "b" on click { ... } check "l" bind: s  if c { } else { }  for t in ts key t.id { Row(t) } }`; holes stay current. `mount(V)`: into #ui or body, with the theme. Tags: any HTML or SVG, row column text field check link (`link to: "/p" "Text"`). A call on its own line is a child; `state` in a view or fn is its own; `state x = e` uses e if it's a signal. std/ui: `load(url|fn)` -> data() error() loading() reload(); every(s, f) after(s, f); path() go(p) at("/x/:id"); persist(key, v); lineChart barChart sparkline svg; form(values, rules) -> at(name) submit(f) valid() values() reset() (tags field/choice/area show errors); `dialog bind: s`; notify(text); rows(items, height, view, props)
 
 ```fut

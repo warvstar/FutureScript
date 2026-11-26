@@ -70,6 +70,7 @@ static bool accepts(uint64_t t, V v, int depth, Tags* tags = nullptr) {
     case TY_BOOL: return v == TRUE_ || v == FALSE_;
     case TY_LIST: return is(v, K::List);
     case TY_MAP: return is(v, K::Map);
+    case TY_BUF: return is(v, K::Buf) && as<Buf>(v)->et == char(t >> 8);
     case TY_FN: return is(v, K::Fn) || is(v, K::Clo);
     case TY_CLS: {
       if (!is(v, K::Inst)) return false;
@@ -183,6 +184,7 @@ std::string typeText(uint64_t t) {
     case TY_MAP: return "map" + q;
     case TY_FN: return "fn" + q;
     case TY_CLS: case TY_NAMED: return symName(int(t >> 8)) + q;
+    case TY_BUF: return bufName(char(t >> 8)) + q;
   }
   const TypeDesc* d = typeDesc(t);
   if (!d) return "?";

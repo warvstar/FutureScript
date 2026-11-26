@@ -140,6 +140,7 @@ static uint64_t header(Obj* o) { uint64_t h; memcpy(&h, o, 8); return h; }
 const char* typeName(V v) {
   if (isNum(v)) return "number";
   if (!isObj(v)) return v == NIL ? "nil" : "bool";
+  if (obj(v)->kind == K::Buf) return bufName(((Buf*)obj(v))->et);
   static const char* n[] = {"string", "list", "function", "class", "instance", "map", "function", "fiber", "js value", "channel", "task"};
   return n[(int)obj(v)->kind];
 }
@@ -211,6 +212,19 @@ static void render(std::string& out, V v, bool quote, std::unordered_set<Obj*>& 
     case K::Ref: out += "<js value>"; return;
     case K::Chan: out += "<channel>"; return;
     case K::Task: out += "<task>"; return;
+    case K::Buf: {  // f32s[1, 0.1]: an f32 shown with the fewest digits that give it back
+      Buf* b = (Buf*)o;
+      out += bufName(b->et), out += '[';
+      for (size_t i = 0; i < b->n; i++) {
+        if (i) out += ", ";
+        if (b->et != 'f') { out += numberText(num(bufGet(b, i))); continue; }
+        char t[32];
+        *std::to_chars(t, t + sizeof t - 1, ((float*)b->p)[i]).ptr = 0;
+        out += numberText(strtod(t, nullptr));
+      }
+      out += ']';
+      return;
+    }
     case K::List: case K::Map: case K::Inst: break;
     default: out += '?'; return;
   }
@@ -512,7 +526,59 @@ void mapPut(Map* m, std::string_view k, V v) {
   volatile V keep[] = {box(m), v};  // on the stack while the key allocates
   (void)keep, mapSet(m, box(newStr(k)), v);
 }
+// ---- packed buffers ----
+const char* bufName(char et) { return et == 'f' ? "f32s" : et == 'u' ? "u32s" : et == 'i' ? "i32s" : "u8s"; }
+Buf* newBuf(char et, size_t n) {
+  if (n > (1ull << 31)) ERR("@argument %s(): %zu elements is more than a buffer holds (2^31)", bufName(et), n);
+  uint8_t* p = (uint8_t*)calloc(n ? n : 1, bufElem(et));
+  if (!p) ERR("@host %s(): out of memory for %zu elements", bufName(et), n);
+  Buf* b = make<Buf>();
+  return b->et = et, b->n = n, b->p = p, b;
+}
+V bufGet(const Buf* b, size_t i) {
+  switch (b->et) {
+    case 'f': return box((double)((float*)b->p)[i]);
+    case 'u': return box((double)((uint32_t*)b->p)[i]);
+    case 'i': return box((double)((int32_t*)b->p)[i]);
+    default: return box((double)b->p[i]);
+  }
+}
+static void bufSet(Buf* b, size_t i, V v) {
+  if (!isNum(v)) ERR("@type cannot store %s in %s: it holds numbers", typeName(v), bufName(b->et));
+  double d = num(v);
+  if (b->et == 'f') return void(((float*)b->p)[i] = (float)d);
+  double lo = b->et == 'i' ? -2147483648.0 : 0, hi = b->et == 'u' ? 4294967295.0 : b->et == 'i' ? 2147483647.0 : 255;
+  if (!(d >= lo && d <= hi && d == std::trunc(d)))
+    ERR("@type cannot store %s in %s: it holds whole numbers from %.0f to %.0f", toStr(v).c_str(), bufName(b->et), lo, hi);
+  if (b->et == 'u') ((uint32_t*)b->p)[i] = (uint32_t)d;
+  else if (b->et == 'i') ((int32_t*)b->p)[i] = (int32_t)d;
+  else b->p[i] = (uint8_t)d;
+}
+// f32s(n): n zeros; f32s(list) or f32s(buffer): its numbers, each checked as it is stored
+template <char ET> static V n_buf(V a) {
+  if (isNum(a)) {
+    double d = num(a);
+    if (!(d >= 0 && d == std::trunc(d))) ERR("@argument %s() expects a length (a whole number, 0 or more), a list or a buffer, got %s", bufName(ET), toStr(a).c_str());
+    return box(newBuf(ET, (size_t)d));
+  }
+  volatile V held = a;
+  (void)held;
+  if (is(a, K::List)) {
+    auto& l = as<List>(a)->v;
+    Buf* b = newBuf(ET, l.size());
+    for (size_t i = 0; i < l.size(); i++) bufSet(b, i, l[i]);
+    return box(b);
+  }
+  if (is(a, K::Buf)) {
+    Buf* s = as<Buf>(a);
+    Buf* b = newBuf(ET, s->n);
+    for (size_t i = 0; i < s->n; i++) bufSet(b, i, bufGet(s, i));
+    return box(b);
+  }
+  ERR("@argument %s() expects a length, a list or a buffer, got %s", bufName(ET), typeName(a));
+}
 static V rt_geti(V a, V i) {
+  if (is(a, K::Buf)) return bufGet(as<Buf>(a), INDEX(i, as<Buf>(a)->n));
   if (is(a, K::Map)) {
     long e = mapFind(as<Map>(a), i);
     return e < 0 ? NIL : as<Map>(a)->e[e].second;
@@ -522,6 +588,11 @@ static V rt_geti(V a, V i) {
   return char1(a, INDEX(i, as<Str>(a)->len));
 }
 static V rt_seti(V a, V i, V v) {
+  if (is(a, K::Buf)) {
+    size_t at = INDEX(i, as<Buf>(a)->n);
+    touch(obj(a)), bufSet(as<Buf>(a), at, v);
+    return v;
+  }
   if (is(a, K::Map)) {
     if (obj(a)->typed) typeWrite(obj(a), i, v, RA());
     return touch(obj(a)), mapSet(as<Map>(a), i, v), v;
@@ -534,6 +605,7 @@ static V rt_seti(V a, V i, V v) {
 }
 static V rt_iter(V c, uint64_t i) {
   if (is(c, K::List)) return i < as<List>(c)->v.size() ? as<List>(c)->v[i] : END;
+  if (is(c, K::Buf)) return i < as<Buf>(c)->n ? bufGet(as<Buf>(c), i) : END;
   if (is(c, K::Map)) return i < as<Map>(c)->e.size() ? as<Map>(c)->e[i].first : END;
   if (is(c, K::Chan)) return chanNext(c, RA());  // each value received, until it is closed and drained
   if (is(c, K::Fiber)) {  // each yielded value; the fiber's return value ends the loop
@@ -705,6 +777,8 @@ V rt_yield(V v) {
 char ffiCheck(Ext* e, int i, V v) {
   char t = e->sig[i];
   if (t == 'a') return t;  // any: toJs checks what it can pass
+  if (t == 'p' && is(v, K::Buf)) return 'B';  // its bytes' address
+  if (t == 'p' && v == NIL) return 'N';     // NULL
   if (t == 'f' ? !is(v, K::Fn) && !is(v, K::Clo) : t == 's' ? !is(v, K::Str) : !isNum(v) || (t != 'd' && !(std::fabs(num(v)) < 9.2e18)))
     ERR("@argument %s() argument %d: expected %s, got %s", symName(e->sym).c_str(), i + 1, t == 'f' ? "a function" : t == 's' ? "a string" : "a number", typeName(v));
   return t;
@@ -759,6 +833,7 @@ static V n_len(V v) {
   if (is(v, K::Str)) return box((double)as<Str>(v)->len);
   if (is(v, K::List)) return box((double)as<List>(v)->v.size());
   if (is(v, K::Map)) return box((double)as<Map>(v)->e.size());
+  if (is(v, K::Buf)) return box((double)as<Buf>(v)->n);
   ERR("@argument len() of %s", typeName(v));
 }
 double now() { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
@@ -833,6 +908,15 @@ static V l_slice(V l, V a, V b) {
   List* r = make<List>();
   if (i < j) r->v.assign(as<List>(l)->v.begin() + i, as<List>(l)->v.begin() + j);
   return box(r);
+}
+static V b_slice(V v, V a, V z) {  // a copy, like a list's
+  volatile V held = v;
+  (void)held;
+  Buf* s = as<Buf>(v);
+  size_t i = clampIx(a, s->n, "slice()"), j = clampIx(z, s->n, "slice()"), e = bufElem(s->et);
+  Buf* b = newBuf(s->et, i < j ? j - i : 0);
+  if (i < j) memcpy(b->p, s->p + i * e, (j - i) * e);
+  return box(b);
 }
 static V n_slice(V v, V a, V b) {
   if (is(v, K::Str)) return s_slice(v, a, b);
@@ -976,7 +1060,10 @@ void rtInit() {
   method<+[](V f) { return fiberResume(f, NIL); }>(K::Fiber, S_resume), method<fiberResume>(K::Fiber, S_send);
   method<+[](V f) { return boxb(as<Fiber>(f)->state == FIB_DONE); }>(K::Fiber, S_done);
   method<l_push>(K::List, S_push), method<l_pop>(K::List, S_pop), method<n_len>(K::List, S_len);
-  method<n_len>(K::Str, S_len), method<n_len>(K::Map, S_len);
+  method<n_len>(K::Str, S_len), method<n_len>(K::Map, S_len), method<n_len>(K::Buf, S_len);
+  method<b_slice>(K::Buf, intern("slice"));
+  method<+[](V b) { return box((double)(as<Buf>(b)->n * bufElem(as<Buf>(b)->et))); }>(K::Buf, intern("bytes"));
+  native<n_buf<'f'>>("f32s"), native<n_buf<'u'>>("u32s"), native<n_buf<'i'>>("i32s"), native<n_buf<'b'>>("u8s");
   gfxInit();
   method<m_has>(K::Map, S_has), method<m_remove>(K::Map, S_remove);
   method<+[](V s, V sub) {  // str.has(part): does it contain part?

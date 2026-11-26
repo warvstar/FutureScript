@@ -121,7 +121,7 @@ inline V box(double d) { return std::bit_cast<V>(d); }
 inline V boxb(bool b) { return b ? TRUE_ : FALSE_; }
 
 // ---- heap objects (no vtables: JIT code reads Inst fields at fixed offsets) ----
-enum class K : uint8_t { Str, List, Fn, Class, Inst, Map, Clo, Fiber, Ref, Chan, Task, Free = 0xff };
+enum class K : uint8_t { Str, List, Fn, Class, Inst, Map, Clo, Fiber, Ref, Chan, Task, Buf, Free = 0xff };
 // For an Inst, `nslots` and `cid` (its class id) are in the header and are zero for every other kind, so one
 // 64-bit compare of the header checks kind, class and slot count together (the field inline cache).
 // `zero` stays 0 for that compare (mark bits live in the GC's side bitmap, not here).
@@ -219,6 +219,13 @@ struct Shared;
 struct Chan : Obj { static constexpr K KIND = K::Chan; Shared* s; };
 struct Task : Obj { static constexpr K KIND = K::Task; Shared* s; };
 void sharedFree(Obj*);  // the GC found a channel or task handle dead
+// A packed buffer of numbers, for the GPU and C: f32s, u32s, i32s, u8s (et: 'f', 'u', 'i', 'b'). Its length is fixed,
+// and its bytes (malloc'd, never moved) are what a `ptr` argument of an extern fn receives.
+struct Buf : Obj { static constexpr K KIND = K::Buf; char et; size_t n; uint8_t* p; };
+inline size_t bufElem(char et) { return et == 'b' ? 1 : 4; }
+const char* bufName(char et);  // "f32s"
+Buf* newBuf(char et, size_t n);  // zeroed
+V bufGet(const Buf* b, size_t i);
 struct Clo : Obj { static constexpr K KIND = K::Clo; Fn* fn; u32 n; V* env() { return (V*)(this + 1); } };
 // A fiber runs a function on a stack of its own; `yield` switches back to whoever resumed it.
 struct Fiber : Obj {
@@ -287,7 +294,7 @@ template <class T> T* make(size_t extra = 0) {
   T* o = new (gcAlloc(sizeof(T) + extra)) T();
   o->kind = T::KIND;
   if constexpr (T::KIND == K::List || T::KIND == K::Map || T::KIND == K::Class || T::KIND == K::Fiber || T::KIND == K::Ref ||
-                T::KIND == K::Chan || T::KIND == K::Task) gcOwn(o);
+                T::KIND == K::Chan || T::KIND == K::Task || T::KIND == K::Buf) gcOwn(o);
   return o;
 }
 Str* newStr(std::string_view, std::string_view = {});
@@ -592,7 +599,7 @@ constexpr uint64_t SETF_OUTSIDE = 1ull << 40;  // with a field's symbol (rt_setf
 // ---- types (types.cpp): optional annotations, checked at run time where they are written ----
 // A type is a kind, TY_OPT if nil is allowed too (`str?`), and for a class its symbol (bits 8..).
 // TY_EXT: a compound type, its TypeDesc's index in bits 8..; TY_NAMED: a `type Name = ...`, its symbol in bits 8...
-enum : uint64_t { TY_ANY = 1, TY_NUM, TY_STR, TY_BOOL, TY_LIST, TY_MAP, TY_FN, TY_CLS, TY_EXT, TY_NAMED, TY_OPT = 16 };
+enum : uint64_t { TY_ANY = 1, TY_NUM, TY_STR, TY_BOOL, TY_LIST, TY_MAP, TY_FN, TY_CLS, TY_EXT, TY_NAMED, TY_BUF, TY_OPT = 16 };  // TY_BUF: its element type in bits 8..
 constexpr uint64_t tyClass(int sym) { return TY_CLS | uint64_t(sym) << 8; }
 // A compound type: k is 'u' (a union of alts), 'l' (a literal: str s, num n, or the value v: true false nil),
 // 's' (a shape: fields, each name's type; other keys are allowed), 'L' (list<elem>), 'M' (map<key, elem>).

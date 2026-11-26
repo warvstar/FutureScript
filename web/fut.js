@@ -189,6 +189,7 @@ export async function createFut(opts) {
     strlen: (s) => enc.encode(s).length, abs: Math.abs, labs: Math.abs, atoi: (s) => parseInt(s, 10) || 0,
     atof: (s) => parseFloat(s) || 0, getenv: (n) => opts.getenv?.(n) ?? null, ldexp: (x, e) => x * 2 ** e,
     pow: Math.pow, sqrt: Math.sqrt, floor: Math.floor, ceil: Math.ceil, fabs: Math.abs, fmod: (a, b) => a % b,
+    memset: (p, c, n) => (u8().fill(c, p, p + Number(n)), p),  // a ptr is an address in fut's memory (a buffer's bytes)
   };
   const externs = [], externWasm = [];  // by index; a function, or {lib, name} the main thread runs (proxied)
   const proxyMode = opts.main ? opts.proxy ?? "declared" : "none";

@@ -341,7 +341,7 @@ static V rt_ffi(V* w, Ext* e) {
     V v = w[i];
     char t = ffiCheck(e, i, v);
     if (t == 'a' || t == 'f') json[i] = toJs(v), a[i] = (double)(uintptr_t)json[i].c_str();
-    else a[i] = t == 's' ? (double)(uintptr_t)as<Str>(v)->s() : num(v);
+    else a[i] = t == 's' ? (double)(uintptr_t)as<Str>(v)->s() : t == 'B' ? (double)(uintptr_t)as<Buf>(v)->p : t == 'N' ? 0 : num(v);  // a buffer: its address in memory
   }
   int failed = 0;
   double r = (syncDepth ? host_ffi_now : host_ffi)((int)(uintptr_t)e->fn - 1, e->sig, a, e->ret, &failed);

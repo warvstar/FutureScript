@@ -20,7 +20,8 @@ WASM_LINK = ["-mexec-model=reactor", "-lsetjmp", "-Wl,--export=__stack_pointer",
 WASM_MT_FLAGS = ["--target=wasm32-wasip1-threads", "-pthread", *WASM_FLAGS[1:]]
 WASM_MT_LINK = [*WASM_LINK, "-Wl,--import-memory,--shared-memory,--max-memory=4294967296", "-Wl,--initial-memory=805306368"]
 NATIVE_ONLY, WASM_ONLY = {"main.cpp", "jit.cpp", "sys.cpp"}, {"wasm.cpp", "interp.cpp"}
-NATIVE_SPECS = set()  # specs only the native build runs
+NATIVE_SPECS = {"gpu_test.fut", "gpu_particles.fut"}  # specs only the native build runs (std/gpu: Dawn, as a C library)
+GPU_SPECS = {"gpu_test.fut", "gpu_particles.fut"}  # these need build/libfutgpu.dylib (python3 build.py gpu)
 WASM_SPECS = {"hello_ui.fut", "ui_test.fut", "views.fut", "garden.fut", "dashboard.fut"}  # std/ui is the DOM's (a JavaScript module): the wasm build only
 
 
@@ -79,6 +80,8 @@ def test(exe, only=()):
         return t.name, ok, f"want: {want}\n  got:  {r.stdout.splitlines()}\n  stderr: {r.stderr.strip()}"
 
     def spec(t, where="specs"):  # specs written with test blocks (and the standard library's tests)
+        if t.name in GPU_SPECS and not (ROOT / "build" / "libfutgpu.dylib").exists():
+            return f"{where}/{t.name} (skipped: python3 build.py gpu builds std/gpu's library)", True, ""
         r = subprocess.run([*runner(exe), "test", str(t)], capture_output=True, text=True, timeout=60)
         last = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else "no output"
         return f"{where}/{t.name} ({last})", r.returncode == 0, (r.stdout + r.stderr).strip().replace("\n", "\n  ")
@@ -92,9 +95,9 @@ def test(exe, only=()):
             + [("specs/" + t.name, lambda t=t: spec(t)) for t in sorted((ROOT / "tests" / "specs").glob("*.fut"))
                if not (exe.suffix == ".wasm" and t.name in NATIVE_SPECS) and not (exe.suffix != ".wasm" and t.name in WASM_SPECS)]
             + [("std/" + t.name, lambda t=t: spec(t, "std")) for t in sorted((ROOT / "std").glob("*/*_test.fut"))
-               if not (exe.suffix != ".wasm" and t.name in WASM_SPECS)]
+               if not (exe.suffix != ".wasm" and t.name in WASM_SPECS) and not (exe.suffix == ".wasm" and t.name in NATIVE_SPECS)]
             + [("examples/" + t.name, lambda t=t: spec(t, "examples")) for t in sorted((ROOT / "examples").glob("*.fut"))
-               if 'test "' in t.read_text()]  # examples with test blocks
+               if 'test "' in t.read_text() and not (exe.suffix == ".wasm" and t.name in NATIVE_SPECS)]  # examples with test blocks
             + [(n, lambda n=n, f=f: check(n, f)) for n, f in RUNNER_TESTS]
             + (isolateJobs(exe, 4) if exe == OUT else []))  # the plain native build: wasm runs one isolate (docs/isolates.md,
     # phase 5), and the sanitizer builds are slow enough that more load makes timed tests (expect grows) flaky

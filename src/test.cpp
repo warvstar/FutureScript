@@ -31,6 +31,14 @@ static bool same(V a, V b, std::string& at, std::string& what, Compared& active)
     if (what.empty()) what = toStr(x, true) + " vs " + toStr(y, true);
     return at = seg + at, false;
   };
+  if (is(a, K::Buf) && is(b, K::Buf)) {  // the same element type, the same numbers
+    Buf *x = as<Buf>(a), *y = as<Buf>(b);
+    if (x->et != y->et) return what = std::string(bufName(x->et)) + " vs " + bufName(y->et), false;
+    for (size_t i = 0; i < x->n && i < y->n; i++)
+      if (V u = bufGet(x, i), w = bufGet(y, i); num(u) != num(w)) return differ("[" + std::to_string(i) + "]", u, w);
+    if (x->n != y->n) return what = "length " + std::to_string(x->n) + " vs " + std::to_string(y->n), false;
+    return true;
+  }
   bool lists = is(a, K::List) && is(b, K::List);
   bool maps = is(a, K::Map) && is(b, K::Map);
   bool sums = is(a, K::Inst) && is(b, K::Inst) && as<Inst>(a)->cls == as<Inst>(b)->cls && as<Inst>(a)->cls->sum == 2;  // an enum's values

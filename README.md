@@ -4,6 +4,7 @@ A small class-based language written in C++23 with no third-party libraries. A s
 
 ```sh
 python3 build.py               # -> build/fut   (clang++ -std=c++23 -O2, files in parallel, only what changed; no cmake)
+python3 build.py gpu           # Dawn (a pinned prebuilt release, downloaded once) and build/libfutgpu.dylib, for std/gpu
 python3 build.py install       # build, then link ~/.local/bin/fut (or a directory given) to build/fut
 python3 build.py test          # language tests, tests/specs/*.fut via `fut test`, live hot-reload scenarios
 python3 build.py test contracts # only the tests whose name contains a word given (all run in parallel, ~7s in all)
@@ -655,6 +656,52 @@ while present() {                    // show the frame, handle input, wait for t
 
 `build/fut -w examples/paddle.fut` is a small game to live-code.
 `build/fut examples/flock.fut` is a simulation that runs the same everywhere. Its boids' behaviours are ordinary functions, each run under a step budget, so a behaviour that loops forever (hold space) is cut off on the same tick everywhere. Its test blocks (`fut test examples/flock.fut`, run by both suites) check that a seeded run's state matches a fingerprint, every bit, natively and in wasm.
+
+## Packed buffers
+
+`f32s`, `u32s`, `i32s` and `u8s` hold numbers packed as the GPU and C want them: 32-bit floats, 32-bit whole numbers (unsigned or signed), or bytes.
+
+```
+var b = f32s(4)                      // 4 zeros; also f32s([1, 2, 3]) or f32s(another buffer)
+b[0] = 0.1                           // stored as an f32: b[0] is now 0.10000000149011612
+for x in b { }                       // b.len(), b.slice(1, 3) (a copy), b.bytes() (16)
+u8s(1)[0] = 256                      // error: cannot store 256 in u8s: it holds whole numbers from 0 to 255
+fn sum(xs: f32s): num { ... }        // each is a type too
+extern fn memset(ptr, int, long): ptr
+memset(u8s(8), 0, 8)                 // a ptr parameter gets the buffer's bytes
+```
+
+Their length is fixed. A store is checked: a non-number, or a number a whole-number buffer can't hold, is an error rather than a value wrapped or clipped. `==` is identity and `expect`'s compares the numbers, as for lists. They print as `f32s[1, 0.1]` (an f32 with the fewest digits that give it back). They are copied when sent to another isolate, become arrays of numbers in `json` and for JavaScript, and an `atomic` block that fails puts their contents back. Indexing goes through the runtime, not an inline fast path yet.
+
+## GPU
+
+`std/gpu` reaches the GPU through WebGPU: [Dawn](https://dawn.googlesource.com/dawn), Google's implementation, which runs on Metal on macOS. `python3 build.py gpu` downloads a pinned Dawn release once and builds `build/libfutgpu.dylib`, a small C library over it that `std/gpu` binds as a foreign module. Shaders are WGSL, written in fut strings (`\{` for each `{`).
+
+```
+import "std/gpu"
+var Vertex = gpu.layout({pos: "vec2f", color: "vec3f"})   // fields in the shader's order: f32 vec2f vec3f vec4f mat4x4f
+var Frame = gpu.layout({angle: "f32"})
+
+window(640, 480)
+var g = gpu.open(nil)                                       // on the window; gpu.open({headless: true, width, height}) draws offscreen
+var verts = g.vertices(Vertex.pack([{pos: [0, 0.6], color: [1, 0, 0]}, ...], false))   // packed tight, as vertices
+var frame = g.uniform(Frame)                                // one struct, laid out as WGSL lays out uniforms
+var tri = g.render({shader: SHADER, vertex: "vs", fragment: "fs", layout: Vertex, bind: [frame]})
+while present() {
+  frame.set({angle: clock()})
+  g.frame(0x101020).draw(tri, verts, 3)                     // present() shows it
+}
+```
+
+- **Compute:** `g.compute({shader, entry: "main", bind: [buffers], size: 64})` and `g.run(p, n)` run `ceil(n / size)` workgroups. `g.storage(f32s)` makes a buffer a shader can read and write, which a draw can also use as vertices. `buf.read(nil)` waits for the GPU and gives its contents as `f32s`.
+- **Layouts:** `layout.pack(maps, asStruct)` fills an `f32s` from maps, checking each field (`[2].color must be a list of 3 numbers (vec3f)`): packed tight for vertices, or with WGSL's alignment for uniform and storage buffers (a `vec3f` takes 4 floats there).
+- **Errors** are fut errors that say what went wrong, with WGSL's own messages and line numbers for a shader: `gpu shader: 2:5: expected ';'`. A bad handle or binding is an error, not a crash.
+- **Headless:** `gpu.open({headless: true, width: 64, height: 64})` draws into a picture of its own, which `g.pixels()` reads back as `u8s` (RGBA, rows top first). `std/gpu/gpu_test.fut` tests compute and drawing this way.
+- **Hot reload:** opening the GPU again, as a reloaded `main` does, gives the same one, and a shader whose text is unchanged is not compiled again, so an edited shader is rebuilt and the rest kept.
+- **Handles** are freed with `.free()` (buffers and pipelines), not by the GC.
+- The wasm build doesn't have `std/gpu` yet (the browser's WebGPU will be its backend).
+
+`fut -w examples/gpu_triangle.fut` is a spinning triangle; `fut examples/gpu_particles.fut` moves 100,000 particles with a compute shader and draws them from the same buffer.
 
 ## Hot reload (`-w`)
 

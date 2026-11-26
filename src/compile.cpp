@@ -369,6 +369,7 @@ struct Compiler : Gen {
       next();
       static const char* const kinds[] = {"any", "num", "str", "bool", "list", "map"};
       for (int i = 0; i < 6; i++) if (symName(prev.sym) == kinds[i]) ty.code = TY_ANY + i;
+      for (char et : {'f', 'u', 'i', 'b'}) if (symName(prev.sym) == bufName(et)) ty.code = TY_BUF | uint64_t(et) << 8;
       if ((ty.code == TY_LIST || ty.code == TY_MAP) && at('<') && !cur.nl) {  // list<T>, map<V>, map<K, V>
         bool list = ty.code == TY_LIST;
         next();
@@ -1204,7 +1205,7 @@ struct Compiler : Gen {
           if (ty.code && !init && !acceptsNow(ty.code, NIL)) failAt(n.p, n.line, "@type %s is %s, so it needs an initial value", what.c_str(), ty.text.c_str());
           Tok v = cur;
           bool num = init ? expr() : (imm(0, NIL), false);
-          if (ty.code && num && (ty.code & 15) != TY_NUM && (ty.code & 15) <= TY_CLS) failAt(v.p, v.line, "@type %s is %s, but its initial value is a number", what.c_str(), ty.text.c_str());
+          if (ty.code && num && (ty.code & 15) != TY_NUM && ((ty.code & 15) <= TY_CLS || (ty.code & 15) == TY_BUF)) failAt(v.p, v.line, "@type %s is %s, but its initial value is a number", what.c_str(), ty.text.c_str());
           checkType(ty, what, num);
           if (top) return gmem(0, global(qualify(s)).slot, true), false;
           int site = ty.code ? typeSite(what, ty.text) : -1;

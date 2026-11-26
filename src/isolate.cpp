@@ -528,6 +528,11 @@ struct Writer {
         for (u32 k = 0; k < c->n; k++) put(c->env()[k]);
         break;
       }
+      case K::Buf: {  // copied, like a list
+        Buf* b = (Buf*)o;
+        m.b += 'P', m.b += b->et, raw((uint64_t)b->n), m.b.append((const char*)b->p, b->n * bufElem(b->et));
+        break;
+      }
       case K::Chan: case K::Task: {
         Shared* s = ((Chan*)o)->s;
         s->rc.fetch_add(1, std::memory_order_relaxed), m.refs.push_back(s);
@@ -564,6 +569,14 @@ struct Reader {
         V r = keep(l);
         l->v.reserve(n);
         for (u32 i = 0; i < n; i++) { V x = get(); l->v.push_back(x); }
+        return r;
+      }
+      case 'P': {
+        char et = m.b[at++];
+        uint64_t n = raw<uint64_t>();
+        Buf* b = newBuf(et, n);
+        V r = keep(b);
+        memcpy(b->p, m.b.data() + at, n * bufElem(et)), at += n * bufElem(et);
         return r;
       }
       case 'm': {

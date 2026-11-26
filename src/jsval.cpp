@@ -88,6 +88,12 @@ static void enc(V v, std::string& o, int depth) {
       o += ']';
       return;
     }
+    case K::Buf: {
+      o += '[';
+      for (size_t i = 0; i < ((Buf*)x)->n; i++) o += i ? "," : "", enc(bufGet((Buf*)x, i), o, depth + 1);
+      o += ']';
+      return;
+    }
     case K::Map: {
       o += '{';
       bool first = true;

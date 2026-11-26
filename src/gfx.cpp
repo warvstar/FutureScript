@@ -40,6 +40,11 @@ template <class F> F cg(const char* name) { return (F)dlsym(RTLD_DEFAULT, name);
 
 static id app, win, layer;
 static void* ctx;
+// A library drawing the window itself (std/gpu's, over Dawn) registers here: present() then calls it to show the
+// frame, instead of showing the pixel buffer.
+static void (*presentHook)(void*);
+static void* presentArg;
+extern "C" __attribute__((visibility("default"), used)) void fut_on_present(void (*f)(void*), void* arg) { presentHook = f, presentArg = arg; }
 
 static V n_window(V w, V h) {
   W = clip(NUM(w, "window"), 4096), H = clip(NUM(h, "window"), 4096);
@@ -77,8 +82,11 @@ void gfxPump() {  // handle pending window events (also called while a stopped p
 }
 static V n_present() {  // show the frame, handle events, wait for the next 1/60 s tick; false once the window is closed
   if (!win) ERR("@host present() before window()");
-  void* img = cg<void* (*)(void*)>("CGBitmapContextCreateImage")(ctx);
-  msg<void>(layer, "setContents:", (id)img), cg<void (*)(void*)>("CGImageRelease")(img);
+  if (presentHook) presentHook(presentArg);
+  else {
+    void* img = cg<void* (*)(void*)>("CGBitmapContextCreateImage")(ctx);
+    msg<void>(layer, "setContents:", (id)img), cg<void (*)(void*)>("CGImageRelease")(img);
+  }
   msg<void>(cls("CATransaction"), "flush"), fflush(stdout), gfxPump();
   static double next;
   double t = now();
