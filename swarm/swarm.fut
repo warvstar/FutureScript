@@ -197,9 +197,10 @@ fn safePath(p) { return p != nil && p != "" && p[0] != "/" && !p.has("..") }
 
 // ---- money ----
 var PRICES = {}         // dollars per million tokens; Haiku 5.5 has a second card for prompts over 100K tokens
-PRICES["claude-haiku-5-5"] = {inp: 0.1, out: 0.5, longInp: 0.5, longOut: 2.5, maxTok: 16000}
-PRICES["claude-sonnet-5-5"] = {inp: 2, out: 10, maxTok: 32000}
-PRICES["claude-opus-5-5"] = {inp: 4, out: 20, maxTok: 32000}
+// read: a cache read's price as a fraction of input (Sonnet 5.5's is $0.10 of $2); cache writes (5 min) are 1.25x
+PRICES["claude-haiku-5-5"] = {inp: 0.1, out: 0.5, longInp: 0.5, longOut: 2.5, read: 0.1, maxTok: 16000}
+PRICES["claude-sonnet-5-5"] = {inp: 2, out: 10, read: 0.05, maxTok: 32000}
+PRICES["claude-opus-5-5"] = {inp: 4, out: 20, read: 0.1, maxTok: 32000}
 fn price(model, promptTokens) {
   var p = PRICES[model]
   if p.longInp && promptTokens > 100000 { return {inp: p.longInp, out: p.longOut} }
@@ -211,8 +212,8 @@ fn charge(u, model) {
   var cr = u.cache_read_input_tokens || 0
   var out = u.output_tokens || 0
   var p = price(model, inp + cw + cr)
-  // conservative: cache writes at 1.25x, cache reads at the full input price
-  var cost = (inp + cw * 1.25 + cr) * p.inp / 1000000 + out * p.out / 1000000
+  // list prices: cache writes at 1.25x input, cache reads at the model's read fraction (92% of prompt tokens are reads)
+  var cost = (inp + cw * 1.25 + cr * PRICES[model].read) * p.inp / 1000000 + out * p.out / 1000000
   ledger.spent += cost
   ledger.byModel[model] = (ledger.byModel[model] || 0) + cost
   ledger.calls += 1
@@ -814,7 +815,7 @@ fn main() {
       who.push({kind: "plan"})
     }
     // the budget: drop what could cross the cap
-    var room = budgetLeft() - 0.02
+    var room = budgetLeft() - 0.05 * CAP  // a margin: requests are also checked at their worst case below
     var keep = []
     var keepWho = []
     for k in 0..reqs.len() {
