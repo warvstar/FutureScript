@@ -6,7 +6,7 @@
 //   node web/worker.mjs build --tests [--shards N | --max-kb K] [--root dir] outdir files...
 //                                                     test files, in shards: outdir/shard-<i>/ each, and
 //                                                     outdir/manifest.json (which tests are in which shard)
-//   node web/worker.mjs build --interp outdir       one static Worker that compiles and runs whatever it is sent,
+//   node web/worker.mjs build --interp [--pages kv-id] outdir   one static Worker that compiles and runs whatever it is sent,
 //                                                     interpreting the code (POST /run: see createInterpWorker)
 //   node web/worker.mjs send bundle|url [--root dir] (--main file | files...) [--filter text]
 //                                                     send sources (every .fut, .api and fut.pkg below root) to an
@@ -175,7 +175,7 @@ async function buildTests(files, out, { shards, maxKb, root }) {
   if (failed) die(`${failed} file${failed == 1 ? "" : "s"} did not compile (left out)`, 1);
 }
 
-function buildInterp(out) {
+function buildInterp(out, pagesKv) {  // pagesKv: a KV namespace id, bound as PAGES (GET /<name> serves pages)
   out = resolve(out), rmSync(out, { recursive: true, force: true }), mkdirSync(out, { recursive: true });
   copyFileSync(join(repo, "build", "fut.wasm"), join(out, "fut.wasm"));
   copyFileSync(join(here, "fut.js"), join(out, "fut.js")), copyFileSync(join(here, "worker-runtime.js"), join(out, "runtime.js"));
@@ -186,7 +186,8 @@ function buildInterp(out) {
     "export default createInterpWorker({ wasm, tryModule });", ""].join("\n"));
   writeFileSync(join(out, "bundle.json"), JSON.stringify({ interp: true }));
   writeFileSync(join(out, "wrangler.toml"), [`name = "fut-interp"`, 'main = "worker.js"', `compatibility_date = "${COMPAT_DATE}"`,
-    "[limits]", "cpu_ms = 300000  # a request runs whole test files, interpreted: the Paid plan's most", ""].join("\n"));
+    "[limits]", "cpu_ms = 300000  # a request runs whole test files, interpreted: the Paid plan's most", "",
+    ...(pagesKv ? ["[[kv_namespaces]]", 'binding = "PAGES"', `id = "${pagesKv}"`, ""] : [])].join("\n"));
   const size = sizeOf(out);
   console.log(`${out}: ${(size.bytes / 1024).toFixed(0)} KB (${(size.gzip / 1024).toFixed(0)} KB gzipped)`);
 }
@@ -283,9 +284,10 @@ const flag = (name, hasValue) => {
 };
 if (cmd == "build") {
   const tests = flag("--tests"), shards = flag("--shards", true), maxKb = flag("--max-kb", true), root = flag("--root", true);
+  const pages = flag("--pages", true);
   if (flag("--interp")) {
     if (args.length != 1) die(usage);
-    buildInterp(args[0]);
+    buildInterp(args[0], pages);
   } else if (tests) {
     if (args.length < 2) die(usage);
     await buildTests(args.slice(1), args[0], { shards: shards && +shards, maxKb: maxKb && +maxKb, root }).catch((e) => die(e.message));

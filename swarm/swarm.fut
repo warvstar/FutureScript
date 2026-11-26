@@ -16,6 +16,8 @@ var MODELS = {worker: env("SWARM_MODEL_WORKER") || MODEL, planner: env("SWARM_MO
               approver: env("SWARM_MODEL_APPROVER") || MODEL, reviewer: env("SWARM_MODEL_REVIEWER") || MODEL}
 var MINUTES = parseNum(env("SWARM_MINUTES") || "0")    // run time limit, summed over restarts; 0: none
 var CF = env("SWARM_CF_URL")                            // set: test files run on this interpreting Worker, one per request
+var DASH = env("SWARM_DASH_URL")                        // set: the dashboard is published to this Worker's pages too
+var lastPush = 0
 var CAP = parseNum(env("SWARM_CAP") || "20")          // dollars, hard: no request starts that could cross it
 var NWORKERS = parseNum(env("SWARM_WORKERS") || "8")
 var MAXSTEPS = 90
@@ -132,8 +134,12 @@ var VERDICT_TOOLS = [tool("verdict", "Approve the change for main, or reject it 
 
 // ---- tests ----
 var CFTOKEN = nil
-fn cfRun(dir, files) {  // each test file in its own request to the Worker, all at once; results shaped as exec's
+fn cfToken() {
   if CFTOKEN == nil { CFTOKEN = (readFile(env("SWARM_CF_TOKEN_FILE") || DIR + "/.cftoken") || "").trim() }
+  return CFTOKEN
+}
+fn cfRun(dir, files) {  // each test file in its own request to the Worker, all at once; results shaped as exec's
+  cfToken()
   var src = {}
   for f in lines(sh("find . -path ./.git -prune -o -path '*/.fut-cache' -prune -o -type f \\( -name '*.fut' -o -name '*.api' -o -name fut.pkg \\) -print", dir).out) {
     src[f.slice(2, f.len())] = readFile(dir + "/" + f)
@@ -580,6 +586,13 @@ fn dashboard(stopped) {  // $SWARM_DIR/dashboard.html: swarm/dashboard.html with
     timeline: ledger.timeline, runs: runs, stopped: stopped}
   var page = readFile(ROOT + "/swarm/dashboard.html").split("/*DATA*/").join(json(d).split("</").join("<\\/"))
   writeFile(DIR + "/dashboard.html", page)
+  if DASH && (stopped || time() - lastPush >= 15) {  // the Worker serves it at / and at /<run>
+    lastPush = time()
+    var h = {authorization: "Bearer " + cfToken(), "content-type": "text/html"}
+    var got = fetchAll([{url: DASH + "/pages/index", method: "PUT", body: page, headers: h, timeout: 20},
+                        {url: DASH + "/pages/" + ledger.run.id, method: "PUT", body: page, headers: h, timeout: 20}])
+    if got[0].status != 200 { log("dashboard push failed: " + str(got[0].status) + " " + clip(got[0].body || got[0].error || "", 200)) }
+  }
 }
 
 // ---- the loop ----

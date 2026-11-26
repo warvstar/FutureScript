@@ -167,8 +167,15 @@ async function testIn(ctx, module, main, filter) {
 export function createInterpWorker({ wasm, tryModule }) {
   return {
     async fetch(request, env) {
+      const path = new URL(request.url).pathname;
+      if (request.method == "GET" && env?.PAGES) return page(env.PAGES, path);  // public: pages others put there
       if (env?.FUT_TOKEN && !sameText(request.headers.get("authorization") ?? "", "Bearer " + env.FUT_TOKEN))
         return new Response("unauthorized\n", { status: 401 });
+      if (request.method == "PUT" && path.startsWith("/pages/") && env?.PAGES) {  // PUT /pages/<name>: an HTML page
+        const name = path.slice(7).replace(/[^\w.-]/g, "") || "index";
+        await env.PAGES.put(name, await request.text(), { metadata: { at: Date.now() } });
+        return new Response("ok\n");
+      }
       if (request.method != "POST" || new URL(request.url).pathname != "/run")
         return new Response("POST /run {files: {path: text}, tests: [path...] | main: path, filter}\n", { status: 404 });
       const b = await request.json().catch(() => null);
@@ -186,6 +193,13 @@ export function createInterpWorker({ wasm, tryModule }) {
       return new Response(body + JSON.stringify(total) + "\n", { headers: { "content-type": "application/x-ndjson" } });
     },
   };
+}
+// Pages: with a KV namespace bound as PAGES, GET /<name> serves the HTML stored under name ("/": index), which an
+// authorized PUT /pages/<name> stores. A swarm publishes its dashboard this way (swarm.fut, SWARM_CF_URL).
+async function page(kv, path) {
+  const name = path.slice(1).replace(/[^\w.-]/g, "") || "index", html = await kv.get(name);
+  if (html == null) return new Response("no page " + name + "\n", { status: 404 });
+  return new Response(html, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
 }
 function sameText(a, b) {  // compares in time independent of where they differ
   let d = a.length ^ b.length;
