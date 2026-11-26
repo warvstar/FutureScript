@@ -1,0 +1,5 @@
+("(" @open ")" @close)
+("[" @open "]" @close)
+("{" @open "}" @close)
+(generic_type "<" @open ">" @close)
+(("\"" @open "\"" @close) (#set! rainbow.exclude))

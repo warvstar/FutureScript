@@ -1,0 +1,15 @@
+id = "fut"
+name = "fut"
+description = "Language support for fut."
+version = "0.1.0"
+schema_version = 1
+
+# For a local checkout, set repository and rev as described in editors/README.md.
+[grammars.fut]
+repository = "file:///path/to/futurescript"
+rev = "GRAMMAR_COMMIT"
+path = "editors/tree-sitter-fut"
+
+[language_servers.fut]
+name = "fut"
+languages = ["fut"]

@@ -1,0 +1,15 @@
+{
+  "grammars": [
+    {
+      "name": "fut",
+      "scope": "source.fut",
+      "path": ".",
+      "file-types": ["fut"],
+      "highlights": "../zed/languages/fut/highlights.scm"
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "description": "Tree-sitter grammar for fut"
+  }
+}
