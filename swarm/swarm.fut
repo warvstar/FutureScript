@@ -37,6 +37,7 @@ var COMMON = ""
 var ROLE = {}
 var TDIR = ""           // swarm/targets/<target>
 var lastScore = -1000   // elapsed seconds at the last acceptance run
+var stopReason = nil
 var accept = nil        // {passed, total} on main, when the target has acceptance tests
 
 // ---- small helpers ----
@@ -230,6 +231,7 @@ fn titles(list) {
   return out.join("\n")
 }
 fn saveState() {
+  dashboard(nil)
   writeFile(DIR + "/ledger.json", json(ledger))
   writeFile(DIR + "/tasks.json", json({tasks: tasks, nextId: nextId, rejections: rejections}))
   var w = []
@@ -548,7 +550,36 @@ fn results() {  // swarm/results/<run>.json: what the run reached, and when
     elapsed: int(ledger.elapsed), spent: int(ledger.spent * 10000) / 10000, byModel: ledger.byModel, calls: ledger.calls,
     merged: ledger.merged, rejected: ledger.rejected, failedTasks: byStatus("failed").len(), tests: mainTests.n.passed,
     accept: accept, srcLines: srcLines, testLines: testLines, checkpoints: checks, timeline: ledger.timeline}
-  writeFile((env("SWARM_RESULTS") || ROOT + "/swarm/results") + "/" + ledger.run.id + ".json", json(out) + "\n")
+  writeFile(RESULTS() + "/" + ledger.run.id + ".json", json(out) + "\n")
+  runs = nil
+}
+fn RESULTS() { return env("SWARM_RESULTS") || ROOT + "/swarm/results" }
+var runs = nil          // the saved runs, for the dashboard (nil: read them again)
+fn dashboard(stopped) {  // $SWARM_DIR/dashboard.html: swarm/dashboard.html with this run's data in it
+  if runs == nil {
+    runs = []
+    for f in lines(sh("ls *.json 2>/dev/null", RESULTS()).out) {
+      var r = nil
+      try { r = parseJson(readFile(RESULTS() + "/" + f)) } catch e { continue }
+      runs.push(r)
+    }
+  }
+  var ws = []
+  for w in workers {
+    var t = nil
+    if w.task { t = {id: w.task.id, title: w.task.title} }
+    ws.push({i: w.i, phase: w.phase, task: t, steps: w.steps})
+  }
+  var ts = []
+  for t in tasks { ts.push({id: t.id, title: t.title, status: t.status, attempts: t.attempts, files: t.files}) }
+  var counts = {}
+  for k in ["active", "queued", "done", "failed"] { counts[k] = byStatus(k).len() }
+  var d = {now: time(), run: ledger.run, target: TARGET, models: MODELS, nworkers: NWORKERS, cap: CAP, minutes: MINUTES,
+    elapsed: ledger.elapsed, spent: ledger.spent, byModel: ledger.byModel, calls: ledger.calls, merged: ledger.merged,
+    rejected: ledger.rejected, tests: mainTests.n, accept: accept, counts: counts, tasks: ts, workerList: ws, events: events,
+    timeline: ledger.timeline, runs: runs, stopped: stopped}
+  var page = readFile(ROOT + "/swarm/dashboard.html").split("/*DATA*/").join(json(d).split("</").join("<\\/"))
+  writeFile(DIR + "/dashboard.html", page)
 }
 
 // ---- the loop ----
@@ -592,8 +623,8 @@ fn main() {
     var now = time()
     ledger.elapsed += now - last
     last = now
-    if readFile(DIR + "/STOP") != nil { log("STOP file: stopping") break }
-    if MINUTES > 0 && ledger.elapsed >= MINUTES * 60 { log("time limit: " + str(MINUTES) + " minutes; stopping") break }
+    if readFile(DIR + "/STOP") != nil { log("STOP file: stopping") stopReason = "STOP file" break }
+    if MINUTES > 0 && ledger.elapsed >= MINUTES * 60 { log("time limit: " + str(MINUTES) + " minutes; stopping") stopReason = "time limit" break }
     var merged = ledger.merged
     ledger.rounds += 1
     // idle workers take queued tasks
@@ -633,7 +664,7 @@ fn main() {
       if c <= room { room -= c keep.push(reqs[k]) keepWho.push(who[k]) }
     }
     if keep.len() == 0 {
-      if reqs.len() > 0 { log("budget reached: $" + str(ledger.spent) + " of $" + str(CAP) + "; stopping") break }
+      if reqs.len() > 0 { log("budget reached: $" + str(ledger.spent) + " of $" + str(CAP) + "; stopping") stopReason = "budget" break }
       saveState()
       sleep(3)
       continue
@@ -660,6 +691,8 @@ fn main() {
       else if h.kind == "decide" { decided(msg) }
     }
     if limited { backoff = backoff * 2 + 2 if backoff > 60 { backoff = 60 } sleep(backoff) } else { backoff = 0 }
+    var lastMark = ledger.timeline[ledger.timeline.len() - 1]
+    if ledger.merged == merged && ledger.elapsed - lastMark.t >= 60 { mark() }
     if ledger.merged != merged {
       if ledger.elapsed - lastScore >= 120 { lastScore = ledger.elapsed score() }
       mark()
@@ -671,4 +704,5 @@ fn main() {
   mark()
   results()
   saveState()
+  dashboard(stopReason)
 }
