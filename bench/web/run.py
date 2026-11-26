@@ -35,14 +35,16 @@ ch.port1.onmessage = () => waiting.shift()();
 window.tick = () => new Promise((r) => (waiting.push(r), ch.port2.postMessage(0)));  // a task, not clamped as setTimeout
 window.until = async (cond, limit = 60000) => {{
   const t = performance.now();
-  while (!cond()) {{ if (performance.now() - t > limit) throw new Error('timed out: ' + cond); await tick(); }}
+  const holds = () => {{ try {{ return cond(); }} catch {{ return false; }} }};  // (a page part-way through a change)
+  while (!holds()) {{ if (performance.now() - t > limit) throw new Error('timed out: ' + cond); await tick(); }}
 }};
 window.painted = () => new Promise((r) => requestAnimationFrame(() => (waiting.push(r), ch.port2.postMessage(0))));  // after the frame
 """
 
 async def measure(page, op):
     _, (ready, n), act, done = op
-    await page.evaluate(f"""async () => {{ click('#{ready}'); await until(() => {COUNT} == {n}); await painted(); }}""")
+    await page.evaluate(f"""async () => {{  // (new rows: a list the same length as before is not yet ready)
+      const was = firstId(); click('#{ready}'); await until(() => {COUNT} == {n} && ({n} == 0 || firstId() != was)); await painted(); }}""")
     await page.wait_for_timeout(50)
     return await page.evaluate(f"""async () => {{
       const rs = {ROWS}, before = {{ first: firstId(), r998: rs[998]?.firstChild.textContent }};
@@ -97,7 +99,7 @@ async def main(a):
             await browser.close()
     finally:
         server.terminate()
-    write_md(apps, res, a)
+    if {"vanilla", "solid", "react", "fut"} <= set(apps): write_md(apps, res, a)  # (a partial run doesn't replace it)
     w = max(len(o[0]) for o in OPS)
     print(f"{'ms (' + stat + ' of ' + str(a.rounds) + ')':<{w}}  " + "  ".join(f"{x:>9}" for x in apps))
     for op in OPS:

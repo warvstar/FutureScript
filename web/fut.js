@@ -214,8 +214,19 @@ export async function createFut(opts) {
   // A call the host's main thread runs (opts.main), waiting for it here. A fut function it calls meanwhile
   // (synchronously, as Array.map does) runs here, as if called during an extern call.
   let mainExc = null;  // a fut error from such a function, which fails the call: thrown again here when it does
+  // Calls to the main thread that give nothing back, or a new object (a function the module marks fresh, as std/ui's
+  // create is), don't wait for it: they queue here, and go in order ahead of the next call that waits (mainCall), or
+  // when this thread is about to wait or let go (flush). A fresh call's object gets an id from opts.freshBase (this
+  // thread's own ids, among the main thread's), so fut has it at once.
+  const queued = [];
+  let freshNext = 0;
+  function flush() {
+    if (!queued.length) return;
+    try { mainCall({ op: "flush" }); } catch (e) { write(2, `[fut] ${e.message}\n`); }
+  }
   function mainCall(req) {
     const ch = opts.main;
+    if (queued.length) req.before = queued.splice(0);
     chanPut(ch, CH.REQ, req), opts.main.bell();
     for (;;) {
       let s;
@@ -229,7 +240,7 @@ export async function createFut(opts) {
       }
       let r;
       ex.fut_sync(1);
-      try { r = { value: cstr(withStr(m.json, (p) => ex.fut_apply(m.id, p))) }; } catch (e) {
+      try { r = { value: cstr(withStr(m.json, (p) => ex.fut_apply(m.id, p))) }, flush(); } catch (e) {
         if (e instanceof Restart || e instanceof Exit) throw e;
         r = { err: e instanceof WebAssembly.Exception && e.is(tag) ? cstr(ex.fut_error_line(e.getArg(tag, 0))) : String(e?.message ?? e) };
         if (e instanceof WebAssembly.Exception) mainExc = e;
@@ -248,7 +259,8 @@ export async function createFut(opts) {
       let exports;
       if (proxied(lib)) {  // the page loads it; here, a stand-in for each function it exports
         exports = {};
-        for (const name of mainCall({ op: "load", lib, stamp })) exports[name] = { lib, name };
+        const got = mainCall({ op: "load", lib, stamp });
+        for (const name of got.names) exports[name] = { lib, name, fresh: got.fresh.includes(name) };
       } else if (kind.startsWith("js")) {
         if (!opts.importModule) throw new Error("this host cannot load JavaScript modules");
         exports = await opts.importModule(file, stamp);
@@ -353,6 +365,7 @@ export async function createFut(opts) {
         report(e), c.rej(new Error(errorText(e).split("\n")[0]));
       }
     }
+    flush();  // what a handler did shows now
   }
   async function withStrAsync(s, f) {
     const b = enc.encode(s), p = ex.fut_alloc(b.length + 1);
@@ -391,6 +404,14 @@ export async function createFut(opts) {
     }
     const f = externs[fn];
     if (typeof f != "function") {  // the main thread's (proxied): it reads the arguments, and gives the result, as text
+      const fresh = f.fresh && ret == 97 /* a */ && freshNext < 2 ** 30;
+      if (opts.freshBase && (ret == 118 /* v */ || fresh)) {  // (the root: it flushes when it waits; see flush)  // nothing to wait for: queued (see flush)
+        const c = { lib: f.lib, name: f.name, sig, ret, args: rawArgs(sig, args) };
+        if (fresh) c.id = opts.freshBase + freshNext++;
+        queued.push(c);
+        if (queued.length >= 8192) flush();
+        return fresh ? -2 - c.id : 0;
+      }
       ffiDepth++;
       try {
         const r = mainCall({ op: "call", lib: f.lib, name: f.name, sig, ret, args: rawArgs(sig, args) });
@@ -575,6 +596,7 @@ export async function createFut(opts) {
   // failed. A deadlock among them, or one that failed with nothing joining it: "" or the text that fails it now.
   const isolatesFinish = async (failed) => cstr(await finishP(failed ? 1 : 0));
   async function finish(st) {
+    flush();
     const r = await isolatesFinish(st != 0);
     if (!r || st) return st;
     return write(2, "runtime error: " + r + "\n"), 1;
@@ -587,7 +609,7 @@ export async function createFut(opts) {
     return (inMain = false), finish(st);
   }
   // the next event; at once if one came while the last was handled (a poke then found no one waiting)
-  const event = () => (callbacks.length || inbox.length || fileChanged ? Promise.resolve() : new Promise((r) => (wake = r)));
+  const event = () => (flush(), callbacks.length || inbox.length || fileChanged ? Promise.resolve() : new Promise((r) => (wake = r)));
   async function waitChange() {  // typed lines still run meanwhile, so the stopped program's state can be inspected
     for (;;) {
       await event(), await evalInbox();
@@ -647,7 +669,7 @@ export async function createFut(opts) {
       return (held = enc.encode(t.split("\n")[0].replace(/^ {2}at /, ""))), held.length;
     },
     last_trace: () => ((held = enc.encode(lastThrown ? trace(lastThrown) : "")), held.length),
-    sleep: S((s) => new Promise((r) => setTimeout(r, Math.max(0, s * 1000)))),
+    sleep: S((s) => (flush(), new Promise((r) => setTimeout(r, Math.max(0, s * 1000))))),
     poll: S(() => (ffiDepth ? void (pollLater = true) : hostPoll())),  // not inside a callback: after the extern call
     run: S(async (argsP, srcP, timeout) => {  // run(): fut in a child process, if the host can (opts.run)
       const args = cstr(argsP).split("\n"), file = args.pop();

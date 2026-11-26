@@ -51,7 +51,7 @@ async function handle(m) {
     const { cfg, thread } = m.init;
     if (thread) return void (await createFut({ ...options(cfg, null), wasm: thread.module, thread }));
     pending = m.init.pending;
-    fut = await createFut({ ...options(cfg, pending), wasm: m.init.wasm });
+    fut = await createFut({ ...options(cfg, pending), wasm: m.init.wasm, freshBase: m.init.freshBase });
     return postMessage({ ready: { memory: fut.memory, pollAt: fut.exports.fut_poll() } }), ready();
   }
   if (m.presented) return presents.get(m.presented)?.(true), presents.delete(m.presented);

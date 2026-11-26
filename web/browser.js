@@ -12,6 +12,8 @@
 // key(code, down), mouse(x, y, down)}, each sent to the root.
 import { CH, FUT, chanGet, chanPut, jsonCodec } from "./fut.js";
 
+const FRESH = 2 ** 31 + 2 ** 30;  // the root's own ids for the page's objects (fresh calls); the page's are below
+
 export async function startFut(o) {
   const cfg = { std: o.std, verbose: o.verbose, serve: o.serve, proxy: o.proxy, poolSize: o.poolSize, seed: o.seed };
   const url = new URL("./fut-worker.js", import.meta.url);
@@ -39,7 +41,9 @@ export async function startFut(o) {
     }
     return c;
   };
+  const gone = new Set();  // fresh ids the worker dropped before its queued call reached the page
   function refGone(w, id) {
+    if (id >= FRESH && !holders.has(id)) return void gone.add(id);
     const h = holders.get(id);
     if (h && (h.delete(w), !h.size)) holders.delete(id), refIds.delete(refs.get(id)), refs.delete(id);
   }
@@ -53,11 +57,36 @@ export async function startFut(o) {
     return typeof f == "function" ? (lib ? f.bind(o) : f) : null;
   }
   function run(w, q) {  // a value, or a Promise of one
+    if (q.before) {  // the calls the worker queued (see flush in fut.js), in order; the first failure fails this call
+      let failed = null;
+      for (const c of q.before) {
+        try {
+          const r = runCall(w, c);
+          if (c.id != null) {  // a fresh object, under the id the worker gave it
+            if (gone.delete(c.id)) continue;  // (already dropped there)
+            refs.set(c.id, r), refIds.set(r, c.id), holders.set(c.id, new Set([w]));
+          }
+        } catch (e) { failed ??= `${c.name}(): ${e?.message ?? e}`; }
+      }
+      if (failed) throw new Error(failed);
+    }
+    if (q.op == "flush") return 0;
     if (q.op == "load") {
       const file = q.lib.slice(q.lib.indexOf(":") + 1);
-      return import(file + "?v=" + (q.stamp ?? 0)).then((m) => (modules.set(q.lib, m), Object.keys(m).filter((k) => typeof m[k] == "function")));
+      return import(file + "?v=" + (q.stamp ?? 0)).then((m) => {
+        modules.set(q.lib, m);
+        const names = Object.keys(m).filter((k) => typeof m[k] == "function");
+        return { names, fresh: names.filter((k) => m[k].fresh) };
+      });
     }
     if (q.op == "has") return !!globalFn(q.lib, q.name);
+    return runCall(w, q);
+  }
+  function runCall(w, q) {
+    if (q.id != null) {  // fresh: the object itself (registered by run)
+      const f = modules.get(q.lib)?.[q.name], c = codec(w);
+      return f(...q.args.map((x, i) => (q.sig[i] == "a" || q.sig[i] == "f" ? c.fromFut(x) : x)));
+    }
     const f = q.lib.includes(":") ? modules.get(q.lib)?.[q.name] : globalFn(q.lib, q.name);
     if (typeof f != "function") throw new Error(`${q.name} is not a function on the page`);
     const c = codec(w), a = q.args.map((x, i) => (q.sig[i] == "a" || q.sig[i] == "f" ? c.fromFut(x) : x));
@@ -142,7 +171,7 @@ export async function startFut(o) {
     for (const w of threads.keys()) w.terminate();
     exited(code);
   }
-  root = start({ cfg, pending, wasm: o.wasm });
+  root = start({ cfg, pending, wasm: o.wasm, freshBase: FRESH });
   await readyP;
   return {
     run: (file, watch) => Promise.race([ask({ run: [file, watch] }), exitP]),
