@@ -23,7 +23,8 @@ extern dom fn removeRange(any, any): void
 extern dom fn setProp(any, str, any): void
 extern dom fn listen(any, str, fn): void
 extern dom fn query(str): any
-extern dom fn css(str): void
+extern dom fn css(str): any
+extern dom fn remove(any): void
 extern dom fn base(str): void
 extern dom fn html(any): str
 extern dom fn fire(any, str, any): void
@@ -181,8 +182,15 @@ pub fn button(label, onclick: fn): any {
   return el("button", {onclick: onclick}, label)
 }
 
-// A style sheet for the page.
-pub fn style(sheet: str) { css(sheet) }
+// A style sheet for the page. Sheets added before show() belong to that page: when show() runs again (as a reload
+// runs the file's top level again), the sheets of the page before go, so an edited sheet replaces the old one.
+pub fn style(sheet: str) {
+  var n = css(sheet)
+  sheets.push(n)
+  return n
+}
+var sheets = []      // added since the last show()
+var pageSheets = []  // the shown page's
 
 // The HTML a node is now, and an event on it as a user would cause it ({value} typed, {checked} ticked): for tests.
 pub fn htmlOf(n): str { return html(n) }
@@ -529,13 +537,25 @@ pub fn make(tag: str, props, kids): any {
 
 var themed = false
 var shown = nil
+var shownView = nil
+// Show the page again, built by the code as it is now: after a reload (a file with views does this in its reload()
+// unless it has its own). The state is kept; a view's own state starts again.
+pub fn refresh() {
+  if shownView != nil { show(shownView) }
+}
 // Show view() on the page (web/index.html's #ui, else the body), with fut's theme under the page's own styles. The
 // page shown before (as a reload shows it again) is taken down first: its effects and timers stop.
 pub fn show(view: fn): fn {
   if !themed { themed = true base(THEME) }
   if shown != nil { shown() }
+  if sheets.len() > 0 {  // the file's top level ran again (else only functions changed: its sheets stay)
+    for s in pageSheets { remove(s) }
+    pageSheets = sheets
+    sheets = []
+  }
   var target = query("#ui")
   if target == nil { target = "body" }
+  shownView = view
   shown = mount(target, view)
   return shown
 }

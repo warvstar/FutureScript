@@ -67,6 +67,10 @@ pub fn path(): str
 // A signal that starts as what was saved under key (else v), and saves each new value: `state theme = ui.persist(...)`.
 pub fn persist(key: str, v): r.Signal
 
+// Show the page again, built by the code as it is now: after a reload (a file with views does this in its reload()
+// unless it has its own). The state is kept; a view's own state starts again.
+pub fn refresh()
+
 // What load() is fetching, and what came back: data() (JSON parsed, else text), error() (nil, or what went wrong) and
 // loading(), each followed as a signal is. The last data stays while a new request runs.
 pub class Resource {
@@ -88,7 +92,8 @@ pub fn show(view: fn): fn
 // A small line of values, no axes: the trend beside a number. values: a list, or a function of one.
 pub fn sparkline(values, props): any
 
-// A style sheet for the page.
+// A style sheet for the page. Sheets added before show() belong to that page: when show() runs again (as a reload
+// runs the file's top level again), the sheets of the page before go, so an edited sheet replaces the old one.
 pub fn style(sheet: str)
 
 // An SVG element (tag, props, kids), as el() makes HTML ones. "label" makes SVG's <text>.

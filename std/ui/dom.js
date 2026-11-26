@@ -36,7 +36,7 @@ export function listen(n, type, f) {
   });
 }
 export const query = (sel) => (sel === "body" ? doc.body : doc.querySelector(sel));
-export function css(s) { const e = doc.createElement("style"); e.textContent = s; (doc.head ?? doc.body).appendChild(e); }
+export function css(s) { const e = doc.createElement("style"); e.textContent = s; (doc.head ?? doc.body).appendChild(e); return e; }
 export function base(s) {  // a style sheet under the page's own: first in the head
   const e = doc.createElement("style"), h = doc.head ?? doc.body;
   e.textContent = s;

@@ -277,6 +277,23 @@ struct Views {
       Tok t = peek();
       if (!t.k) { out += s.substr(t.tb); break; }
       if (depth == 0 && is(s, t, "view") && (t.nl || t.tb == 0) && peek(t.e).k == 'i') { view(t); last = Tok{}; continue; }
+      if (depth == 0 && (t.nl || t.tb == 0) && is(s, t, "ui") && is(s, peek(t.e), ".") && is(s, peek(peek(t.e).e), "style")) {
+        // a page's style sheet: a var's initializer, so an edit to it runs again on reload (a statement would not)
+        // (named for its text: an edit anywhere in it makes a new var, and a reload runs a new var's initializer)
+        size_t at = peek(peek(t.e).e).e, end = at;
+        int depth = 0;
+        for (Tok q = peek(at); q.k; q = peek(q.e)) {
+          if (opener(s, q)) depth++;
+          else if (closer(s, q) && --depth == 0) { end = q.e; break; }
+        }
+        uint64_t h = 1469598103934665603ull;
+        for (size_t k = t.b; k < end; k++) h = (h ^ (unsigned char)s[k]) * 1099511628211ull;
+        char name[32];
+        snprintf(name, sizeof name, "_style_%llx", (unsigned long long)h);
+        out += s.substr(t.tb, t.b - t.tb) + "var " + name + " = ";
+        out += "ui", i = t.e, last = t;
+        continue;
+      }
       if (is(s, t, "mount") && !ownMount && !is(s, last, ".") && is(s, peek(t.e), "(")) {
         out += s.substr(t.tb, t.b - t.tb) + "ui.show", i = t.e, last = t;
         continue;
@@ -587,6 +604,7 @@ void viewsRewrite(std::string& src, const std::string& path) {
   st.emit(0, st.t.size());
   src = std::move(st.out);
   if (!st.tops.empty() || !st.fields.empty()) src = "import \"std/reactive\" as _state " + src;
+  if (v.views && src.find("fn reload(") == std::string::npos) src = "fn reload() { ui.refresh() } " + src;  // a patched view shows
   if (v.views && src.find("import \"std/ui\"") == std::string::npos) src = "import \"std/ui\" " + src;
 #ifndef __wasm__
   if (getenv("FUT_VIEWS")) fprintf(stderr, "%s\n", src.c_str());  // the rewrite, to see what a view became

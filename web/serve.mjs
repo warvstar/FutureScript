@@ -13,8 +13,11 @@ const types = { ".html": "text/html", ".js": "text/javascript", ".mjs": "text/ja
 const clients = new Set();
 // Cross-origin isolated: the page may share memory (SharedArrayBuffer), so it runs fut-mt.wasm, a worker each thread
 const isolated = { "cross-origin-opener-policy": "same-origin", "cross-origin-embedder-policy": "require-corp" };
+const settling = new Map();  // path -> timer: an editor's save can be several writes (truncate, then write)
 watch(root, { recursive: true }, (_, f) => {
-  if (f && /(\.fut|\.js|\.wasm|\/fut\.pkg|^fut\.pkg)$/.test(f)) for (const c of clients) c.write(`data: /${f}\n\n`);  // a program's files, its packages' manifests and modules
+  if (!f || !/(\.fut|\.js|\.wasm|\/fut\.pkg|^fut\.pkg)$/.test(f)) return;  // a program's files, its packages' manifests and modules
+  clearTimeout(settling.get(f));
+  settling.set(f, setTimeout(() => { settling.delete(f); for (const c of clients) c.write(`data: /${f}\n\n`); }, 60));  // once it settles
 });
 createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
