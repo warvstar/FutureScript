@@ -34,7 +34,7 @@ try {
   }
 } catch e { print(e) }  // expect: nil has no field 'x'
 print(items)  // expect: [1, 2, 3]
-print(stock)  // expect: {"apples": 3, "pears": 1}
+print(stock)  // expect: {apples: 3, pears: 1}
 print(count)  // expect: 0
 
 // captured variables

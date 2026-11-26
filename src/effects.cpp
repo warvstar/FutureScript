@@ -185,6 +185,8 @@ void* effPrep(Fn* f, V* w, uint64_t n) {
     if (!usable(rec, o.effect)) forbidden(what, o.effect, RA());
     Fn* h = is(clo, K::Clo) ? as<Clo>(clo)->fn : is(clo, K::Fn) ? as<Fn>(clo) : nullptr;
     if (!h || h->arity - is(clo, K::Clo) != (int)n) rtError(RA(), "@arity the handler for %s must take %d parameters", what.c_str(), (int)n);
+    // Calls through a print value still take one argument; handlers always see its rendered text.
+    if (op == printOp && !is(w[1], K::Str)) w[1] = box(newStr(toStr(w[1])));
     pending = {clo, rec, op, n};
     memmove(w, w + 1, n * 8);
     return invokeCode;

@@ -21,5 +21,5 @@ print([f.status, f.error.len() > 0])
 // expect: 127
 // expect: ["x", nil]
 // expect: [true, nil, true]
-// expect: [{"b": nil}, "é", "{"k":[1,"x",true,null]}"]
+// expect: [{b: nil}, "é", "\{\"k\":[1,\"x\",true,null]}"]
 // expect: [0, true]

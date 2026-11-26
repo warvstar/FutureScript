@@ -6,7 +6,7 @@ var ops = {inc: fn(x) { return x + 1 }, twice: fn(x) { return x * 2 }}
 test "counting words, then keys, remove, len and iteration" {
   for w in ["a", "b", "a", "c", "a"] { if m.has(w) { m[w] += 1 } else { m[w] = 1 } }
   expect m == {a: 3, b: 1, c: 1}
-  expect prints { print(m) } == "\{\"a\": 3, \"b\": 1, \"c\": 1}\n"
+  expect prints { print(m) } == "\{a: 3, b: 1, c: 1}\n"
   expect m.keys() == ["a", "b", "c"]
   expect m.remove("b") == 1
   expect len(m) + m.len() == 4

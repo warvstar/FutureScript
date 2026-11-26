@@ -61,9 +61,10 @@ fn main() {                          // called automatically if defined
 fn reload() { }                      // optional: runs after every hot reload (migrate state here)
 ```
 
-- **Values:** numbers (f64; whole numbers are exact up to 2^53 and print without a decimal point), strings, `true`/`false`/`nil`, lists, maps, functions and closures, classes and instances. `nil` and `false` are the only falsy values.
+- **Values:** numbers (f64; whole numbers are exact up to 2^53), strings, `true`/`false`/`nil`, lists, maps, functions and closures, classes and instances. `nil` and `false` are the only falsy values.
 - **Operators:** `+ - * / %`, `== != < <= > >=`, `&& ||` (short-circuit, return the operand), `!`, `= += -= *= /=`. Bitwise `& | ^ ~ << >>` work on whole numbers as 64-bit integers (`1.5 & 1` is an error), with Python's precedence: `2 + 3 & 6` is `(2 + 3) & 6`. `+` with a string on either side concatenates.
 - **Builtins:** `print len str int clock sleep random floor sqrt fiber run channel cores` (`int` truncates toward zero; `random()` is in [0, 1)), plus graphics (below).
+- **Value rendering:** `print(a, ...)` joins one or more values with single spaces and adds a newline. A `with print(s)` handler receives the joined string before the newline is added. `str(v)` and string interpolation use the same rendering. Standalone strings are raw. Inside lists, maps and instances, strings are quoted and escaped. Maps use bare identifier keys where possible, as in `{a: 1, "b c": "s", n: nil}`. Instances show their stored fields in layout order, as in `P{x: 1, y: [2]}`. Cyclic references display as `<cycle>`. Finite numbers round-trip to the same f64. Nonzero magnitudes below 1e-6 or at least 1e21 use exponent notation.
 - **Host builtins** (`io`; native build except `time`, `json`, `parseJson`, `fetch` and `fetchAll`, which wasm has too, through the host's `fetch()`; `time` is `clock`, and JSON has no effect): `fetch(url)` or `fetch({url, method, headers, body, timeout})` returns `{status, body, headers}` (header names lower-case), or `{status: 0, error}` when nothing came back, without throwing. `fetchAll(reqs)` runs the requests at once and returns their results in order. `exec([argv...])` or `exec({cmd, cwd, input, timeout})` runs a process and returns `{code, out, err, timedOut}`; `execAll(cmds)` runs several at once. `readFile(path)` returns the text or `nil`; `writeFile(path, text)` makes the directories it needs. `env(name)` returns a variable or `nil`; `time()` is seconds since 1970. `json(v)` and `parseJson(text)` convert data as for JavaScript. HTTP uses the system libcurl.
 - **Numbers:** `12`, `1.5`, `2e3`, `0xff8800`.
 - **Keywords:** `var fn class if else while for in return break continue true false nil self super import extern yield try catch throw`. `as`, `pub`, `override`, `atomic`, `effect`, `handle`, `with` and `spawn` are special only where they start an import alias, declaration or block, so they stay usable as names.
@@ -71,7 +72,7 @@ fn reload() { }                      // optional: runs after every hot reload (m
 - **Closures:** a closure captures the enclosing variables by value. The closure can still change its own copy, so counters work, but it does not see later changes in the enclosing function.
 - **Interpolation:** expressions inside `{...}` in a string can't contain `"`. Write `\{` for a literal brace.
 - **Newline rules:** a `(` or `[` on a new line, or a leading `-`, starts a new statement rather than continuing the previous one.
-- **Not in fut** (for those coming from other languages): a ternary operator, `**`, `?.`, slice syntax (there are `slice` methods), negative indexes, `sort`, varargs, default arguments, chained comparisons (`1 < 2 < 3` is an error), named functions inside functions. `print` takes one argument, and `int` takes only numbers.
+- **Not in fut** (for those coming from other languages): a ternary operator, `**`, `?.`, slice syntax (there are `slice` methods), negative indexes, `sort`, varargs, default arguments, chained comparisons (`1 < 2 < 3` is an error), named functions inside functions. `int` takes only numbers.
 
 ## Classes
 

@@ -14,11 +14,6 @@ struct Failure { bool set = false; int site = -1; std::string why, left, right, 
 
 // expect's == compares lists and maps by contents (key order aside). On a mismatch inside them, `at` gets the
 // path to the first difference and what differs there, e.g. `.items[1].qty: 3 vs 4`.
-static std::string show(V v) {  // a value as source would spell it: strings quoted, newlines and tabs escaped
-  std::string o;
-  for (char c : toStr(v, true)) o += c == '\n' ? "\\n" : c == '\t' ? "\\t" : std::string(1, c);
-  return o;
-}
 static std::string key(V k) {
   if (is(k, K::Str)) {
     auto s = as<Str>(k)->sv();
@@ -28,36 +23,41 @@ static std::string key(V k) {
   }
   return "[" + toStr(k, true) + "]";
 }
-static bool same(V a, V b, std::string& at, std::string& what) {
+using Compared = std::vector<std::pair<V, V>>;
+static bool same(V a, V b, std::string& at, std::string& what, Compared& active) {
   if (isNum(a) && isNum(b)) return num(a) == num(b);
   if (is(a, K::Str) && is(b, K::Str)) return as<Str>(a)->sv() == as<Str>(b)->sv();
   auto differ = [&](std::string seg, V x, V y) {
-    if (what.empty()) what = show(x) + " vs " + show(y);
+    if (what.empty()) what = toStr(x, true) + " vs " + toStr(y, true);
     return at = seg + at, false;
   };
-  if (is(a, K::List) && is(b, K::List)) {
+  bool lists = is(a, K::List) && is(b, K::List);
+  bool maps = is(a, K::Map) && is(b, K::Map);
+  if (!lists && !maps) return a == b;
+  std::pair pair{a, b};
+  for (auto p : active) if (p == pair) return true;
+  active.push_back(pair);
+  struct Pop { Compared& active; ~Pop() { active.pop_back(); } } pop{active};
+  if (lists) {
     auto &x = as<List>(a)->v, &y = as<List>(b)->v;
     for (size_t i = 0; i < x.size() && i < y.size(); i++)
-      if (!same(x[i], y[i], at, what)) return differ("[" + std::to_string(i) + "]", x[i], y[i]);
+      if (!same(x[i], y[i], at, what, active)) return differ("[" + std::to_string(i) + "]", x[i], y[i]);
     if (x.size() != y.size()) return what = "length " + std::to_string(x.size()) + " vs " + std::to_string(y.size()), false;
     return true;
   }
-  if (is(a, K::Map) && is(b, K::Map)) {
-    auto &x = as<Map>(a)->e, &y = as<Map>(b)->e;
-    auto find = [](auto& e, V k) -> V* {
-      std::string i1, i2;
-      for (auto& [k2, v] : e) if (same(k, k2, i1, i2)) return &v;
-      return nullptr;
-    };
-    for (auto& [k, v] : x) {
-      V* w = find(y, k);
-      if (!w) return what = "only on the left", at = key(k), false;
-      if (!same(v, *w, at, what)) return differ(key(k), v, *w);
-    }
-    for (auto& [k, v] : y) if (!find(x, k)) return what = "only on the right", at = key(k), false;
-    return true;
+  auto &x = as<Map>(a)->e, &y = as<Map>(b)->e;
+  auto find = [&active](auto& e, V k) -> V* {
+    std::string i1, i2;
+    for (auto& [k2, v] : e) if (same(k, k2, i1, i2, active)) return &v;
+    return nullptr;
+  };
+  for (auto& [k, v] : x) {
+    V* w = find(y, k);
+    if (!w) return what = "only on the left", at = key(k), false;
+    if (!same(v, *w, at, what, active)) return differ(key(k), v, *w);
   }
-  return a == b;
+  for (auto& [k, v] : y) if (!find(x, k)) return what = "only on the right", at = key(k), false;
+  return true;
 }
 static TLS Failure failure;
 ISO_LOCAL(failure);
@@ -92,7 +92,8 @@ static V expectAt(V site, V l, V r) {
   if (s.throws && l == ABSENT) ok = false, f.why = "nothing was thrown";
   else if (s.op < 0) ok = s.throws || (l != NIL && l != FALSE_);
   else if (s.op == O_EQ || s.op == O_NE) {
-    ok = same(l, r, f.at, f.what) == (s.op == O_EQ);
+    Compared active;
+    ok = same(l, r, f.at, f.what, active) == (s.op == O_EQ);
     if (ok || s.op == O_NE) f.at.clear(), f.what.clear();
   } else if (isNum(l) && isNum(r)) {  // compiled code compares numbers inline; binopValue expects not to see them
     double x = num(l), y = num(r);
@@ -100,8 +101,8 @@ static V expectAt(V site, V l, V r) {
   } else { V c = binopValue(l, r, s.op); ok = c != NIL && c != FALSE_; }
   if (ok) return NIL;
   f.set = true, f.site = (int)num(site);
-  if (l != ABSENT) f.left = show(l);
-  if (s.op >= 0) f.right = show(r);
+  if (l != ABSENT) f.left = toStr(l, true);
+  if (s.op >= 0) f.right = toStr(r, true);
   std::string msg = "expect failed: " + oneLine(s.text);
   auto d = details(s, f);
   for (size_t i = 0; i < d.size(); i++) msg += (i ? ", " : " (") + d[i] + (i + 1 == d.size() ? ")" : "");
@@ -114,8 +115,8 @@ static V expectAt(V site, V l, V r) {
 static V contractFail(V site, V l, V r, V who) {
   const ExpectSite& s = sites.at((size_t)num(site));
   Failure f;
-  f.left = show(l);
-  if (s.op >= 0) f.right = show(r);
+  f.left = toStr(l, true);
+  if (s.op >= 0) f.right = toStr(r, true);
   std::string head = s.contract;
   if (head.starts_with('\x01')) head = (who != NIL ? toStr(who) : "a call") + head.substr(1);
   std::string msg = head + " " + oneLine(s.text);
@@ -356,7 +357,7 @@ void shrinkArgs(V args, const std::vector<uint64_t>& types, List* out) {
 }
 std::string showCall(const std::string& f, V args) {
   std::string s = f + "(";
-  for (size_t i = 0; i < as<List>(args)->v.size(); i++) s += (i ? ", " : "") + show(as<List>(args)->v[i]);
+  for (size_t i = 0; i < as<List>(args)->v.size(); i++) s += (i ? ", " : "") + toStr(as<List>(args)->v[i], true);
   return s + ")";
 }
 }  // namespace
@@ -442,7 +443,7 @@ static V propFail(V site, V in, V e, V n) {
   }
   char b[64];
   snprintf(b, sizeof b, "(random input %d, shrunk)", (int)num(n));
-  propFailed(p, why + "\n    " + (is(e, K::Str) ? std::string(as<Str>(e)->sv()) : "threw " + show(e)) + "\n    " + b);
+  propFailed(p, why + "\n    " + (is(e, K::Str) ? std::string(as<Str>(e)->sv()) : "threw " + toStr(e, true)) + "\n    " + b);
 }
 static V propDone(V site, V ok, V n) {  // too few inputs met the requires to call it tested
   if (num(ok) >= 20) return NIL;

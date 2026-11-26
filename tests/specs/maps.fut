@@ -8,6 +8,6 @@ test "literal keys, missing keys, update and printing" {
   m["ver"] += 1
   m.extra = 1 == 1
   expect m == {name: "fut", ver: 3, 3: "three", extra: true}
-  expect prints { print(m) } == "\{\"name\": \"fut\", \"ver\": 3, 3: \"three\", \"extra\": true}\n"
+  expect prints { print(m) } == "\{name: \"fut\", ver: 3, 3: \"three\", extra: true}\n"
   expect m.name + m.missing == "futnil"
 }

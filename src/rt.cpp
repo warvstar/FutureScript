@@ -2,9 +2,11 @@
 // (executable memory, stack traces, fibers, C calls) is in jit.cpp, the WebAssembly half in wasm.cpp.
 #include "fut.h"
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstdarg>
 #include <unordered_map>
+#include <unordered_set>
 #include <time.h>
 #if !__wasm__
 #include <sys/mman.h>
@@ -134,36 +136,118 @@ const char* typeName(V v) {
   static const char* n[] = {"string", "list", "function", "class", "instance", "map", "function", "fiber", "js value", "channel", "task"};
   return n[(int)obj(v)->kind];
 }
-std::string toStr(V v, bool quote) {
-  if (isNum(v)) {
-    char b[32];
-    double d = num(v);
-    if (std::fabs(d) < 1e15 && d == (double)(long long)d) snprintf(b, 32, "%lld", (long long)d);
-    else if (std::fabs(d) < 1e19 && d == std::trunc(d)) snprintf(b, 32, "%.0f", d);  // whole: every digit it holds
-    else snprintf(b, 32, "%.14g", d);
-    return b;
+static std::string numberText(double d) {
+  if (std::isnan(d)) return "(0/0)";
+  if (std::isinf(d)) return d < 0 ? "-1e309" : "1e309";
+  if (std::fabs(d) <= 9007199254740992.0 && d == std::trunc(d))
+    return d == 0 && std::signbit(d) ? "-0" : std::to_string((int64_t)d);
+
+  // Get the shortest round-tripping significand, then choose where to put the decimal point.
+  char buf[32];
+  auto end = std::to_chars(buf, buf + sizeof buf, d, std::chars_format::scientific).ptr;
+  const char* e = std::find(buf, end, 'e');
+  int exponent = 0;
+  std::from_chars(e + 2, end, exponent);
+  if (e[1] == '-') exponent = -exponent;
+  if (exponent < -6 || exponent >= 21) return std::string(buf, e + 1 - buf) + std::to_string(exponent);
+  std::string out = d < 0 ? "-" : "";
+  const char* first = buf + out.size();
+  std::string digits(first, first + 1);
+  if (first + 1 < e) digits.append(first + 2, e);
+  int point = exponent + 1;
+  if (point <= 0) return out + "0." + std::string(-point, '0') + digits;
+  digits.resize(std::max(digits.size(), (size_t)point), '0');
+  if ((size_t)point < digits.size()) digits.insert(point, 1, '.');
+  return out + digits;
+}
+
+static bool bareKey(std::string_view s) {
+  auto letter = [](char c) { return ((c | 32) >= 'a' && (c | 32) <= 'z') || c == '_'; };
+  if (s.empty() || !letter(s.front())) return false;
+  for (char c : s) if (!letter(c) && !(c >= '0' && c <= '9')) return false;
+  static constexpr std::string_view keywords[] = {
+#define KEYWORD_TEXT(k) #k,
+    KEYWORDS(KEYWORD_TEXT)
+#undef KEYWORD_TEXT
+  };
+  return std::find(std::begin(keywords), std::end(keywords), s) == std::end(keywords);
+}
+static void renderString(std::string& out, std::string_view s) {
+  out += '"';
+  for (char c : s) {
+    switch (c) {
+      case '\n': out += "\\n"; break;
+      case '\t': out += "\\t"; break;
+      case '\0': out += "\\0"; break;
+      case '"': case '\\': case '{': out += '\\'; [[fallthrough]];
+      default: out += c;
+    }
   }
-  if (!isObj(v)) return v == NIL ? "nil" : v == TRUE_ ? "true" : "false";
+  out += '"';
+}
+
+static void render(std::string& out, V v, bool quote, std::unordered_set<Obj*>& active) {
+  if (isNum(v)) { out += numberText(num(v)); return; }
+  if (!isObj(v)) { out += v == NIL ? "nil" : v == TRUE_ ? "true" : "false"; return; }
   Obj* o = obj(v);
-  std::string s;
   switch (o->kind) {
-    case K::Str: return quote ? "\"" + std::string(((Str*)o)->sv()) + "\"" : std::string(((Str*)o)->sv());
-    case K::List:
-      for (V x : ((List*)o)->v) s += (s.empty() ? "" : ", ") + toStr(x, true);
-      return "[" + s + "]";
-    case K::Map:
-      for (auto& [k, x] : ((Map*)o)->e) s += (s.empty() ? "" : ", ") + toStr(k, true) + ": " + toStr(x, true);
-      return "{" + s + "}";
-    case K::Fn: return "<fn " + symName(((Fn*)o)->name) + ">";
-    case K::Clo: return "<fn " + symName(((Clo*)o)->fn->name) + ">";
-    case K::Class: return "<class " + symName(((Class*)o)->name) + ">";
-    case K::Inst: return "<" + symName(((Inst*)o)->cls->name) + ">";
-    case K::Fiber: return "<fiber>";
-    case K::Ref: return "<js value>";
-    case K::Chan: return "<channel>";
-    case K::Task: return "<task>";
-    default: return "?";
+    case K::Str: {
+      auto s = as<Str>(v)->sv();
+      if (quote) renderString(out, s);
+      else out += s;
+      return;
+    }
+    case K::Fn: out += "<fn " + symName(as<Fn>(v)->name) + ">"; return;
+    case K::Clo: out += "<fn " + symName(as<Clo>(v)->fn->name) + ">"; return;
+    case K::Class: out += "<class " + symName(as<Class>(v)->name) + ">"; return;
+    case K::Fiber: out += "<fiber>"; return;
+    case K::Ref: out += "<js value>"; return;
+    case K::Chan: out += "<channel>"; return;
+    case K::Task: out += "<task>"; return;
+    case K::List: case K::Map: case K::Inst: break;
+    default: out += '?'; return;
   }
+  if (!active.insert(o).second) { out += "<cycle>"; return; }
+  bool first = true;
+  auto separator = [&] { if (!std::exchange(first, false)) out += ", "; };
+  if (o->kind == K::List) {
+    out += '[';
+    for (V x : as<List>(v)->v) {
+      separator();
+      render(out, x, true, active);
+    }
+    out += ']';
+  } else if (o->kind == K::Map) {
+    out += '{';
+    for (auto& [k, x] : as<Map>(v)->e) {
+      separator();
+      bool bare = is(k, K::Str) && bareKey(as<Str>(k)->sv());
+      render(out, k, !bare, active);
+      out += ": ";
+      render(out, x, true, active);
+    }
+    out += '}';
+  } else {
+    Inst* in = as<Inst>(v);
+    out += symName(in->cls->name);
+    out += '{';
+    const int* names = in->cls->layout.data.load(std::memory_order_acquire);
+    for (u32 i = 0; i < in->nslots; i++) {
+      if (in->slots[i] == ABSENT) continue;
+      separator();
+      out += symName(names[i]);
+      out += ": ";
+      render(out, in->slots[i], true, active);
+    }
+    out += '}';
+  }
+  active.erase(o);
+}
+std::string toStr(V v, bool quote) {
+  std::string out;
+  std::unordered_set<Obj*> active;
+  render(out, v, quote, active);
+  return out;
 }
 static bool equal(V a, V b) {
   if (isNum(a) && isNum(b)) return num(a) == num(b);
@@ -538,6 +622,16 @@ static V n_print(V v) {
   std::string t;
   return emitOut(text(v, t)), NIL;
 }
+static V rt_printArgs(V* w, uint64_t n) {
+  if (n == 1 && is(w[0], K::Str)) return w[0];
+  std::string out;
+  std::unordered_set<Obj*> active;
+  for (uint64_t i = 0; i < n; i++) {
+    if (i) out += ' ';
+    render(out, w[i], false, active);
+  }
+  return box(newStr(out));
+}
 V binopValue(V a, V b, int op) { return rt_binop(a, b, op); }
 static V n_str(V v) { return is(v, K::Str) ? v : box(newStr(toStr(v))); }
 static V n_len(V v) {
@@ -703,6 +797,7 @@ void rtInit() {
   void* h[NH] = {(void*)rt_poll, (void*)rt_stack, (void*)rt_binop, (void*)rt_getf, (void*)rt_setf, (void*)rt_geti,
                  (void*)rt_seti, (void*)rt_prep, (void*)rt_list, (void*)rt_iter, (void*)rt_numchk, (void*)rt_undef,
                  (void*)rt_map, (void*)rt_closure, (void*)rt_stale, (void*)rt_echo, nullptr, (void*)rt_yield, nullptr, (void*)rt_throw};
+  h[H_PRINTARGS] = (void*)rt_printArgs;
   memcpy(vm->helpers, h, sizeof h);  // H_FFI and H_HOT: platformInit
   identCode = callable<+[](V self) { return self; }>();
   platformInit();

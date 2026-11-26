@@ -484,7 +484,7 @@ def runner_modules(exe):
         'try { boom() } catch e { print(e) }\nvar c = counter()\nbump(c)\nprint(bump(c))\nprint(c)\n'
         "print(add(2, 3))\nprint(dbl(4000000000))\n")
     r = run("main.fut")
-    want = ['{"keys": ["n", "s"], "n": 42, "list": [1, [2]], "ok": true, "none": nil}', "[10, 20]", "[true, nil]",
+    want = ['{keys: ["n", "s"], n: 42, list: [1, [2]], ok: true, none: nil}', "[10, 20]", "[true, nil]",
             "boom(): kaboom", "2", "<js value>", "5", "8000000000"]
     return r.stdout.splitlines() == want, f"got: {r.stdout!r}\n  stderr: {r.stderr!r}"
 

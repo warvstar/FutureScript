@@ -580,6 +580,14 @@ struct Compiler : Gen {
     callWindow(base, n, S_push, false);
   }
   void call(int sym, bool super) { int base = slot(); st(0, base), callWindow(base, exprList(')'), sym, super); }
+  void printCall(const Tok& t, Global& g) {
+    int base = slot();
+    gmem(0, g.slot), st(0, base);
+    int n = exprList(')');
+    if (!n) failAt(t.p, t.line, "@arity 'print' expects at least 1 argument, got 0");
+    collect(base + 1, n, H_PRINTARGS), st(0, slot());
+    callWindow(base, 1, 0, false);
+  }
   void construct(Global& g) {  // C(args) for a top-level class C
     int base = slot();
     gmem(0, g.slot), st(0, base);
@@ -753,6 +761,7 @@ struct Compiler : Gen {
     if (pubContract && g->kind != 'n' && !(t.sym < (int)pubSym.size() && pubSym[t.sym]))  // the .api shows the clause, not the name
       failAt(t.p, t.line, "@private %s can only use what its readers can see, and '%s' is private: make it pub, or write the condition without it",
              pubContract, name(prev.sym));
+    if (g->kind == 'n' && at('(') && !cur.nl && symName(t.sym) == "print") return next(), printCall(t, *g), LV{};
     if (g->kind == 'f' && at('(') && !cur.nl) return next(), directCall(t, *g), t.sym == F->self || returnsNum(t.sym) ? NUM : LV{};
     if (g->kind == 'c' && at('(') && !cur.nl) return next(), construct(*g), LV{};
     if (g->kind == 'e') return perform(t), LV{};

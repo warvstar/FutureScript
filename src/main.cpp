@@ -302,6 +302,7 @@ static int workerCommand(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
+  setvbuf(stdout, nullptr, _IOLBF, 0);  // keep completed lines visible even if the program crashes
   findStd();
   if (argc > 1 && std::string(argv[1]) == "explain") return explain(argc > 2 ? argv[2] : nullptr);  // an error code's rule and fix
   if (argc > 1 && std::string(argv[1]) == "worker") return workerCommand(argc, argv);

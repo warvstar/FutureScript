@@ -5,7 +5,7 @@ print(7 % 3)              // expect: 1
 print(-7 % 3)             // expect: 2
 print(10 / 4)             // expect: 2.5
 print(-(2 + 3))           // expect: -5
-print(0.1 + 0.2)          // expect: 0.3
+print(0.1 + 0.2)          // expect: 0.30000000000000004
 print("a" + "b" + 1)      // expect: ab1
 print(1 < 2 && 2 < 3)     // expect: true
 print(!nil)               // expect: true

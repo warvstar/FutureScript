@@ -19,4 +19,11 @@ fn local() { var expect = 1 expect = 2 return expect }
 print(local()) // expect: 2
 var test = "t"
 print(test) // expect: t
+var a = []
+a.push(a)
+a.push({x: 0.1 + 0.2})
+var b = []
+b.push(b)
+b.push({x: 0.3})
+try { expect a == b } catch e { print(e) } // expect: expect failed: a == b (a is [<cycle>, {x: 0.30000000000000004}], b is [<cycle>, {x: 0.3}], first difference at [1].x: 0.30000000000000004 vs 0.3)
 fn main() { print("main runs") } // expect: main runs

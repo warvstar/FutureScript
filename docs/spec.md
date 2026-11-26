@@ -42,7 +42,7 @@ expect s == 6
 ## Builtins
 
 ```
-print(v)                 one value, then a newline
+print(a, ...)            one or more values joined by spaces, then a newline
 len(v)                   of a str, list or map
 str(v)                   v as text
 int(n)  floor(n)  sqrt(n)   int truncates toward 0 (numbers only)

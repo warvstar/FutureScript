@@ -19,4 +19,4 @@ class Counter { fn inc() { self.n = self.n + 1 return self } }
 var c = Counter()
 c.n = 0
 print(c.inc().inc().n)           // expect: 2
-print(r)                         // expect: <Rect>
+print(r)                         // expect: Rect{name: "rect", w: 5, h: 1}

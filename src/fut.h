@@ -279,7 +279,7 @@ const std::string& symName(int);
 
 // ---- the VM block pinned in x28; JIT code reaches helpers and globals with one ldr ----
 enum Helper { H_POLL, H_STACK, H_BINOP, H_GETF, H_SETF, H_GETI, H_SETI, H_PREP, H_LIST, H_ITER, H_NUMCHK, H_UNDEF,
-              H_MAP, H_CLOSURE, H_STALE, H_ECHO, H_FFI, H_YIELD, H_HOT, H_THROW, H_CAPSET, H_TXUNWIND, H_TYPECHK, H_EFFECT, H_INVENTER, NH };
+              H_MAP, H_CLOSURE, H_STALE, H_ECHO, H_FFI, H_YIELD, H_HOT, H_THROW, H_CAPSET, H_TXUNWIND, H_TYPECHK, H_EFFECT, H_INVENTER, H_PRINTARGS, NH };
 enum Op { O_ADD, O_SUB, O_MUL, O_DIV, O_MOD, O_EQ, O_NE, O_LT, O_LE, O_GT, O_GE, O_BAND, O_BOR, O_BXOR, O_SHL, O_SHR };
 constexpr int MAXG = 1 << 16;
 // Per-site inline cache. key: the receiver's header word (methods compare only its class id); val: slot or code.

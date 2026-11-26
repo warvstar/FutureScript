@@ -19,7 +19,7 @@ print(eq("x", "x")) // expect: true
 print(eq(nil, 1)) // expect: false
 print(nan(0 / 0)) // expect: nan
 print(nan(3)) // expect: num
-print(C(5)) // expect: <C>
+print(C(5)) // expect: C{}
 print(C(1).v) // expect: 1
 print(count(1000)) // expect: 1000
 print(mixed(1, 5)) // expect: in

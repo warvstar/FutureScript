@@ -35,6 +35,7 @@ struct Lexer {
         return k.n = (double)strtoull(p, (char**)&p, 16), k.t = T_NUM, k;
       while (dig(*p)) k.n = k.n * 10 + (*p++ - '0');
       if ((*p == '.' && dig(p[1])) || *p == 'e' || *p == 'E') k.n = strtod(k.p, (char**)&p);
+      else if (p - k.p > 15) k.n = strtod(std::string(k.p, p).c_str(), nullptr);  // round the whole decimal token once
       return k.t = T_NUM, k;
     }
     if (idc(*p)) {
