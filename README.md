@@ -629,6 +629,25 @@ for i in 0..8 { spawn render(scene, i) }  // each isolate reads the same one: no
 - **A frozen value goes when nothing holds it:** no isolate reaches it, no message carries it, and no other frozen
   value contains it. `frozenCount()` is how many frozen objects are alive.
 
+### Shared vars
+
+```
+shared var hits = 0
+shared var cache = {}
+fn remember(k, v) { atomic { var c = thaw(cache)  c[k] = v  cache = c } }
+spawn remember("a", 1)  ...  atomic { hits += 1 }  ...  print(hits)
+```
+
+- **One variable for every isolate,** for the rare state that really is global: a counter, a cache. Other globals
+  are copied into each isolate; a `shared var` isn't. It holds frozen values: assigning one freezes a copy, so no
+  isolate can change what another is reading.
+- **Assigned only inside `atomic { }`,** whose blocks become transactions across isolates. A block reads one
+  consistent snapshot, and commits only if no shared var it read changed meanwhile; otherwise it is rolled back and
+  runs again, its function's locals as they were, until it commits. So `atomic { hits += 1 }` from 8 isolates at
+  once loses no update. Outside `atomic`, reading one gives the latest committed value.
+- **Cost:** about 0.4 µs for an uncontended `atomic { hits += 1 }`, 1.6 µs with 8 isolates contending, and 30 ns for
+  a read outside `atomic`. A `parallel for`'s body can't read or assign one (its result would depend on timing).
+
 ## C functions
 
 ```

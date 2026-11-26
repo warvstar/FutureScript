@@ -205,6 +205,7 @@ V n_isFrozen(V v) { return boxb(isObj(v) && (gcFrozen(obj(v)) || image(obj(v))))
 V n_frozenLive() { return box((double)frozenLive()); }
 }  // namespace
 
+V freezeValue(V v) { return n_freeze(v); }
 void freezeInit() {
   native<n_freeze>("freeze"), native<n_thaw>("thaw"), native<n_isFrozen>("isFrozen"), native<n_frozenLive>("frozenCount");
 }

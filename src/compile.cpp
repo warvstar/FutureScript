@@ -603,6 +603,7 @@ struct Compiler : Gen {
       case LV_LOCAL: ldl(0, v.a); break;
       case LV_GLOBAL: gmem(0, v.a); break;
       case LV_CAP: capLoad(v.a); break;
+      case LV_SHARED: imm(0, box((double)v.a)), callNative("shared@get", true); break;
       case LV_FIELD: field(v.b, false); break;
       case LV_INDEX: mv(1, 0), ld(0, v.a), F->depth--, index(false); break;  // index in x0, object in slot a
     }
@@ -1060,6 +1061,7 @@ struct Compiler : Gen {
     if (g->kind == 'c' && at('(') && !cur.nl) return next(), construct(*g), LV{};
     if (g->kind == 'e') return perform(t), LV{};
     if (g->kind == 't') failAt(t.p, t.line, "@not-a-value '%s' is a type: use it after ':' (x: %s)", name(t.sym), name(t.sym));
+    if (g->kind == 's') return {LV_SHARED, g->cell, t.sym};
     return {LV_GLOBAL, g->slot, t.sym, g->kind != 'v'};  // b: its symbol, for its type
   }
   LV postfix() {
@@ -1228,6 +1230,7 @@ struct Compiler : Gen {
     if (accept(';')) return false;
     if (at('{')) return block(), false;
     if (at(T_ID) && cur.sym == S_parallel && peek().t == T_ID && peek().sym == K_for) return next(), parallelFor(), false;
+    if (at(T_ID) && cur.sym == S_shared && peek().t == T_ID && peek().sym == K_var && !peek().nl) return next(), sharedVar(), false;
     if (at(T_ID)) switch (cur.sym) {
         case K_var: {
           next();
@@ -1271,7 +1274,8 @@ struct Compiler : Gen {
           if (F->parVar >= 0) failAt(prev.p, prev.line, "@parallel a parallel for's body can't return: every iteration runs (write each result to a buffer at [i])");
         {
           bool n = at('}') || at(T_EOF) || cur.nl ? (imm(0, NIL), false) : expr();
-          for (int i = 0; i < F->atomics; i++) callNative("atomic@end", true);  // passes x0 through
+          for (int i = 0; i < F->atomics; i++)  // the last is the outermost: it may run the block again
+            i == F->atomics - 1 && F->retry ? commitOrRetry(true) : callNative("atomic@end", true);  // passes x0 through
           for (int i = 0; i < F->handles; i++) callNative("handle@end", true);
           leaveTries(0);                          // leaving every try
           F->retNum &= n || F->retTy == TY_NUM;  // the epilogue checks the result type
@@ -1281,7 +1285,8 @@ struct Compiler : Gen {
           next();
           if (!F->loop && F->parVar >= 0) failAt(prev.p, prev.line, "@parallel a parallel for's body can't %s: every iteration runs", name(prev.sym));
           if (!F->loop) failAt(prev.p, prev.line, "@misplaced '%s' outside a loop", name(prev.sym));
-          for (int i = F->atomics; i > F->loop->atomics; i--) callNative("atomic@end", true);
+          for (int i = F->atomics; i > F->loop->atomics; i--)
+            i == 1 && F->retry ? commitOrRetry(false) : callNative("atomic@end", true);
           for (int i = F->handles; i > F->loop->handles; i--) callNative("handle@end", true);
           leaveTries(F->loop->tries), jump(*F->loop, prev.sym == K_break), F->live = false;
           return false;
@@ -1344,10 +1349,60 @@ struct Compiler : Gen {
   // atomic { }: its changes to state other code can see (fields, lists, maps, globals, captured variables) all
   // happen, or none do: an error leaving it rolls them back (txn.cpp) before whatever catches the error runs.
   // It commits wherever control leaves it normally: its end, return, break or continue.
+  // shared var name = value: one variable for every isolate (shared.cpp). Its first run sets it; a reload's keeps it.
+  void sharedVar() {
+    next();
+    if (!F->top || F->scope) fail("@misplaced 'shared var' is only allowed at top level");
+    Tok n = cur;
+    int s = ident();
+    if (at(':')) failAt(cur.p, cur.line, "@syntax a shared var has no declared type");
+    if (!accept('=')) failAt(n.p, n.line, "@syntax shared var '%s' needs an initial value", name(s));
+    expr();
+    Global* g = findGlobal(qualify(s));
+    if (!g || g->kind != 's') failAt(n.p, n.line, "internal: shared var '%s' wasn't declared", name(s));
+    sharedCall("shared@init", g->cell);
+  }
+  // The outermost atomic block of a function is also a loop: a conflict on a shared var (atomic@commit returning
+  // false, at any exit) rolls it back and runs it again, with the function's locals as they were when it started.
+  // An atomic block inside it joins it (and one in a function called inside it joins it at run time).
   void atomicStmt() {
+    if (F->atomics) {
+      callNative("atomic@begin", false);
+      F->atomics++, block(), F->atomics--;
+      if (F->live) callNative("atomic@end", true);
+      return;
+    }
+    std::vector<std::pair<int, int>> saves;  // (home, slot)
+    for (auto& l : F->locals) {
+      int t = slot();
+      ldl(0, l.home), st(0, t), saves.push_back({l.home, t});
+    }
+    Loop rl;
+    rl.tries = F->tries.size(), rl.handles = F->handles, rl.depth = 0;
+    loopBegin(rl), bodyBegin(rl);
     callNative("atomic@begin", false);
-    F->atomics++, block(), F->atomics--;
-    if (F->live) callNative("atomic@end", true);
+    F->retry = &rl, F->atomics++, block(), F->atomics--;
+    bool live = F->live;
+    if (live) commitOrRetry(false), jump(rl, true);
+    F->retry = nullptr;
+    F->live = true, contHere(rl);
+    for (auto [h, t] : saves) ld(0, t), stl(0, h);
+    F->facts.reset(), loopBack(rl), loopEnd(rl);
+    F->facts.reset(), F->live = live;
+  }
+  // The outermost atomic block ends here: commit, or (another isolate changed a shared var it read) run it again.
+  void commitOrRetry(bool keep) {  // keep: x0 survives (a return's value)
+    int k = slot();
+    if (keep) st(0, k);
+    callNative("atomic@commit", false);
+    Cond c = truthyCond();
+    continueUnless(*F->retry, c);
+    if (keep) ld(0, k);
+    F->depth = k;
+  }
+  void sharedCall(const char* nm, int cell) {  // nm(cell, x0)
+    int base = slot(), a = slot(), b = slot();
+    st(0, b), imm(0, box((double)cell)), st(0, a), internalCall(nm, base, 2);
   }
   static const char* tokStart(const Tok& t) { return t.t == T_STR ? t.p - 1 : t.p; }  // a string token's p is past its quote
   // expect <condition>: `expect` starts a statement unless a variable or function of that name is in scope.
@@ -1519,6 +1574,12 @@ struct Compiler : Gen {
       return;
     }
     auto value = [&](bool lnum = false) { return op < 0 ? expr() : rhs(op, 0, lnum, v.k == LV_LOCAL ? v.a : NOH); };
+    if (v.k == LV_SHARED) {
+      LV t = v;
+      if (op >= 0) load(t);
+      value();
+      return sharedCall("shared@set", v.a);
+    }
     if (v.k == LV_LOCAL || v.k == LV_GLOBAL || v.k == LV_CAP) {
       LV t = v;
       if (op >= 0) load(t);
@@ -2088,6 +2149,7 @@ struct Compiler : Gen {
     else k = kind;
     g.kind = kind;
     if (kind == 'f' && !g.stub) g.stub = newStub();
+    if (kind == 's' && (g.cell = sharedCell(symName(t.sym))) < 0) failAt(t.p, t.line, "@limit too many shared vars");
     mixEnv(uint64_t(t.sym) << 16 | uint64_t(kind) << 8 | uint64_t(arity), pubRaw), pubRaw = -1;
   }
   std::string resolvePath(std::string_view rel) {
@@ -2280,7 +2342,7 @@ struct Compiler : Gen {
       }
       return n;
     };
-    for (Tok t = lex(L), p; t.t != T_EOF; p = t, t = lex(L)) {
+    for (Tok t = lex(L), p, pp; t.t != T_EOF; pp = p, p = t, t = lex(L)) {
       bool afterKw = p.t == T_ID && t.t == T_ID;
       topTry |= tryWord(t) && open.empty();  // a try in top-level code
       if (t.t == T_ID && !stepsOn) {  // a program that names budget or stepCount counts steps from now on (fuel.cpp)
@@ -2335,7 +2397,8 @@ struct Compiler : Gen {
         mixEnv(fnv(from, L.p) ^ uint64_t(d.sym) << 32, raw);  // code that checks fields against it compiles against it
       } else if (depth == 0 && afterKw && (p.sym == K_class || p.sym == K_var)) {
         Tok d = q(t);
-        declare(d, p.sym == K_class ? 'c' : 'v', 0);
+        bool shared = p.sym == K_var && pp.t == T_ID && pp.sym == S_shared && !p.nl;
+        declare(d, p.sym == K_class ? 'c' : shared ? 's' : 'v', 0);
         if (p.sym == K_class) {
           enumDefs.erase(d.sym);  // (an enum by this name before a reload)
           cls = d.sym, classAt[cls] = {{t.p, t.line, file, srcStart}, t.sym};

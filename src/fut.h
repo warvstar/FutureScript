@@ -329,7 +329,16 @@ struct FreezeScope { FreezeScope(); ~FreezeScope(); void ref(Obj*); void hold(Ob
 void frozenRef(Obj*);      // a message or a shared var holds it
 void frozenRelease(Obj*);
 void frozenHold(Obj*);     // the running isolate holds it (a message's, decoded)
-size_t frozenLive();       // frozen objects alive (tests)
+size_t frozenLive();
+// frozenMu held while it lasts (nothing may raise inside): references on frozen values (others are ignored)
+struct FrozenLock { FrozenLock(); ~FrozenLock(); void ref(V); void drop(V); void hold(V); FrozenLock(const FrozenLock&) = delete; };
+V freezeValue(V);  // freeze(v) (freeze.cpp)
+// shared vars (shared.cpp): process-wide cells of frozen values, changed only inside atomic { }
+int sharedCell(const std::string& name);  // the cell of a `shared var`, by its qualified name (the same across reloads)
+void sharedInit();
+bool sharedCommit();  // the outermost atomic block ends: false if another isolate changed what it read (roll back, retry)
+void sharedAbort();   // ... or it is rolled back
+bool txnInParallel();  // in a parallel for's body (txn.cpp)       // frozen objects alive (tests)
 void gcOwn(Obj*);  // o holds malloc'd memory: finalize it when the GC finds it dead
 template <class T> T* make(size_t extra = 0) {
   T* o = new (gcAlloc(sizeof(T) + extra)) T();
@@ -348,7 +357,7 @@ inline TLS uintptr_t* stackTop;
   X(true) X(false) X(nil) X(self) X(super) X(import) X(extern) X(yield) X(try) X(catch) X(throw)
 #define SYM_ENUM(k) K_##k,
 #define SYM_STR(k) #k,
-#define EXTRA_SYMS(X) X(init) X(main) X(push) X(pop) X(len) X(has) X(remove) X(keys) X(values) X(reload) X(resume) X(send) X(done) X(as) X(test) X(expect) X(throws) X(prints) X(pub) X(override) X(atomic) X(effect) X(handle) X(with) X(requires) X(ensures) X(invariant) X(old) X(result) X(allocs) X(grows) X(like) X(todo) X(spawn) X(type) X(enum) X(match) X(parallel)
+#define EXTRA_SYMS(X) X(init) X(main) X(push) X(pop) X(len) X(has) X(remove) X(keys) X(values) X(reload) X(resume) X(send) X(done) X(as) X(test) X(expect) X(throws) X(prints) X(pub) X(override) X(atomic) X(effect) X(handle) X(with) X(requires) X(ensures) X(invariant) X(old) X(result) X(allocs) X(grows) X(like) X(todo) X(spawn) X(type) X(enum) X(match) X(parallel) X(shared)
 #define SYM_S(k) S_##k,
 enum { KEYWORDS(SYM_ENUM) NKW, S_FIRST = NKW - 1, EXTRA_SYMS(SYM_S) };
 int intern(std::string_view);
@@ -419,7 +428,7 @@ extern u32 icEpoch;  // bumped whenever method tables may have changed
 void clearICs();
 void reshape(Class*);  // after its layout grew: what JIT constructors allocate for it
 
-struct Global { int slot = -1; char kind = 'v'; u32* stub = nullptr; Obj* o = nullptr; bool inited = false; uint64_t type = 0; int typeSite = -1; };  // kind: v f c n(ative); type: a var's declared type
+struct Global { int slot = -1, cell = -1; char kind = 'v'; u32* stub = nullptr; Obj* o = nullptr; bool inited = false; uint64_t type = 0; int typeSite = -1; };  // kind: v f c n(ative); type: a var's declared type
 extern std::deque<Global> globals;  // by symbol (slot -1: not declared); a deque, so references survive growth
 extern std::vector<V> consts;       // GC roots forever
 Global& global(int sym);

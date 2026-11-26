@@ -247,6 +247,7 @@ struct Gen : CState {
     for (int c : lp.cont) patch(c, lp.contAt);
   }
   void jump(Loop& lp, bool brk) { (brk ? lp.brk : lp.cont).push_back(E(B)); }
+  void continueUnless(Loop& lp, Cond& c) { for (int j : c) lp.cont.push_back(j); }  // to the continue target if c is false
   void leaveTries(size_t k) { if (F->tries.size() > k) ld(9, F->tries[k]), E(str(9, 28, VM_HANDLER)); }  // unlink tries k..
   // try { } catch e { }: the record (prev, sp, fp, x26, handler pc, vm->txn, then the effect state: vm->allowed,
   // vm->hstack, vm->who with vm->budgets, vm->inv) lives in ten frame slots and is linked into vm->handler; a throw (or runtime error) unlinks

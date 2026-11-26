@@ -188,8 +188,8 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
 7. **Frozen values and shared state.**
    - Step one, done: `freeze(v)` makes a deep-immutable value that is sent as a pointer, not copied; `thaw(v)` a copy
      to change. Counted references free it.
-   - Work: `shared` objects that can be changed only inside `atomic`, which becomes cross-isolate software
-     transactional memory with a version clock, retried on conflict. This is for the rare state that really is
+   - Step two, done: `shared var`s, assigned only inside `atomic`, which becomes cross-isolate software
+     transactional memory with a version clock, run again on conflict. This is for the rare state that really is
      global, such as a cache or a counter.
 
 ## Decisions
@@ -501,3 +501,34 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
   `join` passing it take 28 µs, against 79–104 ms copying it.
 - **Reads race nothing.** Reading never writes a frozen object: strings hash when made, type tagging
   (`src/types.cpp`) skips frozen lists and maps, and nothing frees one while an isolate can still reach it.
+
+## Phase 7, step two as built: shared vars and transactions
+
+- **Decisions** (asked): `freeze` copies; shared state is `shared var` (not shared classes); a read outside `atomic`
+  gives the latest committed value; a block that conflicts runs again with no limit.
+- **Declaring.** `shared var name = value` at top level. The declaration scan marks it (kind `'s'`), and it gets a
+  cell (`sharedCell`, `src/shared.cpp`) by its qualified name, the same across reloads; code names the cell by
+  index (`LV_SHARED`): reads compile to `shared@get(cell)`, assignments to `shared@set(cell, v)`, the declaration
+  to `shared@init(cell, v)`, which sets it only the first time, so a reload keeps the value.
+- **Versions.** A cell keeps its committed values, each with the clock tick of the commit that wrote it (the
+  declaration's is 0) and a reference on the frozen value. A block takes a snapshot (the clock) when it first
+  touches a shared var, registered among the running snapshots; it reads the newest version at or before it, and
+  records what it read; `shared@set` freezes the value and keeps it in the block's write set (with a reference).
+  So a block always sees one state that existed, however others commit meanwhile: no block computes on a mix.
+  A version goes once a newer one is at or before every running snapshot (`prune`, when the cell is written).
+- **Committing.** The outermost atomic block (`Level::stm`) commits shared vars at its end (`atomic@commit`): under
+  the lock, if it wrote anything and any var it read has a version newer than its snapshot, it conflicts;
+  otherwise the clock ticks and its writes become the newest versions. A block that only reads always commits (its
+  snapshot was consistent). On a conflict the block is rolled back as for an error (txn.cpp), its effect state and
+  innermost `try` put back as `atomic@begin` found them, and `atomic@commit` returns false.
+- **Running again.** The compiler makes a function's outermost `atomic { }` a loop (`atomicStmt`): it copies the
+  function's locals to frame slots before it, and every exit (the end, `return`, `break` or `continue` out of it)
+  calls `atomic@commit`, then goes on, or, on false, jumps to the loop's continue target, which puts the locals back
+  and goes round (through a safepoint). An `atomic` inside it, or in a function called inside it, joins it. So a
+  block's retries are invisible: its locals, objects and globals are as they were, and it never ran io.
+- **Locks.** Every shared var operation takes `frozenMu` briefly (`FrozenLock`), which also keeps a value read from
+  being freed before the reader holds it. A read outside `atomic` locks, takes the newest value, and holds it.
+- **Speed** (natively, a loaded 12-core machine): an uncontended `atomic { hits += 1 }` 0.36 µs; 8 isolates
+  incrementing one var 1.6 µs per increment, none lost; a read outside `atomic` 29 ns.
+- **Not yet.** Per-cell locks or a lock-free read path (one global lock serializes shared operations, though
+  briefly); `retry`-style waiting until a var changes; shared vars in a `parallel for` (refused: timing-dependent).

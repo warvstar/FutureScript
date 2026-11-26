@@ -270,6 +270,7 @@ struct Gen : CState {
   void loopBack(Loop& lp) { if (stepsOn) fuel(); poll(), br(BR, lp.depth + 1); }
   void loopEnd(Loop&) { close(), close(); }
   void jump(Loop& lp, bool brk) { br(BR, brk ? lp.depth : lp.depth + 2); }
+  void continueUnless(Loop& lp, Cond&) { op(I32_EQZ), br(BR_IF, lp.depth + 2, UNLIKELY); }  // to the continue target if c is false
   void leaveTries(size_t) {}  // wasm try blocks are structured: leaving one needs nothing
   // block $done { block $catch (result i64) { try_table (catch $fut -> $catch) { body } br $done } e = it; reset sp; ... }
   // A frame slot keeps vm->txn at entry: the handler rolls back the transactions opened since (rt_txunwind). Four

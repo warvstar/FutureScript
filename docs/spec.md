@@ -218,6 +218,14 @@ Every isolate reads a frozen value in place: sending one (to `spawn`, `send`, a 
 however big. Lists, maps, instances, buffers, strings and closures freeze; a frozen value's parts already frozen are
 shared, not copied. Not channels, tasks, fibers, js values, or a value that contains itself. A frozen value goes when
 no isolate, message or other frozen value holds it; `frozenCount()` counts those alive (every isolate's). [frozen]
+```
+shared var hits = 0                 // top level: one variable for every isolate (other globals are copied)
+atomic { hits += 1 }                // assigned only inside atomic; reads anywhere give the latest committed value
+```
+A shared var holds frozen values (assigning freezes a copy). An atomic block that uses shared vars is a transaction
+across isolates: it reads one consistent snapshot, and commits only if no var it read changed meanwhile; otherwise it
+is rolled back and runs again (the function's locals as they were), with no limit. Its first run sets a shared var; a
+reload keeps its value. Not in a parallel for's body. [atomic]
 
 ## Modules, packages
 

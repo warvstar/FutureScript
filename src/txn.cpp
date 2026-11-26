@@ -13,6 +13,9 @@ struct Saved { Obj* o; std::vector<V> v; std::vector<u32> idx; u32 used = 0; std
 struct Level {
   Fiber* owner;                  // the fiber that opened it (null: the main stack)
   bool atomic = false;           // an atomic block (not a reload): it takes io away; allowed/who as it found them
+  bool stm = false;              // the outermost atomic block: it commits shared vars (shared.cpp), or runs again
+  EffState eff{};                // (stm) the effect state and innermost try it found, put back when it runs again
+  void* handler = nullptr;
   bool contract = false;         // a spec's checks: no effects at all, and always rolled back; allowed/who as above
   uint64_t allocs = 0;           // (contract) gcAllocations() when it opened: what the checks allocate isn't counted
   uint64_t allowed = 0;
@@ -91,6 +94,7 @@ void txnCommit() {
 void txnAbort() {
   if (levels.empty()) return;
   Level& l = levels.back();
+  if (l.stm) sharedAbort();
   for (auto& s : l.saved) restore(s);
   std::copy(l.globals.begin(), l.globals.end(), vm->globals);
   for (auto& a : l.after) a.drop(a.p);
@@ -116,6 +120,11 @@ bool txnAtomic() {
   for (auto& l : levels) if (l.atomic) return true;
   return false;
 }
+bool txnInParallel() {  // in a parallel for's body (inside an atomic block there too)
+  if (vm->who == WHO_PARALLEL) return true;
+  for (auto& l : levels) if (l.atomic && l.who == WHO_PARALLEL) return true;
+  return false;
+}
 bool txnOpenIn(Fiber* f) {
   for (auto& l : levels) if (l.owner == f) return true;
   return false;
@@ -136,15 +145,36 @@ void txnMark(void (*markV)(V)) {
 // An atomic block can't undo io, so it takes io away until it ends (a narrowing, like a declared function's): only a
 // handler installed inside the block can answer an io operation there.
 static V atomicBegin() {
+  bool outermost = !txnAtomic();
+  EffState eff = effSave();
   txnBegin();
   Level& l = levels.back();
   l.atomic = true, l.allowed = vm->allowed, l.who = vm->who;
+  if (outermost) l.stm = true, l.eff = eff, l.handler = vm->handler;
   vm->allowed = ((vm->allowed >> EFF_LEVEL) + 1) << EFF_LEVEL | (vm->allowed & EFF_BITS & ~EFF_IO), vm->who = WHO_ATOMIC;
   return NIL;
 }
 static V atomicEnd(V v) {
-  if (!levels.empty() && levels.back().atomic) vm->allowed = levels.back().allowed, vm->who = levels.back().who;
+  if (!levels.empty() && levels.back().atomic) {
+    if (levels.back().stm && !sharedCommit()) ERR("internal: an atomic block that can't run again conflicted on a shared var");
+    vm->allowed = levels.back().allowed, vm->who = levels.back().who;
+  }
   return txnCommit(), v;
+}
+// atomic@commit(): the end of an atomic block that runs again on a conflict (the compiler's atomicStmt). true: it
+// committed (or joined the block around it). false: another isolate changed a shared var it read since its snapshot,
+// so it was rolled back, with the effect state and tries as it found them, and the compiled code runs it again.
+static V atomicCommit() {
+  if (levels.empty() || !levels.back().atomic) return TRUE_;
+  Level& l = levels.back();
+  if (l.stm && !sharedCommit()) {
+    EffState eff = l.eff;
+    void* h = l.handler;
+    txnUnwind(u32(levels.size() - 1)), effLoad(eff), vm->handler = h;
+    return FALSE_;
+  }
+  vm->allowed = l.allowed, vm->who = l.who;
+  return txnCommit(), TRUE_;
 }
 // contract@begin(who) / contract@end(): around a spec's checks that call code. Checking a contract must not change
 // what the program does, so they run with no effects allowed (who: the contract, for messages) and whatever they
@@ -166,7 +196,8 @@ static V contractEnd() {
 static V rt_capset(V v, Clo* c, uint64_t i) { return txnTouch(c), c->env()[i] = v; }  // a captured variable, inside one
 static V rt_txunwind(V v, uint64_t depth) { return txnUnwind((u32)depth), v; }      // a try caught an error
 void txnInit() {
-  native<atomicBegin>("atomic@begin"), native<atomicEnd>("atomic@end");
+  native<atomicBegin>("atomic@begin"), native<atomicEnd>("atomic@end"), native<atomicCommit>("atomic@commit");
+  sharedInit();
   native<contractBegin>("contract@begin"), native<contractEnd>("contract@end");
   vm->helpers[H_CAPSET] = (void*)rt_capset, vm->helpers[H_TXUNWIND] = (void*)rt_txunwind;
 }

@@ -156,7 +156,7 @@ inline int prec(int t) { return t <= T_SHR ? BIN[t].first : 0; }
 inline int opOf(int t) { return BIN[t].second; }
 
 // ---------------- compiler state ----------------
-enum { LV_NONE = -1, LV_VAL, LV_LOCAL, LV_GLOBAL, LV_FIELD, LV_INDEX, LV_CAP };
+enum { LV_NONE = -1, LV_VAL, LV_LOCAL, LV_GLOBAL, LV_FIELD, LV_INDEX, LV_CAP, LV_SHARED };  // LV_SHARED: a shared var (a: its cell)
 struct LV { int k = LV_VAL, a = 0, b = 0; bool ro = false, num = false, own = false; };  // own: self.name  // a not-yet-loaded place, so `x = ...` can store
 constexpr LV NUM{LV_VAL, 0, 0, false, true};  // a value known to be a number
 struct Jumps {  // a few forward branches to patch to one place (no heap allocation)
@@ -188,6 +188,7 @@ struct Fun {  // per-function emission state
   std::bitset<1024> facts;  // locals proven to hold numbers here, by home + 128 (see proveOperands)
   bool live = true;        // false after return/break/continue, until the next join point
   Loop* loop = nullptr;
+  Loop* retry = nullptr;  // the outermost atomic { } being compiled: its exits commit, or run it again (atomicStmt)
   // Tier 2 (a recompile of a hot function): spec = parameters it speculates are numbers (bit i: the i-th
   // declared one); self = the function's own name if its recursive calls are assumed to return numbers,
   // which holds if every return is a proven number (retNum).

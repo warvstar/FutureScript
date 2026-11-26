@@ -434,6 +434,11 @@ void frozenHold(Obj* o) {
   if (cur->held.insert(o).second) frozenRc[o]++;
 }
 size_t frozenLive() { Locked l(frozenMu); return frozenRc.size(); }
+FrozenLock::FrozenLock() { frozenMu.lock(); }
+FrozenLock::~FrozenLock() { frozenMu.unlock(); }
+void FrozenLock::ref(V v) { if (isObj(v) && gcFrozen(obj(v))) frozenRc[obj(v)]++; }
+void FrozenLock::drop(V v) { if (isObj(v) && gcFrozen(obj(v))) frozenDrop(obj(v)); }
+void FrozenLock::hold(V v) { if (isObj(v) && gcFrozen(obj(v)) && cur->held.insert(obj(v)).second) frozenRc[obj(v)]++; }
 // Objects the running isolate allocated so far. Each takes one cell of its size class, so the runs being bumped
 // through (by JIT code too) say how many came from them: counting costs allocation nothing.
 TLS uint64_t gcUncounted;
