@@ -26,7 +26,8 @@
 // that matters is in memory: an allocation that would collect asks for one (Heap::wanted, vm->poll) and goes on.
 
 namespace {
-constexpr size_t PAGE = 1 << 16, REGION = (WASM ? 256ull << 20 : 8ull << 30), NPAGES = REGION / PAGE, GRAN = 16, PBITS = PAGE / GRAN;
+constexpr size_t PAGE = 1 << 16, GRAN = 16, PBITS = PAGE / GRAN;
+size_t REGION = WASM ? 256ull << 20 : 8ull << 30, NPAGES = REGION / PAGE;  // the heap's address range; gcRegion may set it
 constexpr size_t MIN_HEAP = (8 << 20) / PAGE;
 constexpr u32 NONE = ~0u;
 // type: 0 free, 1 small, 2 large head, 3 large tail; cold: madvised; owner: the heap's id (0: none)
@@ -278,6 +279,7 @@ bool due(Heap& h) {  // over the limit: collect now (natively), or at the next s
 }
 }  // namespace
 
+void gcRegion(size_t bytes) { REGION = bytes / PAGE * PAGE, NPAGES = REGION / PAGE; }  // before gcInit
 void gcInit() {
 #if __wasm__
   base = (uint8_t*)aligned_alloc(PAGE, REGION), live = (uint64_t*)calloc(2 * REGION / GRAN / 8, 1);

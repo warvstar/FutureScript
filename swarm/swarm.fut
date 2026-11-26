@@ -15,6 +15,7 @@ var MODEL = env("SWARM_MODEL") || "claude-haiku-5-5"   // every role's default; 
 var MODELS = {worker: env("SWARM_MODEL_WORKER") || MODEL, planner: env("SWARM_MODEL_PLANNER") || MODEL,
               approver: env("SWARM_MODEL_APPROVER") || MODEL, reviewer: env("SWARM_MODEL_REVIEWER") || MODEL}
 var MINUTES = parseNum(env("SWARM_MINUTES") || "0")    // run time limit, summed over restarts; 0: none
+var CF = env("SWARM_CF_URL")                            // set: test files run on this interpreting Worker, one per request
 var CAP = parseNum(env("SWARM_CAP") || "20")          // dollars, hard: no request starts that could cross it
 var NWORKERS = parseNum(env("SWARM_WORKERS") || "8")
 var MAXSTEPS = 90
@@ -129,6 +130,33 @@ var VERDICT_TOOLS = [tool("verdict", "Approve the change for main, or reject it 
   {approve: {type: "boolean"}, feedback: S}, ["approve", "feedback"])]
 
 // ---- tests ----
+var CFTOKEN = nil
+fn cfRun(dir, files) {  // each test file in its own request to the Worker, all at once; results shaped as exec's
+  if CFTOKEN == nil { CFTOKEN = (readFile(env("SWARM_CF_TOKEN_FILE") || DIR + "/.cftoken") || "").trim() }
+  var src = {}
+  for f in lines(sh("find . -path ./.git -prune -o -path '*/.fut-cache' -prune -o -type f \\( -name '*.fut' -o -name '*.api' -o -name fut.pkg \\) -print", dir).out) {
+    src[f.slice(2, f.len())] = readFile(dir + "/" + f)
+  }
+  var reqs = []
+  for f in files {
+    reqs.push({url: CF + "/run", method: "POST", timeout: 300, body: json({files: src, tests: [f]}),
+               headers: {authorization: "Bearer " + CFTOKEN, "content-type": "application/json"}})
+  }
+  var t0 = time()
+  var got = fetchAll(reqs)
+  var ms = (time() - t0) * 1000
+  // Workers Paid: $0.30 a million requests, $0.02 a million CPU ms. CPU time isn't reported back, so each request is
+  // charged the whole batch's wall time: an upper bound.
+  var cost = reqs.len() * (0.3 + ms * 0.02) / 1000000
+  ledger.spent += cost
+  ledger.byModel["cloudflare"] = (ledger.byModel["cloudflare"] || 0) + cost
+  var out = []
+  for r in got {
+    if r.status == 200 { out.push({code: 0, out: r.body, err: "", timedOut: false}) }
+    else { out.push({code: 1, out: "", err: "Cloudflare Worker: " + str(r.status) + " " + clip(r.body || r.error || "", 300), timedOut: false}) }
+  }
+  return out
+}
 fn testFiles(dir) { return lines(sh("ls tests/*_test.fut 2>/dev/null", dir).out) }
 fn runTests(dir) {
   var files = testFiles(dir)
@@ -136,9 +164,13 @@ fn runTests(dir) {
   var api = []
   for f in files { api.push({cmd: [FUT, "api", f], cwd: dir, timeout: 60}) }
   execAll(api)
-  var runs = []
-  for f in files { runs.push({cmd: [FUT, "test", "--json", "--timeout", "20", f], cwd: dir, timeout: 240}) }
-  var res = execAll(runs)
+  var res = nil
+  if CF { res = cfRun(dir, files) }
+  else {
+    var runs = []
+    for f in files { runs.push({cmd: [FUT, "test", "--json", "--timeout", "20", f], cwd: dir, timeout: 240}) }
+    res = execAll(runs)
+  }
   var n = {passed: 0, failed: 0, errors: 0, pending: 0, broken: 0}
   var bad = []
   var pend = []

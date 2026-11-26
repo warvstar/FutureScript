@@ -185,7 +185,8 @@ function buildInterp(out) {
     'import { createInterpWorker } from "./runtime.js";', 'import wasm from "./fut.wasm";', 'import tryModule from "./try.wasm";',
     "export default createInterpWorker({ wasm, tryModule });", ""].join("\n"));
   writeFileSync(join(out, "bundle.json"), JSON.stringify({ interp: true }));
-  writeFileSync(join(out, "wrangler.toml"), [`name = "fut-interp"`, 'main = "worker.js"', `compatibility_date = "${COMPAT_DATE}"`, ""].join("\n"));
+  writeFileSync(join(out, "wrangler.toml"), [`name = "fut-interp"`, 'main = "worker.js"', `compatibility_date = "${COMPAT_DATE}"`,
+    "[limits]", "cpu_ms = 300000  # a request runs whole test files, interpreted: the Paid plan's most", ""].join("\n"));
   const size = sizeOf(out);
   console.log(`${out}: ${(size.bytes / 1024).toFixed(0)} KB (${(size.gzip / 1024).toFixed(0)} KB gzipped)`);
 }
@@ -210,7 +211,8 @@ async function send(target, { root, main, tests, filter }) {
     const w = await interpWorkerOf(target);
     fetchIt = (r) => w.fetch(r);
   }
-  const t0 = performance.now(), r = await fetchIt(new Request(new URL("/run", /^https?:/.test(target) ? target : "http://localhost"), { method: "POST", body }));
+  const headers = process.env.FUT_WORKER_TOKEN ? { authorization: "Bearer " + process.env.FUT_WORKER_TOKEN } : {};  // the Worker's FUT_TOKEN
+  const t0 = performance.now(), r = await fetchIt(new Request(new URL("/run", /^https?:/.test(target) ? target : "http://localhost"), { method: "POST", body, headers }));
   const text = await r.text();
   process.stdout.write(text.endsWith("\n") ? text : text + "\n");
   process.stderr.write(`${r.status} in ${(performance.now() - t0).toFixed(0)} ms (${(body.length / 1024).toFixed(0)} KB sent)\n`);

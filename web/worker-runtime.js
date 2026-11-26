@@ -22,7 +22,7 @@ const enc = new TextEncoder(), dec = new TextDecoder();
 
 // The options both sides give createFut: whatever could change the heap before or during a compile must match.
 export function futOptions({ wasm, read, module, write, fetch, run, interp, tryModule }) {
-  return { wasm, read, module, write, fetch, run, interp, tryModule, verbose: false, noTier: true };
+  return { wasm, read, module, write, fetch, run, interp, tryModule, verbose: false, noTier: true, heapMB: 32 };  // 128 MB per isolate
 }
 
 // run(): a child program, in a fresh instance. A Worker has no processes, and can't compile, so the build runs the
@@ -162,10 +162,13 @@ async function testIn(ctx, module, main, filter) {
 //   { files: { "path": text, ... }, tests: ["path", ...], filter }   -> each test file's `fut test --json` lines, then
 //                                                                      a summary (as /__fut/test)
 //   { files, main: "path", }                                         -> { code, out, err }: the program run
-// Paths are relative (fut sees them below /app).
+// Paths are relative (fut sees them below /app). With the secret FUT_TOKEN set (wrangler secret put FUT_TOKEN), every
+// request must carry "authorization: Bearer <token>": the Worker runs any code it is sent.
 export function createInterpWorker({ wasm, tryModule }) {
   return {
-    async fetch(request) {
+    async fetch(request, env) {
+      if (env?.FUT_TOKEN && !sameText(request.headers.get("authorization") ?? "", "Bearer " + env.FUT_TOKEN))
+        return new Response("unauthorized\n", { status: 401 });
       if (request.method != "POST" || new URL(request.url).pathname != "/run")
         return new Response("POST /run {files: {path: text}, tests: [path...] | main: path, filter}\n", { status: 404 });
       const b = await request.json().catch(() => null);
@@ -183,6 +186,11 @@ export function createInterpWorker({ wasm, tryModule }) {
       return new Response(body + JSON.stringify(total) + "\n", { headers: { "content-type": "application/x-ndjson" } });
     },
   };
+}
+function sameText(a, b) {  // compares in time independent of where they differ
+  let d = a.length ^ b.length;
+  for (let i = 0; i < b.length; i++) d |= (a.charCodeAt(i) | 0) ^ b.charCodeAt(i);
+  return d == 0;
 }
 function summarize(lines, main, total) {  // a file's lines, its summary given "file"; totals counted
   let body = "";

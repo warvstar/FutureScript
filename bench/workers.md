@@ -84,3 +84,18 @@ Tests that failed in some run: failures say how it grows, with the measurements.
 | specs/modules_err.fut | 13.9 | 16.0 |
 | specs/tier.fut | 10.0 | 22.7 |
 | specs/try.fut | 14.5 | 13.7 |
+
+## Deployed (Cloudflare, Paid plan), November 2026
+
+The interpreting Worker (`fut worker build --interp`, deployed as `fut-interp` with a `FUT_TOKEN` secret) against a
+swarm's fsql project: 54 test files, 945 tests, 486 KB of sources sent with each request.
+
+| | wall time |
+|---|---:|
+| native, locally, 12 cores (`fut test` per file, in parallel) | 4.9 s |
+| the Worker, one request per file, all at once | ~300 s (median request 41 s; several stopped at the 300 s client timeout) |
+
+fsql's tests are CPU-heavy (B-tree and sort scale tests over thousands of keys), where interpreting costs 30-100x. For
+such suites, test locally, or use bundles compiled ahead of time; the interpreter suits small, quick test files. Two
+fixes this needed: the wasm heap was a fixed 256 MB reservation, over a Worker's 128 MB (now `heapMB`, 32 MB in
+Workers), and one request running every file hit the default 30 s CPU limit (`cpu_ms = 300000` in the generated config).

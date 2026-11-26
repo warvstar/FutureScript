@@ -401,6 +401,7 @@ struct PropSite { std::string file, text, discard; int line = 0, expect = -1; bo
 int propSite(PropSite);
 void testInit();
 void sysInit();  // fetch, exec, files, env (native; the wasm build has fetch and fetchAll, through its host)
+void gcRegion(size_t bytes);  // the heap's size, before the runtime starts (wasm reserves it all: a Worker has 128 MB)
 V binopValue(V a, V b, int op);  // a op b, as the language computes it (raises on bad operands)
 struct TestRun { bool json = false; std::string filter; double timeout = 10; int isolates = 0; bool changed = false; };
 extern std::string mainFile;  // the program's file: run() finds relative files next to it

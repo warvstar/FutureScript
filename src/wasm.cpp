@@ -437,6 +437,7 @@ EXPORT(fut_init) void futInit(int flags) {  // installs the natives' adapters
   rtInit(), jitCollect(), refRelease = host_ref_gone;
 }
 EXPORT(fut_set_trycall) void futSetTryCall(u32 slot) { interpSetTryCall(slot); }  // the host's try_call (see interp.cpp)
+EXPORT(fut_heap) void futHeap(u32 mb) { gcRegion(size_t(mb) << 20); }  // before fut_init
 EXPORT(fut_alloc) char* futAlloc(u32 n) { return (char*)malloc(n); }
 EXPORT(fut_free) void futFree(char* p) { free(p); }
 // Compile a file (text null) or REPL input; returns the chunk's slot, 0 after an error (printed), -1 if input ended early,
