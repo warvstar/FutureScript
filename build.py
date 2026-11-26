@@ -798,7 +798,7 @@ def runner_init(exe):
 
 
 def runner_site(exe):
-    """web/site.mjs: a page's program as a static site. The site's own files (files.json, its JavaScript modules, fut.js
+    """web/site.mjs: a page's program as a static site, its first view prerendered. The site's own files (files.json, its JavaScript modules, fut.js
     and fut.wasm) run it, here under Node with std/ui's document of its own; a program that doesn't compile fails the
     build."""
     if exe.suffix != ".wasm" or exe.name == "fut-mt.wasm":
@@ -813,7 +813,8 @@ def runner_site(exe):
     html = (d / "ok" / "index.html").read_text()
     if "/app/views.fut" not in files or "/std/ui/ui.fut" not in files or not (d / "ok" / "std" / "ui" / "dom.js").exists():
         return False, f"files: {sorted(files)}"
-    if "<title>Tasks &lt;&amp;&gt;</title>" not in html or '"/app/views.fut"' not in html:
+    if "<title>Tasks &lt;&amp;&gt;</title>" not in html or '"/app/views.fut"' not in html or "<style data-prerendered>" not in html \
+            or '<div id="ui"><div class="column page"><div class="text title">' not in html:
         return False, "index.html: " + html[:400]
     run = """
 import { readFileSync } from "node:fs";

@@ -64,9 +64,10 @@ export function listen(n, type, f) {
     if (r && typeof r.catch === "function") r.catch(() => {});  // a fut error is reported by fut itself
   });
 }
-export const query = (sel) => (sel === "body" ? doc.body : doc.querySelector(sel));
+export const query = (sel) => (sel === "body" ? doc.body : sel === "head" ? doc.head : doc.querySelector(sel));
 export const css = fresh((s) => { const e = doc.createElement("style"); e.textContent = s; (doc.head ?? doc.body).appendChild(e); return e; });
 export function base(s) {  // a style sheet under the page's own: first in the head
+  for (const p of doc.querySelectorAll?.("style[data-prerendered]") ?? []) p.remove();  // a static site's, from its build: the page's own sheets are in now
   const e = doc.createElement("style"), h = doc.head ?? doc.body;
   e.textContent = s;
   h.insertBefore ? h.insertBefore(e, h.firstChild ?? null) : h.appendChild(e);
@@ -85,7 +86,11 @@ export function fire(n, type, data) {  // as a user would: set what they typed o
 const fakes = new Map();  // url -> response, for tests and demos without a server
 export const fake = (url, res) => void fakes.set(url, typeof res == "string" ? { status: 200, body: res, headers: {} } : res);
 const later = (f, ...a) => { const p = f(...a); if (p && typeof p.catch == "function") p.catch(() => {}); };
+// A static site's build shows the page here, as it first is (web/site.mjs): what it would fetch stays loading.
+let prerendering = false;
+export const prerender = () => void (prerendering = true);
 export function request(req, f) {  // fetch, then f({status, body, headers}), or f({status: 0, error}): fut goes on meanwhile
+  if (prerendering) return;
   const url = typeof req == "string" ? req : req.url;
   if (fakes.has(url)) return void Promise.resolve().then(() => later(f, fakes.get(url)));
   const init = typeof req == "string" ? {} : { method: req.method ?? "GET", headers: req.headers ?? undefined, body: req.body ?? undefined };

@@ -1,22 +1,23 @@
 #!/usr/bin/env node
 // A fut program with a page (std/ui) as a static site, for any host that serves files:
 //
-//   node web/site.mjs [--root dir] [--title text] [--copy path]... app.fut outdir
+//   node web/site.mjs [--root dir] [--title text] [--copy path]... [--no-prerender] app.fut outdir
 //
 // outdir gets index.html, fut.js and fut.wasm (the compiler and runtime: the page compiles the program as it loads,
 // as the dev page does), files.json (every source the program reads: its own files and std's, one request), and the
 // JavaScript modules it uses (std/ui's dom.js) at their paths. --root: the directory whose files the program may read
 // (the main file's, by default); --copy: a file or directory below root the page fetches itself (data, images), copied
 // to the same path. In the page, the root is /app and std is /std: ui.load("data/x.json") stays relative to the page.
+// The page's first view is prerendered into index.html (--no-prerender: not), so it shows before fut.wasm has loaded.
 import { copyFileSync, cpSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createFut } from "./fut.js";
 
 const repo = fileURLToPath(new URL("..", import.meta.url));
-const usage = "usage: node web/site.mjs [--root dir] [--title text] [--copy path]... app.fut outdir\n";
+const usage = "usage: node web/site.mjs [--root dir] [--title text] [--copy path]... [--no-prerender] app.fut outdir\n";
 const die = (m) => (process.stderr.write(m.endsWith("\n") ? m : m + "\n"), process.exit(2));
-let root = null, title = null;
+let root = null, title = null, prerender = true;
 const copies = [], rest = [];
 const argv = process.argv.slice(2);
 for (let i = 0; i < argv.length; i++) {
@@ -24,6 +25,7 @@ for (let i = 0; i < argv.length; i++) {
   if (a == "--root" && i + 1 < argv.length) root = resolve(argv[++i]);
   else if (a == "--title" && i + 1 < argv.length) title = argv[++i];
   else if (a == "--copy" && i + 1 < argv.length) copies.push(resolve(argv[++i]));
+  else if (a == "--no-prerender") prerender = false;
   else if (a[0] == "-") die(usage);
   else rest.push(a);
 }
@@ -59,6 +61,22 @@ const fut = await createFut({
 });
 if (!(await fut.compile(main, false))) die(`${rest[0]} did not compile:\n${err.join("")}`);
 
+// The page as it first shows, run here on std/ui's document of its own, so the site shows it before fut.wasm has
+// loaded (fetches stay loading). fut then builds the page again over it, and its style sheets replace these.
+let shown = "", sheets = "";
+const domFile = join(std, "ui", "dom.js");
+if (prerender && modules.has(STD + "/ui/dom.js")) {
+  const dom = await import(pathToFileURL(domFile).href);  // (the instance the program's externs use)
+  dom.prerender();
+  err.length = 0;
+  const st = await Promise.race([fut.run(main, false), new Promise((r) => setTimeout(() => r("time"), 10000))]);
+  const body = dom.query("body");
+  if (st === 0) {
+    shown = body.childNodes.map((n) => dom.html(n)).join("");
+    for (const s of dom.query("head")?.childNodes ?? []) sheets += `<style data-prerendered>${s.textContent.replace(/<\/style/gi, "<\\/style")}</style>\n`;
+  } else process.stderr.write(`site: not prerendered (${st === "time" ? "its top level ran for 10 s" : "it failed under Node: " + err.join("").trim()})\n`);
+}
+
 rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });
 copyFileSync(join(repo, "web", "fut.js"), join(out, "fut.js"));
@@ -87,9 +105,9 @@ writeFileSync(join(out, "index.html"), `<!doctype html>
 <link rel="modulepreload" href="fut.js">
 <link rel="preload" href="fut.wasm" as="fetch" crossorigin>
 <link rel="preload" href="files.json" as="fetch" crossorigin>
-</head>
+${sheets}</head>
 <body>
-<div id="ui"></div>
+<div id="ui">${shown}</div>
 <script type="module">
 // fut: compile ${main} (files.json holds its sources) and run it; its page goes into #ui
 import { createFut } from "./fut.js";
@@ -111,4 +129,4 @@ await fut.run(${JSON.stringify(main)}, true);
 const size = (p) => statSync(join(out, p)).size;
 const kb = (n) => (n / 1024).toFixed(0) + " KB";
 console.log(`${relative(process.cwd(), out) || "."}: index.html, fut.wasm ${kb(size("fut.wasm"))}, fut.js ${kb(size("fut.js"))}, ` +
-  `files.json ${kb(size("files.json"))} (${Object.keys(files).length} sources)` + (modules.size ? `, ${[...modules].map((m) => m.slice(1)).join(", ")}` : ""));
+  `files.json ${kb(size("files.json"))} (${Object.keys(files).length} sources)` + (shown ? `, the first view prerendered (${kb(shown.length + sheets.length)})` : "") + (modules.size ? `, ${[...modules].map((m) => m.slice(1)).join(", ")}` : ""));
