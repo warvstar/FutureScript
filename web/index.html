@@ -52,7 +52,8 @@ const fut = await createFut({
   serve: true,  // a program that builds a page (std/ui, into #ui) keeps handling its events after it finishes
   read(p) {  // fut reads files synchronously
     const x = new XMLHttpRequest();
-    x.open("GET", p, false), x.overrideMimeType("text/plain; charset=x-user-defined"), x.send();
+    p = p.replace(/^\/+/, "/");  // "//fut.pkg" (the root's) would name a host
+    try { x.open("GET", p, false), x.overrideMimeType("text/plain; charset=x-user-defined"), x.send(); } catch { return null; }
     if (x.status != 200) return null;
     const b = new Uint8Array(x.responseText.length);
     for (let i = 0; i < b.length; i++) b[i] = x.responseText.charCodeAt(i) & 0xff;
@@ -91,7 +92,9 @@ $("form").addEventListener("submit", async (e) => {
   if (running) fut.type(l);
   else (prompt = await fut.line(l)), ($("prompt").textContent = prompt.trim());
 });
-if (file) {
+const missing = file && !(await fetch("/" + file.replace(/^\/+/, ""), { method: "HEAD" })).ok;
+if (missing) write(2, new TextEncoder().encode(`fut: there is no ${file} (the server serves files from its own checkout)\n`)), (running = false);
+else if (file) {
   const path = "/" + file.replace(/^\/+/, "");
   new EventSource("/events").onmessage = (e) => watched.has(e.data) && (stamps.set(e.data, (stamps.get(e.data) ?? 0) + 1), fut.changed());
   const st = await fut.run(path, true);
