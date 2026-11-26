@@ -400,6 +400,13 @@ void heapFree(Heap* h) {  // an isolate ended: finalize what needs it and give e
 }
 ImageScope::ImageScope() { if (!imaging++) target = imageHeap; }
 ImageScope::~ImageScope() { if (!--imaging) target = cur; }
+ScratchImage::ScratchImage() : saved(target) {
+  static const uint16_t id = nextId++;
+  if (!id) fputs("fut: too many isolates\n", stderr), exit(1);
+  heap = new Heap{id};
+  heap->image = true, heap->runs = heap->own, target = heap;
+}
+ScratchImage::~ScratchImage() { target = saved, heapFree(heap); }
 // (wasm: a compile error longjmps past ImageScope's destructor; where it lands puts the depth back)
 int imageDepth() { return imaging; }
 void imageUnwind(int depth) { if ((imaging = depth) == 0) target = cur; }

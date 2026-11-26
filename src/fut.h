@@ -315,6 +315,13 @@ Heap* heapNew(Run* runs);  // runs: the isolate's VM block's, which JIT code bum
 void heapUse(Heap*);       // the current thread's isolate allocates here
 void heapFree(Heap*);
 struct ImageScope { ImageScope(); ~ImageScope(); ImageScope(const ImageScope&) = delete; };
+// Unpublished compiler objects can all be freed together. The compile lock serializes these scopes.
+struct ScratchImage {
+  Heap *saved, *heap;
+  ScratchImage();
+  ~ScratchImage();
+  ScratchImage(const ScratchImage&) = delete;
+};
 int imageDepth();
 void imageUnwind(int depth);
 bool gcWanted();           // wasm: a collection waits for the next safepoint
@@ -424,6 +431,7 @@ constexpr int GOFF(int g) { return EOFF + 48 + 8 * g; }
 constexpr u32 VM_HANDLER = 16;
 constexpr u32 IOFF(int i) { return (GOFF(MAXG) + 15) / 16 * 16 + 16 * i; }
 int newIC(bool set = false);  // set: a field store's, which must miss while a transaction is open
+void discardICs(int first);  // an unpublished compile's slots, under codeMu
 extern u32 icEpoch;  // bumped whenever method tables may have changed
 void clearICs();
 void reshape(Class*);  // after its layout grew: what JIT constructors allocate for it
@@ -452,6 +460,7 @@ void jitForked();  // in a child after fork(): put this thread's view of JIT mem
 size_t jitLive();  // bytes of machine code currently allocated
 void jitShiftLines(u32* body, int delta);
 u32* newStub();
+void discardStub(u32*);  // a stub whose code was never published
 void patchStub(u32* stub, void* target);
 u32* staleThunk(int sym);
 void tierUp(void* tier, u32 numArgs);  // compile a hot function again (numArgs: which arguments were numbers)
@@ -490,7 +499,7 @@ struct CompileError : std::runtime_error {  // atEnd: the source ended too early
 };
 // tests: compile `test` blocks into Compiled::tests (otherwise they are skipped)
 Compiled compile(const std::string& path, bool reload, bool echo, const std::string* text = nullptr, bool tests = false);
-bool guardCompile(void (*f)(void*), void* ctx, std::string* err = nullptr);  // f(ctx); false if it failed with a compile error (*err)
+bool guardCompile(void (*f)(void*), void* ctx, std::string* err = nullptr, bool* atEnd = nullptr);  // f(ctx); false if it failed with a compile error (*err)
 // Undo a failed reload's transaction and restore the previous code.
 void rollbackReload(const std::vector<int>& newVars);
 [[noreturn]] void compileFail(const std::string& msg, bool atEnd);  // natively throws CompileError; in wasm, longjmps
@@ -689,7 +698,7 @@ constexpr u32 WHO_ATOMIC = ~0u;  // vm->who inside an atomic block (it takes io 
 constexpr u32 WHO_PARALLEL = ~0u - 1;  // in a parallel for's body (no effects)
 enum { OP_YIELD = 1, OP_EXTERN = 2 };  // operations with fixed ids; builtins and user effects' get theirs at startup / compile time
 int effSite(const std::string& fn, uint64_t mask, const std::string& text);  // a declaring function: what errors name
-uint64_t effBit(int sym);                     // a user effect's bit (0: too many effects)
+uint64_t effBit(int sym, int* probe = nullptr);  // 0: too many effects; probe tracks provisional bits without reserving them
 int effOpId(const std::string& qualified);    // "Log.log" -> its operation id, kept for good
 Fn* effOpFn(int op);                          // the Fn a perform calls (rt_prep resolves it, see effPrep)
 struct EffOpDef { int op, arity; std::vector<uint64_t> ptypes; uint64_t rtype; std::vector<int> psites; int rsite; };

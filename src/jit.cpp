@@ -287,7 +287,13 @@ void patchStub(u32* s, void* target) {
   u32 b = a64::B | (u32((u32*)target - s) & 0x3ffffff);
   jitWrite(s, &b, 1);
 }
-u32* newStub() {  // stubs are packed 4 bytes apart and never freed
+static std::vector<u32*> unusedStubs;
+void discardStub(u32* stub) { unusedStubs.push_back(stub); }
+u32* newStub() {  // stubs are packed 4 bytes apart; only unpublished stubs can be reused
+  if (!unusedStubs.empty()) {
+    u32* stub = unusedStubs.back();
+    return unusedStubs.pop_back(), stub;
+  }
   static u32 *pool, *poolEnd;
   if (pool == poolEnd) pool = jitAlloc(1024), poolEnd = pool + 1024;
   patchStub(pool, trap);
@@ -322,8 +328,14 @@ bool saveFile(const std::string& path, const std::string* text) {
 
 
 void compileFail(const std::string& msg, bool atEnd) { throw CompileError(msg, atEnd); }
-bool guardCompile(void (*f)(void*), void* ctx, std::string* err) {
-  try { return f(ctx), true; } catch (CompileError& e) { return err && (*err = e.what(), true), false; }
+bool guardCompile(void (*f)(void*), void* ctx, std::string* err, bool* atEnd) {
+  try { f(ctx); }
+  catch (CompileError& e) {
+    if (err) *err = e.what();
+    if (atEnd) *atEnd = e.atEnd;
+    return false;
+  }
+  return true;
 }
 std::string canonicalPath(const std::string& p) {
   char* r = realpath(p.c_str(), nullptr);

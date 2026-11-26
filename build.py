@@ -93,6 +93,7 @@ def runner(exe):
 
 def test(exe, only=()):
     """Each tests/*.fut lists `// expect: <line>` for stdout and optionally `// error: <text>` lines for stderr.
+    A sibling .stderr file instead matches the complete diagnostic output and requires exit status 1.
     Each tests/specs/*.fut is run with `fut test` and must pass. Everything runs at once, one job per core;
     a hot-reload test that fails under that load (they are timed) is rerun alone before it counts.
     `only` keeps the jobs whose name contains any of its words."""
@@ -105,6 +106,13 @@ def test(exe, only=()):
         want = re.findall(r"// expect: ?(.*)", src)
         err = re.findall(r"// error: ?(.*)", src)
         r = subprocess.run([*runner(exe), str(t)], capture_output=True, text=True, timeout=60)
+        exact = t.with_suffix(".stderr")
+        if exact.exists():
+            want_err = exact.read_text()
+            got_err = r.stderr.replace(str(t), t.name)
+            return t.name, r.stdout.splitlines() == want and r.returncode == 1 and got_err == want_err, (
+                f"want stdout: {want}\n  got: {r.stdout.splitlines()} (exit {r.returncode})\n"
+                f"  want stderr: {want_err}\n  got: {got_err}")
         ok = r.stdout.splitlines() == want and (all(e in r.stderr for e in err) and r.returncode != 0 if err else r.returncode == 0)
         return t.name, ok, f"want: {want}\n  got:  {r.stdout.splitlines()}\n  stderr: {r.stderr.strip()}"
 

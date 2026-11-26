@@ -12,6 +12,73 @@
 #include "gen_a64.h"
 #endif
 
+void CState::report(const char* pos, int line, const char* fmt, va_list ap) {
+  const char* code = takeCode(fmt);
+  char b[256];
+  vsnprintf(b, sizeof b, fmt, ap);
+  for (auto& r : reports) if (r.diag.file == file && r.diag.line == line) return;
+  const char *ls = pos, *le = pos;
+  while (ls > srcStart && ls[-1] != '\n') ls--;
+  while (*le && *le != '\n') le++;
+  std::string caret;
+  for (const char* c = ls; c < pos; c++) caret += *c == '\t' ? '\t' : ' ';
+  int col = int(pos - ls + 1);
+  reports.push_back({{file, b, code ? code : "", line, col},
+                     file + ":" + std::to_string(line) + ":" + std::to_string(col) + ": error: " + b +
+                     (code ? " [" + std::string(code) + "]" : "") + "\n  " +
+                     std::string(ls, le) + "\n  " + caret + "^"});
+}
+void CState::diagnose(const char* pos, int line, const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  report(pos, line, fmt, ap);
+  va_end(ap);
+  if (!collectErrors) compileFail(reports.back().rendered, !*pos || lexAtEnd);
+  if (reports.size() == 50) reportFailure();
+}
+void CState::failAt(const char* pos, int line, const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  report(pos, line, fmt, ap);
+  va_end(ap);
+  errorPos = pos;
+  if (!collectErrors) compileFail(reports.back().rendered, !*pos || lexAtEnd);
+  if (!recovery || reports.size() == 50) reportFailure();
+#if __wasm__
+  longjmp(*recovery, 1);
+#else
+  throw ParseError{};
+#endif
+}
+void CState::sortReports() {
+  // Keep files in discovery order and diagnostics within each file in source order.
+  std::vector<std::string> files;
+  for (auto& r : reports)
+    if (std::find(files.begin(), files.end(), r.diag.file) == files.end()) files.push_back(r.diag.file);
+  std::stable_sort(reports.begin(), reports.end(), [&](const Report& a, const Report& b) {
+    if (a.diag.file == b.diag.file) return a.diag.line < b.diag.line;
+    return std::find(files.begin(), files.end(), a.diag.file) < std::find(files.begin(), files.end(), b.diag.file);
+  });
+}
+std::string CState::diagnosticText() {
+  sortReports();
+  std::string msg;
+  for (auto& r : reports) msg += (msg.empty() ? "" : "\n") + r.rendered;
+  return msg;
+}
+void CState::reportFailure() {
+  failureText = diagnosticText();  // owned by the compiler across a possible longjmp
+  compileFail(failureText, false);
+}
+Global& CState::global(int sym) {
+  if (Global* g = findGlobal(sym)) return *g;
+  if (!stageGlobals) return ::global(sym);
+  int slot = globalCount() + newGlobals.size();
+  if (slot >= MAXG) compileFail("too many globals", false);
+  newGlobals.push_back(sym);
+  return declarations.emplace(sym, Global{.slot = slot}).first->second;
+}
+
 static uint64_t fnv(const char* a, const char* b) {
   uint64_t h = 1469598103934665603ull;
   for (; a < b; a++) h = (h ^ (uint8_t)*a) * 1099511628211ull;
@@ -82,25 +149,24 @@ static std::map<std::pair<int, int>, Fn*> methodFns;  // (class sym, method sym)
 // so two files' private names never clash and other files can't reach them. A file imported `as` a name (a module)
 // declares all its names that way, and other files reach its `pub` ones as alias.name. In a file imported plainly,
 // `pub` names are global. The program's own file has no prefix: its names are global.
-static std::unordered_map<std::string, std::string> nsOf;                             // imported file -> prefix
-static std::unordered_map<std::string, bool> isModule;                                // imported file -> imported `as`
-static std::unordered_map<std::string, std::vector<std::string>> plainModules;        // file -> the modules it imports without `as`
-static std::unordered_map<std::string, std::unordered_map<int, std::string>> aliases;  // file -> its `as` names
 static std::string base(const std::string& path) { return path.substr(path.rfind('/') + 1); }
 static std::unordered_map<std::string, u32*> invBodies;  // each class's hidden invariant method, installed
-// Packages (pkg.cpp). The program's own package (entryDir) has no prefix, like a program without one. Every other
-// package has a prefix (its name, made unique), and the `pub` names of its plainly imported files are
-// "prefix.name": visible across the package, and to other packages through `import "name"` (the alias) when its
-// root file declares them or re-exports their file with `pub import`. Its files' prefixes are "prefix/stem".
-static std::string entryDir;
 std::vector<std::string> modulesPending;
-static std::unordered_map<std::string, std::string> pkgPreOf;  // package dir -> prefix
-static std::unordered_map<std::string, std::unordered_set<int>> surfaceOf;  // prefix -> its interface's names
-static bool prefixTaken(const std::string& p, const std::string& self) {  // a file's or a package's prefix
-  for (auto& [f, q] : nsOf) if (f != self && q == p) return true;
-  for (auto& [d, q] : pkgPreOf) if (d != self && q == p) return true;
-  return false;
-}
+struct Namespaces {
+  std::unordered_map<std::string, std::string> nsOf;  // imported file -> unique prefix
+  std::unordered_map<std::string, bool> isModule;  // imported file -> imported with a name
+  std::unordered_map<std::string, std::vector<std::string>> plainModules;
+  std::unordered_map<std::string, std::unordered_map<int, std::string>> aliases;
+  std::string entryDir, entryPath;
+  std::unordered_map<std::string, std::string> pkgPreOf;  // package dir -> prefix
+  std::unordered_map<std::string, std::unordered_set<int>> surfaceOf;  // prefix -> interface names
+  bool prefixTaken(const std::string& p, const std::string& self) {
+    for (auto& [f, q] : nsOf) if (f != self && q == p) return true;
+    for (auto& [d, q] : pkgPreOf) if (d != self && q == p) return true;
+    return false;
+  }
+};
+static Namespaces installedNames;
 // The sources of the code running now, and of the code the last compile replaced (what a failed reload goes back
 // to); while the previous code is restored, files are read from `overlay` rather than from disk.
 using Sources = std::vector<std::pair<std::string, std::string>>;
@@ -117,7 +183,8 @@ static bool readSource(const std::string& path, std::string& out) {
   return false;
 }
 
-struct Compiler : Gen {
+struct Compiler : Gen, Namespaces {
+  Compiler() : Namespaces(installedNames) {}
   bool reload = false, echo = false, tiering = false, topTry = false, testing = false;  // testing: compile `test` blocks
   std::vector<TestCase> tests;
   std::string owner;
@@ -130,6 +197,52 @@ struct Compiler : Gen {
   std::vector<std::string> files, present;
   std::unordered_map<std::string, Span> spans;
   std::vector<char> declKind;  // by symbol
+  // Metadata used by parsing and code generation is published together with the code.
+  decltype(::enumDefs) enumDefs = ::enumDefs;
+  decltype(::sigs) sigs = ::sigs;
+  decltype(::varText) varText;
+  decltype(::methodFns) newMethods;
+  decltype(tiers) newTiers;
+  std::vector<u32*> newStubs;
+  bool published = false;
+  std::string* testMissing = nullptr;
+  std::unordered_map<const char*, const char*> invalidDecls;  // declaration start -> failed prescan token
+  std::unordered_set<std::string> unavailableModules;
+
+  template <class Work> bool attempt(Work work) {
+    if (!collectErrors) return work(), true;
+#if __wasm__
+    // Syntax failures occur outside runtime locks. This jump only unwinds the parser;
+    // compileFail still goes to the platform guard for failures that abandon the compile.
+    jmp_buf jb, *outer = recovery;
+    recovery = &jb;
+    if (setjmp(jb)) return recovery = outer, false;
+    work();
+    recovery = outer;
+#else
+    bool outer = std::exchange(recovery, true);
+    try { work(); }
+    catch (ParseError&) { return recovery = outer, false; }
+    recovery = outer;
+#endif
+    return true;
+  }
+
+  u32* parserStub() {
+    if (diagnosticsOnly || !reports.empty()) return (u32*)(uintptr_t)1;  // code generation uses its address as an operand
+    u32* stub = newStub();
+    newStubs.push_back(stub);
+    return stub;
+  }
+  Tier* tierFor(const std::string& name) {
+    if (auto it = tiers.find(name); it != tiers.end()) return &it->second;
+    return &newTiers[name];
+  }
+  Fn*& methodFn(int cls, int m) {
+    auto key = std::make_pair(cls, m);
+    if (auto it = methodFns.find(key); it != methodFns.end()) return it->second;
+    return newMethods[key];
+  }
   std::vector<std::pair<std::string, int>> shifts;
   // What a body compiles against, per package: the declarations of its own package, and the interfaces of the
   // packages it imports. A body whose text and environment are as last compiled is reused, so a new declaration
@@ -183,7 +296,7 @@ struct Compiler : Gen {
   const Package* pkgOf(const std::string& f) {
     auto [it, fresh] = pkgCache.try_emplace(f, nullptr);
     if (fresh) {
-      it->second = packageOf(f.empty() || f[0] == '<' ? mainFile : f);
+      it->second = packageOf(f.empty() || f[0] == '<' ? entryPath : f);
       if (it->second && std::find(pkgDirs.begin(), pkgDirs.end(), it->second->dir) == pkgDirs.end()) pkgDirs.push_back(it->second->dir);
     }
     return it->second;
@@ -212,7 +325,7 @@ struct Compiler : Gen {
     }
     return intern(it->second + "." + symName(s));
   }
-  Tok topName(Tok t) {  // the top-level name t (just read) refers to; reads `.name` after a module alias
+  Tok topName(Tok t, bool asValue = false) {  // the top-level name t (just read) refers to; reads `.name` after a module alias
     const std::string* m = moduleAlias(t.sym);
     if (!m) return t.sym = globalSym(t.sym), t;
     auto root = pkgRootOf.find(*m);
@@ -239,7 +352,12 @@ struct Compiler : Gen {
         failAt(n.p, n.line, "@not-in-interface '%s' is pub inside package %s but not part of its interface: only what %s makes pub (or re-exports with pub import) is", name(raw), name(t.sym), rf.c_str());
       failAt(n.p, n.line, "@not-in-interface package %s has no '%s' in its interface (what %s makes pub, or re-exports with pub import)", name(t.sym), name(raw), rf.c_str());
     }
-    if (!declared) failAt(n.p, n.line, "@undefined-name module '%s' has no '%s'", name(t.sym), name(prev.sym));
+    if (!declared) {
+      if (!asValue) failAt(n.p, n.line, "@undefined-name module '%s' has no '%s'", name(t.sym), name(prev.sym));
+      if (!unavailableModules.contains(*m)) missingName(n, "@undefined-name module '%s' has no '%s'", name(t.sym), name(prev.sym));
+      n.sym = -1;
+      return n;
+    }
     if ((size_t)n.sym >= pubSym.size() || !pubSym[n.sym]) failAt(n.p, n.line, "@private '%s' is private to module '%s' (mark it pub there to use it here)", name(prev.sym), name(t.sym));
     return n;
   }
@@ -249,7 +367,7 @@ struct Compiler : Gen {
     if (symName(t.sym) == "or") return "use '||'";
     return nullptr;
   }
-  [[noreturn]] void undefined(const Tok& t) {
+  void undefined(const Tok& t) {
     const std::string& full = symName(t.sym);
     int s = intern(full.substr(full.rfind('.') + 1));  // as written: globalSym may have put a package's prefix on it
     if (auto it = privateIn.find(s); it != privateIn.end() && it->second != file && pkgOf(it->second) == pkgOf(file))
@@ -264,15 +382,26 @@ struct Compiler : Gen {
     else if (word == "elif") hint = "use 'else if'";
     else if (word == "let" || word == "const") hint = "declare a variable with 'var'";
     else if (word == "function" || word == "def") hint = "declare a function with 'fn'";
-    if (hint) failAt(t.p, t.line, "@undefined-name undefined name '%s': %s", name(s), hint);
+    if (hint) return missingName(t, "@undefined-name undefined name '%s': %s", name(s), hint);
     if (auto f = aliases.find(file); f != aliases.end())  // a pub name of a module or package this file imported with a name
       for (auto& [a, m] : f->second) {
         int q = intern(m + "." + word);
         bool pkg = pkgRootOf.count(m) || surfaceOf.count(m);
         if (findGlobal(q) && (pkg ? !surfaceOf.count(m) || surfaceOf[m].count(s) : (size_t)q < pubSym.size() && pubSym[q]))
-          failAt(t.p, t.line, "@undefined-name undefined name '%s': it is in %s, so write %s.%s", name(s), name(a), name(a), name(s));
+          return missingName(t, "@undefined-name undefined name '%s': it is in %s, so write %s.%s", name(s), name(a), name(a), name(s));
       }
-    failAt(t.p, t.line, "@undefined-name undefined name '%s'", name(s));
+    missingName(t, "@undefined-name undefined name '%s'", name(s));
+  }
+  template<class... A> void missingName(const Tok& t, const char* fmt, A... args) {
+    if (!testMissing) return diagnose(t.p, t.line, fmt, args...);
+    if (!testMissing->empty()) return;
+    const char* code = takeCode(fmt);
+    char b[256];
+    snprintf(b, sizeof b, fmt, args...);
+    const char* ls = t.p;
+    while (ls > srcStart && ls[-1] != '\n') ls--;
+    *testMissing = std::string(b) + " [" + code + "] at " + ::base(file) + ":" +
+                   std::to_string(t.line) + ":" + std::to_string(t.p - ls + 1);
   }
   int globalSym(int s) {  // the file's own names first, then its package's, then global (builtins only, in a package)
     if (auto it = nsOf.find(file); it != nsOf.end())
@@ -292,12 +421,25 @@ struct Compiler : Gen {
     auto it = f == aliases.end() ? decltype(f->second.end()){} : f->second.find(s);
     return f != aliases.end() && it != f->second.end() ? &it->second : nullptr;
   }
+  bool prescanning = false;
   Tok lex(Lexer& l) {
     Tok t = l.next();
-    if (t.t == T_ERR) lexAtEnd = !*l.p, failAt(t.p, t.line, "@syntax %s", l.err);
+    if (prescanning && t.t == T_ERR) {
+      lexAtEnd = !*l.p;
+      diagnose(t.p, t.line, "@syntax %s", l.err);
+      lexAtEnd = false;
+    }
     return t;
   }
-  void next() { const char* e = lx.p; prev = cur, cur = lex(lx), prevEnd = e; }
+  void checkToken() {
+    if (cur.t == T_ERR) lexAtEnd = !*lx.p, failAt(cur.p, cur.line, "@syntax %s", lx.err);
+  }
+  template<class... A> [[noreturn]] void fail(const char* fmt, A... args) { checkToken(); CState::fail(fmt, args...); }
+  void next() {
+    checkToken();
+    prev = cur, prevEnd = lx.p, cur = lx.next();
+    if (!collectErrors) checkToken();
+  }
   Tok peek() { Lexer s = lx; Tok t = s.next(); return t.t == T_ERR ? Tok{} : t; }  // lex errors surface on next()
   bool peekIs(int t) { return peek().t == t; }
   bool at(int t) { return cur.t == t; }
@@ -305,11 +447,13 @@ struct Compiler : Gen {
   bool accept(int t) { return at(t) ? next(), true : false; }
   void expect(int t) {
     if (accept(t)) return;
+    checkToken();
     if (const char* hint = logicHint(cur); hint && !cur.nl)
       fail("@syntax expected '%c'; %s", t, hint);
     fail("@syntax expected '%c'", t);
   }
   int ident() {
+    checkToken();
     if (!at(T_ID) || cur.sym < NKW) fail("@syntax expected a name");
     return next(), prev.sym;
   }
@@ -390,8 +534,11 @@ struct Compiler : Gen {
       } else if (!ty.code) {
         Tok n = topName(prev);
         Global* g = findGlobal(n.sym);
-        if (!g || (g->kind != 'c' && g->kind != 't'))
-          failAt(t.p, t.line, "@unknown-type unknown type '%s' (num, str, bool, list, map, fn, any, a class, or a named type)", std::string(t.p, prevEnd).c_str());
+        if (!g || (g->kind != 'c' && g->kind != 't')) {
+          diagnose(t.p, t.line, "@unknown-type unknown type '%s' (num, str, bool, list, map, fn, any, a class, or a named type)", std::string(t.p, prevEnd).c_str());
+          if (at('?') && !cur.nl) next();
+          return {TY_ANY, std::string(t.p, prevEnd)};
+        }
         if (auto it = enumDefs.find(n.sym); g->kind == 'c' && it != enumDefs.end() && at('.') && !cur.nl) next(), n.sym = variantNamed(it->first, cur)->sym, next();  // Shape.Circle
         ty.code = g->kind == 'c' ? tyClass(n.sym) : TY_NAMED | uint64_t(n.sym) << 8;
       }
@@ -484,6 +631,21 @@ struct Compiler : Gen {
   }
 
   // ---- effects: io clock random yield spawn chan, or an `effect` (geom.Log for a module's) ----
+  int effectProbe = 0;
+  std::unordered_map<int, uint64_t> checkedEffects;
+  std::vector<std::string> checkedOps;
+  uint64_t effectBit(int sym) {
+    if (!diagnosticsOnly) return effBit(sym);
+    auto [it, added] = checkedEffects.try_emplace(sym, 0);
+    if (added) it->second = effBit(sym, &effectProbe);
+    return it->second;
+  }
+  int operationId(const std::string& name) {
+    if (!diagnosticsOnly) return effOpId(name);
+    checkedOps.push_back(name + "()");
+    return -(int)checkedOps.size();
+  }
+  const std::string& operationName(int op) { return op < 0 ? checkedOps[-op - 1] : effOpName(op); }
   uint64_t effectName(std::string& text) {
     Tok t = cur;
     if (atKw(K_yield)) return next(), text += "yield", EFF_YIELD;
@@ -494,7 +656,7 @@ struct Compiler : Gen {
     Tok q = topName(prev);
     Global* g = findGlobal(q.sym);
     if (!g || g->kind != 'e') failAt(t.p, t.line, "@unknown-effect unknown effect '%s' (io, clock, random, yield, spawn, chan, or one declared with 'effect')", std::string(t.p, prevEnd).c_str());
-    uint64_t b = effBit(q.sym);
+    uint64_t b = effectBit(q.sym);
     if (!b) failAt(t.p, t.line, "@limit too many effects (a program can declare at most %d)", EFF_LEVEL - EFF_BUILTIN);
     return text += std::string(t.p, prevEnd), b;
   }
@@ -509,7 +671,7 @@ struct Compiler : Gen {
     Tok ot = cur;
     int o = ident();
     if (auto* l = opsOf(t.sym))
-      for (auto [s, a] : *l) if (s == o) return {effOpId(symName(t.sym) + "." + symName(o)), a};
+      for (auto [s, a] : *l) if (s == o) return {operationId(symName(t.sym) + "." + symName(o)), a};
     failAt(ot.p, ot.line, "@undefined-name effect '%s' has no operation '%s'", name(t.sym), name(o));
   }
   void perform(const Tok& t) {  // E.op(args): a call that rt_prep sends to the nearest handler (see effPrep)
@@ -518,9 +680,10 @@ struct Compiler : Gen {
     if (!at('(') || cur.nl) failAt(ot.p, ot.line, "@syntax expected '(': perform an operation by calling it");
     next();
     int base = slot();
-    imm(0, box(effOpFn(op))), st(0, base);
+    imm(0, diagnosticsOnly ? NIL : box(effOpFn(op))), st(0, base);
     int n = exprList(')');
-    if (n != arity) failAt(ot.p, ot.line, "@arity '%s' expects %d arguments, got %d", effOpName(op).c_str(), arity, n);
+    if (n != arity) return diagnose(ot.p, ot.line, "@arity '%s' expects %d arguments, got %d", operationName(op).c_str(), arity, n),
+                          F->depth = base, imm(0, NIL);
     callWindow(base, n, 0, false);
   }
   // handle { body } with op(params) { ... } ...: each handler is compiled first, as a closure, so it is ready when
@@ -546,7 +709,7 @@ struct Compiler : Gen {
       imm(0, box((double)op)), st(0, slot());
       if (!at('(')) fail("@syntax expected '(' and the operation's parameters");
       Fn* h = lambda(t);
-      if (h->arity - 1 != arity) failAt(t.p, t.line, "@arity a handler for %s takes %d parameters, not %d", effOpName(op).c_str(), arity, h->arity - 1);
+      if (h->arity - 1 != arity) diagnose(t.p, t.line, "@arity a handler for %s takes %d parameters, not %d", operationName(op).c_str(), arity, h->arity - 1);
       st(0, slot()), n += 2;
     }
     collect(base, n, H_LIST);
@@ -641,7 +804,7 @@ struct Compiler : Gen {
     int base = slot();
     gmem(0, g.slot), st(0, base);
     int n = exprList(')');
-    if (!n) failAt(t.p, t.line, "@arity 'print' expects at least 1 argument, got 0");
+    if (!n) return diagnose(t.p, t.line, "@arity 'print' expects at least 1 argument, got 0"), F->depth = base, imm(0, NIL);
     collect(base + 1, n, H_PRINTARGS), st(0, slot());
     callWindow(base, 1, 0, false);
   }
@@ -660,8 +823,9 @@ struct Compiler : Gen {
   }
   void directCall(const Tok& t, Global& g) {  // known top-level fn: called through its stub; reloads repoint the stub
     int base = F->depth, n = exprList(')', true), a = arityOf(t.sym, g);
-    if (a < 0) failAt(t.p, t.line, "@undefined-name '%s' is not defined", name(t.sym));
-    if (a != n) failAt(t.p, t.line, "@arity '%s' expects %d arguments, got %d", name(t.sym), a, n);
+    if (a < 0) diagnose(t.p, t.line, "@undefined-name '%s' is not defined", name(t.sym));
+    else if (a != n) diagnose(t.p, t.line, "@arity '%s' expects %d arguments, got %d", name(t.sym), a, n);
+    if (a != n) return F->depth = base, imm(0, NIL);
     callDirect(base, n, g.stub);
   }
 
@@ -721,10 +885,117 @@ struct Compiler : Gen {
   struct Mark { Lexer lx; Tok cur, prev; const char *prevEnd, *srcStart; std::string file; };  // a place in the source
   Mark mark() { return {lx, cur, prev, prevEnd, srcStart, file}; }
   void rewind(const Mark& m) { lx = m.lx, cur = m.cur, prev = m.prev, prevEnd = m.prevEnd, srcStart = m.srcStart, file = m.file; }
+  enum Boundary { Statement, Member, Top };
+  bool startsItem(const Tok& t, Lexer after, Boundary where) {
+    if (t.t != T_ID) return false;
+    Tok n = after.next();
+    if (where == Member)
+      return t.sym == K_var || t.sym == K_fn || t.sym == S_invariant ||
+             (t.sym == S_override && n.t == T_ID && n.sym == K_fn);
+    if (t.sym == K_var || t.sym == K_if || t.sym == K_while || t.sym == K_for || t.sym == K_try ||
+        t.sym == K_return || t.sym == K_throw || t.sym == K_break || t.sym == K_continue) return true;
+    if (t.sym == K_fn) return where == Top || n.t == T_ID;
+    if (t.sym == S_atomic || t.sym == S_handle) return n.t == '{';
+    if (t.sym == S_parallel || t.sym == S_shared) return n.t == T_ID && (n.sym == K_for || n.sym == K_var);
+    return where == Top && (t.sym == K_import || t.sym == K_class || t.sym == K_extern ||
+                            (pubDecl(n) && t.sym == S_pub) || gpuFn(t, n) ||
+                            t.sym == S_enum || t.sym == S_effect || t.sym == S_type || t.sym == S_test);
+  }
+  // Replay the tokens from the boundary, including braces the failed parse had already consumed.
+  // A missing ')' or ']' cannot keep recovery from finding a new statement on the next line.
+  void synchronize(const Mark& start, const char* reached, Boundary where) {
+    rewind(start);
+    int braces = 0, brackets = 0;
+    for (bool first = true; !at(T_EOF); first = false) {
+      if (!braces && at('}') && where != Top) return;
+      if (!first && !braces && tokStart(cur) >= reached) {
+        if (at(';')) { prev = cur, prevEnd = lx.p, cur = lx.next(); return; }
+        if ((!brackets || cur.nl) && startsItem(cur, lx, where)) return;
+        if (cur.nl && !at('{') && !atKw(K_else) && !atKw(K_catch)) return;
+      }
+      if (at('{')) braces++;
+      else if (at('}') && braces) braces--;
+      else if (at('(') || at('[')) brackets++;
+      else if ((at(')') || at(']')) && brackets) brackets--;
+      prev = cur, prevEnd = lx.p, cur = lx.next();
+    }
+  }
+  bool skipInvalid(Boundary where) {
+    if (auto it = invalidDecls.find(cur.p); it != invalidDecls.end()) {
+      synchronize(mark(), it->second, where);
+      return true;
+    }
+    return false;
+  }
+  template<class Work> void item(Boundary where, Work work) {
+    if (!collectErrors) return work();
+    if (skipInvalid(where)) return;
+    Mark start = mark();
+    Fun* fun = F;
+    // Keep the emitted prefix in place. The rest of Fun includes local homes, numeric facts and open scopes.
+    Code& k = fun->k;
+    Code prefix = std::move(k);
+    Fun saved = *fun;
+    k = std::move(prefix);
+    size_t nc = k.c.size(), nr = k.rel.size(), nl = k.lines.size();
+    size_t nw = k.wlocals.size(), nk = k.relKind.size(), nh = k.hints.size();
+    struct LoopMark {
+      Loop* loop;
+      size_t brk, cont;
+      explicit LoopMark(Loop* l) : loop(l), brk(l ? l->brk.size() : 0), cont(l ? l->cont.size() : 0) {}
+      void restore() { if (loop) loop->brk.resize(brk), loop->cont.resize(cont); }
+    } loop(fun->loop), retry(fun->retry);
+#if __wasm__
+    size_t tee = setF == fun && setAt < nc ? setAt : SIZE_MAX;
+    Word oldOp = tee != SIZE_MAX ? k.c[tee] : 0;
+#endif
+    size_t np = pend.size(), nf = fieldUses.size(), nt = typedUses.size();
+    std::string o = owner, r = refKey, tr = testRefs;
+    auto missing = testMissing;
+    auto oldValues = olds;
+    auto contract = pubContract;
+    int pinned = pinLine;
+    if (attempt([&] { checkToken(); work(); })) return;
+    const char* reached = start.cur.p;
+    if (srcStart == start.srcStart && lx.end == start.lx.end)
+      reached = errorPos == prev.p ? tokStart(prev) : tokStart(cur);
+    k.c.resize(nc), k.rel.resize(nr), k.lines.resize(nl), k.wlocals.resize(nw), k.relKind.resize(nk), k.hints.resize(nh);
+#if __wasm__
+    if (tee != SIZE_MAX) k.c[tee] = oldOp;
+    setAt = SIZE_MAX, setF = nullptr;
+    std::fill(std::begin(pa), std::end(pa), Arg{});
+#else
+    beginFun();
+#endif
+    saved.k = std::move(k);
+    *fun = std::move(saved);
+    F = fun, loop.restore(), retry.restore();
+    pend.resize(np), fieldUses.resize(nf), typedUses.resize(nt);
+    owner = std::move(o), refKey = std::move(r), testRefs = std::move(tr), testMissing = missing;
+    olds = oldValues, pubContract = contract, pinLine = pinned, hasLit = lexAtEnd = false;
+    synchronize(start, reached, where);
+    if (where == Statement && start.cur.t == T_ID && (start.cur.sym == K_var || start.cur.sym == K_fn)) {
+      Lexer look = start.lx;
+      Tok name = look.next();
+      if (name.t == T_ID && name.sym >= NKW &&
+          std::none_of(F->locals.begin() + F->scopeAt, F->locals.end(), [&](auto& l) { return l.sym == name.sym; })) {
+        int h = home();
+        imm(0, NIL), stl(0, h), F->locals.push_back({name.sym, h});
+      }
+    }
+  }
   template <class Body> void detour(const std::string& f, const char* src, const char* at, int line, Body body, const char* end = nullptr) {
     Mark m = mark();
-    file = f, srcStart = src, lx = Lexer{at, line}, lx.end = end, next();
-    body(), rewind(m);
+    file = f, srcStart = src, lx = Lexer{at, line}, lx.end = end, cur = {}, next();
+    if (!attempt([&] { checkToken(); body(); })) {
+      rewind(m);
+#if __wasm__
+      longjmp(*recovery, 1);
+#else
+      throw ParseError{};
+#endif
+    }
+    rewind(m);
   }
   FormatSpec formatSpec(const char* start, const char* end, int line) {
     FormatSpec f;
@@ -815,7 +1086,7 @@ struct Compiler : Gen {
     f.parent = F, f.lambda = true, f.arrow = arrow, f.lambdaName = sym, f.parVar = parVar;
     Fn* fn = make<Fn>();
     consts.push_back(box(fn));
-    fn->code = newStub(), fn->name = sym >= 0 ? sym : intern((parVar >= 0 ? "parallel@" : "fn@") + std::to_string(t.line));
+    fn->code = parserStub(), fn->name = sym >= 0 ? sym : intern((parVar >= 0 ? "parallel@" : "fn@") + std::to_string(t.line));
     fn->arity = function(f, -1, false, symName(fn->name), (u32*)fn->code, fn);
     parWrites = std::move(f.parWrites);
     int base = F->depth, n = (int)f.caps.size();
@@ -861,10 +1132,12 @@ struct Compiler : Gen {
       int s = ident();
       LV v = resolve(F, s);
       if (v.k == LV_NONE) {
-        t.sym = s, t = topName(t);
-        Global* g = findGlobal(t.sym);
-        if (!g) undefined(t);
-        v = {LV_GLOBAL, g->slot, t.sym, true};
+        t.sym = s, t = topName(t, true);
+        if (Global* g = findGlobal(t.sym)) v = {LV_GLOBAL, g->slot, t.sym, true};
+        else {
+          if (t.sym >= 0) undefined(t);
+          imm(0, NIL), v = {LV_BAD};
+        }
       }
       while (accept('.')) { int f = ident(); load(v), v = {LV_FIELD, 0, f}; }
       load(v);
@@ -927,7 +1200,7 @@ struct Compiler : Gen {
       } while (accept(','));
       expect(')');
     }
-    if (k != n) failAt(vt.p, vt.line, "@arity %s expects %d arguments (%s), got %d", name(vd.sym), n, fs.c_str(), k);
+    if (k != n) diagnose(vt.p, vt.line, "@arity %s expects %d arguments (%s), got %d", name(vd.sym), n, fs.c_str(), k);
     ld(0, o), F->depth = base;
   }
   // match value { Circle(r) { ... } Rect(w, _) { ... } Empty { ... } else { ... } }: each arm tests the value's
@@ -988,7 +1261,7 @@ struct Compiler : Gen {
     } else fail("@syntax expected an arm: a variant (with names for its fields), or else");
     if (m.esym >= 0 && esym != m.esym) failAt(pt.p, pt.line, "@match this match is on %s, and '%s' is not one of its variants", name(m.esym), std::string(pt.p, cur.p + symName(cur.sym).size()).c_str());
     if (m.esym < 0) m.esym = esym, m.seen.assign(enumDefs[esym].vs.size(), false);
-    if (traceOn && !tiering) traceRef(!refKey.empty() ? refKey : !owner.empty() ? owner : testRefs, esym);  // the arms depend on its variants
+    if (traceOn && !tiering && !diagnosticsOnly) traceRef(!refKey.empty() ? refKey : !owner.empty() ? owner : testRefs, esym);  // the arms depend on its variants
     const VariantDef& vd = *variantNamed(esym, cur);
     size_t vi = &vd - enumDefs[esym].vs.data();
     if (m.seen[vi]) failAt(pt.p, pt.line, "@duplicate this match already has an arm for %s", name(vd.raw));
@@ -1075,7 +1348,8 @@ struct Compiler : Gen {
       return ldl(0, it->second), LV{};
     }
     if (LV v = resolve(F, t.sym); v.k != LV_NONE) return v;
-    t = topName(t);
+    t = topName(t, true);
+    if (t.sym < 0) return imm(0, NIL), LV{LV_BAD};
     Global* g = findGlobal(t.sym);
     if (!g && t.sym == S_todo && at('(') && !cur.nl) {  // todo(): a body not written yet (fut test: pending)
       next(), expect(')');
@@ -1084,8 +1358,8 @@ struct Compiler : Gen {
       konst(display(o->k.name) + " is not implemented yet"), helper(H_THROW), F->live = false;
       return {};
     }
-    if (!g) undefined(t);
-    if (traceOn && !tiering) traceRef(!refKey.empty() ? refKey : !owner.empty() ? owner : testRefs, t.sym);
+    if (!g) return undefined(t), imm(0, NIL), LV{LV_BAD};
+    if (traceOn && !tiering && !diagnosticsOnly) traceRef(!refKey.empty() ? refKey : !owner.empty() ? owner : testRefs, t.sym);
     if (pubContract && g->kind != 'n' && !(t.sym < (int)pubSym.size() && pubSym[t.sym]))  // the .api shows the clause, not the name
       failAt(t.p, t.line, "@private %s can only use what its readers can see, and '%s' is private: make it pub, or write the condition without it",
              pubContract, name(prev.sym));
@@ -1260,7 +1534,7 @@ struct Compiler : Gen {
   void block() {
     expect('{');
     scope([&] {
-      while (!accept('}')) at(T_EOF) ? fail("@syntax expected '}'") : (void)stmt();
+      while (!accept('}')) at(T_EOF) ? fail("@syntax expected '}'") : item(Statement, [&] { stmt(); });
     });
   }
   bool stmt() {  // returns true for a bare expression statement (the REPL echoes those)
@@ -1277,10 +1551,10 @@ struct Compiler : Gen {
           if (ty.code == TY_ANY) ty = {};
           bool top = F->top && F->scope == 0, init = accept('=');
           std::string what = "var '" + symName(top ? qualify(s) : s) + "'";
-          if (ty.code && !init && !acceptsNow(ty.code, NIL)) failAt(n.p, n.line, "@type %s is %s, so it needs an initial value", what.c_str(), ty.text.c_str());
+          if (ty.code && !init && !acceptsNow(ty.code, NIL)) diagnose(n.p, n.line, "@type %s is %s, so it needs an initial value", what.c_str(), ty.text.c_str());
           Tok v = cur;
           bool num = init ? expr() : (imm(0, NIL), false);
-          if (ty.code && num && (ty.code & 15) != TY_NUM && ((ty.code & 15) <= TY_CLS || (ty.code & 15) == TY_BUF)) failAt(v.p, v.line, "@type %s is %s, but its initial value is a number", what.c_str(), ty.text.c_str());
+          if (ty.code && num && (ty.code & 15) != TY_NUM && ((ty.code & 15) <= TY_CLS || (ty.code & 15) == TY_BUF)) diagnose(v.p, v.line, "@type %s is %s, but its initial value is a number", what.c_str(), ty.text.c_str());
           checkType(ty, what, num);
           if (top) return gmem(0, global(qualify(s)).slot, true), false;
           int site = ty.code ? typeSite(what, ty.text) : -1;
@@ -1346,6 +1620,7 @@ struct Compiler : Gen {
       bool n = v.num;
       return load(v), binRest(1, n, h), true;
     }
+    if (v.k == LV_BAD) return next(), expr(), false;
     if (v.k == LV_VAL || v.ro) fail("@misplaced cannot assign to this");
     next(), assign(v, t == '=' ? -1 : O_ADD + (t - T_ADDEQ));
     return false;
@@ -1662,9 +1937,8 @@ struct Compiler : Gen {
     int h = home();
     stl(0, h), F->locals.push_back({sym, h});
   }
-  [[noreturn]] void defaultArgument(const Tok& t) {
-    failAt(t.p, t.line, "@syntax fut has no default arguments; pass a map of options, e.g. fn f(a, opts: {b: num?})");
-  }
+  static constexpr const char* defaultArgument =
+      "@syntax fut has no default arguments; pass a map of options, e.g. fn f(a, opts: {b: num?})";
   // Compile `(params) { body }` and queue it to be installed behind `stub`. Returns the arity.
   int function(Fun& f, int cls, bool init, const std::string& nm, u32* stub, Fn* fn) {
     f.cls = cls, f.init = init, f.k.name = nm, f.k.file = file;
@@ -1699,7 +1973,7 @@ struct Compiler : Gen {
           int s = ident(), h = home();  // not d8..: arguments arrive, and calls pass them, in x registers
           f.locals.push_back({s, h}), homes.push_back(h);
           ptys.push_back({s, accept(':') ? type() : Ty{}});
-          if (at('=')) defaultArgument(cur);
+          if (at('=')) failAt(cur.p, cur.line, defaultArgument);
           if (Ty& t = ptys.back().second; t.code && t.code != TY_ANY)  // stores to it are checked too
             f.locals.back().ty = t.code, f.locals.back().num = t.code == TY_NUM, f.locals.back().site = typeSite("argument '" + symName(s) + "' of " + display(nm), t.text);
         } while (accept(','));
@@ -1736,7 +2010,7 @@ struct Compiler : Gen {
     int arity = (int)homes.size();
     if (arity > 64) fail("@limit too many parameters");
     for (int i = 0; i < arity; i++) param(i, homes[i]);
-    if (traceOn && !f.test && !(f.lambda && owner.empty())) traceTouch(traceMark(f.lambda ? owner : nm));  // fut test: it ran
+    if (traceOn && !diagnosticsOnly && !f.test && !(f.lambda && owner.empty())) traceTouch(traceMark(f.lambda ? owner : nm));  // fut test: it ran
     for (int i = first; i < arity && i < 8; i++)
       if (f.spec >> (i - first) & 1) f.guard.push_back(i), prove(homes[i]);
     for (size_t i = 0; i < ptys.size(); i++) {  // tier 2: a number parameter its entry guard proved needs no check
@@ -1749,13 +2023,14 @@ struct Compiler : Gen {
     if (edecl) effectsIn(emask, effSite(display(nm), emask, etext));
     if (spec || inv) contract(f, nm, nameTok.line, spec, inv, ptys, homes, first);
     Tier* tier = nullptr;  // (tier 2 compiles a function again without its contract: one with a contract stays in tier 1)
-    if (!f.lambda && !f.test && !tiering && !spec && !inv && !noTier) hotCounter(tier = &tiers[nm], first, homes);
+    if (!f.lambda && !f.test && !tiering && !spec && !inv && !noTier && !diagnosticsOnly)
+      hotCounter(tier = tierFor(nm), first, homes);
     if (!f.arrow) block();
-    else scope([&] { while (!accept('}')) at(T_EOF) ? fail("@syntax expected '}'") : (void)stmt(); });
+    else scope([&] { while (!accept('}')) at(T_EOF) ? fail("@syntax expected '}'") : item(Statement, [&] { stmt(); }); });
     if (f.live) f.retNum = false;  // can end without a return: returns nil
     pend.push_back({stub, fn, arity, finish(), owner, f.lambda || f.test, {}, envFor(file)});  // a test body is installed like a lambda
-    if (tier) {
-      Span& sp = spans.at(nm);
+    if (tier && spans[nm].end) {
+      Span& sp = spans[nm];
       pend.back().tier = {nm, std::string(sp.start, sp.end), file, sp.line, cls, cls < 0 ? intern(nm) : -1, init, stub, nullptr, nullptr, fn, false};
     }
     F = outer;
@@ -1893,8 +2168,8 @@ struct Compiler : Gen {
   // names what the error blames: the method whose call ended, or a store to a field from outside.
   void invariantMethod(ClassDef& cd, const ClassSpec& cs) {
     int inv = invariantSym();
-    Fn*& fn = methodFns[{cd.sym, inv}];
-    if (!fn) fn = make<Fn>(), fn->code = newStub(), fn->name = inv, consts.push_back(box(fn));
+    Fn*& fn = methodFn(cd.sym, inv);
+    if (!fn) fn = make<Fn>(), fn->code = parserStub(), fn->name = inv, consts.push_back(box(fn));
     cd.methods.push_back({inv, fn});
     std::string K = symName(cd.sym), q = K + ".inv@";
     Fun f, *outer = F;
@@ -1902,7 +2177,7 @@ struct Compiler : Gen {
     f.selfHome = home(), f.locals.push_back({K_self, f.selfHome});
     int who = home();
     param(0, f.selfHome), param(1, who);
-    if (traceOn) traceTouch(traceMark(q));
+    if (traceOn && !diagnosticsOnly) traceTouch(traceMark(q));
     bool calls = false;
     for (auto& c : cs.invariants) calls |= c.calls;
     if (calls) imm(0, box((double)effSite("the invariant of " + K, 0, "!"))), callNative("contract@begin", true);
@@ -1922,9 +2197,10 @@ struct Compiler : Gen {
   }
   bool unchanged(const std::string& q) {  // incremental reload: skip a body whose text and environment match
     present.push_back(q);
-    Span& sp = spans.at(q);
+    Span& sp = spans[q];
+    if (!sp.end) return false;
     auto it = recs.find(q);
-    if (it == recs.end() || it->second.text != fnv(sp.start, sp.end) || it->second.env != envFor(file)) return false;
+    if (diagnosticsOnly || it == recs.end() || it->second.text != fnv(sp.start, sp.end) || it->second.env != envFor(file)) return false;
     if (it->second.line != sp.line) shifts.push_back({q, sp.line - it->second.line});
     lx.p = sp.end, lx.line = sp.endLine, next();
     return true;
@@ -1963,58 +2239,69 @@ struct Compiler : Gen {
     }
     expect('{');
     while (!accept('}')) {
-      if (atKw(S_pub)) fail("@misplaced a class's fields and methods are public when the class is: put 'pub' before 'class'");
-      if (atKw(K_var)) {  // var name [= constant]: a declared field
-        next();
-        int s = ident();
-        for (auto& [x, d] : cd.fields) if (x == s) failAt(prev.p, prev.line, "@duplicate duplicate field '%s'", name(s));
-        Ty ty = accept(':') ? type() : Ty{};
-        bool given = accept('=');
-        Tok dt = cur;
-        V d = given ? constant() : NIL;
-        if (ty.code && given && !acceptsNow(ty.code, d)) failAt(dt.p, dt.line, "@type field '%s' is %s, but its default is not", name(s), ty.text.c_str());
-        if (ty.code) cd.ftypes.push_back({s, ty.code, typeSite("field '" + symName(s) + "' of " + symName(cd.sym), ty.text)});
-        cd.fields.push_back({s, d});
-        continue;
+      if (at(T_EOF)) {
+        // A class has always reported the expected member at an unfinished body.
+        fail("@syntax expected 'fn', 'override fn', 'var' or 'invariant' in class body");
       }
-      if (atKw(S_invariant) && !peek().nl) {  // (the prescan has it: compiled into the methods)
-        if (!cur.nl && prev.t != '{') fail("@syntax an invariant goes on its own line");
-        next();
-        for (int d = 0; !(d == 0 && (at('}') || cur.nl)); next()) {
-          if (at(T_EOF)) fail("@syntax expected '}'");
-          if (d == 0 && at('{')) fail("@syntax an invariant ends at the end of its line (wrap a lambda in parentheses)");
-          d += nesting(cur);
+      item(Member, [&] {
+        if (atKw(S_pub)) fail("@misplaced a class's fields and methods are public when the class is: put 'pub' before 'class'");
+        if (atKw(K_var)) {  // var name [= constant]: a declared field
+          next();
+          int s = ident();
+          for (auto& [x, d] : cd.fields) if (x == s) failAt(prev.p, prev.line, "@duplicate duplicate field '%s'", name(s));
+          cd.fields.push_back({s, NIL});
+          Ty ty = accept(':') ? type() : Ty{};
+          bool given = accept('=');
+          Tok dt = cur;
+          V d = given ? constant() : NIL;
+          if (ty.code && given && !acceptsNow(ty.code, d)) diagnose(dt.p, dt.line, "@type field '%s' is %s, but its default is not", name(s), ty.text.c_str());
+          if (ty.code) cd.ftypes.push_back({s, ty.code, typeSite("field '" + symName(s) + "' of " + symName(cd.sym), ty.text)});
+          cd.fields.back().second = d;
+          return;
         }
-        continue;
-      }
-      bool over = atKw(S_override) && peek().t == T_ID && peek().sym == K_fn;
-      if (over) next();
-      if (!atKw(K_fn)) fail("@syntax expected 'fn', 'override fn', 'var' or 'invariant' in class body");
-      next();
-      Tok mt = cur;
-      int m = ident();
-      for (auto& [x, f] : cd.methods) if (x == m) failAt(prev.p, prev.line, "@duplicate duplicate method '%s'", name(m));
-      for (auto& [x, d] : cd.fields) if (x == m) failAt(prev.p, prev.line, "@duplicate '%s' is already a field", name(m));
-      Fn*& f = methodFns[{cd.sym, m}];
-      if (!f) f = make<Fn>(), f->code = newStub(), f->name = m, consts.push_back(box(f));
-      cd.methods.push_back({m, f}), cd.written.push_back({m, over, {mt.p, mt.line, file, srcStart}});
-      std::string q = symName(cd.sym) + "." + symName(m);
-      if (unchanged(q)) continue;
-      Fun fun;
-      owner = q, function(fun, cd.sym, m == S_init, q, (u32*)f->code, f);
+        if (atKw(S_invariant) && !peek().nl) {  // (the prescan has it: compiled into the methods)
+          if (!cur.nl && prev.t != '{') fail("@syntax an invariant goes on its own line");
+          next();
+          for (int d = 0; !(d == 0 && (at('}') || cur.nl)); next()) {
+            if (at(T_EOF)) fail("@syntax expected '}'");
+            if (d == 0 && at('{')) fail("@syntax an invariant ends at the end of its line (wrap a lambda in parentheses)");
+            d += nesting(cur);
+          }
+          return;
+        }
+        bool over = atKw(S_override) && peek().t == T_ID && peek().sym == K_fn;
+        if (over) next();
+        if (skipInvalid(Member)) return;
+        if (!atKw(K_fn)) fail("@syntax expected 'fn', 'override fn', 'var' or 'invariant' in class body");
+        next();
+        Tok mt = cur;
+        int m = ident();
+        for (auto& [x, f] : cd.methods) if (x == m) failAt(prev.p, prev.line, "@duplicate duplicate method '%s'", name(m));
+        for (auto& [x, d] : cd.fields) if (x == m) failAt(prev.p, prev.line, "@duplicate '%s' is already a field", name(m));
+        Fn*& f = methodFn(cd.sym, m);
+        if (!f) f = make<Fn>(), f->code = parserStub(), f->name = m, consts.push_back(box(f));
+        cd.methods.push_back({m, f}), cd.written.push_back({m, over, {mt.p, mt.line, file, srcStart}});
+        std::string q = symName(cd.sym) + "." + symName(m);
+        if (unchanged(q)) return;
+        Fun fun;
+        owner = q, function(fun, cd.sym, m == S_init, q, (u32*)f->code, f);
+      });
     }
     if (auto it = classSpecs.find(cd.sym); it != classSpecs.end() && !it->second.invariants.empty()) invariantMethod(cd, it->second);
     classes.push_back(std::move(cd));
   }
   void enumDecl() {
     int s = qualify(ident());
-    EnumDef& e = enumDefs.at(s);  // the prescan's
     expect('{');
+    auto found = enumDefs.find(s);
+    if (found == enumDefs.end()) fail("@syntax expected a variant: a name, with its fields in parentheses if it has any (Circle(r: num))");
+    EnumDef& e = found->second;
     ClassDef base{s, -1, {}};
     base.sum = 1, classes.push_back(std::move(base));
     for (size_t i = 0; !accept('}');) {
       if (accept(',')) continue;
       ident();
+      if (i >= e.vs.size()) failAt(prev.p, prev.line, "@syntax expected a variant");
       ClassDef cd{e.vs[i++].sym, s, {}};
       cd.sum = 2;
       if (at('(') && !cur.nl)
@@ -2063,7 +2350,7 @@ struct Compiler : Gen {
     // extern "fut": a function of the runtime's own (fmath.cpp: math with the same results on every platform)
     Global* rtg = lib == "fut" ? findGlobal(intern("fut@" + symName(s))) : nullptr;
     if (lib == "fut" && !rtg) failAt(t.p, t.line, "@extern the runtime has no function '%s'", name(s));
-    void* fn = rtg ? (void*)rtg->o : !stub.empty() ? (void*)1 : externLookup(lib, symName(s), &err);
+    void* fn = rtg ? (void*)rtg->o : diagnosticsOnly || !stub.empty() ? (void*)1 : externLookup(lib, symName(s), &err);
     if (err && !strcmp(err, "pending")) {  // the host loads it, then compiles again
       if (std::find(modulesPending.begin(), modulesPending.end(), lib) == modulesPending.end()) modulesPending.push_back(lib);
       fn = (void*)1;
@@ -2108,7 +2395,7 @@ struct Compiler : Gen {
     int raw = ident(), s = qualify(raw);
     for (const char* b : {"io", "clock", "random", "yield", "spawn", "chan"})
       if (symName(raw) == b) failAt(nt.p, nt.line, "@duplicate '%s' is a builtin effect", b);
-    if (!effBit(s)) failAt(nt.p, nt.line, "@limit too many effects (a program can declare at most %d)", EFF_LEVEL - EFF_BUILTIN);
+    if (!effectBit(s)) failAt(nt.p, nt.line, "@limit too many effects (a program can declare at most %d)", EFF_LEVEL - EFF_BUILTIN);
     expect('{');
     EffectDef d{s, {}};
     std::vector<int> seen;
@@ -2121,7 +2408,7 @@ struct Compiler : Gen {
       if (std::find(seen.begin(), seen.end(), o) != seen.end()) failAt(ot.p, ot.line, "@duplicate duplicate operation '%s'", name(o));
       seen.push_back(o);
       std::string q = symName(s) + "." + symName(o);
-      EffOpDef od{effOpId(q), 0, {}, 0, {}, -1};
+      EffOpDef od{operationId(q), 0, {}, 0, {}, -1};
       expect('(');
       if (!accept(')')) {
         do {
@@ -2168,22 +2455,14 @@ struct Compiler : Gen {
     testRefs = traceTestRefs(tc.hash);
     Fun f;
     f.test = true;
-    struct Job { Compiler* c; Fun* f; std::string name; u32* stub; } job{this, &f, "test \"" + nm + "\"", newStub()};
-    Fun* outer = F;
     size_t np = pend.size();
-    std::string err, so = owner;
-    owner.clear();
-    if (guardCompile([](void* v) { auto& j = *(Job*)v; j.c->function(*j.f, -1, false, j.name, j.stub, nullptr); }, &job, &err)) tc.code = job.stub;
-    else {
-      std::string head = err.substr(0, err.find('\n'));
-      size_t at = head.find(": error: ");
-      std::string msg = at == std::string::npos ? head : head.substr(at + 9), loc = at == std::string::npos ? "" : head.substr(0, at);
-      bool missing = msg.starts_with("undefined name '") || msg.ends_with("' is not defined") || (msg.starts_with("module '") && msg.contains("' has no '"));
-      if (!missing) compileFail(err, false);
-      F = outer, pend.resize(np), hasLit = false, rewind(after);
-      tc.pending = msg + (loc.empty() ? "" : " at " + loc.substr(loc.rfind('/') + 1));
-    }
-    owner = so, testRefs = sr;
+    std::string so = std::exchange(owner, "");
+    auto* missing = std::exchange(testMissing, diagnosticsOnly ? nullptr : &tc.pending);
+    u32* stub = parserStub();
+    function(f, -1, false, "test \"" + nm + "\"", stub, nullptr);
+    if (tc.pending.empty()) tc.code = stub;
+    else pend.resize(np), rewind(after);
+    testMissing = missing, owner = std::move(so), testRefs = std::move(sr);
     tests.push_back(std::move(tc));
   }
   void declare(const Tok& t, char kind, int arity) {
@@ -2191,9 +2470,10 @@ struct Compiler : Gen {
     if (g.kind == 'n') failAt(t.p, t.line, "@duplicate cannot redefine builtin '%s'", name(t.sym));
     if (char& k = growAt(declKind, t.sym); k && (kind != 'v' || k != 'v')) failAt(t.p, t.line, "@duplicate '%s' is already defined", name(t.sym));
     else k = kind;
-    g.kind = kind;
-    if (kind == 'f' && !g.stub) g.stub = newStub();
-    if (kind == 's' && (g.cell = sharedCell(symName(t.sym))) < 0) failAt(t.p, t.line, "@limit too many shared vars");
+    Global& staged = declarations.try_emplace(t.sym, g).first->second;
+    staged.kind = kind;
+    if (kind == 'f' && !staged.stub) staged.stub = parserStub();
+    if (kind == 's' && (staged.cell = diagnosticsOnly ? 0 : sharedCell(symName(t.sym))) < 0) failAt(t.p, t.line, "@limit too many shared vars");
     mixEnv(uint64_t(t.sym) << 16 | uint64_t(kind) << 8 | uint64_t(arity), pubRaw), pubRaw = -1;
   }
   std::string resolvePath(std::string_view rel) {
@@ -2267,7 +2547,7 @@ struct Compiler : Gen {
     Tok p, t = lex(L);
     if (t.nl || t.t == '{' || t.t == '}' || t.t == T_EOF) failAt(t.p, t.line, "@syntax expected a condition (on the same line)");
     c.at = {t.p, t.line, file, srcStart};
-    for (int d = 0; !clauseEnds(d, p, t); b = L, p = t, t = lex(L), d += nesting(p)) {
+    for (int d = 0; t.t != T_EOF && !clauseEnds(d, p, t); b = L, p = t, t = lex(L), d += nesting(p)) {
       if (t.t != '(' || t.nl || !(p.t == ')' || p.t == ']' || (p.t == T_ID && (p.sym >= NKW || p.sym == K_fn)))) continue;
       if (p.t != T_ID || p.sym != S_old) c.calls = true;
       else if (!olds) failAt(p.p, p.line, "@misplaced old() is a value as it was on entry: it belongs in an ensures clause");
@@ -2351,6 +2631,7 @@ struct Compiler : Gen {
   void prescan(const std::string& path, const char* src) {
     std::string savedFile = file;
     const char* savedStart = srcStart;
+    bool wasScanning = std::exchange(prescanning, true);
     file = path, srcStart = src, aliases[path].clear(), plainModules[path].clear();
     bool pubNext = false;  // after `pub`: the next top-level declaration is public
     auto q = [&](Tok t) {  // a top-level name as declared: note whether it is public, then its symbol
@@ -2365,6 +2646,7 @@ struct Compiler : Gen {
     std::vector<Open> open;
     Lexer L{src};
     int depth = 0, cls = -1, eff = -1;  // eff: inside `effect Name { }` (its operations have no bodies)
+    const char* externStart = nullptr;
     bool ext = false;  // after `extern` (a C function: no body)
     // The parameters after a declaration's name: how many (a name after `(` or `,`; one after `:` is a type), and
     // whether its result is declared `: num` (and nothing else: `: num?` may be nil).
@@ -2375,7 +2657,9 @@ struct Compiler : Gen {
       for (int d = 1; d > 0; ) {  // a name after `(` or `,` at the parameters' own level (not inside a {shape})
         Tok a = lex(s);
         if (a.t == T_EOF) return n;
-        if (d == 1 && a.t == '=') defaultArgument(a);
+        if (d == 1 && a.t == '=') diagnose(a.p, a.line, defaultArgument);
+        if (d == 1 && (a.t == '}' || (a.t == '{' && last != ':' && last != '|' && last != '<' && last != '(' && last != ','))) return n;
+        if (d == 1 && a.nl && a.t == T_ID && (a.sym == K_var || a.sym == K_class || a.sym == K_import)) return n;
         if ((d += nesting(a) + (a.t == '<') - (a.t == '>') - 2 * (a.t == T_SHR)) == 1) n += a.t == T_ID && (last == '(' || last == ',');
         last = a.t;
       }
@@ -2387,121 +2671,140 @@ struct Compiler : Gen {
       return n;
     };
     for (Tok t = lex(L), p, pp; t.t != T_EOF; pp = p, p = t, t = lex(L)) {
-      bool afterKw = p.t == T_ID && t.t == T_ID;
-      topTry |= tryWord(t) && open.empty();  // a try in top-level code
-      if (t.t == T_ID && !stepsOn) {  // a program that names budget or stepCount counts steps from now on (fuel.cpp)
-        static const int b = intern("budget"), c = intern("stepCount");
-        stepsOn = t.sym == b || t.sym == c;
-      }
-      if (t.t == T_ID && t.sym == S_pub && !depth) {
-        Lexer s = L;
-        Tok n = lex(s);
-        Lexer s2 = s;
-        pubNext = pubDecl(n) || gpuFn(n, lex(s2));
-      } else if (t.t == T_ID && t.sym == K_extern && !depth) ext = true;
-      else if (ext && afterKw && p.sym == K_fn) declare(q(t), 'x', params()), ext = false; else if (t.t == '{') depth++;
-      else if (t.t == '}') {
-        if (--depth == 0) cls = -1, eff = -1;
-        if (!open.empty() && depth == open.back().depth) {
-          Span& sp = spans[open.back().q];
-          sp.start = open.back().start, sp.end = L.p, sp.line = open.back().line, sp.endLine = L.line;
-          open.pop_back();
+      Lexer afterToken = L;
+      const char* declaration = t.p;
+      int here = depth;
+      if (attempt([&] {
+        bool afterKw = p.t == T_ID && t.t == T_ID && t.sym >= NKW;
+        topTry |= tryWord(t) && open.empty();  // a try in top-level code
+        if (!diagnosticsOnly && t.t == T_ID && !stepsOn) {  // names budget or stepCount: instrument the code (fuel.cpp)
+          static const int b = intern("budget"), c = intern("stepCount");
+          stepsOn = t.sym == b || t.sym == c;
         }
-      } else if (afterKw && p.sym == K_fn && depth == 1 && eff >= 0) {  // an effect's operation
-        int n = params();
-        effOps[eff].push_back({t.sym, n});
-        mixEnv(uint64_t(eff) << 40 | uint64_t(t.sym) << 8 | uint64_t(n), -2);
-      } else if (depth == 0 && afterKw && p.sym == S_enum && !t.nl && t.sym >= NKW && [&] { Lexer s = L; return lex(s).t == '{'; }()) {
-        enumScan(L, q(t));
-      } else if (depth == 0 && afterKw && p.sym == S_effect && !t.nl && [&] { Lexer s = L; return lex(s).t == '{'; }()) {
-        Tok d = q(t);
-        declare(d, 'e', 0);
-        effOps[eff = d.sym].clear();
-      } else if (afterKw && p.sym == K_fn && (depth == 0 || (depth == 1 && cls >= 0))) {
-        Tok d = depth ? t : q(t);
-        std::string qn = depth ? symName(cls) + "." + symName(t.sym) : symName(d.sym);
-        if (spans.count(qn)) failAt(t.p, t.line, "@duplicate '%s' is already defined", qn.c_str());
-        Span& sp = spans[qn];
-        Lexer after = L;
-        int n = sp.arity = params(&sp.retNum, &after);
-        open.push_back({qn, p.p, p.line, depth});
-        if (!depth) declare(d, 'f', n | (sp.retNum ? 128 : 0));  // callers rely on a `: num` result
-        if (after.p != L.p) {
-          L = after;
-          declScan(L, qn, p, depth ? cls : -1, t.sym);
-        }
-      } else if (depth == 0 && t.t == T_ID && t.sym == S_type && isTypeDecl(L)) {  // type Name = <type>
-        Tok n = lex(L);
-        lex(L);  // =
-        const char* from = L.p;
-        Tok d = q(n);
-        int raw = pubRaw;  // (declare clears it)
-        declare(d, 't', 0);
-        skipType(L);  // past it: its braces are a type's, not a block's
-        mixEnv(fnv(from, L.p) ^ uint64_t(d.sym) << 32, raw);  // code that checks fields against it compiles against it
-      } else if (depth == 0 && afterKw && (p.sym == K_class || p.sym == K_var)) {
-        Tok d = q(t);
-        bool shared = p.sym == K_var && pp.t == T_ID && pp.sym == S_shared && !p.nl;
-        declare(d, p.sym == K_class ? 'c' : shared ? 's' : 'v', 0);
-        if (p.sym == K_class) {
-          enumDefs.erase(d.sym);  // (an enum by this name before a reload)
-          cls = d.sym, classAt[cls] = {{t.p, t.line, file, srcStart}, t.sym};
+        if (t.t == T_ID && t.sym == S_pub && !depth) {
           Lexer s = L;
-          if (lex(s).t == ':') if (Tok n = lex(s); n.t == T_ID) superAt[cls] = {n.p, n.line, file, srcStart};
-        }
-        else if (VarTy& v = varTypes[d.sym] = {}; [&] { Lexer s = L; return lex(s).t == ':'; }()) {  // a typed var
-          Lexer s = L;
-          lex(s), v.file = path, v.src = src, v.at = s.p, v.line = s.line;
-          const char* e = s.p;
-          for (Lexer r = s;;) {
-            Tok k = lex(r);
-            if (k.t == '=' || k.t == ';' || k.t == T_EOF || k.nl) break;
-            e = r.p;
+          Tok n = lex(s);
+          Lexer s2 = s;
+          pubNext = pubDecl(n) || gpuFn(n, lex(s2));
+        } else if (t.t == T_ID && t.sym == K_extern && !depth) ext = true, externStart = t.p;
+        else if (ext && afterKw && p.sym == K_fn) {
+          declaration = externStart, ext = false;
+          declare(q(t), 'x', params());
+        } else if (t.t == '{') depth++;
+        else if (t.t == '}') {
+          if ((depth = std::max(0, depth - 1)) == 0) cls = -1, eff = -1;
+          if (!open.empty() && depth == open.back().depth) {
+            Span& sp = spans[open.back().q];
+            sp.start = open.back().start, sp.end = L.p, sp.line = open.back().line, sp.endLine = L.line;
+            open.pop_back();
           }
-          mixEnv(fnv(s.p, e) ^ uint64_t(d.sym) << 32, -2);  // its stores check it, in importers too
+        } else if (afterKw && p.sym == K_fn && depth == 1 && eff >= 0) {  // an effect's operation
+          declaration = p.p;
+          int n = params();
+          effOps[eff].push_back({t.sym, n});
+          mixEnv(uint64_t(eff) << 40 | uint64_t(t.sym) << 8 | uint64_t(n), -2);
+        } else if (depth == 0 && afterKw && p.sym == S_enum && !t.nl && t.sym >= NKW && [&] { Lexer s = L; return lex(s).t == '{'; }()) {
+          declaration = p.p;
+          enumScan(L, q(t));
+        } else if (depth == 0 && afterKw && p.sym == S_effect && !t.nl && [&] { Lexer s = L; return lex(s).t == '{'; }()) {
+          declaration = p.p;
+          Tok d = q(t);
+          declare(d, 'e', 0);
+          effOps[eff = d.sym].clear();
+        } else if (afterKw && p.sym == K_fn && (depth == 0 || (depth == 1 && cls >= 0))) {
+          declaration = p.p;
+          Tok d = depth ? t : q(t);
+          std::string qn = depth ? symName(cls) + "." + symName(t.sym) : symName(d.sym);
+          if (spans.count(qn)) failAt(t.p, t.line, "@duplicate '%s' is already defined", qn.c_str());
+          Span& sp = spans[qn];
+          Lexer after = L;
+          int n = sp.arity = params(&sp.retNum, &after);
+          open.push_back({qn, p.p, p.line, depth});
+          if (!depth) declare(d, 'f', n | (sp.retNum ? 128 : 0));  // callers rely on a `: num` result
+          if (after.p != L.p) {
+            L = after;
+            declScan(L, qn, p, depth ? cls : -1, t.sym);
+          }
+        } else if (depth == 0 && t.t == T_ID && t.sym == S_type && isTypeDecl(L)) {  // type Name = <type>
+          Tok n = lex(L);
+          lex(L);  // =
+          const char* from = L.p;
+          Tok d = q(n);
+          int raw = pubRaw;  // (declare clears it)
+          declare(d, 't', 0);
+          skipType(L);  // past it: its braces are a type's, not a block's
+          mixEnv(fnv(from, L.p) ^ uint64_t(d.sym) << 32, raw);  // code that checks fields against it compiles against it
+        } else if (depth == 0 && afterKw && (p.sym == K_class || p.sym == K_var)) {
+          declaration = p.p;
+          Tok d = q(t);
+          bool shared = p.sym == K_var && pp.t == T_ID && pp.sym == S_shared && !p.nl;
+          declare(d, p.sym == K_class ? 'c' : shared ? 's' : 'v', 0);
+          if (p.sym == K_class) {
+            enumDefs.erase(d.sym);  // (an enum by this name before a reload)
+            cls = d.sym, classAt[cls] = {{t.p, t.line, file, srcStart}, t.sym};
+            Lexer s = L;
+            if (lex(s).t == ':') if (Tok n = lex(s); n.t == T_ID) superAt[cls] = {n.p, n.line, file, srcStart};
+          }
+          else if (VarTy& v = varTypes[d.sym] = {}; [&] { Lexer s = L; return lex(s).t == ':'; }()) {  // a typed var
+            Lexer s = L;
+            lex(s), v.file = path, v.src = src, v.at = s.p, v.line = s.line;
+            const char* e = s.p;
+            for (Lexer r = s;;) {
+              Tok k = lex(r);
+              if (k.t == '=' || k.t == ';' || k.t == T_EOF || k.nl) break;
+              e = r.p;
+            }
+            mixEnv(fnv(s.p, e) ^ uint64_t(d.sym) << 32, -2);  // its stores check it, in importers too
+          }
+        } else if (depth == 1 && cls >= 0 && t.t == T_ID && t.sym == S_invariant && (t.nl || p.t == '{') && [&] { Lexer s = L; return !lex(s).nl; }()) {
+          Clause c;
+          const char* from = L.p;
+          clauseScan(L, c, nullptr), classSpec(cls).invariants.push_back(c);
+          mixEnv(fnv(from, L.p) ^ uint64_t(cls) << 32, -1);  // editing one recompiles the class's methods
+        } else if (depth == 1 && cls >= 0 && afterKw && p.sym == K_var) {  // a declared field: methods compile against them
+          mixEnv(uint64_t(cls) << 32 | uint64_t(t.sym) << 2 | 1, -2);
+        } else if (depth == 0 && t.t == T_STR && p.t == T_ID && p.sym == K_import) {
+          declaration = p.p;
+          bool re = pubNext;
+          pubNext = false;
+          Target tg = importTarget(t);
+          std::string ip = tg.path;
+          Lexer s = L;
+          Tok a = lex(s), n = a.t == T_ID && a.sym == S_as ? lex(s) : Tok{};
+          if (a.t == T_ID && a.sym == S_as && (n.t != T_ID || n.sym < NKW)) failAt(n.p, n.line, "@syntax expected a %s name after 'as'", tg.pkg.empty() ? "module" : "package");
+          if (re && !tg.pkg.empty()) failAt(t.p, t.line, "@import 'pub import' re-exports a file of this package; a package's dependencies are not part of its interface");
+          if (re && n.t == T_ID) failAt(n.p, n.line, "@import 'pub import' re-exports the file's pub names as they are: leave out 'as'");
+          if (re) reexports[path].push_back(ip);
+          auto claim = [&](int a, const std::string& m) {  // one name, one module: a second import can't quietly take it
+            auto [it, fresh] = aliases[path].emplace(a, m);
+            if (!fresh && it->second != m)
+              failAt(n.t == T_ID ? n.p : t.p, n.t == T_ID ? n.line : t.line, "@import '%s' already names another import in this file: give one of them a different name with 'as'", symName(a).c_str());
+          };
+          if (!tg.pkg.empty()) claim(n.t == T_ID ? n.sym : intern(::base(std::string(t.p, (size_t)t.len))), tg.pkg);  // the package's name
+          if (sources.count(ip) && !nsOf.count(ip)) return;  // the program's own file: already here, with global names
+          std::string& pre = nsOf[ip];
+          if (pre.empty()) {  // the file's stem (after its package's prefix), made unique
+            pre = ip.substr(ip.rfind('/') + 1), pre = pre.substr(0, pre.find('.'));
+            if (const std::string& P = pkgPrefix(ip); !P.empty()) pre = P + "/" + pre;
+            while (prefixTaken(pre, ip)) pre += "_";
+          }
+          if (tg.pkg.empty() && n.t == T_ID) {  // import "file" as name: a module (unless an earlier import already made its pub names global)
+            claim(n.sym, pre);
+            if (!sources.count(ip)) isModule[ip] = true;
+          } else if (tg.pkg.empty() && isModule[ip]) plainModules[path].push_back(ip);
+          if (sources.count(ip)) return;
+          std::string& text = sources[ip].text;
+          if (!readSource(ip, text)) {
+            unavailableModules.insert(tg.pkg.empty() ? pre : tg.pkg);
+            failAt(t.p, t.line, "@import cannot read '%s'", ip.c_str());
+          }
+          files.push_back(ip), prescan(ip, text.c_str());
         }
-      } else if (depth == 1 && cls >= 0 && t.t == T_ID && t.sym == S_invariant && (t.nl || p.t == '{') && [&] { Lexer s = L; return !lex(s).nl; }()) {
-        Clause c;
-        const char* from = L.p;
-        clauseScan(L, c, nullptr), classSpec(cls).invariants.push_back(c);
-        mixEnv(fnv(from, L.p) ^ uint64_t(cls) << 32, -1);  // editing one recompiles the class's methods
-      } else if (depth == 1 && cls >= 0 && afterKw && p.sym == K_var) {  // a declared field: methods compile against them
-        mixEnv(uint64_t(cls) << 32 | uint64_t(t.sym) << 2 | 1, -2);
-      } else if (depth == 0 && t.t == T_STR && p.t == T_ID && p.sym == K_import) {
-        bool re = pubNext;
-        pubNext = false;
-        Target tg = importTarget(t);
-        std::string ip = tg.path;
-        Lexer s = L;
-        Tok a = lex(s), n = a.t == T_ID && a.sym == S_as ? lex(s) : Tok{};
-        if (a.t == T_ID && a.sym == S_as && (n.t != T_ID || n.sym < NKW)) failAt(n.p, n.line, "@syntax expected a %s name after 'as'", tg.pkg.empty() ? "module" : "package");
-        if (re && !tg.pkg.empty()) failAt(t.p, t.line, "@import 'pub import' re-exports a file of this package; a package's dependencies are not part of its interface");
-        if (re && n.t == T_ID) failAt(n.p, n.line, "@import 'pub import' re-exports the file's pub names as they are: leave out 'as'");
-        if (re) reexports[path].push_back(ip);
-        auto claim = [&](int a, const std::string& m) {  // one name, one module: a second import can't quietly take it
-          auto [it, fresh] = aliases[path].emplace(a, m);
-          if (!fresh && it->second != m)
-            failAt(n.t == T_ID ? n.p : t.p, n.t == T_ID ? n.line : t.line, "@import '%s' already names another import in this file: give one of them a different name with 'as'", symName(a).c_str());
-        };
-        if (!tg.pkg.empty()) claim(n.t == T_ID ? n.sym : intern(::base(std::string(t.p, (size_t)t.len))), tg.pkg);  // the package's name
-        if (sources.count(ip) && !nsOf.count(ip)) continue;  // the program's own file: already here, with global names
-        std::string& pre = nsOf[ip];
-        if (pre.empty()) {  // the file's stem (after its package's prefix), made unique
-          pre = ip.substr(ip.rfind('/') + 1), pre = pre.substr(0, pre.find('.'));
-          if (const std::string& P = pkgPrefix(ip); !P.empty()) pre = P + "/" + pre;
-          while (prefixTaken(pre, ip)) pre += "_";
-        }
-        if (tg.pkg.empty() && n.t == T_ID) {  // import "file" as name: a module (unless an earlier import already made its pub names global)
-          claim(n.sym, pre);
-          if (!sources.count(ip)) isModule[ip] = true;
-        } else if (tg.pkg.empty() && isModule[ip]) plainModules[path].push_back(ip);
-        if (sources.count(ip)) continue;
-        std::string& text = sources[ip].text;
-        if (!readSource(ip, text)) failAt(t.p, t.line, "@import cannot read '%s'", ip.c_str());
-        files.push_back(ip), prescan(ip, text.c_str());
-      }
+      })) continue;
+      invalidDecls[declaration] = errorPos;
+      L = afterToken, depth = here, pubNext = false, pubRaw = -1;
     }
-    file = savedFile, srcStart = savedStart;
+    file = savedFile, srcStart = savedStart, prescanning = wasScanning;
   }
 
   // ---- top level ----
@@ -2520,6 +2823,7 @@ struct Compiler : Gen {
   struct GpuDecl { std::string file; const char* src; size_t i; int q; };
   std::unordered_map<std::string, std::vector<GpuFnSrc>> gpuSrcs;
   std::vector<GpuDecl> gpuDecls;
+  std::vector<std::pair<int, GpuInfo>> gpuInfos;
   void gpuDecl() {  // at `fn`
     const char* p = cur.p;
     int line = cur.line;
@@ -2537,22 +2841,26 @@ struct Compiler : Gen {
         auto it = f == aliases.end() ? decltype(f->second.end()){} : f->second.find(s);
         return f != aliases.end() && it != f->second.end() ? &it->second : nullptr;
       };
-      auto fail = [&](const char* p, int line, const std::string& m) { failHere(At{p, line, d.file, d.src}, "@gpu %s", m); };
-      gpuInfoSet(d.q, wgslOf(gpuSrcs[d.file], d.i, alias, fail));
+      auto fail = [&](const char* p, int line, const std::string& m) {
+        file = d.file, srcStart = d.src;
+        failAt(p, line, "@gpu %s", m.c_str());
+      };
+      attempt([&] { gpuInfos.emplace_back(d.q, wgslOf(gpuSrcs[d.file], d.i, alias, fail)); });
     }
   }
   void topLevel() {
-    while (!at(T_EOF)) {
+    while (!at(T_EOF)) item(Top, [&] {
       const char* item = cur.p;  // where the declaration starts, `pub` included (fut test --changed hashes it)
-      bool trace = traceOn && testing;
+      bool trace = traceOn && testing && !diagnosticsOnly;
       if (atPub()) next();
-      if (atKw(K_fn)) { next(), fnDecl(); if (trace) traceFn(item); continue; }
-      if (at(T_ID) && [&] { Lexer s = lx; return gpuFn(cur, s.next()); }()) { next(), gpuDecl(); if (trace) traceFn(item); continue; }
-      if (atKw(K_class)) { next(), classDecl(); if (trace) traceClassDecl(item); continue; }
-      if (atKw(K_extern)) { next(), externDecl(); continue; }
-      if (atKw(S_effect) && peek().t == T_ID && !peek().nl && peek().sym >= NKW) { next(), effectDecl(); continue; }
-      if (atKw(S_enum) && peek().t == T_ID && !peek().nl && peek().sym >= NKW) { next(), enumDecl(); if (trace) traceEnum(item); continue; }
-      if (atKw(S_test) && peekIs(T_STR)) { next(), testDecl(); if (trace) traceCuts.push_back({item, prevEnd}); continue; }
+      if (skipInvalid(Top)) return;
+      if (atKw(K_fn)) { next(), fnDecl(); if (trace) traceFn(item); return; }
+      if (at(T_ID) && [&] { Lexer s = lx; return gpuFn(cur, s.next()); }()) { next(); if (skipInvalid(Top)) return; gpuDecl(); if (trace) traceFn(item); return; }
+      if (atKw(K_class)) { next(), classDecl(); if (trace) traceClassDecl(item); return; }
+      if (atKw(K_extern)) { next(), externDecl(); return; }
+      if (atKw(S_effect) && peek().t == T_ID && !peek().nl && peek().sym >= NKW) { next(), effectDecl(); return; }
+      if (atKw(S_enum) && peek().t == T_ID && !peek().nl && peek().sym >= NKW) { next(), enumDecl(); if (trace) traceEnum(item); return; }
+      if (atKw(S_test) && peekIs(T_STR)) { next(), testDecl(); if (trace) traceCuts.push_back({item, prevEnd}); return; }
       if (atKw(S_type) && isTypeDecl(lx)) {  // type Name = <type>: checked where it is used, by name
         next();
         Tok n = cur;
@@ -2561,7 +2869,7 @@ struct Compiler : Gen {
         Ty t = type();
         if (resolveNamed(t.code, s)) failAt(n.p, n.line, "@unknown-type type %s is defined as itself", name(s));
         typeDefs[s] = t.code;
-        continue;
+        return;
       }
       if (atKw(K_import)) {
         next();
@@ -2569,8 +2877,12 @@ struct Compiler : Gen {
         next();
         std::string ip = importTarget(prev).path;
         if (at(T_ID) && cur.sym == S_as) next(), ident();
-        if (Source& s = sources.at(ip); !s.compiled) s.compiled = true, detour(ip, s.text.c_str(), s.text.c_str(), 1, [&] { topLevel(); });
-        continue;
+        if (auto it = sources.find(ip); it != sources.end() && !it->second.compiled) {
+          Source& s = it->second;
+          s.compiled = true;
+          detour(ip, s.text.c_str(), s.text.c_str(), 1, [&] { topLevel(); });
+        }
+        return;
       }
       // On reload, top-level statements are compiled (to validate them) and then dropped, except
       // initialisers of vars that are new or whose declaration was edited. Other state survives the reload.
@@ -2584,13 +2896,14 @@ struct Compiler : Gen {
       if (v >= 0 && !echo) {
         const char* end = cur.p;
         while (end > start && (uint8_t)end[-1] <= ' ') end--;
-        uint64_t& h = varText[v], t = fnv(start, end);
+        auto old = ::varText.find(v);
+        uint64_t& h = varText.try_emplace(v, old != ::varText.end() ? old->second : 0).first->second, t = fnv(start, end);
         if (reload && h && h != t) keep = true, add(reset, symName(v));
         h = t;
         if (trace) traceCuts.push_back({item, end}), traceDefine("v:" + symName(v), traceHash(item, end));
       }
       if (!keep) F->k.c.resize(c), F->k.rel.resize(r), F->k.lines.resize(l);
-    }
+    });
   }
 
   Compiled run(const std::string& path, const char* src) {
@@ -2624,16 +2937,19 @@ struct Compiler : Gen {
       envFinal[P] = e;
     }
     invariantClasses();
-    file = path, srcStart = src, lx = Lexer{src}, next();
+    file = path, srcStart = src, lx = Lexer{src}, cur = {}, next();
     Fun top;
     top.top = true, top.noRegs = topTry, top.k.name = "<top>", top.k.file = path, F = &top;
     topLevel();
     if (!modulesPending.empty()) compileFail("waiting for the host to load modules", false);
-    if (testing) todosPending(), specProperties();
-    if (testing && traceOn) traceFiles();
+    if (testing && !diagnosticsOnly && reports.empty()) {
+      todosPending(), specProperties();
+      if (traceOn) traceFiles();
+    }
     checkClasses();
     checkGpu();
-    for (auto& [sym, v] : varTypes) globalType(sym);  // each typed var's type, for commit
+    for (auto& [sym, v] : varTypes) attempt([&] { globalType(sym); });
+    if (diagnosticsOnly || !reports.empty()) return {};
     Code chunk = finish();
     return commit(chunk);
   }
@@ -2718,7 +3034,7 @@ struct Compiler : Gen {
   // (a method they define may run on an instance of it) and its subclasses (they inherit its invariants).
   void invariantClasses() {
     std::unordered_map<int, int> sup;
-    for (auto& [c, at] : superAt) detour(at.file, at.src, at.p, at.line, [&] { ident(), sup[c] = topName(prev).sym; });
+    for (auto& [c, at] : superAt) attempt([&] { detour(at.file, at.src, at.p, at.line, [&] { ident(), sup[c] = topName(prev).sym; }); });
     auto up = [&](int k) { auto it = sup.find(k); return it == sup.end() ? -1 : it->second; };
     auto has = [&](int k) { auto it = classSpecs.find(k); return it != classSpecs.end() && !it->second.invariants.empty(); };
     for (auto& [d, _] : classAt)
@@ -2758,7 +3074,7 @@ struct Compiler : Gen {
     for (auto& q : fnSpecs) all.push_back({q, specFns.at(q).fn, true, nullptr, specFns.at(q).name});
     for (int c : classOrder) all.push_back({symName(c), classSpecs.at(c).at, false, &classSpecs.at(c), classSpecs.at(c).name});
     for (auto& d : all) {
-      if (inStd(d.at.file) && !inStd(canonicalPath(mainFile))) continue;  // the standard library's are tested by its own tests
+      if (inStd(d.at.file) && !inStd(canonicalPath(entryPath))) continue;  // the standard library's are tested by its own tests
       std::string n = d.n, call;
       PropSite ps;
       ps.file = d.at.file, ps.cls = !d.isFn, ps.names = {n};
@@ -2810,7 +3126,7 @@ struct Compiler : Gen {
     for (auto& cd : classes)
       if (cd.sym == sym) {
         v = {cd.super, {}, &cd.fields};
-        for (auto& [m, f] : cd.methods) if (m != invariantSym()) v.methods.push_back({m, spans.at(symName(sym) + "." + symName(m)).arity});
+        for (auto& [m, f] : cd.methods) if (m != invariantSym()) v.methods.push_back({m, spans[symName(sym) + "." + symName(m)].arity});
         return true;
       }
     Global* g = findGlobal(sym);
@@ -2820,12 +3136,23 @@ struct Compiler : Gen {
     for (auto& [m, f] : c->methods) if (m != invariantSym()) v.methods.push_back({m, f->arity - 1});  // a method's Fn counts self
     return true;
   }
-  [[noreturn]] void failHere(const At& a, const char* fmt, const std::string& x, const std::string& y = "", const std::string& z = "", const std::string& w = "") {
+  void diagnoseHere(const At& a, const char* fmt, const std::string& x, const std::string& y = "", const std::string& z = "", const std::string& w = "") {
     file = a.file, srcStart = a.src, lexAtEnd = false;
-    failAt(a.p, a.line, fmt, x.c_str(), y.c_str(), z.c_str(), w.c_str());
+    diagnose(a.p, a.line, fmt, x.c_str(), y.c_str(), z.c_str(), w.c_str());
   }
   static std::string params(int n) { return std::to_string(n) + (n == 1 ? " parameter" : " parameters"); }
   void checkClasses() {
+    for (auto& cd : classes) {
+      if (cd.super < 0 || !superAt.contains(cd.sym)) continue;
+      ClassView v;
+      std::unordered_set<int> seen{cd.sym};
+      for (int s = cd.super; s >= 0 && view(s, v); s = v.super) {
+        if (seen.insert(s).second) continue;
+        diagnoseHere(superAt.at(cd.sym), "@class bad superclass '%s'", symName(cd.super));
+        cd.super = -1;
+        break;
+      }
+    }
     // Methods: one that replaces a superclass's method says `override`, and takes the same parameters; one
     // that says `override` replaces something. So adding a method to a base class can't silently capture a
     // subclass's unrelated method of the same name, and renaming one can't silently orphan an override.
@@ -2837,18 +3164,18 @@ struct Compiler : Gen {
         for (int s = cd.super; s >= 0 && owner < 0 && view(s, v); s = v.super)
           for (auto [m, a] : v.methods) if (m == w.sym) owner = s, arity = a;
         std::string m = symName(w.sym), q = symName(cd.sym) + "." + m;
-        if (owner < 0 && w.over) failHere(w.at, "@override '%s' is marked override, but no superclass of %s has a method '%s'", m, symName(cd.sym), m);
+        if (owner < 0 && w.over) diagnoseHere(w.at, "@override '%s' is marked override, but no superclass of %s has a method '%s'", m, symName(cd.sym), m);
         if (owner < 0) continue;
-        if (!w.over) failHere(w.at, "@override '%s' overrides %s: write 'override fn %s' if that is intended", m, symName(owner) + "." + m, m);
-        if (int mine = spans.at(q).arity; mine != arity)
-          failHere(w.at, "@override '%s' takes %s, but %s, which it overrides, takes %s", m, params(mine), symName(owner) + "." + m, params(arity));
+        if (!w.over) diagnoseHere(w.at, "@override '%s' overrides %s: write 'override fn %s' if that is intended", m, symName(owner) + "." + m, m);
+        if (int mine = spans[q].arity; mine != arity)
+          diagnoseHere(w.at, "@override '%s' takes %s, but %s, which it overrides, takes %s", m, params(mine), symName(owner) + "." + m, params(arity));
         // Callers that hold a superclass's instance rely on its method's types, so an override declares the same.
         auto a = sigs.find(symName(owner) + "." + m), b = sigs.find(q);
         if (a != sigs.end() && b != sigs.end() && a->second.types != b->second.types)
-          failHere(w.at, "@override '%s' must declare the same types as %s, which it overrides: %s, not %s", m, symName(owner) + "." + m, a->second.text, b->second.text);
+          diagnoseHere(w.at, "@override '%s' must declare the same types as %s, which it overrides: %s, not %s", m, symName(owner) + "." + m, a->second.text, b->second.text);
         // ...and may perform only what the method it replaces declares (a subset: doing less breaks no caller).
         if (a != sigs.end() && b != sigs.end() && a->second.eff && (!b->second.eff || (b->second.effMask & ~a->second.effMask)))
-          failHere(w.at, "@override '%s' must declare effects within those of %s, which it overrides (%s), not %s", m, symName(owner) + "." + m,
+          diagnoseHere(w.at, "@override '%s' must declare effects within those of %s, which it overrides (%s), not %s", m, symName(owner) + "." + m,
                    a->second.effText, b->second.eff ? b->second.effText : "none (unchecked)");
       }
     // x.name where x has a declared type: a shape's fields; a class's methods, and its fields if it declares them.
@@ -2879,7 +3206,7 @@ struct Compiler : Gen {
       }
       std::string msg = "'" + symName(u.sym) + "' is not " + (u.call ? "a method or field" : "a field") + " of " + what + " (" + u.var +
                         " is " + what + ": " + (list.empty() ? "it has none" : list) + ")" + (near.empty() ? "" : "; did you mean '" + near + "'?");
-      failHere(u.at, "@no-field %s", msg);
+      diagnoseHere(u.at, "@no-field %s", msg);
     }
     // Fields: in a class that declares its fields (or inherits declared ones), self.name must be one of them.
     for (auto& u : fieldUses) {
@@ -2887,7 +3214,7 @@ struct Compiler : Gen {
       bool closed = false, found = false;
       for (int s = u.cls; s >= 0 && view(s, v); s = v.super)
         for (auto& [f, d] : *v.fields) closed = true, found |= f == u.sym;
-      if (closed && !found) failHere(u.at, "@no-field %s has no field '%s' (declare it in the class: var %s)", symName(u.cls), symName(u.sym), symName(u.sym));
+      if (closed && !found) diagnoseHere(u.at, "@no-field %s has no field '%s' (declare it in the class: var %s)", symName(u.cls), symName(u.sym), symName(u.sym));
     }
   }
 
@@ -2918,6 +3245,16 @@ struct Compiler : Gen {
     return (T*)g.o;
   }
   Compiled commit(Code& chunk) {
+    published = true;
+    for (int s : newGlobals) ::global(s);
+    for (auto& [s, g] : declarations) ::global(s) = g;
+    declarations.clear(), stageGlobals = false;
+    ::enumDefs = std::move(enumDefs), ::sigs = std::move(sigs);
+    installedNames = static_cast<Namespaces&>(*this);
+    mainFile = installedNames.entryPath;
+    methodFns.merge(newMethods), tiers.merge(newTiers);
+    for (auto [s, h] : varText) ::varText[s] = h;
+    for (auto& [q, info] : gpuInfos) gpuInfoSet(q, std::move(info));
     Compiled out;
     out.files = files, out.tests = std::move(tests);
     for (auto& f : files) out.sources.push_back({f, sources.at(f).text});
@@ -3041,29 +3378,96 @@ void tierUp(void* p, u32 numArgs) {
   }
   t.failed = true;
 }
-// The compile in progress lives on the heap: a compile error unwinds past compile() (wasm: by longjmp, which runs
-// no destructors), and the next compile frees what it left.
-static Compiler* active;
+// Keep the compile on the heap, so it can be destroyed after a WASM longjmp past its working stack.
+struct CompileJob {
+  Compiler& c;
+  const std::string& path;
+  const std::string* text;
+  Compiled out;
+};
+static bool compileInput(CompileJob& j, std::string& err, bool& atEnd) {
+  size_t constants = consts.size();
+  bool steps = stepsOn;
+  bool ok = guardCompile([](void* ctx) {
+    auto& [c, path, text, out] = *(CompileJob*)ctx;
+    packagesReset(), modulesPending.clear();
+    if (!c.echo) {
+      c.entryPath = path;
+      const Package* p = packageOf(path);
+      c.entryDir = p ? p->dir : "";
+    }
+    std::string& src = c.sources[path].text;
+    if (text) {
+      src = *text;
+      viewsRewrite(src, path);
+    } else if (!readSource(path, src)) compileFail("cannot read " + path, false);
+    out = c.run(path, src.c_str());
+  }, &j, &err, &atEnd);
+  if (!j.c.published) {
+    for (u32* stub : j.c.newStubs) discardStub(stub);
+    if (j.c.firstIC >= 0) discardICs(j.c.firstIC);
+    consts.resize(constants), stepsOn = steps;
+  }
+  return ok;
+}
 Compiled compile(const std::string& path, bool reload, bool echo, const std::string* text, bool tests) {
   Locked code(codeMu);  // one compile at a time, whichever isolate asks (tierUp too)
   ImageScope image;     // what it makes, compiled code points at, in every isolate
-  JitBatch writable;    // nothing JIT-compiled runs during a compile
-  delete active;
-  Compiler& c = *(active = new Compiler);
-  c.reload = reload, c.echo = echo, c.testing = tests;
-  packagesReset(), modulesPending.clear();
-  if (!echo) {
-    mainFile = path;
-    const Package* p = packageOf(path);
-    entryDir = p ? p->dir : "";
+  JitBatch writable;
+  auto c = std::make_unique<Compiler>();
+  c->reload = reload, c->echo = echo, c->testing = tests;
+  c->collectErrors = !echo, c->stageGlobals = true;
+  CompileJob j{*c, path, text};
+  std::string err;
+  bool atEnd = false;
+  bool ok = compileInput(j, err, atEnd);
+  if (ok && c->reports.empty()) return std::move(j.out);
+  if (c->collectErrors && !c->reports.empty() && c->failureText.empty()) {
+    std::string diags = c->diagnosticText();
+    if (!err.empty()) diags += "\n" + err;
+    err = std::move(diags);
   }
-  std::string& src = c.sources[path].text;
-  if (text) {
-    src = *text;
-    viewsRewrite(src, path);
-  } else if (!readSource(path, src)) compileFail("cannot read " + path, false);
-  Compiled out = c.run(path, src.c_str());
-  delete active, active = nullptr;
+  c.reset();
+#if __wasm__
+  static TLS std::string failure;
+  failure = std::move(err);
+  compileFail(failure, atEnd);
+#else
+  compileFail(err, atEnd);
+#endif
+}
+std::vector<Diag> compileDiagnostics(const std::string& path, const std::string& text) {
+  Locked code(codeMu);
+  ScratchImage image;
+  auto c = std::make_unique<Compiler>();
+  c->collectErrors = c->diagnosticsOnly = c->stageGlobals = c->testing = true;
+  CompileJob job{*c, path, &text};
+  std::string err;
+  bool atEnd = false;
+  auto pending = std::move(modulesPending);
+  bool ok = compileInput(job, err, atEnd);
+  modulesPending = std::move(pending);
+  c->sortReports();
+  std::vector<Diag> out;
+  for (auto& r : c->reports) out.push_back(std::move(r.diag));
+  if (!ok && c->failureText.empty()) {
+    // Manifests, view rewriting and resource limits use the platform's compile error path.
+    std::string msg = err.substr(0, err.find('\n')), file = path, code;
+    int line = 1, col = 1;
+    if (size_t at = msg.find(": error: "); at != std::string::npos) {
+      std::string loc = msg.substr(0, at);
+      msg.erase(0, at + 9);
+      if (size_t last = loc.rfind(':'); last != std::string::npos) {
+        line = atoi(loc.c_str() + last + 1), loc.resize(last);
+        if (size_t first = loc.rfind(':'); first != std::string::npos && dig(loc[first + 1]))
+          col = line, line = atoi(loc.c_str() + first + 1), loc.resize(first);
+      }
+      file = std::move(loc);
+      if (size_t tag = msg.rfind(" ["); tag != std::string::npos && msg.ends_with(']'))
+        code = msg.substr(tag + 2, msg.size() - tag - 3), msg.resize(tag);
+    }
+    out.push_back({std::move(file), std::move(msg), std::move(code), line, col});
+  }
   return out;
 }
 static bool revertReload(const std::vector<int>& newVars, std::string* err) {
