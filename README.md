@@ -598,6 +598,21 @@ fn main() {
 - **Hot reload.** Under `-w`, a reload stops every isolate at a safe point (a loop iteration or call, or where it waits), patches the code once, then has each run the new top level and `reload()` in its own transaction. If any of them fails, every isolate rolls back and the old code returns, as for a failed reload with one isolate. `main()` reloads even while it waits on a channel or a task.
 - **In wasm** fut.wasm (Node, a browser, a Cloudflare Worker) runs a program's isolates on its one thread, taking turns, seeded as `fut test` runs them natively (by 1, or `--seed n`): the same program interleaves the same way every run. Each isolate is a wasm stack of its own, switched with JSPI. **fut-mt.wasm**, the threads build (`python3 build.py wasm --threads`; `FUT_WASM=build/fut-mt.wasm node web/run.mjs prog.fut`), runs them in parallel as natively: a pool of up to `cores()` threads (`--threads n`), each a Node worker, over one shared memory; `fut test` is seeded there too. It needs shared memory: Node, or a cross-origin isolated page (`web/serve.mjs` sends the headers, and the page then runs fut-mt.wasm, every thread a worker, the main isolate's too; `?threads=0` runs fut.wasm), not a Cloudflare Worker. In fut-mt.wasm a reload under `-w` stops the isolates and reloads each, as natively; in fut.wasm it waits until the isolates `main()` started have ended. See phase 5 in `docs/isolates.md`.
 
+### Parallel for
+
+```
+var img = u8s(w * h)
+parallel for i in 0..w * h { img[i] = pixel(i % w, i / w, scene) }   // every core; then the next line
+```
+
+- **The iterations run on the pool's isolates at once,** a block at a time, and the loop ends when all have. A
+  mandelbrot of 1200×800 into a `u8s` takes 65–95 ms instead of 525 ms on 12 cores (a loaded machine).
+- **Its result is a plain `for`'s, on every run, machine and core count.** The body writes its results to buffers,
+  each only at `[i]`: one it writes (as `name[...] =` in the body) it can't read or write at any other index. What it
+  reads from outside (`scene`, other buffers, the globals) is a frozen copy: changing one raises. It can't assign a
+  variable from outside it, `return` or `break` (compile errors), and it performs no effects (no `print`, `random`,
+  channels). An error is the one at the lowest i that fails: `parallel for, at i = 7: ...`.
+
 ## C functions
 
 ```

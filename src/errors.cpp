@@ -51,6 +51,7 @@ const ErrCode codes[] = {
     {"expect", "An expect failed.", "The message shows both sides; fix the code or the expectation."},
     {"send", "A value can't be sent to another isolate (a fiber, a js value, a native function, or nested too deep).", "Send plain data: numbers, strings, lists, maps, instances of compiled classes."},
     {"channel", "A channel was used after it was closed.", "Stop receiving once recv() reports the end; close a channel once."},
+    {"parallel", "A parallel for's body did something that would make its result depend on which isolate ran which iteration: assigned a variable from outside it, changed a value from outside it, reached a buffer it writes at an index other than its own, or performed an effect.", "Write each iteration's result to a buffer at [i], and combine the results after the loop."},
     {"spawn", "spawn was given something it can't run, or the build can't run isolates.", "spawn a fut function (not a builtin), in the native build."},
     {"isolate", "This isolate was stopped because the isolate that started it ended with an error.", "Fix the error the other isolate reported."},
     {"replay", "A run under fut --replay asked for something other than what the recorded run did at that point, or printed something else.", "The program changed since the recording, or did something the log can't repeat (isolates' timing): record it again."},

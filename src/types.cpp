@@ -109,19 +109,19 @@ static bool accepts(uint64_t t, V v, int depth, Tags* tags = nullptr) {
           if (!is(v, K::List)) return false;
           List* l = as<List>(v);
           uint64_t code = typeResolve(t) & ~TY_OPT;
-          if (l->typed && l->etype == code) return true;
+          if ((l->typed & 1) && l->etype == code) return true;
           for (V x : l->v) if (!accepts(d->elem, x, depth + 1, tags)) return false;
-          if (tags && !l->typed) tags->push_back({l, code});
+          if (tags && !(l->typed & 1)) tags->push_back({l, code});
           return true;
         }
         case 'M': {
           if (!is(v, K::Map)) return false;
           Map* m = as<Map>(v);
           uint64_t code = typeResolve(t) & ~TY_OPT;
-          if (m->typed && m->etype == code) return true;
+          if ((m->typed & 1) && m->etype == code) return true;
           for (auto& [k, x] : m->e)
             if (!accepts(d->key, k, depth + 1, tags) || !accepts(d->elem, x, depth + 1, tags)) return false;
-          if (tags && !m->typed) tags->push_back({m, code});
+          if (tags && !(m->typed & 1)) tags->push_back({m, code});
           return true;
         }
       }
@@ -135,7 +135,7 @@ bool typeAccepts(uint64_t t, V v, int site) {
   Tags tags;
   if (!accepts(t, v, 0, &tags)) return false;
   for (auto [o, code] : tags) {
-    o->typed = 1;
+    o->typed |= 1;
     if (o->kind == K::List) ((List*)o)->etype = code, ((List*)o)->esite = site;
     else ((Map*)o)->etype = code, ((Map*)o)->esite = site;
   }

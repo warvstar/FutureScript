@@ -13,6 +13,7 @@
 struct BufData {
   std::atomic<int> rc{1};
   std::atomic<const void*> holder;  // the isolate whose handles may use it; null while a message carries it
+  std::atomic<bool> writing{false};  // a parallel for's body writes it (its isolates' handles reach only [i])
   char et;
   size_t n;
   uint8_t* d;
@@ -36,9 +37,10 @@ V handle(BufData* s) {
   b->et = s->et, point(b, s);
   return box(b);
 }
-enum { LIVE, SENT, ELSEWHERE };
+enum { LIVE, SENT, ELSEWHERE, AT };
 Buf* live(V v) {  // a handle that still reaches its buffer
   Buf* b = as<Buf>(v);
+  if (b->gone == AT) ERR("@parallel a parallel for's body writes this buffer, so it may reach it only at [i] (its own iteration's element)");
   if (b->gone == SENT) ERR("@send this buffer was sent to another isolate: sending a buffer moves it (send back what you still need)");
   if (b->gone == ELSEWHERE) ERR("@send this buffer belongs to another isolate: a spawned isolate's globals don't take their buffers (pass one as an argument to move it)");
   return b;
@@ -68,6 +70,13 @@ void put(char et, uint8_t* p, size_t i, V v) {  // checked
   if (et == 'u') ((uint32_t*)p)[i] = (uint32_t)d;
   else if (et == 'i') ((int32_t*)p)[i] = (int32_t)d;
   else p[i] = (uint8_t)d;
+}
+size_t own(Buf* h, V i) {  // a parallel for's handle on a buffer its body writes: b[i] only at the iteration's i
+  size_t at = whole(i, h->s->n);
+  if (num(i) != parAt)
+    ERR("@parallel a parallel for's body writes this buffer, so it may reach it only at [i] (here i is %s, and the index %s)",
+        toStr(box(parAt)).c_str(), toStr(i).c_str());
+  return at;
 }
 size_t clamp(V v, size_t n, const char* fn) {  // as rt.cpp's clampIx
   if (!isNum(v)) ERR("@argument %s expects numbers, got %s", fn, typeName(v));
@@ -129,19 +138,28 @@ Buf* newBuf(char et, size_t n) { return as<Buf>(handle(alloc(et, n))); }
 const char* bufName(char et) { return et == 'd' ? "f64s" : et == 'f' ? "f32s" : et == 'u' ? "u32s" : et == 'i' ? "i32s" : "u8s"; }
 V bufGet(const Buf* b, size_t i) { return read(b->et, b->p, i); }
 V bufIndex(V b, V i) {
-  Buf* h = live(b);
+  Buf* h = as<Buf>(b);
+  if (h->gone == AT) return read(h->et, h->s->d, own(h, i));
+  h = live(b);
   return bufGet(h, whole(i, h->n));
 }
 V bufStore(V b, V i, V v) {
-  Buf* h = live(b);
+  Buf* h = as<Buf>(b);
+  if (h->gone == AT) {
+    size_t at = own(h, i);
+    if (vm->txn) ERR("@parallel a parallel for's body can't write its buffer inside atomic { } (write it after the block)");
+    return put(h->et, h->s->d, at, v), v;
+  }
+  h = live(b);
   return put(h->et, h->p, whole(i, h->n), v), v;
 }
 Buf* bufLive(V b) { return live(b); }
-size_t bufLength(V b) { return live(b)->n; }
+size_t bufLength(V b) { return as<Buf>(b)->gone == AT ? as<Buf>(b)->s->n : live(b)->n; }
 uint8_t* bufBytes(V b) { return live(b)->p; }
 void bufFree(Obj* o) { release(((Buf*)o)->s), point((Buf*)o, nullptr); }
 BufData* bufTake(Obj* o) {
   Buf* b = live(box(o));
+  if (o->typed & FROZEN) ERR("@parallel a parallel for's body can't send a buffer from outside it");
   if (vm->txn) ERR("@atomic a buffer can't be sent inside atomic { }: sending moves it, which can't be undone (send it after the block)");
   return b->s->rc.fetch_add(1, std::memory_order_relaxed), b->s;
 }
@@ -164,6 +182,25 @@ V bufElsewhere() {
   return box(b);
 }
 void bufRelease(BufData* s) { release(s); }
+BufData* bufShare(Obj* o) {
+  Buf* b = live(box(o));
+  return b->s->rc.fetch_add(1, std::memory_order_relaxed), b->s;
+}
+BufData* bufWriting(Obj* o, bool on) {
+  BufData* s = on ? live(box(o))->s : ((Buf*)o)->s;
+  if (s) s->writing.store(on, std::memory_order_relaxed);  // (the isolates it is lent to start after: their start orders it)
+  return s;
+}
+V bufLend(BufData* s) {
+  s->rc.fetch_add(1, std::memory_order_relaxed);
+  if (!s->writing.load(std::memory_order_relaxed)) {
+    V h = handle(s);
+    return obj(h)->typed |= FROZEN, h;
+  }
+  Buf* b = make<Buf>();  // n 0 here, so compiled code's b[i] always calls bufIndex / bufStore
+  b->et = s->et, point(b, nullptr), b->s = s, b->gone = AT;
+  return box(b);
+}
 void bufInit() {
   native<n_buf<'d'>>("f64s"), native<n_buf<'f'>>("f32s"), native<n_buf<'u'>>("u32s"), native<n_buf<'i'>>("i32s"), native<n_buf<'b'>>("u8s");
   method<b_fill>(K::Buf, intern("fill")), method<b_toList>(K::Buf, intern("toList")), method<b_slice>(K::Buf, intern("slice")),
