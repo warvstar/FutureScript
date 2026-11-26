@@ -5,12 +5,10 @@ Everything needed to write fut. ```fut blocks run as tests (a top-level `expect`
 ```
 fut f.fut                      run: top level, then main() if defined
 fut test f.fut                 test blocks + contract property tests + .api check. exit 0 pass, 1 fail/pending, 2 compile error
-  --json                       one object per line: {type: "test", name, file, line, status: ok|FAIL|ERROR|pending, ms,
-                               output, expect?: {expr, left, right, diff}, message?, code?, trace?}, then {type: "summary", ...};
-                               a compile error: {type: "compile_error", file, line, col, message, code}
+  --json                       one JSON object per line: each test, each compile error, then a summary
   --filter text  --changed     only tests named text / only tests whose inputs changed since the last run
 fut map f.fut [--pub] [pkg]    where everything is: packages, files, declarations, line ranges
-  --json                       one declaration per line, with "hash": its text's; unchanged hash = nobody edited it
+  --json                       one declaration per line, with a hash of its text
 fut explain [code]             an error code's rule and fix (no code: all codes)
 fut api f.fut                  rewrite the .api files after an interface change
 fut -w f.fut                   run, hot-reload on save; stdin lines run inside the program
@@ -99,7 +97,7 @@ expect throws { half("x") }
 type User = {name: str, age: num?}         // also A | B, "GET" 3 true nil, list<T>, map<K, V>; pub type
 fn ages(us: list<User>): num ! { return us.len() }   // given u: User, u.nmae is a compile error
 var us = [{name: "a"}]
-ages(us) expect throws { us.push(3) }      // a checked list stays checked
+ages(us) expect throws { us.push(3) }      // us is list<User> from now on
 effect Log { fn log(m: str) }
 fn work() ! Log, clock { Log.log("hi") }   // ! = may only do these; bare ! = nothing; none = unchecked
 var out = []
@@ -108,6 +106,8 @@ expect out == ["hi", "p"]
 fn bad() ! { print("x") }
 expect throws { bad() }
 ```
+
+A list or map that passes `list<T>`/`map<K, V>` keeps that type for good: any later store into it, through any reference, throws unless it fits, and later checks of it cost nothing. A union or a failed check doesn't do this; `slice()` makes an unchecked copy. A shape is checked only when the value crosses the boundary, so a map can change after it passes; use a class to keep fields checked.
 
 Effects: `io` (print, run, extern, graphics, files, env, exec, fetch) `clock` (clock, sleep, time) `random` `yield`, declared ones; json is pure. A handler's return is the op's result, no resumption.
 
