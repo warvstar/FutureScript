@@ -1,4 +1,4 @@
-// The public interface of package orders 0.1.0 (orders.fut), written by `fut api`. `fut test` fails while it is out of date.
+// The public interface of package orders 0.2.0 (orders.fut), written by `fut api`. `fut test` fails while it is out of date.
 
 // What checkout reports. Callers decide where it goes: a log, the console, a list in a test.
 pub effect Audit {
@@ -17,7 +17,8 @@ pub class Cart {
     requires price >= 0
     requires price == floor(price)
     ensures self.lines.len() == old(self.lines.len()) + 1
-    ensures last(self.lines).qty * last(self.lines).price == qty * price
+    ensures self.lines[self.lines.len() - 1].sku == sku
+    ensures self.lines[self.lines.len() - 1].qty == qty
   fn init()
   fn subtotal(): num
 }

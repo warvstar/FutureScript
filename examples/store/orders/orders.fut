@@ -31,7 +31,8 @@ pub class Cart {
     requires price >= 0
     requires price == floor(price)
     ensures self.lines.len() == old(self.lines.len()) + 1
-    ensures last(self.lines).qty * last(self.lines).price == qty * price
+    ensures self.lines[self.lines.len() - 1].sku == sku
+    ensures self.lines[self.lines.len() - 1].qty == qty
   {
     self.lines.push(Line(sku, qty, price))
   }
@@ -76,5 +77,3 @@ pub fn checkout(cart: Cart, st: stock.Stock): map ! Audit
   Audit.record("order " + money.format(t) + ", " + str(cart.lines.len()) + " lines")
   return {total: t, lines: cart.lines.len()}
 }
-
-fn last(l) { return l[l.len() - 1] }

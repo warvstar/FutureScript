@@ -1,6 +1,6 @@
-// Money as whole cents, so sums are exact. Each function's contract sits between its signature and its body; `fut
-// test` also checks each one on random inputs, throwing away inputs that break a requires, so `requires` also tells
-// the generator which inputs make sense.
+// Money as whole cents, so sums are exact. Each function's contract sits between its signature and its body, and is
+// part of money.api, so it may use only pub names. `fut test` also checks each one on random inputs, throwing away
+// inputs that break a requires, so `requires` also tells the generator which inputs make sense.
 
 // Dollars to cents, rounding half up.
 pub fn cents(dollars: num): num
@@ -39,7 +39,7 @@ pub fn percent(c: num, p: num): num
   return floor(c * p / 100 + 0.5)
 }
 
-// total split into `ways` parts that differ by at most a cent and add up to it exactly; the bigger parts first.
+// total split into `ways` parts that add up to it exactly; the bigger parts first, a cent more than the others.
 pub fn split(total: num, ways: num): list
   requires total >= 0
   requires total == floor(total)
@@ -48,7 +48,7 @@ pub fn split(total: num, ways: num): list
   requires ways == floor(ways)
   ensures result.len() == ways
   ensures sum(result) == total
-  ensures largest(result) - smallest(result) <= 1
+  ensures result[0] - result[ways - 1] <= 1
 {
   var base = floor(total / ways)
   var extra = total - base * ways
@@ -59,7 +59,9 @@ pub fn split(total: num, ways: num): list
   return parts
 }
 
-// For the clauses above: private to the package, like any function without pub.
-fn sum(l) { var s = 0 for x in l { s += x } return s }
-fn largest(l) { var m = l[0] for x in l { if x > m { m = x } } return m }
-fn smallest(l) { var m = l[0] for x in l { if x < m { m = x } } return m }
+// The total of a list of amounts.
+pub fn sum(amounts: list): num {
+  var s = 0
+  for a in amounts { s += a }
+  return s
+}

@@ -139,6 +139,7 @@ struct Compiler : Gen {
   std::unordered_set<int> invClasses;                       // classes whose methods check invariants (theirs, a super's or a subclass's)
   std::vector<std::pair<std::string, At>> todos;            // functions whose body is todo(): pending under fut test
   const std::unordered_map<const char*, int>* olds = nullptr;  // compiling ensures: each old(...)'s home, by where it is
+  const char* pubContract = nullptr;  // compiling a pub declaration's contract: what it is (it may use only pub names)
   struct EffectDef { int sym; std::vector<EffOpDef> ops; };
   std::vector<EffectDef> effDefs;                           // installed by commit
   std::unordered_map<std::string, std::vector<std::string>> reexports;  // file -> files it imports with `pub import`
@@ -594,6 +595,9 @@ struct Compiler : Gen {
       return {};
     }
     if (!g) undefined(t);
+    if (pubContract && g->kind != 'n' && !(t.sym < (int)pubSym.size() && pubSym[t.sym]))  // the .api shows the clause, not the name
+      failAt(t.p, t.line, "%s can only use what its readers can see, and '%s' is private: make it pub, or write the condition without it",
+             pubContract, name(prev.sym));
     if (g->kind == 'f' && at('(') && !cur.nl) return next(), directCall(t, *g), t.sym == F->self || returnsNum(t.sym) ? NUM : LV{};
     if (g->kind == 'c' && at('(') && !cur.nl) return next(), construct(*g), LV{};
     if (g->kind == 'e') return perform(t), LV{};
@@ -1162,6 +1166,9 @@ struct Compiler : Gen {
     bool calls = spec && spec->calls;
     std::string fn = display(nm);
     int who = calls ? effSite("the contract of " + fn, 0, "!") : 0;
+    int g = f.cls >= 0 ? f.cls : intern(nm);
+    bool pub = g < (int)pubSym.size() && pubSym[g];  // a pub declaration's contract is in its .api
+    std::string what = "the contract of " + fn + ", a pub " + (f.cls >= 0 ? "class's method," : "function,");
     std::vector<Fun::Local> in, out;  // what clauses see: on entry, and on exit (where a parameter the body assigns is a copy)
     if (f.cls >= 0) in.push_back({K_self, f.selfHome});
     out = in;
@@ -1176,6 +1183,7 @@ struct Compiler : Gen {
     auto oldAt = std::make_shared<std::unordered_map<const char*, int>>();
     if (spec && (!spec->pre.empty() || !spec->olds.empty())) {
       begin();
+      pubContract = pub ? what.c_str() : nullptr;
       clauses(in, line, [&] {
         for (auto& c : spec->pre) check(c.at, "the caller broke " + fn + "'s contract: requires");
         for (auto& o : spec->olds) {
@@ -1184,7 +1192,7 @@ struct Compiler : Gen {
           stl(0, h), (*oldAt)[o.p] = h;
         }
       });
-      end();
+      pubContract = nullptr, end();
     }
     int outer = -1;  // inv@enter's answer: an outside call
     if (inv) ldl(0, f.selfHome), callNative("inv@enter", true), stl(0, outer = home());
@@ -1195,9 +1203,9 @@ struct Compiler : Gen {
       if (spec && !spec->post.empty()) {
         auto names = out;
         names.push_back({S_result, rh});
-        olds = oldAt.get(), begin();
+        olds = oldAt.get(), begin(), pubContract = pub ? what.c_str() : nullptr;
         clauses(names, line, [&] { for (auto& c : spec->post) check(c.at, fn + " broke its contract: ensures"); });
-        end(), olds = nullptr;
+        end(), olds = nullptr, pubContract = nullptr;
       }
       if (inv) {
         ldl(0, outer);
@@ -1228,7 +1236,10 @@ struct Compiler : Gen {
     bool calls = false;
     for (auto& c : cs.invariants) calls |= c.calls;
     if (calls) imm(0, box((double)effSite("the invariant of " + K, 0, "!"))), callNative("contract@begin", true);
+    std::string what = "the invariant of " + K + ", a pub class,";
+    if (cd.sym < (int)pubSym.size() && pubSym[cd.sym]) pubContract = what.c_str();
     clauses({{K_self, f.selfHome}}, cs.at.line, [&] { for (auto& c : cs.invariants) check(c.at, "\x01 broke " + K + "'s invariant:", who); });
+    pubContract = nullptr;
     if (calls) callNative("contract@end", false);
     if (cd.super >= 0) {
       int b = slot(), w = slot();

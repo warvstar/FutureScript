@@ -182,3 +182,9 @@ test "invariants: with atomic, a call that breaks one changes nothing" {
   try { atomic { s.take(45) } } catch e { }
   expect s.cash == 50
 }
+
+test "a pub declaration's contract may use only pub names (the .api shows it)" {
+  var r = run("progs/contract_private.fut")
+  expect r.code == 1
+  expect r.err.has("contract_private.fut:4:11: error: the contract of spread(), a pub function, can only use what its readers can see, and 'total' is private")
+}
