@@ -1,0 +1,186 @@
+==================
+Contextual names, public declarations, and keyword keys
+==================
+
+var pub = true
+pub
+pub fn test(expect: num): num {
+  var match = {class: expect, yield: 2}
+  return match.class
+}
+expect test(1) == 1
+
+---
+
+(source_file
+  (variable_declaration
+    (identifier)
+    (boolean))
+  (expression_statement
+    (identifier))
+  (function_declaration
+    (identifier)
+    (parameters
+      (parameter
+        (identifier)
+        (named_type
+          (qualified_name
+            (identifier)))))
+    (named_type
+      (qualified_name
+        (identifier)))
+    (block
+      (variable_declaration
+        (identifier)
+        (map
+          (pair
+            (map_key)
+            (identifier))
+          (pair
+            (map_key)
+            (number))))
+      (return_statement
+        (member_expression
+          (identifier)
+          (property_identifier)))))
+  (expect_statement
+    (binary_expression
+      (call_expression
+        (identifier)
+        (arguments
+          (number)))
+      (number))))
+
+==================
+Newline before a parenthesis, bracket, or minus
+==================
+
+fn split() {
+  f()
+  (1 + 2)
+  [3]
+  -4
+  return // a bare return
+  5
+}
+
+---
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameters)
+    (block
+      (expression_statement
+        (call_expression
+          (identifier)
+          (arguments)))
+      (expression_statement
+        (parenthesized_expression
+          (binary_expression
+            (number)
+            (number))))
+      (expression_statement
+        (list
+          (number)))
+      (expression_statement
+        (unary_expression
+          (number)))
+      (return_statement)
+      (comment)
+      (expression_statement
+        (number)))))
+
+==================
+Nested interpolation, format suffix, and a literal test label
+==================
+
+test "raw {words} // still part of the label" {
+  var url = "https://host/{choose({k: "{"path"}"}).k}/"
+  expect "{3.14=:.1f}\u{21}" == "3.14 = 3.1!"
+}
+
+---
+
+(source_file
+  (test_declaration
+    (test_name)
+    (block
+      (variable_declaration
+        (identifier)
+        (string
+          (string_content)
+          (interpolation
+            (member_expression
+              (call_expression
+                (identifier)
+                (arguments
+                  (map
+                    (pair
+                      (map_key
+                        (identifier))
+                      (string
+                        (interpolation
+                          (string
+                            (string_content))))))))
+              (property_identifier
+                (identifier))))
+          (string_content)))
+      (expect_statement
+        (binary_expression
+          (string
+            (interpolation
+              (number)
+              (format_spec))
+            (escape_sequence))
+          (string
+            (string_content)))))))
+
+==================
+A view element, callback, and child call
+==================
+
+view Page {
+  div .row-active {
+    button "Add" on click { n += 1 }
+    if n > 0 { Row(n) }
+    else { text "Empty" }
+  }
+}
+
+---
+
+(source_file
+  (view_declaration
+    (identifier)
+    (view_block
+      (view_element
+        (view_tag)
+        (view_class
+          (view_class_name))
+        (view_block
+          (view_element
+            (view_tag)
+            (string
+              (string_content))
+            (view_event
+              (identifier)
+              (block
+                (assignment_statement
+                  (identifier)
+                  (number)))))
+          (view_if
+            (binary_expression
+              (identifier)
+              (number))
+            (view_block
+              (expression_statement
+                (call_expression
+                  (identifier)
+                  (arguments
+                    (identifier)))))
+            (view_block
+              (view_element
+                (view_tag)
+                (string
+                  (string_content))))))))))
