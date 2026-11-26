@@ -39,6 +39,11 @@ static int pin(V f) {
   return id;
 }
 int jsPin(V f) { return pin(f); }
+V jsRef(u32 id) {  // the Ref for JavaScript value id (the same one while it lives)
+  Ref*& ref = refs[id];
+  if (!ref) ref = make<Ref>(), ref->id = id;
+  return box(ref);
+}
 void refFree(Ref* r) {
   auto it = refs.find(r->id);
   if (it == refs.end() || it->second != r) return;  // (another Ref has the id now, or another thread's host made it)
@@ -233,9 +238,7 @@ struct Parser {
       p = end;
       if (kind == "fn") r = jsPinned((int)id);
       else {
-        Ref*& ref = refs[(u32)id];
-        if (!ref) ref = make<Ref>(), ref->id = (u32)id;
-        r = keep(box(ref));
+        r = keep(jsRef((u32)id));
       }
     }
     ws();

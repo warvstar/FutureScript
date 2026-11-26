@@ -59,7 +59,9 @@ export function tryCallBytes(shared) {  // shared: for fut-mt.wasm, whose memory
 // (refOf(value) -> id, refGet(id) -> value). fut functions made by fnOf carry their id under FUT.
 export const MARK = "\0", FUT = Symbol("fut function");
 export function jsonCodec(fnOf, refOf, refGet) {
-  const fromFut = (s) => JSON.parse(s, (k, v) => {
+  const fromFut = (s) => s.charCodeAt(0) == 34 && s.indexOf("\\") < 0 ? s.slice(1, -1)  // a plain string
+    : s.indexOf("\\u0000") < 0 ? JSON.parse(s)  // no references in it
+    : JSON.parse(s, (k, v) => {
     if (!v || typeof v != "object" || Array.isArray(v) || !(MARK in v)) return v;
     return v[MARK] == "fn" ? fnOf(v.id) : v[MARK] == "js" ? refGet(v.id) : Number(v.v);
   });
@@ -129,9 +131,17 @@ export async function createFut(opts) {
   const enc = new TextEncoder(), dec = new TextDecoder();
   const tag = new WebAssembly.Tag({ parameters: ["i64"] });
   let ex, mem, table, spG, held = new Uint8Array(0);
-  const u8 = () => new Uint8Array(mem.buffer), dv = () => new DataView(mem.buffer);
+  let u8v, dvv;  // views of the memory, made again when it grows (a new buffer)
+  const u8 = () => (u8v?.buffer === mem.buffer ? u8v : (u8v = new Uint8Array(mem.buffer)));
+  const dv = () => (dvv?.buffer === mem.buffer ? dvv : (dvv = new DataView(mem.buffer)));
   let shared = false;  // fut-mt.wasm: the memory is shared (and TextDecoder takes no view of shared memory)
-  const cstr = (p) => { const m = u8(); let e = p; while (m[e]) e++; return dec.decode(shared ? m.slice(p, e) : m.subarray(p, e)); };
+  const cstr = (p) => {
+    const m = u8();
+    let e = p, hi = 0;
+    while (m[e]) hi |= m[e++];
+    if (hi < 128 && e - p < 64) return String.fromCharCode.apply(null, m.subarray(p, e));  // short ASCII: no decoder
+    return dec.decode(shared ? m.slice(p, e) : m.subarray(p, e));
+  };
   const write = (fd, s) => opts.write(fd, typeof s == "string" ? enc.encode(s) : s);
   function withStr(s, f) {  // f(pointer to s as a C string)
     const b = enc.encode(s), p = ex.fut_alloc(b.length + 1);
@@ -316,6 +326,8 @@ export async function createFut(opts) {
     return (f[FUT] = id), unpin.register(f, id), f;
   }
   const { fromFut, toFut } = jsonCodec(futFn, refOf, (id) => refs.get(id));
+  const byRef = (v) => typeof v == "symbol" || (typeof v == "function" && v[FUT] == null)  // what toFut sends as a Ref
+    || (typeof v == "object" && !Array.isArray(v) && !(MARK in v) && Object.getPrototypeOf(v) !== Object.prototype && Object.getPrototypeOf(v) !== null);
   // A fut function called from JavaScript. During an extern call (fut is waiting for it: a callback, as Array.map
   // makes) it runs right away and returns its result; otherwise it runs at the program's next safepoint, and the
   // call returns a Promise of its result.
@@ -353,6 +365,7 @@ export async function createFut(opts) {
     const d = dv();
     return [...sig].map((t, i) => {
       const x = d.getFloat64(args + i * 8, true);
+      if (t == "a" && x < 0) return JSON.stringify({ [MARK]: "js", id: -x });  // a JavaScript value, by id (see ffi)
       return t == "s" || t == "a" || t == "f" ? cstr(x) : t == "i" ? x | 0 : t == "l" ? Math.trunc(x) : x;
     });
   }
@@ -360,7 +373,11 @@ export async function createFut(opts) {
     const sig = cstr(sigP);
     const done = (r) => {
       if (ret == 115 /* s */) return r == null ? -1 : ((held = enc.encode(String(r))), held.length);
-      if (ret == 97 /* a */) return (held = enc.encode(toFut(r))), held.length;
+      if (ret == 97 /* a */) {
+        if (r == null) return -1;
+        if (byRef(r)) return -2 - refOf(r);  // a JavaScript value (a DOM node): its id, without JSON either way
+        return (held = enc.encode(toFut(r))), held.length;
+      }
       return ret == 118 /* v */ ? 0 : Number(r);
     };
     const failed = (e) => {
@@ -383,7 +400,7 @@ export async function createFut(opts) {
     const d = dv(), a = [], big = externWasm[fn];
     for (let i = 0; i < sig.length; i++) {
       const x = d.getFloat64(args + i * 8, true), t = sig[i];
-      a.push(t == "s" ? cstr(x) : t == "a" || t == "f" ? fromFut(cstr(x)) : t == "i" ? x | 0 : t == "l" ? (big ? BigInt(Math.trunc(x)) : Math.trunc(x)) : x);
+      a.push(t == "s" ? cstr(x) : t == "a" && x < 0 ? refs.get(-x) : t == "a" || t == "f" ? fromFut(cstr(x)) : t == "i" ? x | 0 : t == "l" ? (big ? BigInt(Math.trunc(x)) : Math.trunc(x)) : x);
     }
     let r;
     ffiDepth++;

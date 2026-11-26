@@ -16,9 +16,9 @@ test "static elements, props and text" {
 test "a function child shows its current value; text changes in place" {
   var n = r.signal(0)
   var host = page(fn() { return el("span", nil, ["clicked ", fn() { return n.get() }, " times"]) })
-  expect htmlOf(host) == "<div id=\"app\"><span>clicked <!---->0<!----> times</span></div>"
+  expect htmlOf(host) == "<div id=\"app\"><span>clicked 0 times</span></div>"
   n.set(5)
-  expect htmlOf(host) == "<div id=\"app\"><span>clicked <!---->5<!----> times</span></div>"
+  expect htmlOf(host) == "<div id=\"app\"><span>clicked 5 times</span></div>"
 }
 
 test "events, fields, checkboxes" {
@@ -55,13 +55,37 @@ test "reactive props" {
   expect htmlOf(n) == "<div class=\"on\"></div>"
 }
 
+test "each: any reordering, insertion and removal comes out in order" {
+  var items = r.signal([])
+  var made = {n: 0}
+  var host = page(fn() {
+    return el("p", nil, each(fn() { return items.get() }, fn(x) { return x }, fn(x) { made.n += 1 return el("i", nil, "{x}") }))
+  })
+  fn shows() {  // the numbers in the <i>s, in page order
+    var out = []
+    var parts = htmlOf(host).split("<i>")
+    for i in 1..parts.len() { out.push(parts[i].split("</i>")[0]) }
+    return out
+  }
+  for order in [[1, 2, 3, 4, 5, 6], [6, 5, 4, 3, 2, 1], [1, 2, 3, 4, 5, 6], [2, 1, 3, 4, 6, 5], [7, 1, 3, 8, 5, 9], [], [3, 1, 2], [1, 2, 3], [2, 3, 1]] {
+    items.set(order)
+    var want = []
+    for x in order { want.push("{x}") }
+    expect shows() == want
+  }
+  expect made.n == 12  // one view per key it hadn't shown just before: 1-6, then 7, 8, 9, then 3, 1, 2 after the list was empty
+}
+test "each: two items with one key is an error" {
+  var items = r.signal([1, 1])
+  expect throws { page(fn() { return el("p", nil, each(fn() { return items.get() }, fn(x) { return x }, fn(x) { return "{x}" })) }) }
+}
 test "each: keyed items, reused while unchanged" {
   var items = r.signal([{id: 1, t: "a"}, {id: 2, t: "b"}])
   var renders = []
   var host = page(fn() {
     return el("ul", nil, each(fn() { return items.get() }, fn(x) { return x.id }, fn(x) { renders.push(x.t) return el("li", nil, x.t) }))
   })
-  expect htmlOf(host).has("<li>a</li><!----><!----><li>b</li>")
+  expect htmlOf(host).has("<ul><!----><li>a</li><li>b</li><!----></ul>")  // one element an item: no markers of its own
   var l = items.get()
   items.set([l[1], l[0], {id: 3, t: "c"}])  // reorder and add: a and b are moved, not redrawn
   expect renders == ["a", "b", "c"]
@@ -81,5 +105,5 @@ test "an item's own signals update just that item" {
     return each(fn() { return items.get() }, fn(x) { return x.id }, fn(x) { renders += 0 return el("b", nil, fn() { return x.n.get() }) })
   })
   b.set(20)
-  expect htmlOf(host).has("<b><!---->1<!----></b>") && htmlOf(host).has("<b><!---->20<!----></b>")
+  expect htmlOf(host).has("<b>1</b>") && htmlOf(host).has("<b>20</b>")
 }

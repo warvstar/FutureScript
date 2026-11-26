@@ -342,7 +342,8 @@ static V rt_ffi(V* w, Ext* e) {
   for (int i = 0; i < e->n; i++) {
     V v = w[i];
     char t = ffiCheck(e, i, v);
-    if (t == 'a' || t == 'f') json[i] = toJs(v), a[i] = (double)(uintptr_t)json[i].c_str();
+    if (t == 'a' && is(v, K::Ref)) a[i] = -(double)as<Ref>(v)->id;  // a JavaScript value (a DOM node): its id, negated
+    else if (t == 'a' || t == 'f') json[i] = toJs(v), a[i] = (double)(uintptr_t)json[i].c_str();
     else a[i] = t == 's' ? (double)(uintptr_t)as<Str>(v)->s() : num(v);
   }
   int failed = 0;
@@ -352,6 +353,7 @@ static V rt_ffi(V* w, Ext* e) {
     host_take(m.data());
     ERR("@js %s(): %s", symName(e->sym).c_str(), m.c_str());
   }
+  if (e->ret == 'a' && r <= -2) return jsRef((u32)(-r - 2));  // a JavaScript value: its id, as -2 - id
   if (e->ret == 's' || e->ret == 'a') {
     if (r < 0) return NIL;
     std::string s((size_t)r, 0);

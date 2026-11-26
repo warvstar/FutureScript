@@ -986,6 +986,7 @@ void rtInit() {
   method<s_slice>(K::Str, intern("slice")), method<s_find>(K::Str, intern("find")), method<s_split>(K::Str, intern("split"));
   method<s_trim>(K::Str, intern("trim")), method<l_join>(K::List, intern("join")), method<l_slice>(K::List, intern("slice"));
   native<n_parseNum>("parseNum");
+  native<+[](V v) { return box(newStr(typeName(v))); }>("typeOf");  // "number", "string", "list", "map", "function", "js value", ...
   // match: is@(value, variant class) tests an arm; match@fail(value, enum) is reached when no arm takes the value
   native<+[](V v, V c) { return boxb(is(v, K::Inst) && is(c, K::Class) && as<Inst>(v)->cls->name == as<Class>(c)->name); }>("is@");
   native<+[](V v, V c) {  // by name, as match does: an instance made before a reload is still one
