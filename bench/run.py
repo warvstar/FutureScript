@@ -66,6 +66,10 @@ def main():
         prog.write_text((BENCH / f"{n}.fut").read_text() + HARNESS)
         impls["fut"] = [ROOT / "build" / "fut", prog]
         impls["fut wasm"] = ["node", ROOT / "web" / "run.mjs", prog]
+        if (BENCH / f"{n}_par.fut").exists():  # the same kernel over isolates, against C's threads
+            par = OUT / f"{n}_par.fut"
+            par.write_text(f"var THREADS = {THREADS}\n" + (BENCH / f"{n}_par.fut").read_text() + HARNESS)
+            impls[f"fut x{THREADS} isolates"] = [ROOT / "build" / "fut", par]
         res = {k: parse(sh(cmd)) for k, cmd in impls.items()}
         want = res["C"][0]
         for k, (check, first, best) in res.items():

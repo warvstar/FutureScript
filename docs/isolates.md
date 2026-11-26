@@ -1,6 +1,6 @@
 # Isolates and channels
 
-Status: phase 1 (the runtime split per isolate) is done; phase 2 (the language) is next. This is how fut gets parallelism: many isolates run at once, each owning its own heap,
+Status: phases 1 (the runtime split per isolate) and 2 (spawn, join, channels, one thread per isolate) are done. The README has the language as built; `src/isolate.cpp` has the runtime. Phase 3 (the scheduler) is next. This is how fut gets parallelism: many isolates run at once, each owning its own heap,
 and they share data only by sending it over channels. There is no shared mutable memory, so there are no locks,
 no memory orderings and no data races to write. Read this before you add any global state to the runtime.
 
@@ -13,7 +13,7 @@ fn crunch(jobs, results) ! chan {
 
 fn main() {
   var jobs = channel(64)
-  var results = channel()
+  var results = channel(64)
   var ws = []
   for i in 0..cores() { ws.push(spawn crunch(jobs, results)) }
   for j in work { jobs.send(j) }
@@ -30,7 +30,8 @@ fn main() {
 - **`task.join()`** waits for the task and returns `f`'s result, copied over. If `f` raised an error, `join` raises
   it again in the joiner. The error's trace includes the isolate's own frames and the line of the `spawn`.
   `task.done()` reports whether it has finished, without waiting.
-- **`channel(n)`** makes a channel holding up to `n` values (default 64).
+- **`channel(n)`** makes a channel holding up to `n` values. The capacity is required: an explicit bound makes
+  the back-pressure a choice the code shows.
   - `send` blocks while the channel is full, and `recv` while it is empty.
   - `close()` ends a channel: `recv` on a closed, drained channel raises, and `for v in ch` ends.
   - `ch.tryRecv()` returns `nil` instead of blocking when the channel is empty.
@@ -46,15 +47,16 @@ fn main() {
   `spawn`. No global is ever shared, so isolates can't see each other's writes.
 - **Effects.** fut already checks declared effects. Isolates add two:
   - `spawn`, for starting isolates;
-  - `chan`, for blocking on a channel (`send`, `recv`, `join`).
+  - `chan`, for every operation on a channel or a task (`send`, `recv`, `tryRecv`, `close`, `join`, `done`).
 
   A function declared `! io` that blocks on a channel is then an error, so a function's signature says whether
   it can block. This is the main way fut's design differs from Go's, where any call might block.
 - **Transactions.**
   - A `send` inside `atomic { }` is held until the transaction commits, and dropped if it rolls back. Other
     isolates never see a message from a transaction that didn't happen.
-  - `recv` and `join` inside `atomic` are compile errors, like `yield` there today: blocking would hold the
-    transaction open.
+  - `recv` and `join` inside `atomic` are errors: blocking would hold the transaction open. They are runtime
+    errors, since the compiler can't tell a channel's `recv` from any other method's. `spawn` there is an error
+    too: a started isolate can't be taken back.
 - **Deadlocks are errors.** If every isolate is blocked on a channel or a join that nothing can satisfy, the
   program stops. It reports each isolate, what it waits for, and on which line. This is like Go's "all goroutines
   are asleep", but with the waits named.
@@ -161,8 +163,10 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
      runtime: JIT code isn't instrumented, which is why the VM block, inline caches and heaps are per isolate rather
      than locked.
 2. **`spawn`, `join`, channels, copying, the `spawn`/`chan` effects, sends deferred in `atomic`, deadlock reports.**
+   Done.
    - Work: one thread per isolate.
-   - Test: a parallel mandelbrot in `bench/`, against C on 8 threads.
+   - Test: `tests/specs/isolates.fut` (also in N isolates at once, and under TSan), and a parallel mandelbrot in
+     `bench/`, against C on 8 threads.
 3. **The scheduler.**
    - Work: isolate stacks, the thread pool, preemption at polls, and deterministic `fut test` with `--seed`.
 4. **Hot reload across isolates.**
@@ -182,10 +186,31 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
      transactional memory with a version clock, retried on conflict. This is for the rare state that really is
      global, such as a cache or a counter.
 
-## Decisions to confirm
+## Decisions
 
 - **Globals at `spawn`:** copied, rather than rerunning the top level in each isolate. Rerunning would
   repeat the top level's side effects, such as prints and file writes, and give each isolate a different starting
   state from the spawner's.
-- **Channel capacity** defaults to 64, and `channel(0)` is a rendezvous.
-- **`spawn` is a keyword**, and the compiler checks its effects. The alternative is a function `spawn(f, args...)`.
+- **Channel capacity** is required (`channel(n)`), and `channel(0)` is a rendezvous.
+- **`spawn` is a contextual keyword** (`spawn f(args)`), compiled to a call of the runtime's `spawn@(f, [args])`.
+  It stays usable as a name.
+
+## Phase 2 as built
+
+- **One lock** (`chanMu`) guards every channel's queue, every task, and the table of isolates. A message is encoded
+  before it is taken and decoded after it is released, so it is held only to move a message in or out.
+- **Programs.** Each isolate belongs to a program: a root (the main thread, one of `--isolates N`, a test's process)
+  and everything spawned from it. A program counts its live and waiting isolates; when the last one waits, the
+  deadlock report goes to each. A root's `isolatesFinish` waits for the rest when its code ends. If the code
+  failed, it first stops them: they raise at their next poll (their `vm->poll` is set) or wait.
+- **Failures nobody joined** are reported when the program ends. A failure caused by a deadlock or a stop is not
+  reported again.
+- **Handles.** Each isolate has one Chan or Task object per channel or task it holds (a per-isolate table), so the
+  same channel is the same value however it arrived. Shared state is reference-counted; the GC drops a handle's
+  reference when the handle dies. A channel that holds a message holding itself is never freed (a cycle of counts).
+- **Printing.** A worker prints where its spawner's `print` goes outside any `expect prints { }` capture: stdout, or
+  the test's output (`outBase`, appended under a lock).
+- **Tests fork.** `fut test` runs each test in a forked process. The top level's isolates are finished before the
+  tests fork, because a child process has only the thread that forked.
+- **Speed.** `bench/mandelbrot_par.fut` on 8 isolates: 57 ms, against 453 ms on one isolate and 16 ms for C on 8
+  threads. The gap to C is the single-threaded one (the optimizing tier's job); the scaling is near-linear.

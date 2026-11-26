@@ -442,6 +442,7 @@ static V propDone(V site, V ok, V n) {  // too few inputs met the requires to ca
 // expect prints { ... }: print() output inside the block is collected (nested captures stack) and becomes the value.
 struct Capture { std::string* prev; std::string buf; };
 static TLS std::vector<Capture*> captures;
+std::string* outBase() { return captures.empty() ? outSink : captures.front()->prev; }
 static void endCaptures() {  // a test that returned or crashed out of a capture
   for (; !captures.empty(); captures.pop_back()) outSink = captures.back()->prev, delete captures.back();
 }

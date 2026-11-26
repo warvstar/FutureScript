@@ -20,6 +20,8 @@ struct Level {
   std::vector<V> globals;        // as they were when it opened
   std::vector<Saved> saved;      // each object as it was before its first write
   std::unordered_set<Obj*> seen;
+  struct After { void (*run)(void*); void (*drop)(void*); void* p; };
+  std::vector<After> after;      // what waits for the outermost commit: sends to channels (isolate.cpp)
 };
 TLS std::vector<Level> levels;  // per isolate
 }  // namespace
@@ -78,16 +80,20 @@ void txnCommit() {
   if (!levels.empty()) {  // the enclosing transaction keeps the oldest copy of each object
     Level& o = levels.back();
     for (auto& s : top.saved) if (o.seen.insert(s.o).second) o.saved.push_back(std::move(s));
+    o.after.insert(o.after.end(), top.after.begin(), top.after.end());
   }
   depthChanged();
+  if (levels.empty()) for (auto& a : top.after) a.run(a.p);  // committed for good: other isolates may see it now
 }
 void txnAbort() {
   if (levels.empty()) return;
   Level& l = levels.back();
   for (auto& s : l.saved) restore(s);
   std::copy(l.globals.begin(), l.globals.end(), vm->globals);
+  for (auto& a : l.after) a.drop(a.p);
   levels.pop_back(), depthChanged();
 }
+void txnAfter(void (*run)(void*), void (*drop)(void*), void* p) { levels.back().after.push_back({run, drop, p}); }
 void txnUnwind(u32 depth) { while (levels.size() > depth) txnAbort(); }
 void txnTouch(Obj* o) {
   Level& l = levels.back();

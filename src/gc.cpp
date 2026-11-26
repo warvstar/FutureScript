@@ -206,6 +206,7 @@ void finalize(Obj* o) {
     case K::Inst: if (((Inst*)o)->slots != ((Inst*)o)->inl()) free(((Inst*)o)->slots); break;
     case K::Fiber: fiberFree((Fiber*)o); break;
     case K::Ref: refFree((Ref*)o); break;
+    case K::Chan: case K::Task: sharedFree(o); break;
     default: break;
   }
   o->kind = K::Free;
@@ -238,6 +239,7 @@ void collect(Heap& h) {
     for (auto& e : globals) mark(g, e.o);
   }
   isolateMark(markV);
+  isolatesMark(markV);
   txnMark(markV);
   jsMark(markV);
   effMark(markV);
@@ -308,6 +310,10 @@ void heapFree(Heap* h) {  // an isolate ended: finalize what needs it and give e
 // Wasm runs one isolate, and a compile error there longjmps past destructors: allocate in its heap throughout.
 ImageScope::ImageScope() { if (!WASM && !imaging++) target = imageHeap; }
 ImageScope::~ImageScope() { if (!WASM && !--imaging) target = cur; }
+bool gcInImage(Obj* o) {
+  uintptr_t p = (uintptr_t)o, b = (uintptr_t)base;
+  return !WASM && p >= b && p < b + REGION && owner((p - b) / PAGE) == imageHeap->id;
+}
 void gcOwn(Obj* o) { H().owners.push_back(o); }
 // Objects the running isolate allocated so far. Each takes one cell of its size class, so the runs being bumped
 // through (by JIT code too) say how many came from them: counting costs allocation nothing.

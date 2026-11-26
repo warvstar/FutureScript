@@ -302,18 +302,19 @@ struct Compiler : Gen {
     if (t.first && !(num && (t.first & 15) == TY_NUM)) typeCheck(t.first, t.second, t.first == TY_NUM);
   }
 
-  // ---- effects: io clock random yield, or an `effect` (geom.Log for a module's) ----
+  // ---- effects: io clock random yield spawn chan, or an `effect` (geom.Log for a module's) ----
   uint64_t effectName(std::string& text) {
     Tok t = cur;
     if (atKw(K_yield)) return next(), text += "yield", EFF_YIELD;
     int s = ident();
     const std::string& n = symName(s);
-    if (n == "io" || n == "clock" || n == "random") return text += n, n == "io" ? EFF_IO : n == "clock" ? EFF_CLOCK : EFF_RANDOM;
+    for (auto [b, bit] : {std::pair{"io", EFF_IO}, {"clock", EFF_CLOCK}, {"random", EFF_RANDOM}, {"spawn", EFF_SPAWN}, {"chan", EFF_CHAN}})
+      if (n == b) return text += n, bit;
     Tok q = topName(prev);
     Global* g = findGlobal(q.sym);
-    if (!g || g->kind != 'e') failAt(t.p, t.line, "unknown effect '%s' (io, clock, random, yield, or one declared with 'effect')", std::string(t.p, prevEnd).c_str());
+    if (!g || g->kind != 'e') failAt(t.p, t.line, "unknown effect '%s' (io, clock, random, yield, spawn, chan, or one declared with 'effect')", std::string(t.p, prevEnd).c_str());
     uint64_t b = effBit(q.sym);
-    if (!b) failAt(t.p, t.line, "too many effects (a program can declare at most %d)", EFF_LEVEL - 4);
+    if (!b) failAt(t.p, t.line, "too many effects (a program can declare at most %d)", EFF_LEVEL - EFF_BUILTIN);
     return text += std::string(t.p, prevEnd), b;
   }
   const std::vector<std::pair<int, int>>* opsOf(int effSym) {
@@ -542,6 +543,32 @@ struct Compiler : Gen {
     return fn;
   }
 
+  // spawn f(args): spawn@(f, [args]) starts an isolate running f(args) and gives its task (isolate.cpp). f is a
+  // function value: a name, a field (`spawn jobs.run(x)` reads the field run, it does not call a method), or a lambda.
+  void spawnExpr() {
+    int base = slot(), fs = slot();
+    if (atKw(K_fn)) next(), lambda(prev);
+    else {
+      Tok t = cur;
+      int s = ident();
+      LV v = resolve(F, s);
+      if (v.k == LV_NONE) {
+        t.sym = s, t = topName(t);
+        Global* g = findGlobal(t.sym);
+        if (!g) undefined(t);
+        v = {LV_GLOBAL, g->slot, t.sym, true};
+      }
+      while (accept('.')) { int f = ident(); load(v), v = {LV_FIELD, 0, f}; }
+      load(v);
+    }
+    st(0, fs);
+    if (!at('(') || cur.nl) fail("expected the arguments of the function to spawn: spawn f(args)");
+    next();
+    int lb = F->depth, n = exprList(')');
+    collect(lb, n, H_LIST), st(0, slot());
+    gmem(0, findGlobal(intern("spawn@"))->slot), st(0, base), callWindow(base, 2, 0, false);
+  }
+
   // ---- expressions: result in x0 ----
   LV primary() {
     next();
@@ -578,6 +605,7 @@ struct Compiler : Gen {
       }
     }
     if (t.sym < NKW) failAt(t.p, t.line, "unexpected '%s'", name(t.sym));
+    if (t.sym == S_spawn && at(T_ID) && !cur.nl && resolve(F, S_spawn).k == LV_NONE) return spawnExpr(), LV{};
     if (t.sym == S_old && olds && at('(') && !cur.nl) {  // in ensures: the value it had on entry (computed then)
       auto it = olds->find(t.p);
       if (it == olds->end()) failAt(t.p, t.line, "old() is a value as it was on entry: it belongs in an ensures clause");
@@ -1406,9 +1434,9 @@ struct Compiler : Gen {
   void effectDecl() {
     Tok nt = cur;
     int raw = ident(), s = qualify(raw);
-    for (const char* b : {"io", "clock", "random", "yield"})
+    for (const char* b : {"io", "clock", "random", "yield", "spawn", "chan"})
       if (symName(raw) == b) failAt(nt.p, nt.line, "'%s' is a builtin effect", b);
-    if (!effBit(s)) failAt(nt.p, nt.line, "too many effects (a program can declare at most %d)", EFF_LEVEL - 4);
+    if (!effBit(s)) failAt(nt.p, nt.line, "too many effects (a program can declare at most %d)", EFF_LEVEL - EFF_BUILTIN);
     expect('{');
     EffectDef d{s, {}};
     std::vector<int> seen;

@@ -32,6 +32,11 @@ static std::string frameDesc(uintptr_t ra) {
   for (auto [i, l] : it->second.lines) if (it->first + i <= pc) line = l;
   return "  at " + it->second.name + " (" + it->second.file + ":" + std::to_string(line) + ")\n";
 }
+std::string codeWhere(void* ra) {  // frameDesc's "  at f (file:line)\n", as "f (file:line)"
+  Locked code(codeMu);
+  std::string d = frameDesc((uintptr_t)ra);
+  return d.size() > 6 ? d.substr(5, d.size() - 6) : d;
+}
 template <class F> static void eachReturnAddress(F f, uintptr_t* fp = (uintptr_t*)__builtin_frame_address(0), uintptr_t* top = stackTop) {
   for (; fp && fp < top; fp = (uintptr_t*)fp[0]) {
     f(fp[1]);
@@ -54,6 +59,7 @@ __attribute__((naked)) static void enterHandler(Handler*, V, VM*) {
       "mov x28, x2\n movz x27, #0x7ffc, lsl #48\n mov x0, x1\n br x9");
 }
 static TLS std::string fiberTrace;  // frames of a fiber that ended with an error, printed if nothing catches it
+void traceAdd(const std::string& frames) { fiberTrace += frames; }
 [[noreturn]] void throwValue(V v, void* ra) {
   if (auto* h = (Handler*)vm->handler)  // the transactions opened inside the try roll back before its handler runs
     vm->handler = h->prev, txnUnwind((u32)h->txn), effLoad({h->allowed, h->hstack, (u32)h->who, h->inv}), fiberTrace.clear(), __asan_handle_no_return(), enterHandler(h, v, vm);
@@ -75,7 +81,8 @@ static TLS std::string fiberTrace;  // frames of a fiber that ended with an erro
   }
   fiberTrace += trace;
   if (fiberCur) fiberCur->val = v, longjmp(*errJmp, 1);  // ends the fiber; fiberResume throws v in its resumer
-  if (errSink) *errSink = toStr(v) + "\n" + fiberTrace;
+  if (errValue) *errValue = v, *errSink = fiberTrace;  // an isolate's: its task keeps both (isolate.cpp)
+  else if (errSink) *errSink = toStr(v) + "\n" + fiberTrace;
   else fflush(stdout), fprintf(stderr, "runtime error: %s\n%s", toStr(v).c_str(), fiberTrace.c_str());
   fiberTrace.clear();
   if (errJmp) longjmp(*errJmp, 1);

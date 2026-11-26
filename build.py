@@ -16,6 +16,7 @@ WASM_FLAGS = ["--target=wasm32-wasip1", "--sysroot=/opt/homebrew/share/wasi-sysr
 WASM_LINK = ["-mexec-model=reactor", "-lsetjmp", "-Wl,--export=__stack_pointer", "-Wl,--export-table", "-Wl,--growable-table",
              "-Wl,-z,stack-size=8388608", "-Wl,--stack-first"]
 NATIVE_ONLY, WASM_ONLY = {"main.cpp", "jit.cpp", "sys.cpp"}, {"wasm.cpp"}
+NATIVE_SPECS = {"isolates.fut"}  # spawn needs threads: in wasm, isolates will be web workers (docs/isolates.md, phase 5)
 
 
 def build(debug=False, wasm=False, tsan=False):
@@ -80,7 +81,8 @@ def test(exe, only=()):
 
     jobs = ([("hot reload: " + n, lambda n=n, f=f: check("hot reload: " + n, f)) for n, f in HOT_TESTS]  # the slowest (they sleep) start first
             + [(t.name, lambda t=t: program(t)) for t in sorted((ROOT / "tests").glob("*.fut"))]
-            + [("specs/" + t.name, lambda t=t: spec(t)) for t in sorted((ROOT / "tests" / "specs").glob("*.fut"))]
+            + [("specs/" + t.name, lambda t=t: spec(t)) for t in sorted((ROOT / "tests" / "specs").glob("*.fut"))
+               if not (exe.suffix == ".wasm" and t.name in NATIVE_SPECS)]
             + [("std/" + t.name, lambda t=t: spec(t, "std")) for t in sorted((ROOT / "std").glob("*/*_test.fut"))]
             + [(n, lambda n=n, f=f: check(n, f)) for n, f in RUNNER_TESTS]
             + (isolateJobs(exe, 4) if exe == OUT else []))  # the plain native build: wasm runs one isolate (docs/isolates.md,

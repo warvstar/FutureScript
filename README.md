@@ -62,11 +62,11 @@ fn reload() { }                      // optional: runs after every hot reload (m
 
 - **Values:** numbers (f64; whole numbers are exact up to 2^53 and print without a decimal point), strings, `true`/`false`/`nil`, lists, maps, functions and closures, classes and instances. `nil` and `false` are the only falsy values.
 - **Operators:** `+ - * / %`, `== != < <= > >=`, `&& ||` (short-circuit, return the operand), `!`, `= += -= *= /=`. Bitwise `& | ^ ~ << >>` work on whole numbers as 64-bit integers (`1.5 & 1` is an error), with Python's precedence: `2 + 3 & 6` is `(2 + 3) & 6`. `+` with a string on either side concatenates.
-- **Builtins:** `print len str int clock sleep random floor sqrt fiber run` (`int` truncates toward zero; `random()` is in [0, 1)), plus graphics (below).
+- **Builtins:** `print len str int clock sleep random floor sqrt fiber run channel cores` (`int` truncates toward zero; `random()` is in [0, 1)), plus graphics (below).
 - **Host builtins** (`io`; native build except `time`, `json` and `parseJson`, which wasm has too; `time` is `clock`, and JSON has no effect): `fetch(url)` or `fetch({url, method, headers, body, timeout})` returns `{status, body, headers}` (header names lower-case), or `{status: 0, error}` when nothing came back, without throwing. `fetchAll(reqs)` runs the requests at once and returns their results in order. `exec([argv...])` or `exec({cmd, cwd, input, timeout})` runs a process and returns `{code, out, err, timedOut}`; `execAll(cmds)` runs several at once. `readFile(path)` returns the text or `nil`; `writeFile(path, text)` makes the directories it needs. `env(name)` returns a variable or `nil`; `time()` is seconds since 1970. `json(v)` and `parseJson(text)` convert data as for JavaScript. HTTP uses the system libcurl.
 - **Numbers:** `12`, `1.5`, `2e3`, `0xff8800`.
-- **Keywords:** `var fn class if else while for in return break continue true false nil self super import extern yield try catch throw`. `as`, `pub`, `override`, `atomic`, `effect`, `handle` and `with` are special only where they start an import alias, declaration or block, so they stay usable as names.
-- **Methods:** `list.push/pop/len/slice/join`, `map.has/remove/keys/values/len`, `str.len/has/find/slice/split/trim`, `fiber.resume/send/done`. `has` asks whether a string contains a part, and `find` gives its index or -1. `slice(from, to)` excludes `to` and clamps both to the length. `split(sep)` keeps empty parts. `join(sep)` writes strings as they are and other values as `str` does. `parseNum(s)` gives the number a string spells, or nil. Indexes count bytes, as `len` and `s[i]` do.
+- **Keywords:** `var fn class if else while for in return break continue true false nil self super import extern yield try catch throw`. `as`, `pub`, `override`, `atomic`, `effect`, `handle`, `with` and `spawn` are special only where they start an import alias, declaration or block, so they stay usable as names.
+- **Methods:** `list.push/pop/len/slice/join`, `map.has/remove/keys/values/len`, `str.len/has/find/slice/split/trim`, `fiber.resume/send/done`, `channel.send/recv/tryRecv/close`, `task.join/done`. `has` asks whether a string contains a part, and `find` gives its index or -1. `slice(from, to)` excludes `to` and clamps both to the length. `split(sep)` keeps empty parts. `join(sep)` writes strings as they are and other values as `str` does. `parseNum(s)` gives the number a string spells, or nil. Indexes count bytes, as `len` and `s[i]` do.
 - **Closures:** a closure captures the enclosing variables by value. The closure can still change its own copy, so counters work, but it does not see later changes in the enclosing function.
 - **Interpolation:** expressions inside `{...}` in a string can't contain `"`. Write `\{` for a literal brace.
 - **Newline rules:** a `(` or `[` on a new line, or a leading `-`, starts a new statement rather than continuing the previous one.
@@ -135,7 +135,7 @@ fn report() ! clock { save(p) }   // -> save() declares io, but it is called fro
 fn total() ! { print(n) }         // -> print() performs io, which total() does not declare (it declares no effects)
 ```
 
-- **Effects:** `io` (print, `run()`, the host builtins, `extern` calls, the window and its input), `clock` (`clock`, `sleep`, `time`), `random` (`random()`, a number in [0, 1)), `yield` (a fiber's `yield`), and effects a program declares (below). Builtins perform theirs. Throwing is not an effect.
+- **Effects:** `io` (print, `run()`, the host builtins, `extern` calls, the window and its input), `clock` (`clock`, `sleep`, `time`), `random` (`random()`, a number in [0, 1)), `yield` (a fiber's `yield`), `spawn` (starting an isolate), `chan` (every operation on a channel or a task: `send`, `recv`, `join`, ...), and effects a program declares (below). Builtins perform theirs. Throwing is not an effect.
 - **How it is checked:** while a function that declares effects runs, only those are allowed. Entering it checks that the code calling it is allowed all of them, so a declared function can't be reached from one that declares less. Performing an operation checks it at the place it happens. Functions that declare nothing run under whatever their caller allows, so `helper()` above may print when called from `main` but not when called from `total`. What is allowed comes back when the function returns or a throw leaves it, and each fiber keeps its own.
 - **Why:** when many people or agents change code at once, a signature should say what a function may touch. `fn score(hits: list): num !` promises that changing `score` won't start writing files, and the promise is kept by the program, not by review. As with types, checking at run time keeps every change local: a reload, or a caller compiled against an older version, gets a clean error naming the function and the effect, instead of a static check that would have to revisit every caller.
 
@@ -177,7 +177,7 @@ An `effect` declares operations without bodies, at the top level (`pub` makes it
 - **Interfaces:** effects are part of a `.api` file (`pub fn save(p): bool ! io`), so adding `io` to a `pub` function is an interface change that `fut test` reports. `pub effect` declarations are listed with their operations.
 - **Hot reload:** changing a function's declared effects takes effect at its next call, from any caller, like a changed result type. Its callers are not recompiled, since the check is in the function itself. Frames already running keep their old declaration until they return.
 - **Cost:** none for functions that declare nothing: they contain no extra code. A declaring function checks and narrows the allowed set on entry with about a dozen instructions and no call, and puts it back in its epilogue with four. 5M calls of `fn f(x) ! { return x + 1 }` take 11 ms against 8 ms undeclared (wasm: 20 vs 18). The set is a bitmask in the VM block (44 effects, the rest of the word counts nested narrowings). A builtin that performs an effect is checked when it is called, inside the runtime call that already resolves it. Entering a `try` saves three more words. A handled operation is a list walk and a call through the runtime.
-- `effect`, `handle` and `with` are special only where they start a declaration or a block, so they stay usable as names. `io`, `clock`, `random` and `yield` are effect names only after `!`.
+- `effect`, `handle` and `with` are special only where they start a declaration or a block, so they stay usable as names. `io`, `clock`, `random`, `yield`, `spawn` and `chan` are effect names only after `!`.
 
 ## Errors
 
@@ -440,6 +440,38 @@ f.resume()  f.done()                 // resume() sends nil
 ```
 
 An error inside a fiber ends it and is raised again in its resumer. Each fiber has its own effect handlers and allowed effects (see [Effects](#effects)). Switching costs about as much as a function call: callee-saved registers are saved on one stack, and the stack pointer moves to the other. Hot reload sees suspended fibers' frames, so code they will return into is kept.
+
+## Isolates and channels
+
+An isolate runs a function in parallel with the rest of the program, on a thread of its own, with a heap of its own. Isolates share no objects, so there are no data races to write: they communicate by sending values over channels, and each value sent is copied.
+
+```
+fn crunch(jobs, results) ! chan {
+  for job in jobs { results.send(score(job)) }   // for-in receives until the channel is closed and empty
+}
+fn main() {
+  var jobs = channel(64)       // holds up to 64 values: send waits while it is full
+  var results = channel(64)
+  var ws = []
+  for i in 0..cores() { ws.push(spawn crunch(jobs, results)) }
+  for j in work { jobs.send(j) }
+  jobs.close()
+  var total = 0
+  for i in 0..len(work) { total += results.recv() }
+  for w in ws { w.join() }
+}
+```
+
+- **`spawn f(args)`** starts an isolate running `f(args)` and gives its task. `f` is a function value: a name, a field, or a lambda (`spawn fn(n) { ... }(4)`). `task.join()` waits for it and gives its result; if it failed, `join` raises its error, with its frames and the line of the `spawn`. `task.done()` says whether it has finished.
+- **What an isolate starts with:** a copy of the spawner's globals as they were at `spawn`, the copied arguments, and the effects the spawner may perform. What it changes stays its own.
+- **`channel(n)`** holds up to `n` values. `send(v)` waits while it is full; `recv()` waits while it is empty. `channel(0)` hands each value over directly: `send` waits until a receiver has taken it. `close()` ends it: what is in it can still be received, then `recv()` raises and a `for` loop over it ends. `tryRecv()` gives nil instead of waiting.
+- **Sending copies.** Strings, lists, maps, instances and closures are copied into the receiver's heap, with their sharing and cycles: a list holding one map twice arrives holding one copy twice. Functions and classes are compiled code, shared by every isolate, so they are not copied. A channel or a task is sent as itself. A fiber can't be sent.
+- **Effects.** `spawn` performs `spawn`, and every channel or task operation performs `chan`, so a function's declared effects say whether it can start isolates or wait on one: `fn log(msg) ! io` can't send to a channel.
+- **Atomic blocks.** A `send` inside `atomic { }` happens when the block commits, and never if it rolls back, so no isolate sees a message from a block that didn't happen. `recv`, `join` and `spawn` inside one are errors: waiting would hold the block open, and a started isolate can't be taken back.
+- **Deadlocks are errors.** If every isolate of a program is waiting on the others, none can ever go on. Each raises an error that names every isolate, what it waits in and where, instead of hanging.
+- **Nothing is lost.** When `main()` returns, the program waits for the isolates it started. An isolate that failed with nothing joining it fails the program, with its error. If `main()` fails, the others are stopped. `fut test` does the same at the end of each test.
+- **Speed.** An isolate costs a thread and a VM block (its globals and inline caches); code compiled by one is used by all. `bench/mandelbrot_par.fut` on 8 isolates runs 7.9 times as fast as on one. Spawning copies every global, so keep large data out of globals that workers don't need, or send it.
+- Natively only for now: in wasm, `spawn` raises (channels work within the one isolate). Under `-w`, a reload waits until the isolates `main()` started have ended. Both are later phases of `docs/isolates.md`, as are a scheduler for thousands of isolates and deterministic replay in tests.
 
 ## C functions
 

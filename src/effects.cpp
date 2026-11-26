@@ -39,7 +39,7 @@ std::unordered_map<int, int> builtinOps;     // builtin native's symbol -> its o
 std::unordered_map<int, uint64_t> userBits;  // user effect symbol -> its bit
 std::string effName[EFF_LEVEL];
 std::vector<int> effOps[EFF_LEVEL];          // each effect's operations (a handle that answers all of them allows it)
-int nextBit = 4;
+int nextBit = EFF_BUILTIN;
 int printOp;  // print(): deterministic where tests run (their output is captured), so it leaves a test cacheable
 TLS std::vector<EffState> saved;    // effEnter (per isolate)
 struct Pending { V clo = 0, rec = 0; int op = 0; uint64_t n = 0; };
@@ -115,7 +115,7 @@ void effMark(void (*mark)(V)) {
 static std::string whoName() { return vm->who && vm->who < sites.size() ? sites[vm->who].fn : "this code"; }
 [[noreturn]] static void forbidden(const std::string& what, uint64_t effect, void* ra) {
   const char* e = effName[bitIndex(effect)].c_str();
-  if (vm->who == WHO_ATOMIC || (effect == EFF_IO && txnAtomic() && (vm->allowed & effect)))
+  if (effect == EFF_IO && (vm->who == WHO_ATOMIC || (txnAtomic() && (vm->allowed & effect))))
     rtError(ra, "%s performs io, which can't be undone inside atomic { } (do it after the block, or handle it inside the block)", what.c_str());
   if (vm->who && vm->who < sites.size())
     rtError(ra, "%s performs %s, which %s does not declare (%s)", what.c_str(), e, sites[vm->who].fn.c_str(), declares(sites[vm->who]).c_str());
@@ -129,6 +129,9 @@ static void rt_effect(uint64_t site) {  // entering a declaring function whose e
   rtError(RA(), "%s declares %s, but it is called from inside %s, which does not (%s)", s.fn.c_str(), extra.c_str(),
           whoName().c_str(), vm->who && vm->who < sites.size() ? declares(sites[vm->who]).c_str() : "");
 }
+
+// A runtime operation with no handler form (spawn, a channel's): this code must be allowed to perform it.
+void effRequire(uint64_t effect, const char* what, void* ra) { if (!(vm->allowed & effect)) forbidden(what, effect, ra); }
 
 // ---- handlers ----
 static uint64_t recAllowed(List* r) { return (uint64_t)num(r->v[1]) | (uint64_t)num(r->v[2]) << 32; }
@@ -252,7 +255,7 @@ static V n_random() {  // xorshift64*, seeded from the clock: [0, 1)
 
 void effectsInit() {
   vm->allowed = EFF_BITS, vm->hstack = NIL, vm->who = 0, vm->inv = 0, vm->invObj = 0;
-  effName[0] = "io", effName[1] = "clock", effName[2] = "random", effName[3] = "yield";
+  effName[0] = "io", effName[1] = "clock", effName[2] = "random", effName[3] = "yield", effName[4] = "spawn", effName[5] = "chan";
   ops[OP_YIELD] = {"yield", EFF_YIELD, 1}, ops[OP_EXTERN] = {"extern", EFF_IO, -1};
   effOps[3] = {OP_YIELD}, effOps[0] = {OP_EXTERN};  // externs can't be handled, so no handle allows io as a whole
   vm->helpers[H_EFFECT] = (void*)rt_effect;

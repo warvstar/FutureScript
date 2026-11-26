@@ -11,7 +11,7 @@
 #endif
 
 std::deque<Global> globals;
-static std::vector<Fn*> builtins[8];  // by object kind, then method sym
+static std::vector<Fn*> builtins[16];  // by object kind, then method sym
 std::vector<V> consts;
 std::string mainFile;
 void (*pollHook)();
@@ -114,7 +114,7 @@ static uint64_t header(Obj* o) { uint64_t h; memcpy(&h, o, 8); return h; }
 const char* typeName(V v) {
   if (isNum(v)) return "number";
   if (!isObj(v)) return v == NIL ? "nil" : "bool";
-  static const char* n[] = {"string", "list", "function", "class", "instance", "map", "function", "fiber", "js value"};
+  static const char* n[] = {"string", "list", "function", "class", "instance", "map", "function", "fiber", "js value", "channel", "task"};
   return n[(int)obj(v)->kind];
 }
 std::string toStr(V v, bool quote) {
@@ -143,6 +143,8 @@ std::string toStr(V v, bool quote) {
     case K::Inst: return "<" + symName(((Inst*)o)->cls->name) + ">";
     case K::Fiber: return "<fiber>";
     case K::Ref: return "<js value>";
+    case K::Chan: return "<channel>";
+    case K::Task: return "<task>";
     default: return "?";
   }
 }
@@ -278,7 +280,7 @@ static V rt_setf(V o, uint64_t s, V v, IC* ic) {
 #define INDEX(i, n) (isNum(i) && num(i) >= 0 && num(i) < (n) ? (size_t)num(i) : (ERR("index %s out of range (len %zu)", toStr(i).c_str(), (size_t)(n)), 0))
 #define NUMARG(v, f) (isNum(v) ? num(v) : (ERR(f "() expects a number"), 0.0))
 static V char1(V s, size_t i) { return cached(charStrs[(uint8_t)as<Str>(s)->s()[i]], {as<Str>(s)->s() + i, 1}); }
-static void mapSet(Map* m, V k, V v) {
+void mapSet(Map* m, V k, V v) {
   if ((m->used + 1) * 4 > m->idx.size() * 3) {  // grow (and drop deleted slots): rebuild the index
     m->idx.assign(std::bit_ceil(m->e.size() * 2 + 8), 0), m->used = (u32)m->e.size();
     for (u32 i = 0; i < m->e.size(); i++) *mapSlot(m, m->e[i].first) = i + 1;
@@ -310,6 +312,7 @@ static V rt_seti(V a, V i, V v) {
 static V rt_iter(V c, uint64_t i) {
   if (is(c, K::List)) return i < as<List>(c)->v.size() ? as<List>(c)->v[i] : END;
   if (is(c, K::Map)) return i < as<Map>(c)->e.size() ? as<Map>(c)->e[i].first : END;
+  if (is(c, K::Chan)) return chanNext(c, RA());  // each value received, until it is closed and drained
   if (is(c, K::Fiber)) {  // each yielded value; the fiber's return value ends the loop
     V r = as<Fiber>(c)->state == FIB_DONE ? END : fiberResume(c, NIL);
     return as<Fiber>(c)->state == FIB_DONE ? END : r;
@@ -473,7 +476,10 @@ u32* ffiThunk(void* fn, const std::string& sig, char ret, int sym) {
   memcpy(e->sig, sig.data(), sig.size());
   return t = ffiCode(e);
 }
-static void rt_poll() { if (pollHook) pollHook(); }
+static void rt_poll() {
+  if (isolateStopped()) vm->poll = 0, ERR("stopped: the isolate that started this one ended with an error");
+  if (pollHook) pollHook();
+}
 
 static V rt_echo(V v) {
   if (v != NIL) printf("%s\n", toStr(v, true).c_str());
@@ -481,11 +487,14 @@ static V rt_echo(V v) {
 }
 
 // ---------------- natives ----------------
+static Mutex outMu;  // an isolate's workers print to its outSink too
+void emitOut(std::string_view s) {
+  if (outSink) { Locked l(outMu); outSink->append(s).push_back('\n'); return; }
+  flockfile(stdout), fwrite(s.data(), 1, s.size(), stdout), putc_unlocked('\n', stdout), funlockfile(stdout);
+}
 static V n_print(V v) {
   std::string t;
-  auto s = text(v, t);
-  if (outSink) return outSink->append(s).push_back('\n'), NIL;
-  return fwrite(s.data(), 1, s.size(), stdout), putchar('\n'), NIL;
+  return emitOut(text(v, t)), NIL;
 }
 V binopValue(V a, V b, int op) { return rt_binop(a, b, op); }
 static V n_str(V v) { return is(v, K::Str) ? v : box(newStr(toStr(v))); }
@@ -674,5 +683,6 @@ void rtInit() {
   method<+[](V m) { return mapList(m, false); }>(K::Map, S_values);
   testInit();
   sysInit();
+  isolatesInit();
   effectsInit();  // after the natives it marks as operations
 }

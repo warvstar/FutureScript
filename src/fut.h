@@ -62,7 +62,7 @@ inline V box(double d) { return std::bit_cast<V>(d); }
 inline V boxb(bool b) { return b ? TRUE_ : FALSE_; }
 
 // ---- heap objects (no vtables: JIT code reads Inst fields at fixed offsets) ----
-enum class K : uint8_t { Str, List, Fn, Class, Inst, Map, Clo, Fiber, Ref, Free = 0xff };
+enum class K : uint8_t { Str, List, Fn, Class, Inst, Map, Clo, Fiber, Ref, Chan, Task, Free = 0xff };
 // For an Inst, `nslots` and `cid` (its class id) are in the header and are zero for every other kind, so one
 // 64-bit compare of the header checks kind, class and slot count together (the field inline cache).
 // `zero` stays 0 for that compare (mark bits live in the GC's side bitmap, not here).
@@ -146,6 +146,11 @@ struct Inst : Obj {  // slots point at the inline area sized when constructed, o
 // Entries in insertion order, plus an open-addressing index: entry + 1, 0 empty, ~0u deleted (`used` counts both).
 struct Map : Obj { static constexpr K KIND = K::Map; std::vector<std::pair<V, V>> e; std::vector<u32> idx; u32 used = 0; };
 struct Ref : Obj { static constexpr K KIND = K::Ref; u32 id; };  // a JavaScript value fut code holds (wasm)
+// A channel or a task, as one isolate sees it: a handle on state every isolate holding it shares (isolate.cpp).
+struct Shared;
+struct Chan : Obj { static constexpr K KIND = K::Chan; Shared* s; };
+struct Task : Obj { static constexpr K KIND = K::Task; Shared* s; };
+void sharedFree(Obj*);  // the GC found a channel or task handle dead
 struct Clo : Obj { static constexpr K KIND = K::Clo; Fn* fn; u32 n; V* env() { return (V*)(this + 1); } };
 // A fiber runs a function on a stack of its own; `yield` switches back to whoever resumed it.
 struct Fiber : Obj {
@@ -206,11 +211,13 @@ struct ImageScope { ImageScope(); ~ImageScope(); ImageScope(const ImageScope&) =
 bool gcWanted();           // wasm: a collection waits for the next safepoint
 void gcCollect();
 void isolateMark(void (*mark)(V));  // the isolate's own roots kept by the runtime (rt.cpp)
+bool gcInImage(Obj*);      // compiled code's: shared by every isolate, never collected
 void gcOwn(Obj*);  // o holds malloc'd memory: finalize it when the GC finds it dead
 template <class T> T* make(size_t extra = 0) {
   T* o = new (gcAlloc(sizeof(T) + extra)) T();
   o->kind = T::KIND;
-  if constexpr (T::KIND == K::List || T::KIND == K::Map || T::KIND == K::Class || T::KIND == K::Fiber || T::KIND == K::Ref) gcOwn(o);
+  if constexpr (T::KIND == K::List || T::KIND == K::Map || T::KIND == K::Class || T::KIND == K::Fiber || T::KIND == K::Ref ||
+                T::KIND == K::Chan || T::KIND == K::Task) gcOwn(o);
   return o;
 }
 Str* newStr(std::string_view, std::string_view = {});
@@ -222,7 +229,7 @@ inline TLS uintptr_t* stackTop;
   X(true) X(false) X(nil) X(self) X(super) X(import) X(extern) X(yield) X(try) X(catch) X(throw)
 #define SYM_ENUM(k) K_##k,
 #define SYM_STR(k) #k,
-#define EXTRA_SYMS(X) X(init) X(main) X(push) X(pop) X(len) X(has) X(remove) X(keys) X(values) X(reload) X(resume) X(send) X(done) X(as) X(test) X(expect) X(throws) X(prints) X(pub) X(override) X(atomic) X(effect) X(handle) X(with) X(requires) X(ensures) X(invariant) X(old) X(result) X(allocs) X(grows) X(like) X(todo)
+#define EXTRA_SYMS(X) X(init) X(main) X(push) X(pop) X(len) X(has) X(remove) X(keys) X(values) X(reload) X(resume) X(send) X(done) X(as) X(test) X(expect) X(throws) X(prints) X(pub) X(override) X(atomic) X(effect) X(handle) X(with) X(requires) X(ensures) X(invariant) X(old) X(result) X(allocs) X(grows) X(like) X(todo) X(spawn)
 #define SYM_S(k) S_##k,
 enum { KEYWORDS(SYM_ENUM) NKW, S_FIRST = NKW - 1, EXTRA_SYMS(SYM_S) };
 int intern(std::string_view);
@@ -358,6 +365,20 @@ extern void (*pollHook)();
 inline TLS jmp_buf* errJmp;
 inline TLS std::string* outSink;  // when set, print() appends here instead of writing to stdout (a test's output)
 inline TLS std::string* errSink;  // when set, an uncaught error's message and trace go here instead of to stderr
+inline TLS V* errValue;           // when set, an uncaught error's value goes here, and its trace to *errSink
+void traceAdd(const std::string& frames);  // frames to print after the next uncaught error's own (a failed join)
+std::string codeWhere(void* ra);  // "f (file.fut:12)" for a return address in JIT code, or ""
+void emitOut(std::string_view line);  // print(): to outSink (locked: an isolate's workers share it) or stdout
+
+// ---- isolates and channels (isolate.cpp): spawn, join, channel(n), copying sends ----
+void isolatesInit();
+void isolateRoot();          // this thread runs a program (main, a test run, one of --isolates N): its isolates' root
+std::string isolatesFinish(bool failed);  // the root's program ended: wait for the isolates it started (stopping them
+                                          // if it failed); what went wrong among them (a deadlock, an unjoined failure)
+void isolatesMark(void (*mark)(V));
+bool isolateStopped();       // this isolate was asked to stop (rt_poll raises)
+V chanNext(V ch, void* ra);  // for v in ch: the next value received, or END once it is closed and drained
+void txnAfter(void (*run)(void*), void (*drop)(void*), void* p);  // when the outermost transaction commits (else drop)
 
 // ---- tests (test.cpp): `expect` sites, and the runner behind `fut test` ----
 struct ExpectSite { std::string file, text, left, right; int line = 0, op = -1; bool throws = false; std::string contract; };  // op < 0: truthiness
@@ -375,6 +396,8 @@ V binopValue(V a, V b, int op);  // a op b, as the language computes it (raises 
 struct TestRun { bool json = false; std::string filter; double timeout = 10; int isolates = 0; bool changed = false; };
 extern std::string mainFile;  // the program's file: run() finds relative files next to it
 void mapPut(Map*, std::string_view key, V v);
+void mapSet(Map*, V key, V v);
+std::string* outBase();  // where print() goes outside any `expect prints { }` capture (an isolate's workers print there)
 struct ProcResult { int code = 0; std::string out, err; bool timedOut = false; };
 // Run this fut executable with args, then file (or a temporary file holding *source); false if it could not start.
 int reap(int pid, std::vector<std::pair<int, std::string*>> pipes, double timeout, bool& timedOut);  // native only
@@ -441,7 +464,8 @@ void typesInit();
 // vm->allowed holds the effects code may perform now in its low 44 bits (all set: unchecked) and, above them, a
 // level that each narrowing (a declared function, an atomic block) raises by one. vm->who names the narrowing.
 constexpr int EFF_LEVEL = 44;
-constexpr uint64_t EFF_IO = 1, EFF_CLOCK = 2, EFF_RANDOM = 4, EFF_YIELD = 8, EFF_BITS = (1ull << EFF_LEVEL) - 1;
+constexpr uint64_t EFF_IO = 1, EFF_CLOCK = 2, EFF_RANDOM = 4, EFF_YIELD = 8, EFF_SPAWN = 16, EFF_CHAN = 32, EFF_BITS = (1ull << EFF_LEVEL) - 1;
+constexpr int EFF_BUILTIN = 6;  // io, clock, random, yield, spawn, chan: user effects get the bits after them
 constexpr u32 WHO_ATOMIC = ~0u;  // vm->who inside an atomic block (it takes io away)
 enum { OP_YIELD = 1, OP_EXTERN = 2 };  // operations with fixed ids; builtins and user effects' get theirs at startup / compile time
 int effSite(const std::string& fn, uint64_t mask, const std::string& text);  // a declaring function: what errors name
@@ -462,6 +486,7 @@ void effLoad(const EffState&);
 u32 effEnter();             // a driver runs code (top level, main, REPL line, reload): unchecked, no handlers
 void effLeave(u32 depth);   // and back
 void effMark(void (*mark)(V));
+void effRequire(uint64_t effect, const char* what, void* ra);  // raises unless this code may perform it (no handlers)
 void effectsInit();
 
 // ---- packages (pkg.cpp): a directory with a fut.pkg manifest ----

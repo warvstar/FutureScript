@@ -256,6 +256,8 @@ V vmEnter(void* code, V* args) {
 
 // ---------------- errors ----------------
 [[noreturn]] void throwValue(V v, void*) { host_throw(v); }
+void traceAdd(const std::string&) {}  // wasm traces come from the engine
+std::string codeWhere(void*) { return ""; }
 static jmp_buf* compileJmp;
 static std::string compileErr;
 static bool compileAtEnd;

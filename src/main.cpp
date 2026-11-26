@@ -62,12 +62,21 @@ static Global* fnNamed(int sym) {
   Global* g = findGlobal(sym);
   return g && g->kind == 'f' && g->o ? g : nullptr;
 }
+// The program ended (st: 0, or 1 after an uncaught error): wait for the isolates it started, stopping them if it
+// failed. A deadlock among them, or one that failed with nothing joining it, fails the program.
+static int finish(int st, std::string* to = nullptr) {
+  std::string r = isolatesFinish(st != 0);
+  if (r.empty() || st) return st;
+  if (to) *to = r + "\n";
+  else fflush(stdout), fprintf(stderr, "runtime error: %s\n", r.c_str());
+  return 1;
+}
 static int start(Compiled& c) {  // run the top level, then main() (rerun when a reload changes it)
   int st = run(c.chunk);
   jitRetire((u32*)c.chunk), inMain = true;
   for (Global* m; !st && (m = fnNamed(S_main)) && (st = run(m->stub)) == 2; st = 0) fputs("[fut] main() changed: restarting it\n", stderr);
   inMain = false;
-  return st;
+  return finish(st);
 }
 // ---- --isolates N: the same code in N isolates at once, each on a thread of its own ----
 // Isolates share no mutable state, so each must behave exactly as it would alone: the same output, the same end.
@@ -76,10 +85,11 @@ static void* isolateMain(void* p) {
   IsoJob& j = *(IsoJob*)p;
   vm = vmNew();
   Heap* h = heapNew(vm->runs);
-  heapUse(h), threadInit();
+  heapUse(h), threadInit(), isolateRoot();
   for (auto& g : globals) if (g.slot >= 0 && g.o) vm->globals[g.slot] = box(g.o);  // its functions and classes
   outSink = &j.out, errSink = &j.err;
   for (void* c : j.code) if ((j.st = run(c))) break;
+  j.st = finish(j.st, &j.err);
   outSink = errSink = nullptr;
   heapFree(h), vmFree(vm), vm = nullptr;
   return nullptr;
@@ -133,6 +143,7 @@ static void evalInbox() {
 // Runs at a safepoint (loop back-edge) on the main thread when a watched file changed or a line was typed. Inside
 // a transaction (atomic { }) both wait for it to end.
 static void hotReload() {
+  if (isolates > 1) return;  // isolates it spawned run the code: it waits for them (reloading across them: phase 4)
   vm->poll = 0;
   if (vm->txn) return void(txnPollLater = true);
   evalInbox();
@@ -182,7 +193,7 @@ static void isolated(const TestCase& t, void* code, double timeout) {
     std::string err;
     errSink = &err;
     char status;
-    int st = run(code);
+    int st = finish(run(code), &err);
     std::string text = testReport(t, st != 0, err, status);
     text.insert(text.begin(), status);
     for (size_t o = 0; o < text.size();) {
@@ -225,7 +236,8 @@ static int runTests(const TestRun& o) {
   }
   std::string err;
   errSink = &err;
-  int st = testsToRun(c.tests) ? run(c.chunk) : 0;  // --changed with every test cached: nothing runs, not even the top level
+  int st = testsToRun(c.tests) ? finish(run(c.chunk), &err) : 0;  // --changed with every test cached: nothing runs, not even
+  // the top level. Its isolates are finished before the tests fork: a child process has only the forking thread.
   jitRetire((u32*)c.chunk);
   // A public interface out of date fails the run too, reported last so it is what the reader sees with the status.
   auto api = [&](int st) { return reportInterfaces(checkInterfaces(c), o.json, path) ? std::max(st, 1) : st; };
