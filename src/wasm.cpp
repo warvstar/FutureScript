@@ -81,6 +81,21 @@ static thread_local u32 tableAt;      // how much of it this thread's table has
 // The C library has no thread exit hooks for thread_local destructors. fut's threads (a pool's, the ticker) never
 // end, and the main thread's end is the process's: nothing to run.
 extern "C" int __cxa_thread_atexit(void (*)(void*), void*, void*) { return 0; }
+// exit(), replaced: the C library's runs the atexit handlers and closes stdio under locks, which a worker thread
+// can't, as the main thread goes on (and its JavaScript can't end the process): a worker asks the main thread to
+// (isolatesExit) and waits. On the main thread, output is flushed and the process ends; static objects are left as
+// they are, and other threads may still be using them.
+extern "C" void exit(int code) {
+  fflush(stdout), fflush(stderr);
+  if (!isolateMainThread()) {
+    isolatesExit(code);
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    static pthread_cond_t never = PTHREAD_COND_INITIALIZER;
+    pthread_mutex_lock(&mu);
+    for (;;) pthread_cond_wait(&never, &mu);
+  }
+  _Exit(code);
+}
 // malloc's memory (the C library's sbrk, replaced). A thread that grows the memory sees the new size at once, but
 // V8 tells the other threads' instances (and their JavaScript) asynchronously, and until they hear, memory past the
 // old end is out of bounds to them. So grow well ahead of use: what malloc hands out was grown long before. (The

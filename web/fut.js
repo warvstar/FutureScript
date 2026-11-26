@@ -279,6 +279,7 @@ export async function createFut(opts) {
       dv().setInt32(failedP, 1, true);
       return (held = enc.encode(String(e?.message ?? e))), held.length;
     };
+    if (!externs[fn] && opts.thread) return failed(new Error("this isolate runs on a worker thread, and extern functions (JavaScript's) run only on the main one: call it from the program's main isolate"));
     let r;
     ffiDepth++;
     try { r = externs[fn](...a); } catch (e) { return failed(e); } finally { if (!--ffiDepth && pollLater) (pollLater = false), poke(); }
@@ -552,7 +553,7 @@ export async function createFut(opts) {
   ex.fut_init((opts.verbose ? 1 : 0) | (opts.noTier ? 2 : 0) | (opts.interp ? 4 : 0)), (pollAt = ex.fut_poll());
   if (opts.std) withStr(opts.std, (p) => ex.fut_std(p));
   if (opts.poolSize) ex.fut_threads(opts.poolSize);  // fut-mt.wasm: at most this many threads run isolates (default cores)
-  if (opts.seed) ex.fut_seed(opts.seed);  // how a program's isolates interleave (default 1)  // where the standard library's packages are
+  if (opts.seed || (shared && !opts.threads)) ex.fut_seed(opts.seed || 1);  // (no threads: seeded, on this one)  // how a program's isolates interleave (default 1)  // where the standard library's packages are
 
   const pinned = new Map();  // name -> id, for apply()
   let applying = Promise.resolve();  // one apply at a time: they share the main shadow stack

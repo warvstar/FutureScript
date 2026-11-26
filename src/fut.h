@@ -498,6 +498,7 @@ inline uint64_t isolateSeed;
 inline int isolateThreads;  // the pool's size (--threads n; 0: cores())
 void isolateExitPoint();     // (wasm threads) at a poll: end the process, if another thread asked (isolatesExit)
 void isolatesExit(int code);
+bool isolateMainThread();    // (wasm threads)
 std::string isolateSeedNote();  // a failed test's: the seed that replays it, if its isolates were scheduled by one
 // Hot reload across isolates (main.cpp's hotReload, on the root): stop the program's other isolates at safe points
 // (false: there are none), copy compiled functions and classes into their globals, have each run the new top level

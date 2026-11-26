@@ -1,6 +1,6 @@
 # Isolates and channels
 
-Status: phases 1 (the runtime split per isolate), 2 (spawn, join, channels), 3 (the scheduler: isolate stacks, a thread pool with preemption, seeded runs) and 4 (hot reload across isolates) are done, and so is the first step of 5 (isolates in wasm, on one thread). The README has the language as built; `src/isolate.cpp` has the runtime. The rest of phase 5 (wasm isolates in parallel, on workers) is next. This is how fut gets parallelism: many isolates run at once, each owning its own heap,
+Status: phases 1 (the runtime split per isolate), 2 (spawn, join, channels), 3 (the scheduler: isolate stacks, a thread pool with preemption, seeded runs) and 4 (hot reload across isolates) are done, and so is 5 in Node (isolates in wasm: on one thread in fut.wasm, in parallel on workers in fut-mt.wasm). The README has the language as built; `src/isolate.cpp` has the runtime. What remains of 5 is the browser (a page's main thread can't block, and needs COOP/COEP headers). This is how fut gets parallelism: many isolates run at once, each owning its own heap,
 and they share data only by sending it over channels. There is no shared mutable memory, so there are no locks,
 no memory orderings and no data races to write. Read this before you add any global state to the runtime.
 
@@ -138,13 +138,12 @@ Code is shared, so a reload must reach every isolate at once:
 
 ## Wasm
 
-- Each isolate is a Web Worker (or a Node worker thread) instantiating the same module over one shared
-  `WebAssembly.Memory`.
+- Each pool thread is a Web Worker (or a Node worker thread) instantiating the same module over one shared
+  `WebAssembly.Memory` (done in step two, in Node).
 - **The VM block.** Done in step one: JIT wasm code reads the running isolate's VM block from wasm global 1 once per
   frame, into a local, and reaches its fields as offsets from it.
 - **JIT modules.** Each one is instantiated in every worker, because each worker has its own function table
-  (shared tables aren't standardized). A compiled `WebAssembly.Module` can be posted to workers. Reload installs
-  the new module in each worker at its stop.
+  (shared tables aren't standardized). Done in step two: a log of every table change, which each thread replays.
 - **Blocking.** `Atomics.wait` works in workers and in Node, but not on a browser's main thread. There, the main
   isolate's `recv` suspends through JSPI, as fibers already do.
 - **Headers.** Shared memory requires a cross-origin-isolated page (COOP/COEP). `web/serve.mjs` will send them.
@@ -175,8 +174,9 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
    - Test: the hot-reload suite with workers running (`build.py`'s `hot_isolates`).
 5. **Wasm workers.**
    - Step one, done: isolates in wasm on one thread (the VM base global; contexts switched with JSPI; seeded).
-   - Step two: per-worker instantiation over shared memory (a threads build), the table log, blocking on the
-     browser's main thread, COOP/COEP.
+   - Step two, done in Node: per-worker instantiation over shared memory (fut-mt.wasm, a threads build), the
+     table log.
+   - Left: the browser (blocking on a page's main thread, COOP/COEP), and reloads with isolates running.
 6. **Shared buffers and `parallel for`, for C-like throughput.**
    - Work: typed buffers (`f64buffer(n)` and the like) live outside every heap, so all isolates read and write them
      directly. Sending a buffer moves its ownership instead of copying it.
@@ -298,3 +298,47 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
 - **Cloudflare Workers.** A Worker can't compile code, so every bundle ships `try_call` compiled (`try.wasm`), and
   `run()` there takes `--seed n` (and `--threads n`, which does nothing on one thread). `tests/specs/isolates.fut`
   passes in a bundle compiled ahead of time (`build.py`'s Worker check runs it).
+
+## Phase 5, step two as built: isolates in parallel, on workers
+
+- **Two builds.** fut.wasm stays as step one left it (one thread: Cloudflare Workers can't share memory). fut-mt.wasm
+  is the same sources for `wasm32-wasip1-threads` with `-pthread` (`build.py wasm --threads`, `test --wasm-mt`):
+  `ONE_THREAD` (fut.h) is false there, so the locks are pthread mutexes, `TLS` is `thread_local`, and isolate.cpp's
+  pool, ticker and pinned root are the native ones. Programs are pooled by default, as natively, and `fut test` is
+  seeded (by 1). `web/run.mjs` takes the build from `FUT_WASM`.
+- **Threads.** `pthread_create` asks the host for a thread (wasi `thread-spawn`). In Node that is a worker
+  (`web/thread.mjs`) with its own instance of fut-mt.wasm over the one shared memory, which runs `wasi_thread_start`
+  as a promising call: a pool thread's loop (whose isolates switch with JSPI, as in step one) or the ticker. Each
+  thread's host has the options `web/node.mjs` makes, which `run.mjs` uses too (files, output, child processes), so
+  output from any thread goes straight to the file descriptor. The root runs on the main thread, and its waits block
+  it (`Atomics.wait` is allowed in Node's main thread).
+- **The table log.** Each thread has its own function table, and every table must hold the same function in the same
+  slot. Every change (a module installed, the table grown, `try_call` added) is made by a thread holding `codeMu`,
+  which first replays what it has yet to, and then logged with the module's bytes. Another thread replays the log
+  (`codeSync`) before it could reach what was added: when it switches isolates, decodes a message (which may hold a
+  function compiled since), adds `try_call`, or reaches a safepoint. Tier 2 code compiled on one thread sets bit 32
+  of every other isolate's `vm->poll`, so each adopts it at its next poll. A thread instantiates each module from the
+  logged bytes itself; the bytes are kept for threads not started yet.
+- **The image.** Compiled code's constants, functions and classes now go to the image in wasm too (as natively): a
+  tier-2 compile on a spawned isolate had put them in that isolate's heap, which is freed when it ends. A compile
+  error longjmps past `ImageScope` and `Locked`, so where it lands puts their state back (`Guard` in wasm.cpp).
+- **Memory growth.** When one thread grows shared memory, V8 tells the other threads' instances (and their
+  JavaScript) asynchronously; until they hear, the new memory is out of bounds to them, and a block `malloc` handed
+  out just after a growth on another thread trapped. fut-mt.wasm starts with 768 MB of memory (reserved; pages are
+  touched as used), and replaces the C library's `sbrk` with one that grows 64 MB ahead of use, so what `malloc`
+  hands out was grown long before.
+- **Ending.** A worker can't end the process (in Node, `process.exit` there ends only the worker), and the C library's
+  `exit` runs handlers under locks the main thread may need. So `exit` is replaced too: on a worker it asks the main
+  thread to end the process (`isolatesExit`: bit 64 of every `vm->poll`, and a wake of the root's wait) and waits;
+  on the main thread it flushes output and ends.
+- **Limits.**
+  - Extern functions (JavaScript's) and JavaScript values are the main thread's: an isolate on a worker that calls
+    one gets an error saying so.
+  - A host call that waits (`sleep`, `fetch`) holds up the other isolates of its thread, as it does on one thread.
+  - Deep recursion runs out of V8's stack (984 KB for a JSPI stack) before fut's own check, so it ends the program
+    rather than failing the isolate. The same holds on fut.wasm's main isolate.
+  - V8 has no on-stack replacement for wasm: a long loop entered while V8 still runs a module's baseline code stays in
+    it, so timings vary between runs (up to 10x on a loop of 10^8 iterations), on one thread or many.
+- **Speed.** Eight isolates each summing 10^8 numbers: 0.95 s on 8 threads, 2.1 s on 2, and 3.3 s in fut.wasm on one
+  thread (natively: 0.26 s). `tests/isolates_busy.fut` (12 isolates collecting, compiling tier 2 and sending closures
+  at once) runs in every build's suite.

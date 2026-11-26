@@ -1,5 +1,5 @@
 // Isolates and channels: spawn f(args) runs f in an isolate of its own, join() waits for its result, channel(n)
-// carries copies of values between isolates. Native only: in wasm, isolates will be web workers (docs/isolates.md).
+// carries copies of values between isolates. In wasm too: on one thread (fut.wasm), or on workers (fut-mt.wasm).
 fn square(x) { return x * x }
 fn worker(jobs, results) ! chan {
   for j in jobs { results.send(j * j) }

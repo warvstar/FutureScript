@@ -979,10 +979,11 @@ void isolateNudge() {
 
 void isolateExitPoint() {
 #if __wasm__ && !ONE_THREAD
-  if (exitAsked.load() >= 0 && pthread_equal(pthread_self(), mainThread)) chanMu.lock(), exitNow();
+  if (exitAsked.load() >= 0 && isolateMainThread()) chanMu.lock(), exitNow();
 #endif
 }
 #if __wasm__ && !ONE_THREAD
+bool isolateMainThread() { return pthread_equal(pthread_self(), mainThread); }
 void isolatesExit(int code) {
   int none = -1;
   exitAsked.compare_exchange_strong(none, code);
