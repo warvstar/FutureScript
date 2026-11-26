@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fut</title>
+<style>
+  :root { color-scheme: dark; --bg: #14141c; --fg: #d8d8e0; --dim: #7a7a8c; --err: #ff7a7a; --line: #2a2a38; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 13px/1.45 ui-monospace, Menlo, monospace; display: flex; flex-direction: column; height: 100vh; }
+  header { padding: 8px 16px; border-bottom: 1px solid var(--line); color: var(--dim); }
+  header b { color: var(--fg); }
+  main { flex: 1; display: flex; gap: 16px; padding: 16px; min-height: 0; flex-wrap: wrap; }
+  canvas { image-rendering: pixelated; background: #000; display: none; align-self: flex-start; width: min(640px, 100%); outline: none; }
+  #side { flex: 1; min-width: 280px; display: flex; flex-direction: column; min-height: 0; }
+  #out { flex: 1; margin: 0; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+  .e { color: var(--err); }
+  form { display: flex; border-top: 1px solid var(--line); padding-top: 8px; }
+  #prompt { color: var(--dim); padding-right: 6px; }
+  input { flex: 1; background: none; border: 0; color: var(--fg); font: inherit; outline: none; }
+</style>
+</head>
+<body>
+<header><b>fut</b> on WebAssembly · <span id="file"></span> · edits to the file hot-reload · type to poke the running program</header>
+<main>
+  <canvas id="screen" tabindex="0"></canvas>
+  <div id="side">
+    <pre id="out"></pre>
+    <form id="form"><span id="prompt">&gt;</span><input id="in" autocomplete="off" spellcheck="false" autofocus></form>
+  </div>
+</main>
+<script type="module">
+import { createFut } from "/web/fut.js";
+const $ = (id) => document.getElementById(id);
+const out = $("out"), canvas = $("screen"), ctx = canvas.getContext("2d");
+const file = new URLSearchParams(location.search).get("file");
+$("file").textContent = file ?? "REPL (add ?file=examples/paddle.fut)";
+const decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
+function write(fd, bytes) {
+  const s = document.createElement("span");
+  s.textContent = decoders[fd].decode(bytes, { stream: true });
+  if (fd == 2) s.className = "e";
+  out.append(s), (out.scrollTop = out.scrollHeight);
+}
+let watched = new Set();
+const fut = await createFut({
+  wasm: await (await fetch("/build/fut.wasm")).arrayBuffer(),
+  verbose: true,
+  read(p) {  // fut reads files synchronously
+    const x = new XMLHttpRequest();
+    x.open("GET", p, false), x.overrideMimeType("text/plain; charset=x-user-defined"), x.send();
+    if (x.status != 200) return null;
+    const b = new Uint8Array(x.responseText.length);
+    for (let i = 0; i < b.length; i++) b[i] = x.responseText.charCodeAt(i) & 0xff;
+    return b;
+  },
+  write,
+  files: (f) => (watched = new Set(f)),
+  window(w, h) { canvas.width = w, canvas.height = h, (canvas.style.display = "block"), canvas.focus(); return true; },
+  async present(rgba, w, h) {
+    ctx.putImageData(new ImageData(rgba, w, h), 0, 0);
+    await new Promise(requestAnimationFrame);
+    return true;
+  },
+});
+// keys: the codes key() looks up (arrows as AppKit numbers them)
+const named = { ArrowUp: 0xf700, ArrowDown: 0xf701, ArrowLeft: 0xf702, ArrowRight: 0xf703, Enter: 13, Escape: 27, Tab: 9 };
+const code = (e) => named[e.key] ?? (e.key.length == 1 ? e.key.toLowerCase().charCodeAt(0) : -1);
+for (const [type, down] of [["keydown", 1], ["keyup", 0]])
+  canvas.addEventListener(type, (e) => { const c = code(e); if (c >= 0) fut.exports.fut_key(c, down), e.preventDefault(); });
+let mouseDown = 0;
+const mouse = (e) => {
+  const r = canvas.getBoundingClientRect();
+  fut.exports.fut_mouse((e.clientX - r.left) * canvas.width / r.width, (e.clientY - r.top) * canvas.height / r.height, mouseDown);
+};
+canvas.addEventListener("mousemove", mouse);
+canvas.addEventListener("mousedown", (e) => ((mouseDown = 1), mouse(e)));
+addEventListener("mouseup", (e) => ((mouseDown = 0), mouse(e)));
+
+let running = !!file, prompt = "> ";
+$("form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const l = $("in").value + "\n";
+  $("in").value = "", write(1, new TextEncoder().encode((running ? "" : prompt) + l));
+  if (running) fut.type(l);
+  else (prompt = await fut.line(l)), ($("prompt").textContent = prompt.trim());
+});
+if (file) {
+  const path = "/" + file.replace(/^\/+/, "");
+  new EventSource("/events").onmessage = (e) => watched.has(e.data) && fut.changed();
+  const st = await fut.run(path, true);
+  running = false, write(2, new TextEncoder().encode(`[fut] exited (${st})\n`));
+}
+</script>
+</body>
+</html>

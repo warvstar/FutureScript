@@ -1,25 +1,27 @@
 // Driver: run a file, hot-patch it on save (-w), dump its machine code (--asm), or start a REPL.
 #include "fut.h"
-#include <chrono>
-#include <iostream>
-#include <mutex>
+#include <pthread.h>
 #include <sys/stat.h>
-#include <thread>
+#include <time.h>
 #include <unistd.h>
-using namespace std::chrono;
 
 static std::string path;
-static std::mutex watchMu;
+static pthread_mutex_t watchMu = PTHREAD_MUTEX_INITIALIZER;
 static std::vector<std::string> watched;  // the program file and everything it imports
+static std::vector<std::string> inbox;    // lines typed into a running program (both guarded by watchMu)
+static std::string replBuf;               // REPL input so far (more lines may follow)
 static bool inMain;
+static int fileChanged;
 
 static Compiled load(bool reload) {
-  auto t0 = steady_clock::now();
+  timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
   try {
     Compiled c = compile(path, reload, false);
-    { std::lock_guard l(watchMu); watched = c.files; }
+    pthread_mutex_lock(&watchMu), watched = c.files, pthread_mutex_unlock(&watchMu);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
     if (reload) fprintf(stderr, "[fut] %s (%.2f ms, %zu KB code)\n", c.log.c_str(),
-                        duration<double, std::milli>(steady_clock::now() - t0).count(), jitLive() >> 10);
+                        (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) * 1e-6, jitLive() >> 10);
     return c;
   } catch (std::exception& e) {
     fflush(stdout);
@@ -29,16 +31,17 @@ static Compiled load(bool reload) {
 }
 static int run(void* code) {  // 0 ok, 1 runtime error, 2 restart requested
   jmp_buf jb, *outer = errJmp;
+  void* handler = vm.handler;  // REPL lines typed into a running program must not land in its try blocks
   int st = 0;
-  errJmp = &jb;
+  errJmp = &jb, vm.handler = nullptr;
   if (int r = setjmp(jb)) st = r;
   else vmCall(code);
-  errJmp = outer;
+  errJmp = outer, vm.handler = handler;
   return st;
 }
 static Global* fnNamed(int sym) {
-  auto it = globals.find(sym);
-  return it != globals.end() && it->second.kind == 'f' && it->second.o ? &it->second : nullptr;
+  Global* g = findGlobal(sym);
+  return g && g->kind == 'f' && g->o ? g : nullptr;
 }
 static int start(Compiled& c) {  // run the top level, then main() (rerun when a reload changes it)
   int st = run(c.chunk);
@@ -47,9 +50,27 @@ static int start(Compiled& c) {  // run the top level, then main() (rerun when a
   inMain = false;
   return st;
 }
-// Runs at a safepoint (loop back-edge) on the main thread when a watched file changed.
+static void eval(bool more) {  // compile and run replBuf, unless it is unfinished and `more` may follow
+  try {
+    Compiled c = compile("<repl>", false, true, &replBuf);
+    run(c.chunk), jitRetire((u32*)c.chunk);
+  } catch (CompileError& e) {
+    if (e.atEnd && more) return;
+    fprintf(stderr, "%s\n", e.what());
+  } catch (std::exception& e) { fprintf(stderr, "%s\n", e.what()); }
+  replBuf.clear(), fflush(stdout);
+}
+static void evalInbox() {
+  pthread_mutex_lock(&watchMu);
+  std::vector<std::string> lines = std::move(inbox);
+  inbox.clear(), pthread_mutex_unlock(&watchMu);
+  for (auto& l : lines) replBuf += l, eval(l.size() > 1);  // an empty line gives up on unfinished input
+}
+// Runs at a safepoint (loop back-edge) on the main thread when a watched file changed or a line was typed.
 static void hotReload() {
   vm.poll = 0;
+  evalInbox();
+  if (!__atomic_exchange_n(&fileChanged, 0, __ATOMIC_ACQUIRE)) return;
   Compiled c = load(true);
   if (!c.chunk) return;  // compile error: keep running the old code
   vmCall(c.chunk), jitRetire((u32*)c.chunk);
@@ -57,34 +78,26 @@ static void hotReload() {
   if (c.mainChanged && inMain) c = {}, longjmp(*errJmp, 2);                       // unwind and rerun main()
 }
 static long long stamp() {
-  std::lock_guard l(watchMu);
+  pthread_mutex_lock(&watchMu);
   long long s = 0;
   for (auto& f : watched) {
     struct stat st;
     if (!stat(f.c_str(), &st)) s = s * 31 + st.st_mtimespec.tv_sec * 1000000000LL + st.st_mtimespec.tv_nsec;
   }
-  return s;
+  return pthread_mutex_unlock(&watchMu), s;
 }
-static void waitChange() {
-  while (!__atomic_exchange_n(&vm.poll, 0, __ATOMIC_ACQUIRE)) std::this_thread::sleep_for(50ms);
+static void waitChange() {  // typed lines still run meanwhile, so the stopped program's state can be inspected
+  for (;; gfxPump(), usleep(50000))
+    if (__atomic_exchange_n(&vm.poll, 0, __ATOMIC_ACQUIRE) && (evalInbox(), __atomic_exchange_n(&fileChanged, 0, __ATOMIC_ACQUIRE))) return;
 }
 
 static int repl() {
-  std::string buf, line;
-  for (;;) {
-    fputs(buf.empty() ? "> " : ". ", stdout), fflush(stdout);
-    if (!std::getline(std::cin, line)) return puts(""), 0;
-    buf += line + "\n";
-    try {
-      Compiled c = compile("<repl>", false, true, &buf);
-      run(c.chunk), jitRetire((u32*)c.chunk);
-    } catch (CompileError& e) {
-      if (e.atEnd && !line.empty()) continue;  // unfinished input: keep reading (an empty line gives up)
-      fprintf(stderr, "%s\n", e.what());
-    } catch (std::exception& e) {
-      fprintf(stderr, "%s\n", e.what());
-    }
-    buf.clear(), fflush(stdout);
+  char* line = nullptr;
+  size_t cap = 0;
+  for (ssize_t n;;) {
+    fputs(replBuf.empty() ? "> " : ". ", stdout), fflush(stdout);
+    if ((n = getline(&line, &cap, stdin)) < 0) return puts(""), 0;
+    replBuf.append(line, n), eval(n > 1);
   }
 }
 static int dumpAsm() {  // assemble the emitted words with clang and disassemble with otool
@@ -103,9 +116,10 @@ int main(int argc, char** argv) {
   bool watch = false, asmMode = false;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
-    if (a == "-w") watch = true;
+    if (a == "-w") watch = verbose = true;
+    else if (a == "-v") verbose = true;
     else if (a == "--asm") asmMode = true;
-    else if (a[0] == '-') return fputs("usage: fut [-w | --asm] [file.fut]   (no file: REPL)\n", stderr), 2;
+    else if (a[0] == '-') return fputs("usage: fut [-w | -v | --asm] [file.fut]   (no file: REPL)\n", stderr), 2;
     else path = a;
   }
   rtInit();
@@ -116,10 +130,18 @@ int main(int argc, char** argv) {
   if (watch) {  // started after the first load, so the baseline covers every imported file
     // The watcher only raises a flag; the main thread recompiles at its next safepoint.
     pollHook = hotReload;
-    std::thread([] {
-      for (long long t = stamp(), n;; std::this_thread::sleep_for(100ms))
-        if ((n = stamp()) != t) std::this_thread::sleep_for(30ms), t = stamp(), __atomic_store_n(&vm.poll, 1, __ATOMIC_RELEASE);
-    }).detach();
+    pthread_t th;
+    pthread_create(&th, nullptr, [](void*) -> void* {
+      for (long long t = stamp(), n;; usleep(100000))
+        if ((n = stamp()) != t) usleep(30000), t = stamp(), __atomic_store_n(&fileChanged, 1, __ATOMIC_RELAXED), __atomic_store_n(&vm.poll, 1, __ATOMIC_RELEASE);
+    }, nullptr);
+    pthread_create(&th, nullptr, [](void*) -> void* {  // a REPL into the running program: lines run at the next safepoint
+      char* line = nullptr;
+      size_t cap = 0;
+      for (ssize_t n; (n = getline(&line, &cap, stdin)) > 0; __atomic_store_n(&vm.poll, 1, __ATOMIC_RELEASE))
+        pthread_mutex_lock(&watchMu), inbox.emplace_back(line, n), pthread_mutex_unlock(&watchMu);
+      return nullptr;
+    }, nullptr);
   }
   bool loaded = c.chunk;
   int st = loaded ? start(c) : 1;

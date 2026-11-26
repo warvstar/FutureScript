@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and test fut.   python3 build.py [build | debug | test [--debug] | fuzz [N] | clean]"""
+"""Build and test fut.   python3 build.py [build | debug | wasm | test [--debug | --wasm] | fuzz [N] | clean]"""
 import os, random, re, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -9,18 +9,42 @@ OUT = ROOT / "build" / "fut"
 FLAGS = ["-std=c++23", "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-missing-field-initializers", "-Wno-invalid-offsetof"]
 
 
-def build(debug=False):
-    srcs = sorted((ROOT / "src").glob("*.cpp"))
-    deps = srcs + sorted((ROOT / "src").glob("*.h")) + [Path(__file__)]
-    out = OUT.with_name("fut-debug") if debug else OUT
-    if out.exists() and out.stat().st_mtime > max(p.stat().st_mtime for p in deps):
-        return out
-    out.parent.mkdir(exist_ok=True)
-    opt = ["-O1", "-g", "-fsanitize=address,undefined"] if debug else ["-O2"]
-    cmd = ["clang++", *FLAGS, *opt, *map(str, srcs), "-o", str(out)]
-    print(" ".join(cmd))
-    subprocess.run(cmd, check=True)
+# The WebAssembly build uses Homebrew's LLVM and WASI libc/libc++ (brew install llvm lld wasi-libc wasi-runtimes).
+LLVM = Path("/opt/homebrew/opt/llvm/bin/clang++")
+WASM_FLAGS = ["--target=wasm32-wasip1", "--sysroot=/opt/homebrew/share/wasi-sysroot", "-fno-exceptions", "-mexception-handling",
+              "-mllvm", "-wasm-enable-sjlj"]
+WASM_LINK = ["-mexec-model=reactor", "-lsetjmp", "-Wl,--export=__stack_pointer", "-Wl,--export-table", "-Wl,--growable-table",
+             "-Wl,-z,stack-size=8388608", "-Wl,--stack-first"]
+NATIVE_ONLY, WASM_ONLY = {"main.cpp", "jit.cpp"}, {"wasm.cpp"}
+
+
+def build(debug=False, wasm=False):
+    """Compile each src/*.cpp to its own object in parallel (only stale ones), then link."""
+    out = ROOT / "build" / "fut.wasm" if wasm else OUT.with_name("fut-debug") if debug else OUT
+    objdir = ROOT / "build" / ("obj-wasm" if wasm else "obj-debug" if debug else "obj")
+    objdir.mkdir(parents=True, exist_ok=True)
+    opt = ["-O2", *WASM_FLAGS] if wasm else ["-O1", "-g", "-fsanitize=address,undefined"] if debug else ["-O2"]
+    cxx = str(LLVM) if wasm else "clang++"
+    skip = NATIVE_ONLY if wasm else WASM_ONLY
+    shared = max(p.stat().st_mtime for p in [*(ROOT / "src").glob("*.h"), Path(__file__)])
+    objs = [(c, objdir / (c.stem + ".o")) for c in sorted((ROOT / "src").glob("*.cpp")) if c.name not in skip]
+    stale = [(c, o) for c, o in objs if not o.exists() or o.stat().st_mtime < max(shared, c.stat().st_mtime)]
+
+    def cc(job):
+        print(("wasm " if wasm else "") + "clang++", job[0].name, flush=True)
+        return subprocess.run([cxx, *FLAGS, *opt, "-c", str(job[0]), "-o", str(job[1])]).returncode
+    with ThreadPoolExecutor(len(stale) or 1) as ex:
+        if any(list(ex.map(cc, stale))):
+            sys.exit(1)
+    if stale or not out.exists():
+        link = WASM_LINK if wasm else ["-lobjc"]
+        subprocess.run([cxx, *(o for o in opt if o not in ("-mllvm", "-wasm-enable-sjlj")), *(str(o) for _, o in objs), *link, "-o", str(out)], check=True)
     return out
+
+
+def runner(exe):
+    """The command that runs a fut program: the native binary, or the WebAssembly build under Node."""
+    return ["node", str(ROOT / "web" / "run.mjs")] if exe.suffix == ".wasm" else [str(exe)]
 
 
 def test(exe):
@@ -30,7 +54,7 @@ def test(exe):
         src = t.read_text()
         want = re.findall(r"// expect: ?(.*)", src)
         err = re.findall(r"// error: ?(.*)", src)
-        r = subprocess.run([str(exe), str(t)], capture_output=True, text=True, timeout=60)
+        r = subprocess.run([*runner(exe), str(t)], capture_output=True, text=True, timeout=60)
         ok = r.stdout.splitlines() == want and (all(e in r.stderr for e in err) and r.returncode != 0 if err else r.returncode == 0)
         print(f"{'ok  ' if ok else 'FAIL'} {t.name}")
         if not ok:
@@ -47,15 +71,19 @@ def test(exe):
 
 
 def live(exe, files, edits, settle=0.4, timeout=6):
-    """Run files[0] with -w, apply edits [(file, text)] one at a time while it runs; return (stdout, stderr)."""
+    """Run files[0] with -w, apply edits [(file, text)] one at a time while it runs (file "<stdin>" types the
+    text into its live REPL); return (stdout, stderr)."""
     d = ROOT / "build" / "hot"
     d.mkdir(parents=True, exist_ok=True)
     for name, text in files.items():
         (d / name).write_text(text)
-    p = subprocess.Popen([str(exe), "-w", str(d / next(iter(files)))], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    p = subprocess.Popen([*runner(exe), "-w", str(d / next(iter(files)))], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     for name, text in edits:
         time.sleep(settle)
-        (d / name).write_text(text)
+        if name == "<stdin>":
+            p.stdin.write(text), p.stdin.flush()
+        else:
+            (d / name).write_text(text)
     try:
         out, err = p.communicate(timeout=timeout if p.poll() is None else 1)
     except subprocess.TimeoutExpired:
@@ -101,6 +129,19 @@ def hot_imports_stale_hook(exe):
     return ok, f"stdout: {out!r}\n  stderr: {err!r}"
 
 
+def hot_repl_and_reset(exe):
+    """Lines typed into a running program run in it; editing a var's declaration resets it (other state survives);
+    functions defined at the REPL outlive file reloads; after a runtime error the REPL can still inspect state."""
+    prog = ("class P {{ fn init(hp) {{ self.hp = hp }} }}\nvar p = P(10)\nvar speed = {s}\nvar hits = 0\n"
+            "fn main() {{ var n = 0\n  while n < 100 {{ n += 1 hits += 1 sleep(0.02) }}\n  print(\"end {{p.hp}} {{speed}}\")\n  nil.x }}\n")
+    out, err = live(exe, {"g.fut": prog.format(s=5)},
+                    [("<stdin>", "p.hp\np.hp = 99\nfn twice(x) {\n  return x * 2 }\n"), ("<stdin>", "twice(speed)\n"),
+                     ("g.fut", prog.format(s=7)), ("<stdin>", "twice(speed)\nhits > 0\n")] + [("<stdin>", "")] * 6 +
+                    [("<stdin>", "speed + 1\n")], settle=0.3, timeout=1)
+    ok = out.split() == ["10", "10", "14", "true", "end", "99", "7", "8"] and "reset speed" in err and "nil has no field" in err
+    return ok, f"stdout: {out!r}\n  stderr: {err!r}"
+
+
 def hot_reclaim(exe):
     """Many reloads of a running program must not grow live machine code without bound."""
     prog = "fn body() {{ var x = {n} {pad} return x }}\nfn main() {{ while true {{ body() sleep(0.005) }} }}\n"
@@ -114,6 +155,7 @@ def hot_reclaim(exe):
 
 HOT_TESTS = [("methods, errors, main restart", hot_methods_and_main),
              ("imports, no-op, hook, stale arity", hot_imports_stale_hook),
+             ("live REPL, var reset", hot_repl_and_reset),
              ("code reclamation", hot_reclaim)]
 
 
@@ -121,6 +163,7 @@ def fuzz(exe, n=300, seed=None):
     """Mutate the test programs and run them under ASan/UBSan. Errors are fine; crashes and sanitizer reports are not."""
     rng = random.Random(seed if seed is not None else time.time_ns())
     corpus = [p.read_text() for p in sorted((ROOT / "tests").glob("*.fut")) + sorted((ROOT / "examples").glob("*.fut"))]
+    corpus = [c for c in corpus if "window(" not in c and "extern" not in c]  # no windows; C calls are unchecked
     toks = ["(", ")", "{", "}", "[", "]", ",", ".", ":", "=", "+=", "-", "*", "/", "%", "==", "<", "&&", "!", "..", "\"",
             "\"{x}\"", "fn", "var", "class", "if", "else", "while", "for", "in", "return", "break", "self", "super", "nil",
             "1", "0", "-1", "x", "f", "fn(a) { return a }", "{a: 1}", "\n"]
@@ -141,7 +184,7 @@ def fuzz(exe, n=300, seed=None):
         f = ROOT / "build" / f"fuzz{k % 64}.fut"
         f.write_text(cases[k])
         try:
-            r = subprocess.run([str(exe), str(f)], capture_output=True, text=True, timeout=3, env=env)
+            r = subprocess.run([*runner(exe), str(f)], capture_output=True, text=True, timeout=3, env=env)
         except subprocess.TimeoutExpired:
             return None
         bad = r.returncode < 0 or "Sanitizer" in r.stderr or re.search(r"\.(cpp|h):\d+:\d+: runtime error", r.stderr)
@@ -161,7 +204,9 @@ if __name__ == "__main__":
     if cmd == "clean":
         subprocess.run(["rm", "-rf", str(ROOT / "build")])
     elif cmd == "test":
-        sys.exit(1 if test(build("--debug" in sys.argv)) else 0)
+        sys.exit(1 if test(build("--debug" in sys.argv, "--wasm" in sys.argv)) else 0)
+    elif cmd == "wasm":
+        build(wasm=True)
     elif cmd == "fuzz":
         sys.exit(1 if fuzz(build(True), int(sys.argv[2]) if len(sys.argv) > 2 else 300) else 0)
     else:
