@@ -24,7 +24,7 @@ node web/serve.mjs             # browser: http://localhost:8000/?file=examples/p
 
 Requires macOS on Apple silicon (arm64, `MAP_JIT`).
 
-Agents: [docs/spec.md](docs/spec.md) is the language in 5 KB; every example in it runs as a test.
+Agents: [docs/spec.md](docs/spec.md) is the whole language in about 6 KB; every example in it runs as a test.
 
 ## Language
 
@@ -69,6 +69,7 @@ fn reload() { }                      // optional: runs after every hot reload (m
 - **Closures:** a closure captures the enclosing variables by value. The closure can still change its own copy, so counters work, but it does not see later changes in the enclosing function.
 - **Interpolation:** expressions inside `{...}` in a string can't contain `"`. Write `\{` for a literal brace.
 - **Newline rules:** a `(` or `[` on a new line, or a leading `-`, starts a new statement rather than continuing the previous one.
+- **Not in fut** (for those coming from other languages): a ternary operator, `**`, `?.`, slices, negative indexes, `sort`, varargs, default arguments, string methods besides `len` and `has`, chained comparisons (`1 < 2 < 3` is an error), named functions inside functions. `print` takes one argument, and `int` takes only numbers.
 
 ## Classes
 

@@ -2,7 +2,7 @@
 
 Terse; README has the rest. ```fut blocks run as tests (top-level `expect` asserts).
 
-`fut f.fut` | `fut test f.fut [--json --filter s]` | `fut api f.fut` (write .api) | `fut map f.fut [--pub --json]` | `fut -w f.fut` (hot reload + REPL) | `node web/run.mjs` (wasm)
+`fut f.fut` | `fut test f.fut [--json --filter s]` (exit 0 pass, 1 fail/pending, 2 compile error) | `fut api f.fut` (write .api) | `fut map f.fut [--pub --json]` | `fut -w f.fut` (hot reload + REPL) | `node web/run.mjs` (wasm)
 
 ## Core
 
@@ -28,9 +28,35 @@ for i in 0..4 { s += i }           // also: list, map keys, str chars, fiber
 expect s == 6
 ```
 
-Not in fut: ternary `**` `?.` slices negative-index sort varargs defaults string-methods(beyond len/has) chained `<`. Named `fn`/`class` top level only; else `var f = fn(x) {}`. `print` takes one arg. `int` takes numbers only.
+## Builtins
 
-Builtins: `print len str int floor sqrt clock sleep random fiber run todo`; graphics `window present clear rect circle key mousex mousey mousedown`.
+```
+print(v)                 one value, then a newline
+len(v)                   of a str, list or map
+str(v)                   v as text
+int(n)  floor(n)  sqrt(n)   int truncates toward 0 (numbers only)
+clock()                  seconds (monotonic)
+sleep(s)                 seconds
+random()                 in [0, 1)
+fiber(fn(x) { ... })     f.resume()  f.send(v)  f.done()
+run(path)  run({source, args, timeout})   fut in a child process -> {code, out, err, timedOut}
+todo()                   placeholder body: throws "f() is not implemented yet"
+time()                   seconds since 1970
+json(v)  parseJson(s)    data <-> JSON text (nil is null)
+env(name) -> str | nil
+readFile(path) -> str | nil    writeFile(path, text)   (makes parent dirs)
+exec([argv...])  exec({cmd: [argv...], cwd, input, timeout}) -> {code, out, err, timedOut}
+fetch(url)  fetch({url, method, headers, body, timeout}) -> {status, body, headers}; failure: {status: 0, error}, no throw
+execAll([cmd, ...])  fetchAll([req, ...])   run at once, results in order
+                         time/json/parseJson also in wasm; the other host builtins are native only
+l.push(v) -> l   l.pop() -> v   l.len()
+m.has(k)   m.remove(k) -> v   m.keys()   m.values()   m.len()
+s.len()    s.has(sub)   s[i] -> 1-char str
+window(w, h)   present() -> false once closed (once per frame, waits 1/60 s)
+clear(rgb)   rect(x, y, w, h, rgb)   circle(x, y, r, rgb)     rgb = 0xRRGGBB, origin top-left
+key(name) -> bool   "a".."z" "0".."9" space enter escape tab up down left right
+mousex()   mousey()   mousedown() -> bool
+```
 
 ## Functions, classes
 
@@ -48,7 +74,7 @@ expect Sq(3).area() == 9
 expect throws { Sq(1).sid = 2 }
 ```
 
-`main()` runs after top level; `reload()` after each hot reload. Arity is checked. Overrides keep param count and types.
+`fn`/`class` declarations are top level only; inside a function use `var g = fn(x) { ... }`. `main()` runs after top level; `reload()` after each hot reload. Arity is checked. Overrides keep param count and types.
 
 ## Types, effects
 
@@ -65,7 +91,7 @@ fn bad() ! { print("x") }
 expect throws { bad() }
 ```
 
-Effects: `io` (print, run, extern, graphics) `clock` `random` `yield`, declared ones. A handler's return is the op's result, no resumption.
+Effects: `io` (print, run, extern, graphics, files, env, exec, fetch) `clock` (clock, sleep, time) `random` `yield`, declared ones; json is pure. A handler's return is the op's result, no resumption.
 
 ## Errors, atomic, contracts
 
