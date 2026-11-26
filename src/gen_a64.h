@@ -297,7 +297,7 @@ struct Gen : CState {
   void index(bool set) {
     Jumps miss;
     isObject(miss);
-    E(ldrb(10, 9)), E(cmpwi(10, (u32)K::List)), miss.push_back(E(bcond(NE)));
+    E(set ? ldrh(10, 9) : ldrb(10, 9)), E(cmpwi(10, (u32)K::List)), miss.push_back(E(bcond(NE)));  // a store: not typed
     if (set) E(ldrw(10, 28, 4)), E(cmpwi(10, 0)), miss.push_back(E(bcond(NE)));
     E(fmovdx(16, 1)), E(fcmpz(16)), miss.push_back(E(bcond(LT)));
     E(ldr(11, 9, LIST_V)), E(ldr(12, 9, LIST_V + 8));  // the elements; the end or the length
@@ -311,12 +311,12 @@ struct Gen : CState {
     for (int m : miss) patch(m);
     helper(set ? H_SETI : H_GETI), patch(done);
   }
-  // x.push(v), x in slot base, v in x0: appended inline when x is a list with spare capacity and no transaction
+  // x.push(v), x in slot base, v in x0: appended inline when x is an untyped list with spare capacity and no transaction
   // is open (l_push saves the list first); the result is x. Else the method call.
   void listPush(int base) {
     Jumps miss;
     ld(1, base), E(mvn(9, 1)), E(tstptr(9)), miss.push_back(E(bcond(NE))), E(andaddr(9, 1));
-    E(ldrb(10, 9)), E(cmpwi(10, (u32)K::List)), miss.push_back(E(bcond(NE)));
+    E(ldrh(10, 9)), E(cmpwi(10, (u32)K::List)), miss.push_back(E(bcond(NE)));  // a list, not typed
     E(ldrw(10, 28, 4)), E(cmpwi(10, 0)), miss.push_back(E(bcond(NE)));
     E(ldr(11, 9, LIST_V + 8)), E(ldr(12, 9, LIST_V + 16)), E(cmp(11, 12)), miss.push_back(E(bcond(HS)));  // full
     if (vecCount) E(ldr(12, 9, LIST_V)), E(strreg(0, 12, 11)), E(addi(11, 11, 1));

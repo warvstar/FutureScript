@@ -53,13 +53,36 @@ struct Scan {
     for (int d = 0; t.t != T_EOF; t = next()) if ((d += (t.t == '(') - (t.t == ')')) == 0) return t.p + 1;
     return t.p;
   }
-  const char* typed(const char* end) {  // `: type` next (a name, maybe module.name, maybe ?): through it
+  const char* typed(const char* end) {  // `: type` next: through it
     Lexer s = L;
-    if (s.next().t != ':' || s.next().t != T_ID) return end;
-    L = s, end = s.p;
-    if (Lexer d = L; d.next().t == '.' && d.next().t == T_ID) L = d, end = d.p;
-    if (Lexer q = L; q.next().t == '?') L = q, end = q.p;
-    return end;
+    if (s.next().t != ':') return end;
+    return L = s, type();
+  }
+  // A type at L (see Compiler::type): atoms joined by |, each maybe followed by ?. Returns just past it.
+  const char* type() {
+    for (;;) {
+      Lexer s = L;
+      Tok t = s.next();
+      auto balanced = [&](int open, int close) {
+        for (int d = 1; d > 0;) {
+          Tok x = next();
+          if (x.t == T_EOF) return;
+          d += (x.t == open) - (x.t == close) - (close == '>' && x.t == T_SHR ? 2 : 0);  // list<list<num>>
+        }
+      };
+      if (t.t == '{') L = s, balanced('{', '}');
+      else if (t.t == '(') L = s, balanced('(', ')');
+      else if (t.t == T_STR || t.t == T_NUM) L = s;
+      else if (t.t == '-') L = s, next();
+      else if (t.t == T_ID) {
+        L = s;
+        if (Lexer d = L; d.next().t == '.' && d.next().t == T_ID) L = d;
+        if (Lexer a = L; [&] { Tok o = a.next(); return o.t == '<' && !o.nl; }()) L = a, balanced('<', '>');
+      } else return L.p;
+      if (Lexer q = L; [&] { Tok o = q.next(); return o.t == '?' && !o.nl; }()) L = q;
+      if (Lexer u = L; [&] { Tok o = u.next(); return o.t != '|' || o.nl; }()) return L.p;
+      else L = u;
+    }
   }
   const char* effects(const char* end) {  // `! io, geom.Log` next (or a bare `!`): through it
     Lexer s = L;
@@ -121,7 +144,7 @@ static std::vector<Decl> declsOf(const std::string& text) {
     if (isKw(t, S_pub)) {
       Lexer save = L;
       Tok n = S.next();
-      if (n.t != T_ID || n.nl || !(n.sym == K_fn || n.sym == K_class || n.sym == K_var || n.sym == K_extern || n.sym == S_effect || n.sym == K_import)) { L = save; continue; }
+      if (n.t != T_ID || n.nl || !(n.sym == K_fn || n.sym == K_class || n.sym == K_var || n.sym == K_extern || n.sym == S_effect || n.sym == K_import || n.sym == S_type)) { L = save; continue; }
       pub = true, k = n;
     }
     const char* from = pub ? t.p : k.p;
@@ -135,6 +158,11 @@ static std::vector<Decl> declsOf(const std::string& text) {
       int end = b.line;
       if (b.t == '{') S.skipBody(b), end = b.line;
       out.push_back({"fn", symName(n.sym), squash(from, e), "", "", pub, k.line, end, doc, cl});
+    } else if (isKw(k, S_type)) {  // type Name = <type>
+      Lexer save = L;
+      Tok n = S.next(), eq = S.next();
+      if (n.t != T_ID || n.nl || eq.t != '=') { L = save; continue; }
+      out.push_back({"type", symName(n.sym), squash(from, S.type()), "", "", pub, k.line, L.line, doc, {}});
     } else if (isKw(k, K_var)) {
       Tok n = S.next();
       if (n.t != T_ID) continue;

@@ -234,6 +234,19 @@ static TLS std::vector<V> keyStrs;
 static TLS V charStrs[256];
 static V cached(V& slot, std::string_view s) { return slot ? slot : (slot = box(newStr(s))); }
 static V mapKey(uint64_t s) { return cached(growAt(keyStrs, s), symName(s)); }
+// What a shape type checks: o's field or key named s, if it has one (a map's key; an instance's field, or its method).
+bool fieldOf(V o, int s, V* out, bool* method) {
+  if (is(o, K::Map)) {
+    long i = mapFind(as<Map>(o), mapKey((uint64_t)s));
+    return i >= 0 ? (*out = as<Map>(o)->e[i].second, true) : false;
+  }
+  if (!is(o, K::Inst)) return false;
+  Inst* in = as<Inst>(o);
+  if (u32 i = (u32)in->cls->layout.find(s); i < in->nslots && in->slots[i] != ABSENT) return *out = in->slots[i], true;
+  if (const V* d = in->cls->declared(s)) return *out = *d, true;
+  if (in->cls->find(s)) return *out = NIL, *method = true, true;  // a method: a shape's fn field accepts it
+  return false;
+}
 void isolateMark(void (*mark)(V)) {
   for (V v : keyStrs) if (v) mark(v);
   for (V v : charStrs) if (v) mark(v);
@@ -288,7 +301,7 @@ static V rt_setf(V o, uint64_t s, V v, IC* ic) {
     in->slots = s, in->nslots = (uint16_t)n;
   }
   const Class::FieldType* ty = in->cls->typed((int)s);
-  if (ty && !typeAccepts(ty->type, v)) typeFail(ty->site, v, RA());
+  if (ty && !typeAccepts(ty->type, v, ty->site)) typeFail(ty->site, v, RA(), ty->type);
   // A store from outside an instance whose class has invariants: the site checks them next (bit 33 of the cached slot
   // tells its fast path to ask the same, through vm->invObj).
   bool inv = outside && in->cls->find(invariantSym());
@@ -323,10 +336,14 @@ static V rt_geti(V a, V i) {
   return char1(a, INDEX(i, as<Str>(a)->len));
 }
 static V rt_seti(V a, V i, V v) {
-  if (is(a, K::Map)) return touch(obj(a)), mapSet(as<Map>(a), i, v), v;
+  if (is(a, K::Map)) {
+    if (obj(a)->typed) typeWrite(obj(a), i, v, RA());
+    return touch(obj(a)), mapSet(as<Map>(a), i, v), v;
+  }
   if (!is(a, K::List)) ERR("@index cannot assign into %s", typeName(a));
   auto& l = as<List>(a)->v;
   size_t at = INDEX(i, l.size());
+  if (obj(a)->typed) typeWrite(obj(a), NIL, v, RA());
   return touch(obj(a)), l[at] = v;
 }
 static V rt_iter(V c, uint64_t i) {
@@ -621,7 +638,11 @@ static V n_parseJson(V s) {
 static V n_sleep(V v) { return sleepFor(NUMARG(v, "sleep")), NIL; }
 static V n_floor(V v) { return box(std::floor(NUMARG(v, "floor"))); }
 static V n_sqrt(V v) { return box(std::sqrt(NUMARG(v, "sqrt"))); }
-static V l_push(V l, V v) { touch(obj(l)), as<List>(l)->v.push_back(v); return l; }
+static V l_push(V l, V v) {
+  if (obj(l)->typed) typeWrite(obj(l), NIL, v, RA());
+  touch(obj(l)), as<List>(l)->v.push_back(v);
+  return l;
+}
 static V l_pop(V l) {
   auto& v = as<List>(l)->v;
   if (v.empty()) ERR("@index pop() from empty list");

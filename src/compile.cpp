@@ -30,6 +30,23 @@ struct ClassDef {
   std::vector<Class::FieldType> ftypes;   // those with a type
 };
 struct FieldUse { int cls, sym; At at; };  // `self.name` in a method: checked against declared fields
+// `x.name` where x is a variable with a declared type (a shape, or a class): checked against that type's fields once
+// every type is known. Stores to x are checked, so x has its type wherever it is used.
+static int editDistance(const std::string& a, const std::string& b) {  // for "did you mean"
+  std::vector<int> row(b.size() + 1);
+  for (size_t j = 0; j <= b.size(); j++) row[j] = (int)j;
+  for (size_t i = 1; i <= a.size(); i++) {
+    int diag = row[0];
+    row[0] = (int)i;
+    for (size_t j = 1; j <= b.size(); j++) {
+      int up = row[j];
+      row[j] = std::min({row[j] + 1, row[j - 1] + 1, diag + (a[i - 1] != b[j - 1])});
+      diag = up;
+    }
+  }
+  return row[b.size()];
+}
+struct TypedUse { uint64_t type; int sym; At at; bool call; std::string var; };
 // A fn/method in the source. retNum: it declares `: num`, so a direct call's result is known to be a number.
 struct Span { const char *start = nullptr, *end = nullptr; int line = 0, endLine = 0, arity = 0; bool retNum = false; };
 // A contract's clause: where its condition starts, and whether it calls anything (then the checks run in a
@@ -121,6 +138,7 @@ struct Compiler : Gen {
   std::vector<Pend> pend;
   std::vector<ClassDef> classes;
   std::vector<FieldUse> fieldUses;
+  std::vector<TypedUse> typedUses;
   std::vector<std::pair<int, int>> fnDefs;  // (sym, arity)
   std::vector<int> inits;                   // top-level vars initialised by this chunk
   struct Extern { int sym; void* fn; std::string sig; char ret; bool pure; };  // pure: declared `!`, performs nothing
@@ -245,31 +263,133 @@ struct Compiler : Gen {
   }
   void konst(std::string_view s) { consts.push_back(box(newStr(s))), imm(0, consts.back()); }
 
-  // ---- types: num str bool list map fn any, or a class (geom.Shape for a module's); `?` after one allows nil ----
+  // ---- types: num str bool list map fn any, a class (geom.Shape for a module's) or a named type; a literal ("GET",
+  // 3, true, nil); a shape ({name: str, age: num?}); list<T>, map<V>, map<K, V>; a union of them (A | B); `?` after
+  // one allows nil. Compound ones are interned by their structure, so equal types have equal codes. ----
   struct Ty { uint64_t code = 0; std::string text; };  // code 0: none written
+  std::unordered_map<int, uint64_t> typeDefs;  // this compile's `type Name = ...` definitions (committed to globals)
+  static std::string codeKey(uint64_t c) { return std::to_string(c); }
   Ty type() {
+    std::vector<Ty> alts{typeAtom()};
+    while (at('|') && !cur.nl) next(), alts.push_back(typeAtom());
+    if (alts.size() == 1) return alts[0];
+    TypeDesc d;
+    d.k = 'u';
+    std::string key = "u", text;
+    for (auto& a : alts) d.alts.push_back(a.code), key += "," + codeKey(a.code), text += (text.empty() ? "" : " | ") + a.text;
+    return {typeIntern(key, d), text};
+  }
+  void closeAngle() {  // the '>' ending list<...> or map<...>; in list<list<num>>, '>>' is two of them
+    if (at(T_SHR)) cur.t = '>', cur.p++;
+    else expect('>');
+  }
+  Ty typeAtom() {
     Tok t = cur;
     Ty ty;
+    auto lit = [&](TypeDesc d, const std::string& key) { d.k = 'l'; ty.code = typeIntern(key, d); };
     if (atKw(K_fn)) next(), ty.code = TY_FN;
-    else {
-      if (!at(T_ID) || cur.sym < NKW) fail("@unknown-type expected a type (num, str, bool, list, map, fn, any, or a class)");
+    else if (accept('(')) {
+      ty = type(), expect(')');
+      ty.text = "(" + ty.text + ")";
+    } else if (at(T_STR)) {
+      TypeDesc d;
+      d.lit = 's', d.s = std::string(cur.p, (size_t)cur.len);
+      if (d.s.find('{') != std::string::npos || d.s.find('\\') != std::string::npos) fail("@unknown-type a literal type is plain text: no escapes or {");
+      next(), lit(d, "ls" + d.s);
+    } else if (at(T_NUM) || (at('-') && peekIs(T_NUM))) {
+      bool neg = accept('-');
+      TypeDesc d;
+      d.lit = 'n', d.n = neg ? -cur.n : cur.n;
+      next(), lit(d, "ln" + std::to_string(d.n));
+    } else if (atKw(K_true) || atKw(K_false) || atKw(K_nil)) {
+      TypeDesc d;
+      d.lit = 'v', d.v = atKw(K_true) ? TRUE_ : atKw(K_false) ? FALSE_ : NIL;
+      next(), lit(d, "lv" + std::to_string(d.v));
+    } else if (accept('{')) {  // a shape: name: type, one per field (commas or newlines between)
+      TypeDesc d;
+      d.k = 's';
+      std::string key = "s";
+      while (!accept('}')) {
+        if (at(T_EOF)) fail("@syntax expected '}'");
+        int f = at(T_STR) ? (next(), intern(std::string(prev.p, (size_t)prev.len))) : at(T_ID) ? (next(), prev.sym) : (fail("@syntax expected a field name"), 0);
+        for (auto& [g, _] : d.fields) if (g == f) failAt(prev.p, prev.line, "@duplicate field '%s' is listed twice", name(f));
+        expect(':');
+        Ty ft = type();
+        d.fields.push_back({f, ft.code}), key += "," + std::to_string(f) + ":" + codeKey(ft.code);
+        accept(',');
+      }
+      ty.code = typeIntern(key, d);
+    } else {
+      if (!at(T_ID) || cur.sym < NKW) fail("@unknown-type expected a type (num, str, bool, list, map, fn, any, a class, a named type, a literal, or a {shape})");
       next();
       static const char* const kinds[] = {"any", "num", "str", "bool", "list", "map"};
       for (int i = 0; i < 6; i++) if (symName(prev.sym) == kinds[i]) ty.code = TY_ANY + i;
-      if (!ty.code) {
+      if ((ty.code == TY_LIST || ty.code == TY_MAP) && at('<') && !cur.nl) {  // list<T>, map<V>, map<K, V>
+        bool list = ty.code == TY_LIST;
+        next();
+        TypeDesc d;
+        Ty a = type(), b;
+        if (!list && accept(',')) b = type();
+        closeAngle();
+        d.k = list ? 'L' : 'M', d.key = b.code ? a.code : TY_ANY, d.elem = b.code ? b.code : a.code;
+        ty.code = typeIntern(std::string(list ? "L" : "M") + codeKey(d.key) + "," + codeKey(d.elem), d);
+      } else if (!ty.code) {
         Tok n = topName(prev);
         Global* g = findGlobal(n.sym);
-        if (!g || g->kind != 'c') failAt(t.p, t.line, "@unknown-type unknown type '%s' (num, str, bool, list, map, fn, any, or a class)", std::string(t.p, prevEnd).c_str());
-        ty.code = tyClass(n.sym);
+        if (!g || (g->kind != 'c' && g->kind != 't'))
+          failAt(t.p, t.line, "@unknown-type unknown type '%s' (num, str, bool, list, map, fn, any, a class, or a named type)", std::string(t.p, prevEnd).c_str());
+        ty.code = g->kind == 'c' ? tyClass(n.sym) : TY_NAMED | uint64_t(n.sym) << 8;
       }
     }
-    ty.text = (ty.code & 15) == TY_CLS ? symName(int(ty.code >> 8)) : std::string(t.p, prevEnd);  // a module's class: bank.Account
+    ty.text = (ty.code & 15) == TY_CLS ? symName(int(ty.code >> 8)) : ty.text.empty() ? squashed(t.p, prevEnd) : ty.text;  // a module's class: bank.Account
     if (at('?') && !cur.nl) {
       if (ty.code == TY_ANY) fail("@unknown-type 'any' already includes nil");
       next(), ty.code |= TY_OPT, ty.text += "?";
     }
     return ty;
   }
+  static std::string squashed(const char* a, const char* b) {  // source text on one line, runs of space as one
+    std::string s;
+    for (; a < b; a++) {
+      if (*a == '/' && a + 1 < b && a[1] == '/') { while (a < b && *a != '\n') a++; continue; }
+      bool sp = *a == ' ' || *a == '\t' || *a == '\n' || *a == '\r';
+      if (sp) { if (!s.empty() && s.back() != ' ' && s.back() != '{' && s.back() != '<') s += ' '; }
+      else {
+        if ((*a == '}' || *a == '>') && !s.empty() && s.back() == ' ') s.pop_back();
+        if (*a == '}' && !s.empty() && s.back() == ',') s.pop_back();
+        s += *a;
+      }
+    }
+    return s;
+  }
+  // What the compiler knows of a type now: a named one through this compile's definitions, then committed ones.
+  uint64_t resolveNow(uint64_t t) {
+    for (int n = 0; (t & 15) == TY_NAMED && n < 32; n++) {
+      auto it = typeDefs.find(int(t >> 8));
+      uint64_t d = it != typeDefs.end() ? it->second : findGlobal(int(t >> 8)) && findGlobal(int(t >> 8))->kind == 't' ? findGlobal(int(t >> 8))->type : 0;
+      if (!d) return t;
+      t = d | (t & TY_OPT);
+    }
+    return t;
+  }
+  bool resolveNamed(uint64_t t, int self) {  // is t (a definition of self) just self again, through other names?
+    for (int n = 0; (t & 15) == TY_NAMED && n < 32; n++) {
+      if (int(t >> 8) == self) return true;
+      auto it = typeDefs.find(int(t >> 8));
+      if (it == typeDefs.end()) return false;
+      t = it->second;
+    }
+    return false;
+  }
+  bool hasNamed(uint64_t t, int depth = 0) {  // does checking t depend on a named type (not known for sure until commit)?
+    if ((t & 15) == TY_NAMED) return true;
+    const TypeDesc* d = (t & 15) == TY_EXT ? typeDesc(t) : nullptr;
+    if (!d || depth > 16) return false;
+    for (uint64_t a : d->alts) if (hasNamed(a, depth + 1)) return true;
+    for (auto& [_, f] : d->fields) if (hasNamed(f, depth + 1)) return true;
+    return (d->key && hasNamed(d->key, depth + 1)) || (d->elem && hasNamed(d->elem, depth + 1));
+  }
+  bool acceptsNow(uint64_t t, V v) { return hasNamed(t) ? typeAccepts(resolveNow(t), v) || hasNamed(resolveNow(t)) : typeAccepts(t, v); }
   void checkType(const Ty& ty, const std::string& what, bool known = false) {  // x0 must have type ty (known: it is a number)
     if (ty.code && !(known && (ty.code & 15) == TY_NUM)) typeCheck(ty.code, typeSite(what, ty.text), ty.code == TY_NUM);
   }
@@ -297,6 +417,12 @@ struct Compiler : Gen {
     if (v.k == LV_LOCAL)
       for (auto i = f->locals.rbegin(); i != f->locals.rend(); ++i) if (i->home == v.a) return {i->ty, i->site};
     return {0, -1};
+  }
+  std::string varName(const LV& v) {  // a variable's name, for messages
+    if (v.k == LV_GLOBAL) return symName(v.b);
+    if (v.k == LV_CAP) return symName(F->caps[v.a].first);
+    for (auto i = F->locals.rbegin(); i != F->locals.rend(); ++i) if (i->home == v.a) return symName(i->sym);
+    return "it";
   }
   void storeCheck(std::pair<uint64_t, int> t, bool num) {  // x0, about to be stored to a var of type t
     if (t.first && !(num && (t.first & 15) == TY_NUM)) typeCheck(t.first, t.second, t.first == TY_NUM);
@@ -630,6 +756,7 @@ struct Compiler : Gen {
     if (g->kind == 'f' && at('(') && !cur.nl) return next(), directCall(t, *g), t.sym == F->self || returnsNum(t.sym) ? NUM : LV{};
     if (g->kind == 'c' && at('(') && !cur.nl) return next(), construct(*g), LV{};
     if (g->kind == 'e') return perform(t), LV{};
+    if (g->kind == 't') failAt(t.p, t.line, "@not-a-value '%s' is a type: use it after ':' (x: %s)", name(t.sym), name(t.sym));
     return {LV_GLOBAL, g->slot, t.sym, g->kind != 'v'};  // b: its symbol, for its type
   }
   LV postfix() {
@@ -641,6 +768,9 @@ struct Compiler : Gen {
         bool own = v.k == LV_LOCAL && F->cls >= 0 && v.a == F->selfHome;  // self.name
         if (own && !tiering && !(at('(') && !cur.nl))
           fieldUses.push_back({F->cls, s, {ft.p, ft.line, file, srcStart}});  // self.name: checked once every class is known
+        if (!own && !tiering && (v.k == LV_LOCAL || v.k == LV_CAP || v.k == LV_GLOBAL))
+          if (uint64_t ty = varType(F, v).first)
+            typedUses.push_back({ty, s, {ft.p, ft.line, file, srcStart}, at('(') && !cur.nl, varName(v)});
         load(v);
         v = {LV_FIELD, 0, s}, v.own = own;
         if (at('(') && !cur.nl) next(), s == S_push ? pushCall() : call(s, false), v = {};
@@ -738,10 +868,10 @@ struct Compiler : Gen {
           if (ty.code == TY_ANY) ty = {};
           bool top = F->top && F->scope == 0, init = accept('=');
           std::string what = "var '" + symName(top ? qualify(s) : s) + "'";
-          if (ty.code && !init && !(ty.code & TY_OPT)) failAt(n.p, n.line, "@type %s is %s, so it needs an initial value", what.c_str(), ty.text.c_str());
+          if (ty.code && !init && !acceptsNow(ty.code, NIL)) failAt(n.p, n.line, "@type %s is %s, so it needs an initial value", what.c_str(), ty.text.c_str());
           Tok v = cur;
           bool num = init ? expr() : (imm(0, NIL), false);
-          if (ty.code && num && (ty.code & 15) != TY_NUM) failAt(v.p, v.line, "@type %s is %s, but its initial value is a number", what.c_str(), ty.text.c_str());
+          if (ty.code && num && (ty.code & 15) != TY_NUM && (ty.code & 15) <= TY_CLS) failAt(v.p, v.line, "@type %s is %s, but its initial value is a number", what.c_str(), ty.text.c_str());
           checkType(ty, what, num);
           if (top) return gmem(0, global(qualify(s)).slot, true), false;
           int site = ty.code ? typeSite(what, ty.text) : -1;
@@ -1336,7 +1466,7 @@ struct Compiler : Gen {
         bool given = accept('=');
         Tok dt = cur;
         V d = given ? constant() : NIL;
-        if (ty.code && given && !typeAccepts(ty.code, d)) failAt(dt.p, dt.line, "@type field '%s' is %s, but its default is not", name(s), ty.text.c_str());
+        if (ty.code && given && !acceptsNow(ty.code, d)) failAt(dt.p, dt.line, "@type field '%s' is %s, but its default is not", name(s), ty.text.c_str());
         if (ty.code) cd.ftypes.push_back({s, ty.code, typeSite("field '" + symName(s) + "' of " + symName(cd.sym), ty.text)});
         cd.fields.push_back({s, d});
         continue;
@@ -1605,14 +1735,50 @@ struct Compiler : Gen {
   // After a function's name: its parameters, result type and effects, then its contract (requires and ensures
   // clauses, one per line) before its body. L is left after the clauses, so a lambda's braces in one aren't taken for
   // the body's. A body that is just todo() is noted: under fut test the function is pending.
+  bool isTypeDecl(const Lexer& at) {  // `type Name =` next (after `type`)? Otherwise `type` is an ordinary name
+    Lexer s = at;
+    Tok n = lex(s), e = lex(s);
+    return n.t == T_ID && n.sym >= NKW && !n.nl && e.t == '=' && !e.nl;
+  }
+  // A type's tokens (see type()), from L: atoms joined by |, each maybe followed by ?. Leaves L after it.
+  void skipType(Lexer& L) {
+    for (;;) {
+      Lexer s = L;
+      Tok t = lex(s);
+      auto balanced = [&](int open, int close) {
+        for (int d = 1; d > 0;) {
+          Tok x = lex(L);
+          if (x.t == T_EOF) return;
+          d += (x.t == open) - (x.t == close) - (close == '>' && x.t == T_SHR ? 2 : 0);
+        }
+      };
+      if (t.t == '{') L = s, balanced('{', '}');
+      else if (t.t == '(') L = s, balanced('(', ')');
+      else if (t.t == T_STR || t.t == T_NUM) L = s;
+      else if (t.t == '-') L = s, lex(L);
+      else if (t.t == T_ID) {
+        L = s;
+        if (Lexer d = L; lex(d).t == '.' && lex(d).t == T_ID) L = d;
+        if (Lexer a = L; [&] { Tok o = lex(a); return o.t == '<' && !o.nl; }()) L = a, balanced('<', '>');
+      } else return;
+      if (Lexer q = L; [&] { Tok o = lex(q); return o.t == '?' && !o.nl; }()) L = q;
+      if (Lexer u = L; [&] { Tok o = lex(u); return o.t != '|' || o.nl; }()) return;
+      else L = u;
+    }
+  }
+  // After a function's name: its parameters, result type and effects, then its contract (requires and ensures
+  // clauses, one per line) before its body. L is left before the body, so braces in a type ({name: str}) or in a
+  // clause (a lambda) aren't taken for the body's.
   void declScan(Lexer& L, const std::string& qn, const Tok& fnTok, int cls, int m) {
     Lexer s = L;
     Tok t = lex(s);
     if (t.t != '(') return;
     for (int d = 1; d > 0;) if ((t = lex(s)).t == T_EOF) return; else d += nesting(t);
+    L = s;
     SpecFn f;
     f.fn = {fnTok.p, fnTok.line, file, srcStart}, f.name = symName(m);
     for (;;) {
+      if (Lexer r = s; lex(r).t == ':') { skipType(s = r), L = s; continue; }  // its result type
       Tok k = lex(s);
       if (k.t == '{') {
         Lexer r = s;
@@ -1621,7 +1787,7 @@ struct Compiler : Gen {
       }
       if (k.t == '{' || k.t == '}' || k.t == T_EOF) break;
       bool post = k.t == T_ID && k.sym == S_ensures;
-      if (!post && !(k.t == T_ID && k.sym == S_requires)) continue;  // its types and effects
+      if (!post && !(k.t == T_ID && k.sym == S_requires)) { L = s; continue; }  // its effects
       Clause c;
       clauseScan(s, c, post ? &f.olds : nullptr);
       f.calls |= c.calls, (post ? f.post : f.pre).push_back(c), L = s;
@@ -1661,10 +1827,15 @@ struct Compiler : Gen {
       Lexer s = L;
       int n = 0, last = '(';
       if (lex(s).t != '(') return 0;
-      for (Tok a = lex(s); a.t != ')' && a.t != T_EOF; last = a.t, a = lex(s)) n += a.t == T_ID && (last == '(' || last == ',');
+      for (int d = 1; d > 0; ) {  // a name after `(` or `,` at the parameters' own level (not inside a {shape})
+        Tok a = lex(s);
+        if (a.t == T_EOF) break;
+        if ((d += nesting(a) + (a.t == '<') - (a.t == '>') - 2 * (a.t == T_SHR)) == 1) n += a.t == T_ID && (last == '(' || last == ',');
+        last = a.t;
+      }
       if (Lexer r = s; retNum && lex(r).t == ':') {
         Tok a = lex(r), b = lex(r);
-        *retNum = a.t == T_ID && symName(a.sym) == "num" && !(b.t == '?' && !b.nl);
+        *retNum = a.t == T_ID && symName(a.sym) == "num" && !((b.t == '?' || b.t == '|') && !b.nl);
       }
       return n;
     };
@@ -1674,7 +1845,7 @@ struct Compiler : Gen {
       if (t.t == T_ID && t.sym == S_pub && !depth) {
         Lexer s = L;
         Tok n = lex(s);
-        pubNext = n.t == T_ID && !n.nl && (n.sym == K_fn || n.sym == K_class || n.sym == K_var || n.sym == K_extern || n.sym == S_effect || n.sym == K_import);
+        pubNext = n.t == T_ID && !n.nl && (n.sym == K_fn || n.sym == K_class || n.sym == K_var || n.sym == K_extern || n.sym == S_effect || n.sym == K_import || n.sym == S_type);
       } else if (t.t == T_ID && t.sym == K_extern && !depth) ext = true;
       else if (ext && afterKw && p.sym == K_fn) declare(q(t), 'x', params()), ext = false; else if (t.t == '{') depth++;
       else if (t.t == '}') {
@@ -1701,6 +1872,15 @@ struct Compiler : Gen {
         open.push_back({qn, p.p, p.line, depth});
         if (!depth) declare(d, 'f', n | (sp.retNum ? 128 : 0));  // callers rely on a `: num` result
         declScan(L, qn, p, depth ? cls : -1, t.sym);
+      } else if (depth == 0 && t.t == T_ID && t.sym == S_type && isTypeDecl(L)) {  // type Name = <type>
+        Tok n = lex(L);
+        lex(L);  // =
+        const char* from = L.p;
+        Tok d = q(n);
+        int raw = pubRaw;  // (declare clears it)
+        declare(d, 't', 0);
+        skipType(L);  // past it: its braces are a type's, not a block's
+        mixEnv(fnv(from, L.p) ^ uint64_t(d.sym) << 32, raw);  // code that checks fields against it compiles against it
       } else if (depth == 0 && afterKw && (p.sym == K_class || p.sym == K_var)) {
         Tok d = q(t);
         declare(d, p.sym == K_class ? 'c' : 'v', 0);
@@ -1760,7 +1940,7 @@ struct Compiler : Gen {
   bool atPub() {  // `pub` before a top-level declaration (the prescan noted it); elsewhere `pub` is an ordinary name
     if (!atKw(S_pub)) return false;
     Tok n = peek();
-    return n.t == T_ID && !n.nl && (n.sym == K_fn || n.sym == K_class || n.sym == K_var || n.sym == K_extern || n.sym == S_effect || n.sym == K_import);
+    return n.t == T_ID && !n.nl && (n.sym == K_fn || n.sym == K_class || n.sym == K_var || n.sym == K_extern || n.sym == S_effect || n.sym == K_import || n.sym == S_type);
   }
   void topLevel() {
     while (!at(T_EOF)) {
@@ -1772,6 +1952,16 @@ struct Compiler : Gen {
       if (atKw(K_extern)) { next(), externDecl(); continue; }
       if (atKw(S_effect) && peek().t == T_ID && !peek().nl && peek().sym >= NKW) { next(), effectDecl(); continue; }
       if (atKw(S_test) && peekIs(T_STR)) { next(), testDecl(); if (trace) traceCuts.push_back({item, prevEnd}); continue; }
+      if (atKw(S_type) && isTypeDecl(lx)) {  // type Name = <type>: checked where it is used, by name
+        next();
+        Tok n = cur;
+        int s = qualify(ident());
+        expect('=');
+        Ty t = type();
+        if (resolveNamed(t.code, s)) failAt(n.p, n.line, "@unknown-type type %s is defined as itself", name(s));
+        typeDefs[s] = t.code;
+        continue;
+      }
       if (atKw(K_import)) {
         next();
         if (!at(T_STR)) fail("@syntax expected a file or package name");
@@ -2052,6 +2242,36 @@ struct Compiler : Gen {
           failHere(w.at, "@override '%s' must declare effects within those of %s, which it overrides (%s), not %s", m, symName(owner) + "." + m,
                    a->second.effText, b->second.eff ? b->second.effText : "none (unchecked)");
       }
+    // x.name where x has a declared type: a shape's fields; a class's methods, and its fields if it declares them.
+    for (auto& u : typedUses) {
+      uint64_t t = resolveNow(u.type) & ~TY_OPT;
+      std::vector<int> names;
+      std::string what;
+      bool ok = false, isMethod = false;
+      if ((t & 15) == TY_CLS) {
+        ClassView v;
+        bool closed = false;
+        for (int s = int(t >> 8); s >= 0 && view(s, v); s = v.super) {
+          for (auto& [f, d] : *v.fields) closed = true, names.push_back(f), ok |= f == u.sym;
+          for (auto& [m, a] : v.methods) names.push_back(m), isMethod |= m == u.sym;
+        }
+        ok |= isMethod || !closed;  // an open class gets fields by assignment
+        what = symName(int(t >> 8));
+      } else if (const TypeDesc* d = (t & 15) == TY_EXT ? typeDesc(t) : nullptr; d && d->k == 's') {
+        for (auto& [f, _] : d->fields) names.push_back(f), ok |= f == u.sym;
+        if (u.call) for (int m : {S_has, S_remove, S_keys, S_values, S_len}) ok |= m == u.sym;  // a map's methods
+        what = (u.type & 15) == TY_NAMED ? symName(int(u.type >> 8)) : typeText(t);
+      } else continue;
+      if (ok) continue;
+      std::string list, near;
+      for (int n : names) {
+        list += (list.empty() ? "" : ", ") + symName(n);
+        if (editDistance(symName(n), symName(u.sym)) <= 2) near = symName(n);
+      }
+      std::string msg = "'" + symName(u.sym) + "' is not " + (u.call ? "a method or field" : "a field") + " of " + what + " (" + u.var +
+                        " is " + what + ": " + (list.empty() ? "it has none" : list) + ")" + (near.empty() ? "" : "; did you mean '" + near + "'?");
+      failHere(u.at, "@no-field %s", msg);
+    }
     // Fields: in a class that declares its fields (or inherits declared ones), self.name must be one of them.
     for (auto& u : fieldUses) {
       ClassView v;
@@ -2167,6 +2387,7 @@ struct Compiler : Gen {
       f->code = ffiThunk(e.fn, e.sig, e.ret, e.sym), f->arity = (int)e.sig.size(), f->op = e.pure ? 0 : OP_EXTERN;  // performs io
     }
     for (auto& d : effDefs) effDefine(d.sym, symName(d.sym), d.ops);
+    for (auto& [s, c] : typeDefs) global(s).type = c;  // named types: checks look them up when they run
     for (auto& [s, l] : effOps) effectOps[s] = l;
     for (auto& cd : classes) globalObj<Class>(cd.sym);  // all exist before any superclass link is made
     for (auto& cd : classes) {

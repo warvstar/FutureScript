@@ -291,7 +291,7 @@ struct Gen : CState {
     auto idx = [&] { get(R0 + 1), op(F64_REINTERPRET); };
     open(BLOCK), open(BLOCK);  // $done, $miss
     isPtr(0, false), br(BR_IF, F->blocks, UNLIKELY);
-    addr(0), mem(I32_LOAD8_U, 0, 0), i32c((int)K::List), op(I32_NE), br(BR_IF, F->blocks, UNLIKELY);
+    addr(0), mem(store ? I32_LOAD16_U : I32_LOAD8_U, 0, 0), i32c((int)K::List), op(I32_NE), br(BR_IF, F->blocks, UNLIKELY);  // a store: not typed
     if (store) txnDepth(), br(BR_IF, F->blocks, UNLIKELY);
     idx(), op(F64_CONST), f64(0), op(F64_GE), op(I32_EQZ), br(BR_IF, F->blocks, UNLIKELY);
     addr(0), mem(I32_LOAD, 2, LIST_V), set(T2);  // T2 = begin
@@ -305,12 +305,12 @@ struct Gen : CState {
     br(BR, F->blocks - 1), close();
     helper(store ? H_SETI : H_GETI), close();
   }
-  // x.push(v), x in slot base, v in r0: appended inline when x is a list with spare capacity and no transaction
+  // x.push(v), x in slot base, v in r0: appended inline when x is an untyped list with spare capacity and no transaction
   // is open (l_push saves the list first); the result is x. Else the method call.
   void listPush(int base) {
     open(BLOCK), open(BLOCK);  // $done, $miss
     ld(1, base), isPtr(1, false), br(BR_IF, F->blocks, UNLIKELY);
-    addr(1), mem(I32_LOAD8_U, 0, 0), i32c((int)K::List), op(I32_NE), br(BR_IF, F->blocks, UNLIKELY);
+    addr(1), mem(I32_LOAD16_U, 1, 0), i32c((int)K::List), op(I32_NE), br(BR_IF, F->blocks, UNLIKELY);  // a list, not typed
     txnDepth(), br(BR_IF, F->blocks, UNLIKELY);
     addr(1), mem(I32_LOAD, 2, LIST_V + 4), set(T);  // the end, or the count
     get(T), addr(1), mem(I32_LOAD, 2, LIST_V + 8), op(I32_GE_U), br(BR_IF, F->blocks, UNLIKELY);  // full

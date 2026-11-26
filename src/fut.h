@@ -66,14 +66,15 @@ enum class K : uint8_t { Str, List, Fn, Class, Inst, Map, Clo, Fiber, Ref, Chan,
 // For an Inst, `nslots` and `cid` (its class id) are in the header and are zero for every other kind, so one
 // 64-bit compare of the header checks kind, class and slot count together (the field inline cache).
 // `zero` stays 0 for that compare (mark bits live in the GC's side bitmap, not here).
-struct Obj { K kind; uint8_t zero; uint16_t nslots; u32 cid; };
+// typed: a list or map that has its element type (types.cpp); the inline list stores test it along with the kind.
+struct Obj { K kind; uint8_t typed; uint16_t nslots; u32 cid; };
 struct Str : Obj {
   static constexpr K KIND = K::Str;
   u32 len, hash;
   char* s() { return (char*)(this + 1); }  // bytes stored inline after the header
   std::string_view sv() { return {s(), len}; }
 };
-struct List : Obj { static constexpr K KIND = K::List; std::vector<V> v; };
+struct List : Obj { static constexpr K KIND = K::List; std::vector<V> v; uint64_t etype = 0; int esite = 0; };
 struct Fn : Obj { static constexpr K KIND = K::Fn; void* code; int arity, name, op = 0; };  // op: an effect operation (effects.cpp)
 inline u32 classCount;
 // A class's field layout: field syms, the index being the slot. Every isolate shares it. It only grows, under
@@ -144,7 +145,14 @@ struct Inst : Obj {  // slots point at the inline area sized when constructed, o
   V* inl() { return (V*)(this + 1); }
 };
 // Entries in insertion order, plus an open-addressing index: entry + 1, 0 empty, ~0u deleted (`used` counts both).
-struct Map : Obj { static constexpr K KIND = K::Map; std::vector<std::pair<V, V>> e; std::vector<u32> idx; u32 used = 0; };
+struct Map : Obj {
+  static constexpr K KIND = K::Map;
+  std::vector<std::pair<V, V>> e;
+  std::vector<u32> idx;
+  u32 used = 0;
+  uint64_t etype = 0;
+  int esite = 0;
+};
 struct Ref : Obj { static constexpr K KIND = K::Ref; u32 id; };  // a JavaScript value fut code holds (wasm)
 // A channel or a task, as one isolate sees it: a handle on state every isolate holding it shares (isolate.cpp).
 struct Shared;
@@ -229,7 +237,7 @@ inline TLS uintptr_t* stackTop;
   X(true) X(false) X(nil) X(self) X(super) X(import) X(extern) X(yield) X(try) X(catch) X(throw)
 #define SYM_ENUM(k) K_##k,
 #define SYM_STR(k) #k,
-#define EXTRA_SYMS(X) X(init) X(main) X(push) X(pop) X(len) X(has) X(remove) X(keys) X(values) X(reload) X(resume) X(send) X(done) X(as) X(test) X(expect) X(throws) X(prints) X(pub) X(override) X(atomic) X(effect) X(handle) X(with) X(requires) X(ensures) X(invariant) X(old) X(result) X(allocs) X(grows) X(like) X(todo) X(spawn)
+#define EXTRA_SYMS(X) X(init) X(main) X(push) X(pop) X(len) X(has) X(remove) X(keys) X(values) X(reload) X(resume) X(send) X(done) X(as) X(test) X(expect) X(throws) X(prints) X(pub) X(override) X(atomic) X(effect) X(handle) X(with) X(requires) X(ensures) X(invariant) X(old) X(result) X(allocs) X(grows) X(like) X(todo) X(spawn) X(type)
 #define SYM_S(k) S_##k,
 enum { KEYWORDS(SYM_ENUM) NKW, S_FIRST = NKW - 1, EXTRA_SYMS(SYM_S) };
 int intern(std::string_view);
@@ -454,11 +462,29 @@ constexpr uint64_t SETF_OUTSIDE = 1ull << 40;  // with a field's symbol (rt_setf
 
 // ---- types (types.cpp): optional annotations, checked at run time where they are written ----
 // A type is a kind, TY_OPT if nil is allowed too (`str?`), and for a class its symbol (bits 8..).
-enum : uint64_t { TY_ANY = 1, TY_NUM, TY_STR, TY_BOOL, TY_LIST, TY_MAP, TY_FN, TY_CLS, TY_OPT = 16 };
+// TY_EXT: a compound type, its TypeDesc's index in bits 8..; TY_NAMED: a `type Name = ...`, its symbol in bits 8...
+enum : uint64_t { TY_ANY = 1, TY_NUM, TY_STR, TY_BOOL, TY_LIST, TY_MAP, TY_FN, TY_CLS, TY_EXT, TY_NAMED, TY_OPT = 16 };
 constexpr uint64_t tyClass(int sym) { return TY_CLS | uint64_t(sym) << 8; }
-bool typeAccepts(uint64_t type, V v);
+// A compound type: k is 'u' (a union of alts), 'l' (a literal: str s, num n, or the value v: true false nil),
+// 's' (a shape: fields, each name's type; other keys are allowed), 'L' (list<elem>), 'M' (map<key, elem>).
+struct TypeDesc {
+  char k = 0, lit = 0;  // lit: 's' str, 'n' num, 'v' value
+  std::vector<uint64_t> alts;
+  std::string s;
+  double n = 0;
+  V v = 0;
+  std::vector<std::pair<int, uint64_t>> fields;
+  uint64_t key = 0, elem = 0;
+};
+uint64_t typeIntern(const std::string& text, TypeDesc d);  // one code per distinct type text
+std::string typeText(uint64_t t);                          // a type as written, from its code
+const TypeDesc* typeDesc(uint64_t t);                     // its description, if t is compound (after ? and names)
+uint64_t typeResolve(uint64_t t);                          // a named type's definition (TY_OPT kept); else t
+bool fieldOf(V o, int sym, V* out, bool* method);          // o's field or key named sym, or its method (rt.cpp)
+bool typeAccepts(uint64_t type, V v, int site = -1);  // site: a check at run time, which gives the lists and maps it passes their element type
+void typeWrite(Obj* o, V key, V v, void* ra);  // a store into a list or map that has its element type
 int typeSite(const std::string& what, const std::string& type);  // what a check names when it fails: its number
-[[noreturn]] void typeFail(int site, V v, void* ra);
+[[noreturn]] void typeFail(int site, V v, void* ra, uint64_t type = 0);  // type: to say which part failed
 void typesInit();
 
 // ---- effects (effects.cpp): declared effect sets (`fn f() ! io, clock`), checked at run time, and handlers ----
@@ -557,6 +583,7 @@ constexpr u32 ldr(u32 t, u32 n, u32 off) { return 0xf9400000 | (off / 8) << 10 |
 constexpr u32 str(u32 t, u32 n, u32 off) { return 0xf9000000 | (off / 8) << 10 | n << 5 | t; }
 constexpr u32 ldrw(u32 t, u32 n, u32 off) { return 0xb9400000 | (off / 4) << 10 | n << 5 | t; }
 constexpr u32 ldrb(u32 t, u32 n) { return 0x39400000 | n << 5 | t; }
+constexpr u32 ldrh(u32 t, u32 n) { return 0x79400000 | n << 5 | t; }
 constexpr u32 ldrreg(u32 t, u32 n, u32 m) { return 0xf8607800 | m << 16 | n << 5 | t; }  // ldr t, [n, m, lsl #3]
 constexpr u32 strreg(u32 t, u32 n, u32 m) { return 0xf8207800 | m << 16 | n << 5 | t; }
 constexpr u32 strregw(u32 t, u32 n, u32 m) { return 0xf8205800 | m << 16 | n << 5 | t; }  // str t, [n, w(m), uxtw #3]

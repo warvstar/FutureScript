@@ -158,7 +158,7 @@ static V callHandler(V clo, V rec, int op, const V* args, uint64_t n) {
   Fn* f = is(clo, K::Clo) ? as<Clo>(clo)->fn : as<Fn>(clo);
   V res = vmEnter(f->code, is(clo, K::Clo) ? a : a + 1);
   effLoad(mine);
-  if (OpInfo& o = ops[op]; o.rtype && !typeAccepts(o.rtype, res)) typeFail(o.rsite, res, nullptr);
+  if (OpInfo& o = ops[op]; o.rtype && !typeAccepts(o.rtype, res, o.rsite)) typeFail(o.rsite, res, nullptr, o.rtype);
   return res;
 }
 static V invokeHandler(V a0, V a1, V a2, V a3, V a4, V a5, V a6, V a7) {  // effPrep sent a call here
@@ -177,7 +177,7 @@ void* effPrep(Fn* f, V* w, uint64_t n) {
   if (arity != (int)n) rtError(RA(), "@arity %s expects %d arguments, got %d", what.c_str(), arity, (int)n);
   if (!o.effect) rtError(RA(), "@effect %s: its effect is not defined", what.c_str());
   for (size_t i = 0; i < o.ptypes.size() && i < n; i++)
-    if (o.ptypes[i] && !typeAccepts(o.ptypes[i], w[i + 1])) typeFail(o.psites[i], w[i + 1], RA());
+    if (o.ptypes[i] && !typeAccepts(o.ptypes[i], w[i + 1], o.psites[i])) typeFail(o.psites[i], w[i + 1], RA(), o.ptypes[i]);
   V clo, rec;
   if (findHandler(op, clo, rec)) {
     if (!usable(rec, o.effect)) forbidden(what, o.effect, RA());

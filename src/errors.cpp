@@ -16,7 +16,7 @@ const ErrCode codes[] = {
     {"not-in-interface", "A name is pub inside a package but not part of the package's interface.", "Make it pub in the root file, or re-export its file there with pub import."},
     {"not-a-value", "A module or an effect is used as a value.", "Use one of its members: m.name, or Effect.op(...)."},
     {"arity", "A call passes a different number of arguments than the function, operation or handler takes.", "Pass exactly the declared parameters."},
-    {"unknown-type", "A type annotation names no type.", "Use num, str, bool, list, map, fn, any, a class, or T?."},
+    {"unknown-type", "A type annotation names no type.", "Use num, str, bool, list, map, fn, any, a class, a type declared with type, A | B, a literal (\"GET\", 3, true, nil), a {shape}, list<T>, map<K, V>, or T?."},
     {"unknown-effect", "An effect name or a handled operation isn't one.", "Use io, clock, random, yield, a declared effect, or one of its operations."},
     {"misplaced", "A construct is used where it isn't allowed (self outside a method, break outside a loop, a nested named fn, ...).", "Move it where the message says it belongs."},
     {"duplicate", "A name is declared twice in one scope.", "Rename or remove one of them."},
@@ -31,7 +31,7 @@ const ErrCode codes[] = {
     {"atomic", "Something that can't be undone (io, yield) happens inside atomic { }.", "Do it after the block, or handle the io inside the block."},
     {"effect", "A function performs or calls something its declared effects don't allow.", "Add the effect to the declaration (and its callers'), or handle it."},
     {"unhandled", "An operation of a declared effect is performed with no handler for it.", "Wrap the call in handle { } with Effect.op(...) { }."},
-    {"no-field", "A field is read or written that the object doesn't have (or, in a closed class, didn't declare).", "Declare it in the class (var name), or fix the spelling."},
+    {"no-field", "A field is read or written that the object doesn't have (or, in a closed class, didn't declare).", "Declare it in the class (var name) or the shape, or fix the spelling."},
     // run time
     {"operand", "An operator got operand types it doesn't take.", "Convert first: str(x) for text, int(x) for whole numbers; check for nil."},
     {"no-method", "A method is called that the value doesn't have.", "Check the value's type; list, map, str and fiber have a fixed set of methods."},
