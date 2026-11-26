@@ -38,3 +38,22 @@ test "a parameter named like a field still sets the field" {
   p.x += 1
   expect p.x == 5
 }
+class Plant {
+  state stage = "sown"
+  fn init(n) { self.n = n }
+}
+fn rename(r) { r.stage = "label" return r }
+test "a field named like a state field, on a record or another class, is plain" {
+  var p = Plant(1)
+  var rec = {stage: "a record's"}
+  expect rec.stage == "a record's"
+  rename(rec)
+  expect rec.stage == "label"
+  rec.stage += "!"
+  expect rec.stage == "label!"
+  var ps = [p]
+  expect ps[0].stage == "sown"
+  ps[0].stage += "ed"
+  expect p.stage == "sowned"
+  expect "{p.stage} and {rec.stage}" == "sowned and label!"
+}

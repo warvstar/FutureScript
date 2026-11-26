@@ -112,6 +112,18 @@ pub fn signal(v): Signal {
   return Signal(v)
 }
 
+// For `state` fields (src/views.cpp): a field of that name read or set on something that may not be a class
+// declaring it. val(x) is x's value if x is a signal, else x; store(old, v) sets old if it is a signal (and keeps it
+// in the field), else v replaces it.
+pub fn val(x) {
+  if isa(x, Signal) { return x.get() }
+  return x
+}
+pub fn store(old, v) {
+  if isa(old, Signal) { old.set(v) return old }
+  return v
+}
+
 // Run f now, and again whenever a signal it read last time changes. dispose() on the result stops it.
 pub fn effect(f: fn) {
   var e = owned(f)

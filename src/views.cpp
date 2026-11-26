@@ -416,11 +416,37 @@ struct State {
     for (auto& [f, d] : c.fields) r += " self." + f + " = _state.signal(" + d + ")";
     return r;
   }
+  // The first token of the value `.name` at j is read from: `a`, `a.b`, `f(x)[i]`, `(e)`.
+  size_t receiver(size_t j) const {
+    static const std::set<std::string> words = {"return", "if", "while", "for", "in", "else", "var", "fn", "throw",
+                                                "yield", "spawn", "match", "and", "or", "not", "expect"};
+    size_t q = j - 2;
+    for (;;) {
+      if (is(s, t[q], ")") || is(s, t[q], "]")) {
+        q = match[q];
+        if (q && !t[q].nl && !t[q].sp() && ((t[q - 1].k == 'i' && !words.count(textOf(s, t[q - 1]))) || is(s, t[q - 1], ")") ||
+                                           is(s, t[q - 1], "]"))) { q--; continue; }
+        return q;
+      }
+      if (is(s, t[q], "}")) return match[q];
+      if (q >= 2 && (is(s, t[q - 1], ".") || is(s, t[q - 1], "?.")) && !t[q - 1].sp()) { q -= 2; continue; }
+      return q;
+    }
+  }
+  std::vector<size_t> at;  // where each token's text starts in out
+  // Put text in out at a token's place (before what was emitted from there on), keeping the later places right.
+  void insertAt(size_t tok, size_t upto, const std::string& text) {
+    size_t p = at[tok];
+    out.insert(p, text);
+    for (size_t q = tok + 1; q <= upto; q++) if (at[q] >= p) at[q] += text.size();
+  }
   void emit(size_t from, size_t to) {
     bool mute = false;  // after the mark: a bound signal, not its value
+    if (at.size() < t.size()) at.assign(t.size(), 0);
     for (size_t j = from; j < to; j++) {
       const Tok& k = t[j];
       std::string pre = s.substr(k.tb, k.b - k.tb);
+      at[j] = out.size() + pre.size();
       if (k.k == 'm') { out += pre, mute = true; continue; }
       if (mute && !(k.k == 'i' || is(s, k, "."))) mute = false;
       if (!k.k) { out += pre; continue; }
@@ -466,6 +492,29 @@ struct State {
         bool member = j && (is(s, before, ".") || is(s, before, "?."));
         bool key = j && t[j + 1].k == 'p' && is(s, t[j + 1], ":") && !t[j + 1].sp() && (is(s, before, "{") || is(s, before, ","));
         bool decl = j && (is(s, before, "var") || is(s, before, "fn") || is(s, before, "for"));
+        if (member && fields.count(name) && !key && !(is(s, t[j + 1], "(") && !t[j + 1].sp())) {
+          size_t r = receiver(j);
+          const ClassBody* c = inClass(j);
+          bool own = false;
+          if (c) for (auto& f : c->fields) own |= f.first == name;
+          if (r == j - 2 && is(s, t[r], "self") && !own) { out += pre + name; continue; }  // a plain field of this class
+          if (!(r == j - 2 && is(s, t[r], "self"))) {  // anything else's field of that name: a signal only if it holds one
+            const Tok& op = t[j + 1];
+            if (!assignOp(s, op)) {
+              insertAt(r, j, "_state.val(");
+              out += pre + name + ")";
+              continue;
+            }
+            std::string lhs = out.substr(at[r]) + pre + name, o = textOf(s, op);
+            size_t e = exprEnd(j + 2);
+            out += pre + name + s.substr(op.tb, op.b - op.tb) + "= _state.store(" + lhs + ",";
+            if (o != "=") out += " _state.val(" + lhs + ") " + o.substr(0, 1) + " (";
+            emit(j + 2, e);
+            out += o == "=" ? ")" : "))";
+            j = e - 1;
+            continue;
+          }
+        }
         if (((member && fields.count(name)) || (!member && tops.count(name))) && !key && !decl) {
           out += pre + name;
           const Tok& op = t[j + 1];

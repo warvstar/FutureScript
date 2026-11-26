@@ -988,6 +988,10 @@ void rtInit() {
   native<n_parseNum>("parseNum");
   // match: is@(value, variant class) tests an arm; match@fail(value, enum) is reached when no arm takes the value
   native<+[](V v, V c) { return boxb(is(v, K::Inst) && is(c, K::Class) && as<Inst>(v)->cls->name == as<Class>(c)->name); }>("is@");
+  native<+[](V v, V c) {  // by name, as match does: an instance made before a reload is still one
+    if (!is(c, K::Class)) ERR("@argument isa(v, C) expects a class as C, got %s", typeName(c));
+    return boxb(is(v, K::Inst) && as<Inst>(v)->cls->name == as<Class>(c)->name);
+  }>("isa");
   native<+[](V v, V e) {
     ERR("@match match on %s got %s, which is not one of its variants", symName(as<Class>(e)->name).c_str(), toStr(v, true).c_str());
     return NIL;

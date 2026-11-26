@@ -30,5 +30,12 @@ pub class Signal {
 
 pub fn signal(v): Signal
 
+pub fn store(old, v)
+
 // f(), reading signals without subscribing the running effect to them.
 pub fn untrack(f: fn)
+
+// For `state` fields (src/views.cpp): a field of that name read or set on something that may not be a class
+// declaring it. val(x) is x's value if x is a signal, else x; store(old, v) sets old if it is a signal (and keeps it
+// in the field), else v replaces it.
+pub fn val(x)
