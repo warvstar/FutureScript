@@ -1,0 +1,2 @@
+{"description": "fwebbrowser from scratch: 8 Haiku workers, Haiku planning and review; one hour, $5",
+ "target": "fwebbrowser", "workers": 8, "model": "claude-haiku-5-5", "cap": 5, "minutes": 60}
