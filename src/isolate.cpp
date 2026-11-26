@@ -69,12 +69,17 @@ struct Msg {
   std::string b;
   std::vector<Shared*> refs;
   std::vector<BufData*> bufs;  // buffers it moves (buffer.cpp)
+  std::vector<Obj*> frozen;    // frozen values it carries, by pointer (a reference on each)
   Msg() = default;
-  Msg(Msg&& o) noexcept : b(std::move(o.b)), refs(std::move(o.refs)), bufs(std::move(o.bufs)) {}
-  Msg& operator=(Msg&& o) noexcept { std::swap(b, o.b), std::swap(refs, o.refs), std::swap(bufs, o.bufs); return *this; }
+  Msg(Msg&& o) noexcept : b(std::move(o.b)), refs(std::move(o.refs)), bufs(std::move(o.bufs)), frozen(std::move(o.frozen)) {}
+  Msg& operator=(Msg&& o) noexcept {
+    std::swap(b, o.b), std::swap(refs, o.refs), std::swap(bufs, o.bufs), std::swap(frozen, o.frozen);
+    return *this;
+  }
   ~Msg() {
     for (Shared* s : refs) release(s);
     for (BufData* s : bufs) bufRelease(s);
+    for (Obj* o : frozen) frozenRelease(o);
   }
 };
 struct ChanState : Shared {
@@ -408,6 +413,7 @@ Iso* self() {
 }
 }  // namespace
 const void* isolateId() { return self(); }
+std::vector<V>* gcBuilding(std::vector<V>* b) { auto o = building; building = b; return o; }
 namespace {
 void wake(Iso* i) {  // (chanMu held)
   if (!i->waiting || i->woken) return;
@@ -517,6 +523,7 @@ struct Writer {
   void put(V v) {
     if (!isObj(v)) return m.b += 'v', raw(v);
     Obj* o = obj(v);
+    if (gcFrozen(o)) return frozenRef(o), m.frozen.push_back(o), m.b += 'F', raw(o);  // shared, not copied
     if (auto it = seen.find(o); it != seen.end()) return m.b += 'r', raw(it->second);
     if (o->kind == K::Fn || o->kind == K::Class || (o->kind == K::Str && gcInImage(o))) {
       if (!gcInImage(o)) ERR("@send cannot send %s: it is not compiled code's", typeName(v));
@@ -632,6 +639,7 @@ struct Reader {
       case 'B': { V h = bufGive(m.bufs[raw<u32>()]); return keep(obj(h)); }
       case 'D': return keep(obj(bufElsewhere()));
       case 'L': { V h = bufLend(m.bufs[raw<u32>()]); return keep(obj(h)); }
+      case 'F': { Obj* o = raw<Obj*>(); return frozenHold(o), box(o); }
       case 'C': case 'T': {
         char t = m.b[at - 1];
         V h = handle(m.refs[raw<u32>()], t == 'C' ? K::Chan : K::Task);

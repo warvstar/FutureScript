@@ -186,7 +186,8 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
      and the others only read; values it captures arrive as frozen copies, so changing one raises; and it runs with
      no effects (no print, random, sleep or channels).
 7. **Frozen values and shared state.**
-   - Work: `freeze(v)` makes a deep-immutable value that is sent as a pointer, not copied.
+   - Step one, done: `freeze(v)` makes a deep-immutable value that is sent as a pointer, not copied; `thaw(v)` a copy
+     to change. Counted references free it.
    - Work: `shared` objects that can be changed only inside `atomic`, which becomes cross-isolate software
      transactional memory with a version clock, retried on conflict. This is for the rare state that really is
      global, such as a cache or a counter.
@@ -472,3 +473,31 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
 - **Not yet.** A persistent pool of workers (each loop starts its isolates), a cheaper VM block in wasm, and
   reductions (`parallel for` that sums): for now each iteration writes a buffer element and the sum is a plain loop.
 
+
+## Phase 7, step one as built: frozen values
+
+- **The frozen heap.** `freeze(v)` (`src/freeze.cpp`) copies v into one more heap (`frozenHeap` in `src/gc.cpp`),
+  whose pages every isolate reads and none marks or sweeps. It checks first, allocating nothing (marking what it
+  visits with header bits, cleared after, rather than hash sets): what can't be copied
+  (channels, tasks, fibers, js values, a buffer this isolate no longer has, a function compiled outside the image),
+  a cycle, or nesting past 10000 raise `[frozen]` with nothing made. Then it copies under `frozenMu`
+  (`FreezeScope`, which points allocation at the frozen heap and, at its end, retires the runs so what it made has
+  its live bits). Lists, maps, instances and buffer handles get `FROZEN`, so stores miss to their helpers and
+  `touch()` raises as for a parallel for's copies; strings and closures never change anyway. A part already frozen,
+  and the image's functions, classes and constant strings, are shared, not copied. `thaw(v)` is a deep copy into the
+  running isolate's heap.
+- **Counting instead of marking.** Each frozen object has a count (`frozenRc`, a side table under `frozenMu`): one
+  for each frozen object that points at it, each message that carries it, and each isolate that holds it. An
+  isolate holds what its collector finds: marking records each frozen object it reaches (precisely through objects,
+  conservatively from stacks), and at the end (`frozenReconcile`) newly reached ones are counted, then ones no longer
+  reached released, under the lock, which also checks a stack word really is a live frozen object. Counting the new
+  before releasing the old keeps a part read out of a parent the isolate then dropped. At 0 an object is finalized
+  and freed, and its parts released; freeze refuses cycles, so counting frees everything. An isolate that ends
+  releases all it holds (`heapFree`).
+- **Sending.** `Writer::put` encodes a frozen object as its pointer ('F'), with a reference the message keeps until
+  it is destroyed; `Reader` makes the receiving isolate hold it. So `spawn`, `send`, `join` and a `parallel for`'s
+  captures pass a frozen value in O(1), whatever its size.
+- **Speed.** 200,000 small lists of a number and a string (400,000 objects): `freeze` takes 49 ms once; `spawn` and
+  `join` passing it take 28 µs, against 79–104 ms copying it.
+- **Reads race nothing.** Reading never writes a frozen object: strings hash when made, type tagging
+  (`src/types.cpp`) skips frozen lists and maps, and nothing frees one while an isolate can still reach it.

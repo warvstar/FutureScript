@@ -111,7 +111,7 @@ static bool accepts(uint64_t t, V v, int depth, Tags* tags = nullptr) {
           uint64_t code = typeResolve(t) & ~TY_OPT;
           if ((l->typed & 1) && l->etype == code) return true;
           for (V x : l->v) if (!accepts(d->elem, x, depth + 1, tags)) return false;
-          if (tags && !(l->typed & 1)) tags->push_back({l, code});
+          if (tags && !(l->typed & (1 | FROZEN))) tags->push_back({l, code});  // (a frozen one never changes: nothing to check)
           return true;
         }
         case 'M': {
@@ -121,7 +121,7 @@ static bool accepts(uint64_t t, V v, int depth, Tags* tags = nullptr) {
           if ((m->typed & 1) && m->etype == code) return true;
           for (auto& [k, x] : m->e)
             if (!accepts(d->key, k, depth + 1, tags) || !accepts(d->elem, x, depth + 1, tags)) return false;
-          if (tags && !(m->typed & 1)) tags->push_back({m, code});
+          if (tags && !(m->typed & (1 | FROZEN))) tags->push_back({m, code});
           return true;
         }
       }

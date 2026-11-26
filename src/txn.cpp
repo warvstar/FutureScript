@@ -100,6 +100,7 @@ void txnAfter(void (*run)(void*), void (*drop)(void*), void* p) { levels.back().
 void txnUnwind(u32 depth) { while (levels.size() > depth) txnAbort(); }
 void touchSlow(Obj* o) {
   if (o->typed & FROZEN) {
+    if (gcFrozen(o)) ERR("@frozen this %s is frozen (freeze() made it), so it never changes: thaw() gives a copy you may change", typeName(box(o)));
     if (o->kind == K::Buf)
       ERR("@parallel a parallel for's body can't change this buffer: it writes only buffers it names, as name[i] = ... in the body itself, and each only at [i]");
     ERR("@parallel a parallel for's body can't change this %s, from outside it: each iteration has a frozen copy (write each result to a buffer at [i])",

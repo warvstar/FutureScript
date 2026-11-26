@@ -614,6 +614,21 @@ parallel for i in 0..w * h { img[i] = pixel(i % w, i / w, scene) }   // every co
   variable from outside it, `return` or `break` (compile errors), and it performs no effects (no `print`, `random`,
   channels). An error is the one at the lowest i that fails: `parallel for, at i = 7: ...`.
 
+### Frozen values
+
+```
+var scene = freeze(loadScene())          // a deep copy that never changes
+for i in 0..8 { spawn render(scene, i) }  // each isolate reads the same one: nothing is copied
+```
+
+- **`freeze(v)` copies v once, into memory every isolate reads.** Sending a frozen value, to `spawn`, a channel or a
+  `parallel for`, passes a pointer instead of copying it, however big it is. Changing one raises (`[frozen]`);
+  `thaw(v)` gives a copy you may change, and `isFrozen(v)` says which you have.
+- **What freezes:** numbers, strings, lists, maps, instances, closures and buffers. A part already frozen is shared,
+  not copied again. Not channels, tasks, fibers or js values, and not a value that contains itself.
+- **A frozen value goes when nothing holds it:** no isolate reaches it, no message carries it, and no other frozen
+  value contains it. `frozenCount()` is how many frozen objects are alive.
+
 ## C functions
 
 ```

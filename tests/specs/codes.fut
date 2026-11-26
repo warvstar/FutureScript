@@ -27,6 +27,7 @@ test "compile errors" {
 test "runtime errors" {
   expect err("fn f(n: num) \{ }\nf(\"x\")").has(" [type]\n")
   expect err("atomic \{ print(1) }").has(" [atomic]\n")
+  expect err("var xs = freeze([1])\nxs.push(2)").has(" [frozen]\n")
   expect err("fn f() ! \{ print(1) }\nf()").has(" [effect]\n")
   expect err("effect E \{ fn op() }\nE.op()").has(" [unhandled]\n")
   expect err("var x = 1\nprint(x.nope)").has(" [no-field]\n")

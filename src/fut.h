@@ -255,6 +255,8 @@ V bufLend(BufData*);
 inline TLS double parAt;     // the iteration a parallel for's body runs (an isolate's: ISO_LOCAL)
 inline TLS bool parBody;     // this isolate runs a parallel for's body
 const void* isolateId();  // the running isolate's identity (isolate.cpp)
+std::vector<V>* gcBuilding(std::vector<V>*);  // objects being built (GC roots until set back): the old list (isolate.cpp)
+void freezeInit();  // freeze, thaw, isFrozen (freeze.cpp)
 struct Clo : Obj { static constexpr K KIND = K::Clo; Fn* fn; u32 n; V* env() { return (V*)(this + 1); } };
 // A fiber runs a function on a stack of its own; `yield` switches back to whoever resumed it.
 struct Fiber : Obj {
@@ -319,6 +321,15 @@ bool gcWanted();           // wasm: a collection waits for the next safepoint
 void gcCollect();
 void isolateMark(void (*mark)(V));  // the isolate's own roots kept by the runtime (rt.cpp)
 bool gcInImage(Obj*);      // compiled code's: shared by every isolate, never collected
+// Frozen values (freeze(): freeze.cpp): copies in the frozen heap, which no isolate collects and every isolate reads;
+// reference counted (gc.cpp). A FreezeScope sends allocations there and holds its lock: ref() counts one more
+// reference on a frozen object (from one being built), hold() has the running isolate hold one.
+bool gcFrozen(Obj*);
+struct FreezeScope { FreezeScope(); ~FreezeScope(); void ref(Obj*); void hold(Obj*); FreezeScope(const FreezeScope&) = delete; };
+void frozenRef(Obj*);      // a message or a shared var holds it
+void frozenRelease(Obj*);
+void frozenHold(Obj*);     // the running isolate holds it (a message's, decoded)
+size_t frozenLive();       // frozen objects alive (tests)
 void gcOwn(Obj*);  // o holds malloc'd memory: finalize it when the GC finds it dead
 template <class T> T* make(size_t extra = 0) {
   T* o = new (gcAlloc(sizeof(T) + extra)) T();

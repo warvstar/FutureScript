@@ -12,6 +12,8 @@
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <unordered_map>
+#include <unordered_set>
 #if !__wasm__
 #include <sys/mman.h>
 #endif
@@ -54,6 +56,8 @@ struct Heap {
   uintptr_t runStart[NCLS] = {}; // where runs[c] began: [runStart, cur) has been allocated
   std::vector<u32> mine;         // its small pages and the first page of each large object
   std::vector<Obj*> work, owners;
+  std::vector<Obj*> reached;           // frozen objects marking met (some, from the stacks, maybe not objects)
+  std::unordered_set<Obj*> held;       // frozen objects it holds a reference on (see frozenReconcile)
   size_t inUse = 0, limit = MIN_HEAP;
   uint64_t allocated = 0;        // objects allocated from retired runs, and large ones (see gcAllocations)
 };
@@ -63,6 +67,8 @@ TLS Heap* cur;         // the running isolate's heap
 TLS int imaging;       // ImageScope depth: allocations go to the image
 TLS Heap* target;      // where allocations go: the image while imaging, else cur (one thread-local read per allocation)
 Heap* imageHeap;
+Heap* frozenHeap;      // frozen values (freeze()): every isolate reads them, none marks them
+uint16_t frozenId;
 std::atomic<uint16_t> nextId{1};
 Heap& H() { return *target; }
 
@@ -165,6 +171,7 @@ Obj* find(Heap& g, uintptr_t p) {  // the allocated object of g starting exactly
   uintptr_t b = (uintptr_t)base;
   if (p < b || p >= b + REGION || (p & (GRAN - 1))) return nullptr;
   size_t i = (p - b) / PAGE, off = (p - b) % PAGE;
+  if (owner(i) == frozenId) return g.reached.push_back((Obj*)p), nullptr;  // (checked when reconciled, under its lock)
   if (owner(i) != g.id) return nullptr;  // another isolate's, the image's, or free (only g's thread makes a page g's)
   if (pages[i].type == 1) {
     if (off % sizeClasses[pages[i].cls] || off + sizeClasses[pages[i].cls] > PAGE) return nullptr;
@@ -173,7 +180,11 @@ Obj* find(Heap& g, uintptr_t p) {  // the allocated object of g starting exactly
 }
 bool marked(Obj* o) { return test(marks, bitOf((uintptr_t)o)); }
 void mark(Heap& g, Obj* o) {  // objects of other heaps (the image's) are not g's to mark, and point at none of g's
-  if (!o || owner(((uintptr_t)o - (uintptr_t)base) / PAGE) != g.id) return;
+  if (!o) return;
+  if (uint16_t w = owner(((uintptr_t)o - (uintptr_t)base) / PAGE); w != g.id) {
+    if (w == frozenId) g.reached.push_back(o);
+    return;
+  }
   size_t i = bitOf((uintptr_t)o);
   uint64_t& w = marks[i >> 6];
   if (uint64_t m = 1ull << (i & 63); !(w & m)) w |= m, g.work.push_back(o);
@@ -220,6 +231,76 @@ void finalize(Obj* o) {
 size_t words(size_t page, size_t n) { return n * PBITS / 64; }  // bitmap words of n pages
 uint64_t* wordsAt(uint64_t* b, size_t page) { return b + page * PBITS / 64; }
 
+// ---- frozen values: freeze() copies a value into the frozen heap, whose objects never change ----
+// No isolate marks them, so none is collected the usual way: each has a count of the references on it, from frozen
+// objects pointing at it, from messages carrying it, from shared vars holding it, and one from each isolate that
+// holds it. An isolate holds the frozen objects its collector finds it reaches (frozenReconcile): when one is no
+// longer found, its reference goes. At 0 an object is freed, and its references on others go. A frozen value has no
+// cycles (freeze() refuses them), so counting frees everything. All of it is under frozenMu.
+Mutex frozenMu;
+std::unordered_map<Obj*, u32>& frozenRc = *new std::unordered_map<Obj*, u32>;
+bool frozenObject(Obj* o) {  // (frozenMu held) is o the start of a live object of the frozen heap?
+  uintptr_t p = (uintptr_t)o, b = (uintptr_t)base;
+  if (p < b || p >= b + REGION || (p & (GRAN - 1))) return false;
+  size_t i = (p - b) / PAGE, off = (p - b) % PAGE;
+  if (owner(i) != frozenId) return false;
+  if (pages[i].type == 1) {
+    if (off % sizeClasses[pages[i].cls] || off + sizeClasses[pages[i].cls] > PAGE) return false;
+  } else if (pages[i].type != 2 || off) return false;
+  return test(live, bitOf(p)) && o->kind != K::Free;
+}
+template <class F> void frozenChildren(Obj* o, F f) {  // the frozen objects o points at
+  auto v = [&](V x) { if (isObj(x) && gcFrozen(obj(x))) f(obj(x)); };
+  switch (o->kind) {
+    case K::List: for (V x : ((List*)o)->v) v(x); break;
+    case K::Map: for (auto& [k, x] : ((Map*)o)->e) v(k), v(x); break;
+    case K::Inst: for (u32 k = 0; k < o->nslots; k++) v(((Inst*)o)->slots[k]); break;
+    case K::Clo: for (u32 k = 0; k < ((Clo*)o)->n; k++) v(((Clo*)o)->env()[k]); break;
+    default: break;
+  }
+}
+void frozenFree(Obj* o) {  // (frozenMu held) its count reached 0
+  std::vector<Obj*> work{o};
+  while (!work.empty()) {
+    Obj* x = work.back();
+    work.pop_back();
+    frozenRc.erase(x);
+    frozenChildren(x, [&](Obj* c) { if (--frozenRc[c] == 0) work.push_back(c); });
+    finalize(x);
+    size_t i = ((uintptr_t)x - (uintptr_t)base) / PAGE, n = pages[i].type == 2 ? pages[i].n : 1;
+    live[bitOf((uintptr_t)x) >> 6] &= ~(1ull << (bitOf((uintptr_t)x) & 63));
+    bool empty = true;
+    for (size_t w = 0; w < words(i, n) && empty; w++) empty = !wordsAt(live, i)[w];
+    Heap& h = *frozenHeap;
+    if (empty) {
+      if (pages[i].type == 1) {
+        int c = pages[i].cls;
+        std::erase(h.avail[c], (u32)i);
+        if (h.scans[c].page == i) h.scans[c] = {};
+      }
+      std::erase(h.mine, (u32)i), freePages(i, n);
+    } else if (int c = pages[i].cls; std::find(h.avail[c].begin(), h.avail[c].end(), (u32)i) == h.avail[c].end())
+      h.avail[c].push_back((u32)i);
+  }
+}
+void frozenDrop(Obj* o) { if (--frozenRc[o] == 0) frozenFree(o); }  // (frozenMu held)
+// The end of h's marking: what it reaches now is what it holds. Newly reached objects are counted before ones no
+// longer reached are released, so a child read from a parent the isolate then dropped stays.
+void frozenReconcile(Heap& h) {
+  if (h.reached.empty() && h.held.empty()) return;
+  std::sort(h.reached.begin(), h.reached.end());
+  h.reached.erase(std::unique(h.reached.begin(), h.reached.end()), h.reached.end());
+  Locked l(frozenMu);
+  std::unordered_set<Obj*> now;
+  for (Obj* o : h.reached)
+    if (frozenObject(o)) {
+      if (!h.held.count(o)) frozenRc[o]++;
+      now.insert(o);
+    }
+  for (Obj* o : h.held) if (!now.count(o)) frozenDrop(o);
+  h.held = std::move(now), h.reached.clear();
+}
+
 void collect(Heap& h) {
   Heap& g = h;
   G = &h;
@@ -250,6 +331,7 @@ void collect(Heap& h) {
     h.work.pop_back();
     trace(g, o);
   }
+  frozenReconcile(h);
   std::erase_if(h.owners, [](Obj* o) { return !marked(o) && (finalize(o), true); });
   h.inUse = 0;
   std::vector<u32> keep;
@@ -294,6 +376,8 @@ void gcInit() {
   pages.resize(NPAGES);
   imageHeap = new Heap{nextId++};
   imageHeap->image = true, imageHeap->runs = imageHeap->own;
+  frozenHeap = new Heap{nextId++};
+  frozenHeap->image = true, frozenHeap->runs = frozenHeap->own, frozenId = frozenHeap->id;
 }
 Heap* heapNew(Run* runs) {
   Heap* h = new Heap{nextId++};
@@ -302,6 +386,10 @@ Heap* heapNew(Run* runs) {
 }
 void heapUse(Heap* h) { cur = h; if (!imaging) target = h; }
 void heapFree(Heap* h) {  // an isolate ended: finalize what needs it and give every page back
+  if (!h->held.empty()) {
+    Locked l(frozenMu);
+    for (Obj* o : h->held) frozenDrop(o);
+  }
   for (int c = 0; c < NCLS; c++) h->runStart[c] = h->runs[c].cur = h->runs[c].end = 0;
   for (Obj* o : h->owners) finalize(o);
   for (u32 i : h->mine) {
@@ -319,7 +407,33 @@ bool gcInImage(Obj* o) {
   uintptr_t p = (uintptr_t)o, b = (uintptr_t)base;
   return p >= b && p < b + REGION && owner((p - b) / PAGE) == imageHeap->id;
 }
-void gcOwn(Obj* o) { H().owners.push_back(o); }
+void gcOwn(Obj* o) { if (&H() != frozenHeap) H().owners.push_back(o); }  // (a frozen object is finalized when freed)
+bool gcFrozen(Obj* o) {
+  uintptr_t p = (uintptr_t)o, b = (uintptr_t)base;
+  return p >= b && p < b + REGION && owner((p - b) / PAGE) == frozenId;
+}
+FreezeScope::FreezeScope() { frozenMu.lock(), target = frozenHeap; }
+FreezeScope::~FreezeScope() {
+  Heap& h = *frozenHeap;
+  for (int c = 0; c < NCLS; c++) {  // what it made goes in `live` (frozenObject reads it); a run's page keeps its free cells
+    if (!h.runs[c].cur) continue;
+    u32 page = u32((h.runStart[c] - (uintptr_t)base) / PAGE);
+    retire(h, c);
+    if (std::find(h.avail[c].begin(), h.avail[c].end(), page) == h.avail[c].end()) h.avail[c].push_back(page);
+  }
+  target = imaging ? imageHeap : cur, frozenMu.unlock();
+}
+void FreezeScope::ref(Obj* o) { frozenRc[o]++; }
+void FreezeScope::hold(Obj* o) {  // the running isolate holds o (its count is 1 more, until its collector drops it)
+  if (cur->held.insert(o).second) frozenRc[o]++;
+}
+void frozenRef(Obj* o) { Locked l(frozenMu); frozenRc[o]++; }
+void frozenRelease(Obj* o) { Locked l(frozenMu); frozenDrop(o); }
+void frozenHold(Obj* o) {
+  Locked l(frozenMu);
+  if (cur->held.insert(o).second) frozenRc[o]++;
+}
+size_t frozenLive() { Locked l(frozenMu); return frozenRc.size(); }
 // Objects the running isolate allocated so far. Each takes one cell of its size class, so the runs being bumped
 // through (by JIT code too) say how many came from them: counting costs allocation nothing.
 TLS uint64_t gcUncounted;

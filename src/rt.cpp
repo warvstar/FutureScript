@@ -1128,6 +1128,6 @@ void rtInit() {
   method<+[](V m) { return mapList(m, false); }>(K::Map, S_values);
   testInit();
   sysInit();
-  isolatesInit(), bufInit();
+  isolatesInit(), bufInit(), freezeInit();
   effectsInit();  // after the natives it marks as operations
 }

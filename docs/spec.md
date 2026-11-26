@@ -210,6 +210,14 @@ Same result as a plain `for`, every run: whole-number range; the body can't assi
 `break` (compile errors); a buffer it writes (`name[...] = ` in the body itself) it reaches only at `[i]`; what else it
 reads from outside is a frozen copy (changing one raises, globals too); no effects. An error is the lowest failing
 i's: "parallel for, at i = 7: ...". [parallel]
+```
+var cfg = freeze({sizes: [1, 2], name: "a"})   // a deep copy that never changes; isFrozen(cfg) -> true
+cfg.sizes.push(3)                              // raises [frozen]; thaw(cfg) -> a copy you may change
+```
+Every isolate reads a frozen value in place: sending one (to `spawn`, `send`, a `parallel for`) passes a pointer,
+however big. Lists, maps, instances, buffers, strings and closures freeze; a frozen value's parts already frozen are
+shared, not copied. Not channels, tasks, fibers, js values, or a value that contains itself. A frozen value goes when
+no isolate, message or other frozen value holds it; `frozenCount()` counts those alive (every isolate's). [frozen]
 
 ## Modules, packages
 
