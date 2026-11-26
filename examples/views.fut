@@ -1,5 +1,5 @@
-// The hello-ui task list as views in blocks: one of the two view syntaxes on trial (the other: views-markup.fut).
-//   node web/serve.mjs   then open http://localhost:8000/?file=examples/views-blocks.fut
+// The hello-ui task list as views.
+//   node web/serve.mjs   then open http://localhost:8000/?file=examples/views.fut
 import "std/ui"
 
 class Task {

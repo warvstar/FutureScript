@@ -1,4 +1,4 @@
-// Allotment: a season's plants, bed by bed, from seed to harvest. The bigger trial of fut's views (views in blocks; the same app in markup: garden-markup.fut).
+// Allotment: a season's plants, bed by bed, from seed to harvest. A whole app in fut's views.
 //   node web/serve.mjs   then open http://localhost:8000/?file=examples/garden.fut
 import "std/ui"
 import "std/lists"

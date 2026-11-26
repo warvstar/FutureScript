@@ -1,11 +1,11 @@
-// examples/garden-markup.fut (views in markup), driven as a user would (wasm only: std/ui is the DOM's).
-import "../../examples/garden-markup.fut"
+// examples/garden.fut, driven as a user would (wasm only: std/ui is the DOM's).
+import "../../examples/garden.fut"
 import "std/ui"
 
 fn page() { return ui.htmlOf(ui.find("body")) }
 fn click(sel) { ui.trigger(ui.find(sel), "click", nil) }
 
-test "Allotment in markup: browse, filter, edit, move, note, remove" {
+test "Allotment in blocks: browse, filter, edit, move, note, remove" {
   expect page().has("Every bed") && page().has("18 plants, 4 ready to pick")
   expect page().has("Sungold") && page().has("Raised bed by the shed")
   click("#bed-b3")

@@ -1,12 +1,11 @@
-// Views and state, for now as a rewrite of the source before it compiles (two syntaxes on trial; one will stay and be
-// compiled directly). A file that declares `view` or `state` is rewritten into std/ui calls:
+// Views and state, for now as a rewrite of the source before it compiles. A file that declares `view` or `state` is
+// rewritten into std/ui calls:
 //
 //   state n = 0                     var n = std/reactive signal(0); reading n is n.get(), n = v is n.set(v), n += v an update
 //   class T { state done }          a field holding a signal, made in init; t.done reads it, t.done = v sets it
 //   view Row(t) { ...body... }      fn Row(t), returning the nodes its body makes; mount(Page) shows Page
 //
-// A body is blocks (`row .task .done: t.done { check "x" bind: t.done }`) or markup (`<div .task .done={t.done}>`),
-// chosen by its first character. Any expression in a view is a function of the state it reads: only that part of
+// A body is elements, one a line (`row .task .done: t.done { check "x" bind: t.done }`). Any expression in a view is a function of the state it reads: only that part of
 // the page changes when the state does. The rewrite keeps every line where it was, so errors point at the source.
 #include "fut.h"
 #include <algorithm>
@@ -67,7 +66,6 @@ struct Views {
   const std::string& s;
   size_t i = 0;  // what's read so far
   std::string out;
-  std::map<std::string, std::vector<std::string>> params;  // each view's parameters, for <Row t={t}/>
   Views(const std::string& src, const std::string& file) : s(src), path(file) {}
 
   Tok peek(size_t at) const { return lexAt(s, at); }
@@ -156,7 +154,6 @@ struct Views {
     return r;
   }
 
-  // ---- blocks ----
   // Statements of a children block into pushes onto list k, up to its `}` (not consumed).
   void children(int n) {
     std::string k = "_k" + std::to_string(n);
@@ -241,7 +238,7 @@ struct Views {
       Tok n2 = peek(t.e);
       if (is(s, t, ".") && n2.k == 'i' && !n2.sp()) {
         i = n2.b;
-        std::string c = markName();  // a class: dashes allowed (.bed-title)
+        std::string c = markName();
         if (Tok col = peek(); is(s, col, ":") && !col.sp()) take(), when.push_back({c, expr()});
         else fixed.push_back(c);
       } else if (t.k == 'i' && is(s, n2, ":") && !n2.sp()) {
@@ -263,180 +260,15 @@ struct Views {
     out += "_k" + std::to_string(n) + ".push(ui.make(" + quote(name) + ", {" + join(props) + "}, [" + join(kids) + "]))" + lines(lead);
   }
 
-  // ---- markup ----
-  void ws(std::string& debt) {  // spaces and line breaks between markup parts: the breaks are kept for after it
-    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) debt += s[i++] == '\n' ? "\n" : "";
-  }
-  std::string markName() {
+  std::string markName() {  // a class name: dashes allowed (.bed-title)
     size_t b = i;
     while (i < s.size() && (idChar(s[i]) || s[i] == '-')) i++;
     if (b == i) fail(b, "expected a name");
     return s.substr(b, i - b);
   }
-  std::string braced(std::string& debt) {  // {expr}: its text, the braces consumed
-    if (s[i] != '{') fail(i, "expected '{'");
-    i++;
-    std::string body = braceBody();
-    debt += lines(body);
-    for (char& c : body) if (c == '\n') c = ' ';
-    return body;
-  }
-  std::string markup(std::string& debt) {  // at '<'
-    size_t at = i++;
-    std::string tag = markName();
-    std::vector<std::string> props, fixed, args;
-    std::vector<std::pair<std::string, std::string>> when;
-    bool view = tag[0] >= 'A' && tag[0] <= 'Z';
-    std::map<std::string, std::string> named;
-    for (;;) {
-      ws(debt);
-      if (i >= s.size()) fail(at, "<" + tag + "> is not closed");
-      if (s.compare(i, 2, "/>") == 0) { i += 2; return finish(tag, props, fixed, when, named, {}, at); }
-      if (s[i] == '>') { i++; break; }
-      if (s[i] == '.') {
-        i++;
-        std::string c = markName();
-        if (i < s.size() && s[i] == '=') i++, when.push_back({c, braced(debt)});
-        else fixed.push_back(c);
-        continue;
-      }
-      std::string a = markName();
-      if (a == "on" && i < s.size() && s[i] == ':') i++, a = "on" + markName();
-      if (i >= s.size() || s[i] != '=') fail(i, "expected '=' after " + a);
-      i++;
-      std::string v;
-      if (s[i] == '"') { Tok t = lexAt(s, i); v = textOf(s, t), i = t.e; }
-      else v = braced(debt);
-      if (view) named[a] = v;
-      else if (a == "class") when.push_back({"=" + v, "true"});
-      else if (a == "bind") props.push_back("\"bind\": \x01" + v);
-      else if (a.compare(0, 2, "on") == 0 && a.size() > 2) props.push_back(quote(a) + ": fn(e) { " + v + " }");
-      else props.push_back(quote(a) + ": " + live(v));
-    }
-    std::vector<std::string> kids = markKids(debt, "</");
-    i += 2;
-    if (std::string close = markName(); close != tag) fail(i, "<" + tag + "> is closed by </" + close + ">");
-    ws(debt);
-    if (s[i] != '>') fail(i, "expected '>'");
-    i++;
-    return finish(tag, props, fixed, when, named, kids, at);
-  }
-  std::string finish(const std::string& tag, std::vector<std::string>& props, const std::vector<std::string>& fixed,
-                     const std::vector<std::pair<std::string, std::string>>& when, std::map<std::string, std::string>& named,
-                     const std::vector<std::string>& kids, size_t at) {
-    if (tag[0] >= 'A' && tag[0] <= 'Z') {
-      std::vector<std::string> args;
-      if (auto p = params.find(tag); p != params.end()) {
-        for (auto& n : p->second) args.push_back(named.count(n) ? named[n] : "nil"), named.erase(n);
-        if (!named.empty()) fail(at, tag + " has no parameter '" + named.begin()->first + "'");
-      } else for (auto& [_, v] : named) args.push_back(v);
-      return tag + "(" + join(args) + ")";
-    }
-    if (!fixed.empty() || !when.empty()) props.insert(props.begin(), classProp(fixed, when));
-    return "ui.make(" + quote(tag) + ", {" + join(props) + "}, [" + join(kids) + "])";
-  }
-  // Children up to `until` ("</" or "}"), not consumed: text, {holes} and elements. Text and simple holes next to
-  // each other make one interpolated string; whitespace with a line break in it is one space, or none at the ends.
-  std::vector<std::string> markKids(std::string& debt, const char* until) {
-    std::vector<std::string> kids;
-    std::string run;
-    bool hole = false, space = false;
-    auto flush = [&] {
-      if (!run.empty()) kids.push_back(hole ? "fn() { return \"" + run + "\" }" : "\"" + run + "\"");
-      run.clear(), hole = space = false;
-    };
-    auto put = [&](const std::string& x) { if (space && !run.empty()) run += ' '; space = false, run += x; };
-    for (;;) {
-      if (i >= s.size()) fail(i, std::string("expected ") + until);
-      if (s.compare(i, strlen(until), until) == 0) { flush(); return kids; }
-      char c = s[i];
-      if (c == '<') { flush(), kids.push_back(markup(debt)); continue; }
-      if (c == '{') {
-        size_t j = i + 1;
-        while (j < s.size() && (s[j] == ' ' || s[j] == '\n' || s[j] == '\t')) j++;
-        Tok w = lexAt(s, j);
-        if (is(s, w, "if") || is(s, w, "for") || s[j] == '<') {
-          flush();
-          i = j;
-          kids.push_back(is(s, w, "if") ? markIf(debt) : is(s, w, "for") ? markFor(debt) : markup(debt));
-          ws(debt);
-          if (s[i] != '}') fail(i, "expected '}'");
-          i++;
-          continue;
-        }
-        std::string e = braced(debt);
-        if (e.find('"') != std::string::npos) flush(), kids.push_back("fn() { return " + e + " }");
-        else put("{" + e + "}"), hole = true;
-        continue;
-      }
-      if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
-        size_t b = i;
-        std::string nl;
-        ws(nl);
-        debt += nl;
-        if (!nl.empty()) space = true;
-        else if (!run.empty()) put(s.substr(b, i - b));
-        continue;
-      }
-      put(c == '"' ? "\\\"" : c == '\\' ? "\\\\" : std::string(1, c)), i++;
-    }
-  }
-  std::string markBranch(std::string& debt) {  // { markup... } as a list
-    ws(debt);
-    if (s[i] != '{') fail(i, "expected '{'");
-    i++;
-    std::vector<std::string> kids = markKids(debt, "}");
-    i++;
-    return "[" + join(kids) + "]";
-  }
-  std::string markCond(std::string& debt, bool stopAtKey) {
-    std::string saved = std::exchange(out, "");
-    std::string e = expr(true, stopAtKey);
-    debt += lines(std::exchange(out, saved)) + lines(e);
-    for (char& c : e) if (c == '\n') c = ' ';
-    return e;
-  }
-  std::string markIf(std::string& debt) {
-    std::string r = "fn() {";
-    for (bool first = true;; first = false) {
-      i = take().e;  // if
-      std::string cond = markCond(debt, false);
-      r += std::string(first ? " if " : " else if ") + cond + " { return " + markBranch(debt) + " }";
-      Tok e = peek();
-      if (!is(s, e, "else")) break;
-      debt += lines(s.substr(e.tb, e.b - e.tb)), i = e.e;
-      if (Tok w = peek(); is(s, w, "if")) { debt += lines(s.substr(w.tb, w.b - w.tb)), i = w.b; continue; }
-      r += " else { return " + markBranch(debt) + " }";
-      break;
-    }
-    return r + " return nil }";
-  }
-  std::string markFor(std::string& debt) {
-    take();
-    Tok v = take();
-    if (v.k != 'i') fail(v.b, "expected a name after 'for'");
-    std::string var = textOf(s, v);
-    if (Tok in = take(); !is(s, in, "in")) fail(in.b, "expected 'in'");
-    std::string list = markCond(debt, true), key = var;
-    if (Tok kw = peek(); is(s, kw, "key")) take(), key = markCond(debt, false);
-    return "ui.each(fn() { return " + list + " }, fn(" + var + ") { return " + key + " }, fn(" + var + ") { return " +
-           markBranch(debt) + " })";
-  }
 
   // ---- the file ----
   std::string run() {
-    for (size_t at = 0;;) {  // the views' parameters first, for <View a={x}/> anywhere
-      Tok t = peek(at);
-      if (!t.k) break;
-      if (is(s, t, "view") && (t.nl || t.b == 0 || t.tb == 0)) {
-        Tok n = peek(t.e), p = peek(n.e);
-        if (n.k == 'i' && is(s, p, "(")) {
-          auto& ps = params[textOf(s, n)];
-          for (Tok a = peek(p.e); a.k && !is(s, a, ")"); a = peek(a.e)) if (a.k == 'i') ps.push_back(textOf(s, a));
-        }
-      }
-      at = t.e;
-    }
     bool ownMount = s.find("fn mount(") != std::string::npos;
     int depth = 0;
     Tok last;
@@ -466,16 +298,6 @@ struct Views {
     Tok o = take();
     if (!is(s, o, "{")) fail(o.b, "expected '{' to start the view");
     out += s.substr(o.tb, o.e - o.tb);
-    Tok first = peek();
-    if (is(s, first, "<")) {
-      out += s.substr(first.tb, first.b - first.tb) + " return ", i = first.b;
-      std::string debt, m = markup(debt);
-      out += m + debt;
-      Tok c = take();
-      if (!is(s, c, "}")) fail(c.b, "a view in markup is one element: wrap several in one");
-      out += s.substr(c.tb, c.e - c.tb);
-      return;
-    }
     out += " return ui.kids(fn(_k1) {";
     children(1);
     Tok c = take();

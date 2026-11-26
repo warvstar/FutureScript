@@ -481,34 +481,27 @@ ui.mount("#ui", fn() {
 - **Lists:** `ui.each(items, key, view)` keeps one view per item, reused while the item's key and value stay the same. Changing one item redraws only that item, and reordering moves nodes without redrawing them. Signals held inside an item, as `examples/hello-ui.fut` keeps each task's `done` and `effort`, update just their part of that item.
 - **Running it:** `node web/serve.mjs`, then open `http://localhost:8000/?file=examples/hello-ui.fut`. The page mounts into `#ui`. Once the program finishes, the page keeps handling its events, and edits reload it. Under Node, `std/ui/dom.js` uses a small document of its own, so `fut test` can drive a page with `ui.trigger` and read it with `ui.htmlOf` (`tests/specs/hello_ui.fut`).
 
-#### Views and state (on trial)
+#### Views and state
 
-`state` and `view` write the same pages with less code. Two view syntaxes are on trial, and either can be used in any view; one will stay. Both compile to the calls above (`src/views.cpp` rewrites the file first, keeping each line where it was; `FUT_VIEWS=1 fut file.fut` prints the result).
+`state` and `view` write the same pages with less code. They compile to the calls above (`src/views.cpp` rewrites the file first, keeping each line where it was; `FUT_VIEWS=1 fut file.fut` prints the result).
 
 ```
 state name = ""                 // a variable the page follows: reading it subscribes, assigning it updates
 class Task { state done }       // a field the page follows, the same way (a field holding a signal, made in init)
 
-view Greeting {                 // blocks: an element per line, children in braces
+view Greeting {                 // an element per line, children in braces
   column .card {
     field "Your name" bind: name
     if name.len() > 0 { text "Hi, {name}!" } else { text .muted "Type your name." }
     button .primary "Clear" on click { name = "" }
   }
 }
-view Greeting2 {                // markup
-  <column .card>
-    <field bind={name}>Your name</field>
-    {if name.len() > 0 { <text>Hi, {name}!</text> } else { <text .muted>Type your name.</text> }}
-    <button .primary on:click={name = ""}>Clear</button>
-  </column>
-}
 mount(Greeting)                 // into #ui (else the body), with fut's theme
 ```
 
-- **Elements:** any HTML tag, or fut's own: `row` and `column` (flex, with gaps), `text`, `field` (a labelled text box), `check` (a labelled checkbox). `.name` adds a class; `.name: cond` (`.name={cond}`) adds it while cond is true. `name: value` (`name="text"`, `name={value}`) sets an attribute. `bind: s` (`bind={s}`) ties a `field`, `check` or `input` to state `s`, both ways. `on click { ... }` (`on:click={...}`) handles an event, given as `e`.
-- **Children:** text and expressions (shown and kept current), elements, other views (`Row(t)`, `<Row t={t}/>`), `if`/`else`, and `for x in list key k { ... }` (`{for ... { <Row t={x}/> }}`), which keeps one view per key, as `ui.each` does.
-- **The theme:** `mount` adds a style sheet that makes the elements above, buttons and inputs look finished, light and dark (`--bg`, `--fg`, `--muted`, `--line`, `--accent` and `--radius` are CSS variables to override); `.title`, `.muted` and `.primary` are its classes for headings, quiet text and the main button. `examples/views-blocks.fut` and `examples/views-markup.fut` are the hello-ui task list in each syntax. `examples/garden.fut` and `examples/garden-markup.fut` are a whole app in each: a season's plants bed by bed, with a list grouped by stage, a board, search and filters, an editing drawer with selects and a notes journal, dark mode, and a layout that follows its own width (container queries).
+- **Elements:** any HTML tag, or fut's own: `row` and `column` (flex, with gaps), `text`, `field` (a labelled text box), `check` (a labelled checkbox). `.name` adds a class; `.name: cond` adds it while cond is true. `name: value` sets an attribute. `bind: s` ties a `field`, `check` or `input` to state `s`, both ways. `on click { ... }` handles an event, given as `e`.
+- **Children:** text and expressions (shown and kept current), elements, other views (`Row(t)`), `if`/`else`, and `for x in list key k { ... }`, which keeps one view per key, as `ui.each` does.
+- **The theme:** `mount` adds a style sheet that makes the elements above, buttons and inputs look finished, light and dark (`--bg`, `--fg`, `--muted`, `--line`, `--accent` and `--radius` are CSS variables to override); `.title`, `.muted` and `.primary` are its classes for headings, quiet text and the main button. `examples/views.fut` is the hello-ui task list as views. `examples/garden.fut` is a whole app: a season's plants bed by bed, with a list grouped by stage, a board, search and filters, an editing drawer with selects and a notes journal, dark mode, and a layout that follows its own width (container queries).
 - **Limits, for now:** state is per file, top level and class fields; a local or parameter of the same name hides it. A state field's name means that field wherever `.name` is read in the file, so give other fields other names. An element's props stay on its line. `bind:` works on `field`, `check`, `input`, `textarea` and `select`; `class: expr` adds classes from an expression; class names may contain dashes.
 
 ### Error codes

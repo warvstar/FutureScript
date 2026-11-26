@@ -1,5 +1,5 @@
-// examples/views-blocks.fut, driven as a user would (wasm only: std/ui is the DOM's).
-import "../../examples/views-blocks.fut"
+// examples/views.fut, driven as a user would (wasm only: std/ui is the DOM's).
+import "../../examples/views.fut"
 import "std/ui"
 
 fn page() { return ui.htmlOf(ui.find("body")) }
