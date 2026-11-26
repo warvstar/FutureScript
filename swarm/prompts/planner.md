@@ -13,3 +13,4 @@ Good tasks:
 - Done conditions are about the code and its tests ("tests/x_test.fut covers ... and passes"). The harness runs the tests; don't ask workers to report command output.
 - A task may only rely on files that are on main (in the map above). A file from a task still in progress or queued isn't there yet: wait for it to be done.
 - A task's owned files must be enough to do it. If the change needs another module's signature changed, own that module too.
+- Reach the public API early. Hidden acceptance tests call only the public API the spec fixes, so a module that isn't wired into it yet scores nothing. Once a piece's prerequisites are on main, prefer the integration task that makes more of the public API work end to end over another audit of a module that already has tests.
