@@ -45,14 +45,18 @@ var FORMATS = {f32: "float32", vec2f: "float32x2", vec3f: "float32x3", vec4f: "f
 // As a vertex the fields are packed tight (stride floats each); as a struct in a uniform or storage buffer they
 // follow WGSL's alignment (size floats each, a field at structAt).
 pub class Layout {
-  var names = []
-  var kinds = []
-  var vertexAt = []
-  var structAt = []
+  var names
+  var kinds
+  var vertexAt
+  var structAt
   var stride = 0
   var size = 0
   var attrs = ""
   fn init(spec: map) {
+    self.names = []
+    self.kinds = []
+    self.vertexAt = []
+    self.structAt = []
     var align = 1
     for name in spec {
       var k = spec[name]
@@ -152,8 +156,9 @@ pub class Gpu {
   var headless = false
   var width = 0
   var height = 0
-  var shaders = {}  // WGSL text -> its module, so a reloaded program asking again gets the same one
+  var shaders  // WGSL text -> its module, so a reloaded program asking again gets the same one
   fn init(o: map) {
+    self.shaders = {}
     self.headless = o.headless == true
     self.width = o.width || 256
     self.height = o.height || 256

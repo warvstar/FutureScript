@@ -90,7 +90,8 @@ static V n_present() {  // show the frame, handle events, wait for the next 1/60
   msg<void>(cls("CATransaction"), "flush"), fflush(stdout), gfxPump();
   static double next;
   double t = now();
-  if ((next += 1 / 60.0) < t) next = t;  // fell behind: start counting from here
+  if (presentHook) next = t;  // the library's present waits for the display's refresh: waiting here too could halve the rate
+  else if ((next += 1 / 60.0) < t) next = t;  // fell behind: start counting from here
   else sleepFor(next - t);
   return boxb(msg<bool>(win, "isVisible"));
 }

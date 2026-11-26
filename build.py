@@ -921,16 +921,22 @@ def dawn():
 
 
 def gpu(check=False):
-    """build/libfutgpu.dylib from std/gpu/futgpu.cpp and Dawn (only when stale). check: build and run the headless
-    smoke test (std/gpu/futgpu_check.c) against it."""
+    """build/libfutgpu_dawn.dylib from std/gpu/futgpu.cpp and Dawn, and build/libfutgpu.dylib, which std/gpu binds and
+    which loads the first on its first call (std/gpu/futgpu_lazy.c: `fut test` forks, and only a process that hasn't
+    loaded Dawn may). Only what is stale. check: build and run the headless smoke test (std/gpu/futgpu_check.c)."""
     d, src = dawn(), ROOT / "std" / "gpu" / "futgpu.cpp"
+    real, lazy = ROOT / "build" / "libfutgpu_dawn.dylib", ROOT / "std" / "gpu" / "futgpu_lazy.c"
     lib = ROOT / "build" / "libfutgpu.dylib"
-    if not lib.exists() or lib.stat().st_mtime < max(src.stat().st_mtime, (d / "lib" / "libwebgpu_dawn.a").stat().st_mtime):
+    if not real.exists() or real.stat().st_mtime < max(src.stat().st_mtime, (d / "lib" / "libwebgpu_dawn.a").stat().st_mtime):
         print("clang++ futgpu.cpp", flush=True)
         subprocess.run(["clang++", *FLAGS, "-O2", "-fvisibility=hidden", "-dynamiclib", "-I", str(d / "include"), str(src),
                         str(d / "lib" / "libwebgpu_dawn.a"), *(a for f in GPU_FRAMEWORKS for a in ("-framework", f)), "-lobjc",
-                        "-Wl,-exported_symbol,_fg_*", "-Wl,-dead_strip", "-install_name", "@rpath/libfutgpu.dylib", "-o", str(lib)],
+                        "-Wl,-exported_symbol,_fg_*", "-Wl,-dead_strip", "-install_name", "@rpath/libfutgpu_dawn.dylib", "-o", str(real)],
                        check=True)
+    if not lib.exists() or lib.stat().st_mtime < lazy.stat().st_mtime:
+        print("clang futgpu_lazy.c", flush=True)
+        subprocess.run(["clang", "-std=c11", "-Wall", "-O2", "-fvisibility=hidden", "-dynamiclib", str(lazy),
+                        "-install_name", "@rpath/libfutgpu.dylib", "-o", str(lib)], check=True)
     if check:
         exe = ROOT / "build" / "futgpu_check"
         subprocess.run(["clang", "-std=c11", "-Wall", "-Wextra", "-O1", str(ROOT / "std" / "gpu" / "futgpu_check.c"), str(lib),

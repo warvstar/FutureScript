@@ -1,0 +1,83 @@
+// The public interface of package gpu 0.1.0 (gpu.fut), written by `fut api`. `fut test` fails while it is out of date.
+
+// ---- buffers, pipelines, frames ----
+pub class Buffer {
+  var bytes = 0
+  var g
+  var h = 0
+  fn free()
+  fn init(g, data: f32s | u32s | i32s | u8s, usage: num)
+  // its contents, back from the GPU: into a new f32s, or into `into` (a buffer no bigger than this one)
+  fn read(into)
+  // replace its contents, from the start (no more than it holds)
+  fn write(data: f32s | u32s | i32s | u8s)
+}
+
+pub class Frame {
+  var g
+  // draw count vertices from buf (nil: the vertex shader makes them from its vertex_index)
+  fn draw(p: Pipeline, buf, count: num): Frame
+}
+
+pub class Gpu {
+  var h = 0
+  var headless = false
+  var height = 0
+  var shaders
+  var width = 0
+  // {shader: wgsl, entry: "main", bind: [buffers, in binding order], size: its @workgroup_size (64)}
+  fn compute(o: map): Pipeline
+  // begin a frame cleared to 0xRRGGBB; present() shows it (or pixels(), headless)
+  fn frame(rgb: num): Frame
+  fn init(o: map)
+  // headless: the frame as u8s, 4 per pixel (r, g, b, a), rows top first
+  fn pixels(): u8s
+  // {shader: wgsl, vertex: "vs", fragment: "fs", layout: its vertices' Layout (nil: no vertex buffer),
+  //  bind: [buffers, in binding order], draw: "triangles" | "points" | "lines" | "strip" | "linestrip"}
+  fn render(o: map): Pipeline
+  // run a compute pipeline over n items: ceil(n / size) workgroups
+  fn run(p: Pipeline, n: num)
+  fn shader(wgsl: str): num
+  // a storage buffer, which a draw can also read as vertices: layout.pack(items, true), or numbers of your own
+  fn storage(data: f32s | u32s | i32s | u8s): Buffer
+  // a uniform buffer holding one struct of layout
+  fn uniform(layout: Layout): Uniform
+  // a vertex buffer: layout.pack(items, false), or numbers of your own
+  fn vertices(data: f32s | u32s | i32s | u8s): Buffer
+}
+
+// {pos: "vec2f", color: "vec3f"}: field names in the shader's order, each an f32, vec2f, vec3f, vec4f or mat4x4f.
+// As a vertex the fields are packed tight (stride floats each); as a struct in a uniform or storage buffer they
+// follow WGSL's alignment (size floats each, a field at structAt).
+pub class Layout {
+  var attrs = ""
+  var kinds
+  var names
+  var size = 0
+  var stride = 0
+  var structAt
+  var vertexAt
+  fn init(spec: map)
+  // items (maps) as f32s: packed tight as vertices, or aligned as structs (asStruct) for a uniform or storage buffer
+  fn pack(items: list, asStruct: bool): f32s
+}
+
+pub fn layout(spec: map): Layout
+
+// the GPU: on the window (open it with window(w, h) first), or {headless: true, width, height} (256 x 256 by
+// default). Opening it again, as a reloaded program does, gives the same one.
+pub fn open(opts): Gpu
+
+pub class Pipeline {
+  var bind = 0
+  var g
+  var h = 0
+  var size = 64
+  fn free()
+}
+
+// a uniform buffer holding one struct of its layout: set({field: value, ...}) writes it
+pub class Uniform : Buffer {
+  var layout
+  fn set(values: map)
+}

@@ -1,5 +1,5 @@
 // std/gpu on a real GPU, headless: compute, a draw read back as pixels, layouts, and errors that name what is wrong.
-import "std/gpu"
+import "./gpu.fut" as gpu
 
 fn err(f) { try { f() } catch e { return "{e}" } return "" }
 var g = gpu.open({headless: true, width: 64, height: 64})
@@ -45,9 +45,11 @@ test "render: a triangle in a uniform's color, read back as pixels" {
 
 test "layouts: vertices packed tight, structs aligned as WGSL lays them out" {
   var L = gpu.layout({pos: "vec2f", color: "vec3f", w: "f32"})
-  expect L.stride == 6 && L.size == 12 && L.structAt == [0, 4, 7] && L.attrs == "float32x2 float32x3 float32"
+  expect L.stride == 6 && L.size == 8 && L.attrs == "float32x2 float32x3 float32"
+  expect L.structAt == [0, 4, 7]  // a vec3f starts on 4 floats, and the f32 after it fills its fourth
   expect L.pack([{pos: [1, 2], color: [3, 4, 5], w: 6}], false) == f32s([1, 2, 3, 4, 5, 6])
-  expect L.pack([{pos: [1, 2], color: [3, 4, 5], w: 6}], true) == f32s([1, 2, 0, 0, 3, 4, 5, 6, 0, 0, 0, 0])
+  expect L.pack([{pos: [1, 2], color: [3, 4, 5], w: 6}], true) == f32s([1, 2, 0, 0, 3, 4, 5, 6])
+  expect gpu.layout({a: "f32", b: "vec4f"}).size == 8
   expect err(fn() { L.pack([{pos: [1], color: [3, 4, 5], w: 6}], false) }).has("[0].pos must be a list of 2 numbers (vec2f)")
   expect err(fn() { gpu.layout({p: "vec9"}) }).has("field 'p' is vec9")
 }

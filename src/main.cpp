@@ -8,6 +8,9 @@
 #include <time.h>
 #include <unistd.h>
 #include <mach-o/dyld.h>
+#include <fcntl.h>
+#include <spawn.h>
+extern char** environ;
 
 // The standard library: $FUT_STD, else std/ beside the directory holding this binary (build/fut -> std/).
 static void findStd() {
@@ -204,25 +207,51 @@ static void waitChange() {  // typed lines still run meanwhile, so the stopped p
 
 // One test in a child process (fork, after the top level ran): its globals, a crash or a hang stay in it.
 // The child sends its report (status letter, then the text) back over a pipe.
-static void isolated(const TestCase& t, void* code, double timeout) {
+// A program that binds a C library (a `c` module, as std/gpu's over Dawn and Metal) gets a new fut process per test
+// instead (spawned: `fut test --test-child <index>:<fd> file`), which compiles and runs the top level again: system
+// frameworks don't survive a fork.
+static bool spawnTests;
+static int childTest = -1, childFd = -1;
+static TestRun childOpts;
+static void sendReport(int fd, const TestCase& t, int st, const std::string& err) {
+  char status;
+  std::string text = testReport(t, st != 0, err, status);
+  text.insert(text.begin(), status);
+  for (size_t o = 0; o < text.size();) {
+    ssize_t n = write(fd, text.data() + o, text.size() - o);
+    if (n <= 0) break;
+    o += n;
+  }
+}
+static pid_t spawnTest(int index, int fd, int other) {
+  char exe[4096];
+  uint32_t n = sizeof exe;
+  if (_NSGetExecutablePath(exe, &n)) return -1;
+  std::string which = std::to_string(index) + ":" + std::to_string(fd), seed = std::to_string(isolateSeed);
+  std::vector<const char*> av{exe, "test", "--test-child", which.c_str(), "--seed", seed.c_str()};
+  if (childOpts.json) av.push_back("--json");
+  av.push_back(path.c_str()), av.push_back(nullptr);
+  posix_spawn_file_actions_t fa;
+  posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_addclose(&fa, other);  // what the top level prints was shown once already
+  posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0), posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+  pid_t pid;
+  int e = posix_spawn(&pid, exe, &fa, nullptr, (char* const*)av.data(), environ);
+  posix_spawn_file_actions_destroy(&fa);
+  return e ? -1 : pid;
+}
+static void isolated(const TestCase& t, int index, void* code, double timeout) {
   int p[2];
   fflush(stdout), fflush(stderr);
   if (pipe(p)) return testFinish(t, true, "cannot create a pipe for the test process\n");
-  pid_t pid = fork();
+  pid_t pid = spawnTests ? spawnTest(index, p[1], p[0]) : fork();
   if (pid < 0) return close(p[0]), close(p[1]), testFinish(t, true, "cannot start the test process\n");
   if (!pid) {
     jitForked(), close(p[0]);
     std::string err;
     errSink = &err;
-    char status;
     int st = finish(run(code), &err);
-    std::string text = testReport(t, st != 0, err, status);
-    text.insert(text.begin(), status);
-    for (size_t o = 0; o < text.size();) {
-      ssize_t n = write(p[1], text.data() + o, text.size() - o);
-      if (n <= 0) break;
-      o += n;
-    }
+    sendReport(p[1], t, st, err);
     _exit(0);
   }
   close(p[1]);
@@ -243,6 +272,24 @@ static int runTests(const TestRun& o) {
   try {
     c = compile(path, false, false, nullptr, true);
   } catch (std::exception& e) { return reportCompileError(e.what()), 2; }
+  if (childTest >= 0) {  // spawned for one test: the top level, then it, reported to the parent
+    if (childTest >= (int)c.tests.size()) return 2;
+    std::string err;
+    errSink = &err;
+    const TestCase& t = c.tests[childTest];
+    int st = finish(run(c.chunk), &err);
+    void* code = st ? nullptr : testStart(t);
+    if (st) testStart(t), err = "the top level failed in the test's process: " + err;
+    else if (code) st = finish(run(code), &err);
+    sendReport(childFd, t, st, err);
+    fflush(nullptr);
+    _exit(0);
+  }
+  childOpts = o;
+  spawnTests = false;
+  for (auto& d : c.packages)
+    if (const Package* p = packageAt(d))
+      for (auto& m : p->mods) spawnTests |= m.kind == "c";
   if (o.isolates) {  // each test in o.isolates isolates at once, each running the top level first
     for (auto& t : c.tests) {
       if (!testStart(t)) continue;
@@ -261,8 +308,8 @@ static int runTests(const TestRun& o) {
   // A public interface out of date fails the run too, reported last so it is what the reader sees with the status.
   auto api = [&](int st) { return reportInterfaces(checkInterfaces(c), o.json, path) ? std::max(st, 1) : st; };
   if (st) return errSink = nullptr, reportTopError(err), api(1);
-  for (auto& t : c.tests)
-    if (void* code = testStart(t)) isolated(t, code, o.timeout);
+  for (size_t i = 0; i < c.tests.size(); i++)
+    if (void* code = testStart(c.tests[i])) isolated(c.tests[i], (int)i, code, o.timeout);
   errSink = nullptr;
   return api(testsEnd());
 }
@@ -412,6 +459,7 @@ int main(int argc, char** argv) {
     else if (testMode && a == "--json") topts.json = true;
     else if (testMode && a == "--filter" && i + 1 < argc) topts.filter = argv[++i];
     else if (testMode && a == "--changed") topts.changed = true;
+    else if (testMode && a == "--test-child" && i + 1 < argc && sscanf(argv[i + 1], "%d:%d", &childTest, &childFd) == 2) i++;
     else if (testMode && a == "--timeout" && i + 1 < argc && atof(argv[i + 1]) > 0) topts.timeout = atof(argv[++i]);
     else if ((a == "--record" || a == "--replay") && i + 1 < argc && !testMode) record = a == "--record", replayLog = argv[++i];
     else if (a == "-w" && !testMode) watch = verbose = true;

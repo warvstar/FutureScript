@@ -23,7 +23,7 @@ fn main() {
   var verts = g.vertices(Vertex.pack([
     {pos: [0, 0.6], color: [1, 0.3, 0.2]},
     {pos: [-0.5, -0.4], color: [0.2, 1, 0.3]},
-    {pos: [0.5, -0.4], color: [0.2, 0.4, 1]},
+    {pos: [0.5, -0.4], color: [0.2, 0.4, 1]}
   ], false))
   var frame = g.uniform(Frame)
   var tri = g.render({shader: SHADER, layout: Vertex, bind: [frame]})
