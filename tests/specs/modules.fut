@@ -23,6 +23,14 @@ test "a module var assigned from outside is seen by the module's code" {
   expect Ring(1).area() == 2        // a class may extend a module's class
   geom.PI = pi
 }
+test "a file imported as a module in one place and plainly in another, in either order" {
+  var a = run("progs/modules_twice_as_first.fut")
+  expect a.code == 0
+  expect a.out == "3\n"
+  var b = run("progs/modules_twice_plain_first.fut")
+  expect b.code == 0
+  expect b.out == "3\n"
+}
 test "a module's main is not run" {
   // progs/modules_main.fut imports mods/geom.fut, whose main prints "geom main must not run"
   var r = run("progs/modules_main.fut")

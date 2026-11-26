@@ -84,6 +84,7 @@ static std::map<std::pair<int, int>, Fn*> methodFns;  // (class sym, method sym)
 // `pub` names are global. The program's own file has no prefix: its names are global.
 static std::unordered_map<std::string, std::string> nsOf;                             // imported file -> prefix
 static std::unordered_map<std::string, bool> isModule;                                // imported file -> imported `as`
+static std::unordered_map<std::string, std::vector<std::string>> plainModules;        // file -> the modules it imports without `as`
 static std::unordered_map<std::string, std::unordered_map<int, std::string>> aliases;  // file -> its `as` names
 static std::string base(const std::string& path) { return path.substr(path.rfind('/') + 1); }
 static std::unordered_map<std::string, u32*> invBodies;  // each class's hidden invariant method, installed
@@ -216,6 +217,15 @@ struct Compiler : Gen {
     Tok n = cur;
     n.sym = intern(*m + "." + symName(ident()));
     int raw = prev.sym;
+    if (!pkg && !findGlobal(n.sym))  // a file imported plainly elsewhere first: its pub names are global
+      for (auto& [ip, pre] : nsOf)
+        if (pre == *m && !isModule[ip]) {
+          std::string keep = file;
+          file = ip;
+          int g = qualify(raw);
+          file = keep;
+          if (findGlobal(g) && g < (int)pubSym.size() && pubSym[g]) return n.sym = g, n;
+        }
     bool declared = declKind.empty() ? findGlobal(n.sym) != nullptr : (size_t)n.sym < declKind.size() && declKind[n.sym];  // tier 2, the REPL: as installed
     if (pkg) {
       if (surface != surfaceOf.end() && surface->second.count(raw) && declared) return n;
@@ -255,6 +265,9 @@ struct Compiler : Gen {
   int globalSym(int s) {  // the file's own names first, then its package's, then global (builtins only, in a package)
     if (auto it = nsOf.find(file); it != nsOf.end())
       if (int q = intern(it->second + "." + symName(s)); findGlobal(q)) return q;
+    if (auto it = plainModules.find(file); it != plainModules.end())  // a module (imported `as` elsewhere) imported plainly here
+      for (const std::string& ip : it->second)
+        if (int q = intern(nsOf[ip] + "." + symName(s)); findGlobal(q) && q < (int)pubSym.size() && pubSym[q]) return q;
     const std::string& P = pkgPrefix(file);
     if (P.empty()) return s;
     int q = intern(P + "." + symName(s));
@@ -2178,7 +2191,7 @@ struct Compiler : Gen {
   void prescan(const std::string& path, const char* src) {
     std::string savedFile = file;
     const char* savedStart = srcStart;
-    file = path, srcStart = src, aliases[path].clear();
+    file = path, srcStart = src, aliases[path].clear(), plainModules[path].clear();
     bool pubNext = false;  // after `pub`: the next top-level declaration is public
     auto q = [&](Tok t) {  // a top-level name as declared: note whether it is public, then its symbol
       if (pubNext) pubs[path].push_back(t.sym);
@@ -2311,7 +2324,10 @@ struct Compiler : Gen {
           if (const std::string& P = pkgPrefix(ip); !P.empty()) pre = P + "/" + pre;
           while (prefixTaken(pre, ip)) pre += "_";
         }
-        if (tg.pkg.empty() && n.t == T_ID) aliases[path][n.sym] = pre, isModule[ip] = true;  // import "file" as name: a module
+        if (tg.pkg.empty() && n.t == T_ID) {  // import "file" as name: a module (unless an earlier import already made its pub names global)
+          aliases[path][n.sym] = pre;
+          if (!sources.count(ip)) isModule[ip] = true;
+        } else if (tg.pkg.empty() && isModule[ip]) plainModules[path].push_back(ip);
         if (sources.count(ip)) continue;
         std::string& text = sources[ip].text;
         if (!readSource(ip, text)) failAt(t.p, t.line, "@import cannot read '%s'", ip.c_str());

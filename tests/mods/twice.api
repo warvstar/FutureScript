@@ -1,0 +1,4 @@
+// The public interface of twice.fut, written by `fut api`. `fut test` fails while it is out of date.
+
+// imported both ways: as a module (twice_as.fut) and plainly (twice_plain.fut)
+pub fn twiceMk()
