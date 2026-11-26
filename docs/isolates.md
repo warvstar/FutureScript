@@ -1,6 +1,6 @@
 # Isolates and channels
 
-Status: phases 1 (the runtime split per isolate), 2 (spawn, join, channels) and 3 (the scheduler: isolate stacks, a thread pool with preemption, seeded runs) are done. The README has the language as built; `src/isolate.cpp` has the runtime. Phase 4 (hot reload across isolates) is next. This is how fut gets parallelism: many isolates run at once, each owning its own heap,
+Status: phases 1 (the runtime split per isolate), 2 (spawn, join, channels), 3 (the scheduler: isolate stacks, a thread pool with preemption, seeded runs) and 4 (hot reload across isolates) are done. The README has the language as built; `src/isolate.cpp` has the runtime. Phase 5 (wasm workers) is next. This is how fut gets parallelism: many isolates run at once, each owning its own heap,
 and they share data only by sending it over channels. There is no shared mutable memory, so there are no locks,
 no memory orderings and no data races to write. Read this before you add any global state to the runtime.
 
@@ -171,9 +171,9 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
    - Work: isolate stacks, the thread pool, preemption at polls, and deterministic `fut test` with `--seed`.
    - Test: thousands of isolates; more busy isolates than threads, which finish only if they are preempted; the same
      seed giving the same interleaving and other seeds others; a failed test naming its seed.
-4. **Hot reload across isolates.**
+4. **Hot reload across isolates.** Done.
    - Work: stop the world, then the two-phase commit.
-   - Test: the hot-reload suite with workers running.
+   - Test: the hot-reload suite with workers running (`build.py`'s `hot_isolates`).
 5. **Wasm workers.**
    - Work: the VM base global, per-worker instantiation, JSPI on the main thread, COOP/COEP.
 6. **Shared buffers and `parallel for`, for C-like throughput.**
@@ -247,3 +247,28 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
   Whoever resumes it next waits for `onStack` to clear, which the side it switched to sets once it is off the stack.
 - **Speed.** `bench/mandelbrot_par.fut` on 8 isolates is as fast as with a thread each (about 55 ms, against 372 ms
   on one). 3000 isolates spawned and joined take 0.17 s.
+
+## Phase 4 as built
+
+- **Who reloads.** The main thread, as before: the watcher sets its poll bit, and `hotReload` runs at its next
+  poll. If `main()` is waiting on a channel or a task, the watcher also wakes it (`isolateNudge`); it reloads from
+  inside the wait and then waits again. A line typed into the REPL is compiled with the others stopped (it may
+  define functions they call), then runs on the main isolate only, with the others going again: it may wait on them.
+- **Stop.** `isolatesStop` sets bit 16 of every other isolate's `vm->poll`, then waits until none is running. A
+  running isolate stops at its next poll; one inside `atomic` stops at the first poll after the block. An isolate
+  waiting on a channel is already stopped; if a send wakes it meanwhile, it stops before returning to fut code
+  (`reloadPoint` runs wherever a pool isolate resumes: in `park`, `isolateYield` and `isoEntry`). Pool threads take
+  no new work while a stop is on. `-w` always uses the pool: a seeded program's isolates share the main thread, so
+  they could not be stopped at their own polls.
+- **Patch, once.** The main thread compiles and patches the stubs as before. The compiled functions and classes
+  that globals hold are copied into each stopped isolate's VM block (`isolatesSync`), since each has its own
+  globals.
+- **Two-phase commit.** The main thread runs the new top level (initializers of new and edited vars) and
+  `reload()` in a transaction. Then `isolatesParts` has every other isolate do the same in a transaction of its
+  own, on its own thread, all in parallel; each then waits. If all succeeded, `isolatesVerdict(true)` commits each
+  transaction. If any failed, the main thread rolls back its own and reverts the code, then copies the old
+  functions back into the isolates' globals, and `isolatesVerdict(false)` has each roll back. The first failure is
+  printed as `[fut] reload failed in isolate N: ...`, with its trace.
+- **Limits.** Code replaced while other isolates exist is kept until the program is down to one isolate:
+  `jitCollect` looks only at the reloading thread's stacks, so it can't tell whether a stopped isolate's frame
+  will return into old code. Walking the stopped isolates' stacks (and their fibers') would allow freeing it.

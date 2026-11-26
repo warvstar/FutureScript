@@ -261,6 +261,30 @@ def hot_packages(exe):
     return ok, f"out: {out!r}\n  err: {err!r}"
 
 
+def hot_isolates(exe):
+    """A reload with isolates running: each stops, runs the new top level and reload() in a transaction of its own,
+    and all commit or all roll back. Here a part that fails in a worker only undoes the reload everywhere (main's
+    reload() too), and the next one gives each isolate its own new var and reload() run. Main waits in recv() all
+    along, and reloads from there. (Native only: in wasm, spawn raises.)"""
+    if exe.suffix == ".wasm":
+        return True, "native only"
+    head = "var who = \"main\"\nvar reloads = 0\nfn reload() { reloads += 1 }\n"
+    rest = ("fn worker(i, c) { who = \"w{i}\"  var last = 0\n"
+            "  while true { var v = tick()\n    if v != last { c.send(report(i, v))  last = v }\n    if v == 3 { return }\n    sleep(0.01) } }\n"
+            "fn main() { var c = channel(16)\n  for i in 0..3 { spawn worker(i, c) }\n"
+            "  for n in 0..6 { print(c.recv()) }\n  print(\"main r{reloads}\") }\n")
+    first = head + "fn tick() { return 1 }\nfn report(i, v) { return \"w{i}:v{v}\" }\n" + rest
+    bad = (head + "fn fail() { if who != \"main\" { throw \"worker migration failed\" }  return 1 }\nvar boom = fail()\n"
+           "fn tick() { return 2 }\nfn report(i, v) { return \"w{i}:v{v}\" }\n" + rest)
+    good = head + "var k = 7\nfn tick() { return 3 }\nfn report(i, v) { return \"w{i}:v{v}:k{k}:r{reloads}:{who}\" }\n" + rest
+    out, err = live(exe, {"i.fut": first}, [("i.fut", bad), ("i.fut", good)], settle=0.6)
+    want = sorted([f"w{i}:v1" for i in range(3)] + [f"w{i}:v3:k7:r1:w{i}" for i in range(3)])
+    lines = out.splitlines()
+    ok = (sorted(lines[:-1]) == want and lines[-1:] == ["main r1"]
+          and "reload failed in isolate" in err and "worker migration failed" in err and "reload rolled back" in err)
+    return ok, f"stdout: {out!r}\n  stderr: {err!r}"
+
+
 HOT_TESTS = [("methods, errors, main restart", hot_methods_and_main),
              ("packages: per-package recompiles, JS modules", hot_packages),
              ("a changed effect declaration takes effect", hot_effects),
@@ -269,7 +293,8 @@ HOT_TESTS = [("methods, errors, main restart", hot_methods_and_main),
              ("a failed reload rolls back", hot_reload_rollback),
              ("imports, no-op, hook, stale arity", hot_imports_stale_hook),
              ("live REPL, var reset", hot_repl_and_reset),
-             ("code reclamation", hot_reclaim)]
+             ("code reclamation", hot_reclaim),
+             ("isolates: each reloads, all commit or all roll back", hot_isolates)]
 
 
 def runner_json(exe):

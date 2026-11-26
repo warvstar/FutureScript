@@ -430,6 +430,15 @@ void isolatePoint();         // a seeded program may switch isolates here (each 
 inline uint64_t isolateSeed;
 inline int isolateThreads;  // the pool's size (--threads n; 0: cores())
 std::string isolateSeedNote();  // a failed test's: the seed that replays it, if its isolates were scheduled by one
+// Hot reload across isolates (main.cpp's hotReload, on the root): stop the program's other isolates at safe points
+// (false: there are none), copy compiled functions and classes into their globals, have each run the new top level
+// and reload() in a transaction of its own ("" or the first failure), then let each commit or roll back, and go on.
+bool isolatesStop();
+void isolatesSync();
+std::string isolatesParts(void* chunk, void* hook);
+void isolatesVerdict(bool commit);
+void isolateReloadPoint();  // rt_poll: vm->poll bit 16
+void isolateNudge();        // a watcher thread: a root waiting on a channel or a task runs its pollHook now
 V chanNext(V ch, void* ra);  // for v in ch: the next value received, or END once it is closed and drained
 void txnAfter(void (*run)(void*), void (*drop)(void*), void* p);  // when the outermost transaction commits (else drop)
 

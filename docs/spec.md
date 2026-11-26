@@ -160,7 +160,8 @@ c.send(v)  c.recv()  c.tryRecv() -> v | nil  c.close()  for v in c { }   // valu
 ```
 No shared objects. All waiting on each other: a deadlock error naming each wait. `send` in `atomic` waits for the
 commit; `recv`/`join`/`spawn` there raise. Unjoined failures fail the program. Pool of `cores()` threads (`--threads n`); `fut test`
-(and `--seed n`) runs them on one thread, interleaved by the seed (default 1): same seed, same run. Native only.
+(and `--seed n`) runs them on one thread, interleaved by the seed (default 1): same seed, same run. Under `-w` a reload
+stops all isolates, then each runs the new top level and `reload()`; all commit or all roll back. Native only.
 
 ## Modules, packages
 

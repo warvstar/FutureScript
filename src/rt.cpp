@@ -604,7 +604,9 @@ u32* ffiThunk(void* fn, const std::string& sig, char ret, int sym) {
 static void rt_poll() {
   // (atomic: another thread sets bits, the ticker for one)
   if (isolateStopped()) __atomic_store_n(&vm->poll, 0, __ATOMIC_RELAXED), ERR("@isolate stopped: the isolate that started this one ended with an error");
-  if (__atomic_load_n(&vm->poll, __ATOMIC_RELAXED) & 8) isolateYield();  // a pool isolate's turn is up
+  u32 bits = __atomic_load_n(&vm->poll, __ATOMIC_RELAXED);
+  if (bits & 16) isolateReloadPoint();  // a reload stops this isolate
+  if (bits & 8) isolateYield();         // a pool isolate's turn is up
   if (pollHook) pollHook();
 }
 

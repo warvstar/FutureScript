@@ -104,6 +104,12 @@ struct Iso {
   std::atomic<bool> onStack{true};  // a thread is on its stack, maybe still switching away: wait before resuming it
   std::atomic<double> since{0};     // when its turn on a thread began (the ticker reads it)
   bool exited = false;              // switched away from for the last time: whoever resumes next frees it
+  // hot reload (reloadPoint):
+  u32 rlEpoch = 0;                  // the last reload whose top level and reload() it ran
+  bool rlParted = false;            // ran them, in a transaction still open: waits for the verdict
+  bool rlParked = false;            // parked for the reload (not in any queue)
+  int rlVerdict = 0;                // 1 commit, 2 roll back its transaction
+  bool nudged = false;              // (a pinned root) a reload or a typed line waits for it
   void* sp = nullptr;      // while switched out
   char* stack = nullptr;   // its own (a root runs on its thread's)
   char* lo = nullptr;      // the stack's bounds, its own or its thread's (for ASan)
@@ -253,6 +259,20 @@ Iso* pick(Sched* s, size_t k) {  // take the k-th runnable isolate (chanMu held)
   s->runq.erase(s->runq.begin() + (long)k), i->state = Iso::RUNNING;
   return i;
 }
+// ---- hot reload across isolates: the root reloads (main.cpp's hotReload); the rest stop, then each runs the new
+// top level and reload() in a transaction of its own, then all commit or all roll back ----
+enum { RL_NONE, RL_STOP, RL_PARTS };
+struct Reload {
+  int phase = RL_NONE;
+  u32 epoch = 0;
+  Iso* by = nullptr;      // the root reloading
+  void *chunk = nullptr, *hook = nullptr;
+  int pending = 0;        // isolates yet to run their part
+  std::string err;        // the first part that failed
+};
+Reload& rl = *new Reload;
+pthread_cond_t rlCv = PTHREAD_COND_INITIALIZER;  // the reloader waits on it for the others to stop, or to report
+void rlLeft() { if (rl.phase) pthread_cond_broadcast(&rlCv); }  // an isolate stopped running (chanMu held)
 void* ticker(void*) {  // ask isolates that had a whole slice to yield, while another of their thread's waits
   for (;;) {
     usleep((useconds_t)(SLICE * 1e6));
@@ -285,7 +305,7 @@ void* worker(void* p) {  // a pool thread: runs the isolates given to it, each u
 #endif
   chanMu.lock();
   for (;;) {
-    while (w->runq.empty()) pthread_cond_wait(&w->cv, &chanMu.m);
+    while (w->runq.empty() || rl.phase == RL_STOP) pthread_cond_wait(&w->cv, &chanMu.m);
     Iso* i = w->cur = pick(w, 0);
     chanMu.unlock();
     switchTo(nullptr, i);
@@ -306,9 +326,10 @@ Sched* poolThread() {  // the pool thread a new isolate goes to: a new one while
 }
 // m gives up its thread until woken (chanMu held, and held again when it returns): seeded, to the next isolate the
 // generator picks; else back to the pool thread's loop.
+void reloadPoint();
 void park(Iso* m) {
   Sched* s = m->sched;
-  m->state = Iso::PARKED;
+  m->state = Iso::PARKED, rlLeft();
   Iso* to = nullptr;
   if (s->det) {
     if (s->runq.empty()) fputs("internal: a seeded program has nothing to run\n", stderr), abort();
@@ -316,6 +337,7 @@ void park(Iso* m) {
   }
   chanMu.unlock();
   switchTo(m, to);
+  reloadPoint();  // (resumed, perhaps only to take part in a reload)
   chanMu.lock();
 }
 void schedule(Iso* r) {  // r's program spawns for the first time: how its isolates will run (chanMu held)
@@ -368,7 +390,17 @@ std::string waitFor(std::vector<Iso*>* q, const char* what, void* ra) {
   if (++r->blocked >= r->live) deadlock(r);
 #if !__wasm__
   if (m->pinned)
-    while (!m->woken) pthread_cond_wait(&m->cv, &chanMu.m);
+    while (!m->woken) {
+      if (std::exchange(m->nudged, false) && pollHook) {  // a reload or a typed line: run it now, then wait again
+        m->waiting = false, r->blocked--;
+        if (q) std::erase(*q, m);
+        chanMu.unlock();
+        pollHook();  // (it may unwind past here, to restart main: nothing is left registered)
+        chanMu.lock();
+        return "";   // the caller looks again at what it waits for
+      }
+      pthread_cond_wait(&m->cv, &chanMu.m);
+    }
   else
     while (!m->woken) park(m);
 #endif
@@ -647,6 +679,10 @@ void isoEntry() {  // the bottom frame of every spawned isolate's stack
     bool clo;
     void* code;
     {
+      Locked code(codeMu);  // compiled functions and classes, a reload's new ones too (the spawner's copy may predate it)
+      for (auto& g : globals) if (g.slot >= 0 && g.o) vm->globals[g.slot] = box(g.o);
+    }
+    {
       Reader r(t->start);  // the function, its arguments, then the spawner's globals (rebuilt before any code runs)
       V f = r.get(), args = r.get();
       u32 ng = r.raw<u32>();
@@ -657,6 +693,7 @@ void isoEntry() {  // the bottom frame of every spawned isolate's stack
       for (size_t i = 0; i < l.size(); i++) a[i + clo] = l[i];
     }
     t->start = Msg();  // only this isolate reads it
+    reloadPoint();     // spawned before a reload, and starting during it: its part first
     result = encode(vmEnter(code, (V*)a));
   }
   errJmp = nullptr, errValue = nullptr, errSink = nullptr, outSink = nullptr;
@@ -678,7 +715,9 @@ void isoEntry() {  // the bottom frame of every spawned isolate's stack
     r->live--, std::erase(isos, m), wakeAll(r->exitq);
     if (r->blocked && r->blocked >= r->live) deadlock(r);
     m->exited = true;
-    if (!m->sched->det) m->sched->load--, m->sched->cur = nullptr;  // (the ticker looks at it; it is freed soon)
+    if (!m->sched->det) m->sched->load--, m->sched->cur = nullptr;
+    if (rl.phase == RL_PARTS && m->rlEpoch != rl.epoch) rl.pending--;  // a part it will never run
+    rlLeft();  // (the ticker looks at it; it is freed soon)
     if (Sched* s = m->sched; s->det) {  // never empty: the root waits for this program to end
       if (s->runq.empty()) fputs("internal: a seeded program has nothing to run\n", stderr), abort();
       to = pick(s, draw(s) % s->runq.size());
@@ -768,7 +807,117 @@ V n_cores() {
   return box((double)sysconf(_SC_NPROCESSORS_ONLN));
 #endif
 }
+#if !__wasm__
+// Run code as a driver would (main.cpp's run): unchecked effects, no handlers; an error is caught, its text in err.
+int partRun(void* code, std::string& err) {
+  jmp_buf jb, *outer = errJmp;
+  std::string* sink = errSink;
+  V* val = errValue;
+  void* handler = vm->handler;
+  u32 txn = vm->txn, eff = effEnter();
+  int st = 0;
+  errJmp = &jb, errSink = &err, errValue = nullptr, vm->handler = nullptr;
+  if (int r = setjmp(jb)) st = r, txnUnwind(txn);
+  else vmCall(code, {});
+  errJmp = outer, errSink = sink, errValue = val, vm->handler = handler, effLeave(eff);
+  return st;
+}
+void parkForReload(Iso* m) {  // (chanMu held, and held again on return)
+  m->state = Iso::PARKED, m->rlParked = true, rlLeft();
+  chanMu.unlock();
+  switchTo(m, nullptr);
+  chanMu.lock();
+}
+// Where a pool isolate meets a reload: at a poll (vm->poll bit 16), or when resumed. It stops, runs its part when
+// asked, waits for the verdict, and applies it to its transaction. Inside an atomic block it goes on, and stops at
+// the first poll after the block (the bit stays set).
+void reloadPoint() {
+  Iso* m = me;
+  if (!m || m->pinned || m->sched->det) return;
+  chanMu.lock();
+  for (;;) {
+    if (int v = std::exchange(m->rlVerdict, 0)) {
+      chanMu.unlock();
+      v == 1 ? txnCommit() : txnAbort();
+      chanMu.lock();
+      continue;
+    }
+    if (m->rlParted) { parkForReload(m); continue; }  // (resumed by a waker meanwhile)
+    if (!rl.phase || vm->txn) break;
+    if (rl.phase == RL_STOP || m->rlEpoch == rl.epoch) { parkForReload(m); continue; }
+    m->rlEpoch = rl.epoch;
+    void *chunk = rl.chunk, *hook = rl.hook;
+    chanMu.unlock();
+    std::string err;
+    txnBegin();
+    int st = partRun(chunk, err);
+    if (!st && hook) st = partRun(hook, err);
+    chanMu.lock();
+    if (st && rl.err.empty()) rl.err = "isolate " + std::to_string(m->id) + ": " + err;
+    m->rlParted = true, rl.pending--;
+    parkForReload(m);
+  }
+  if (!rl.phase) __atomic_fetch_and(&vm->poll, ~16u, __ATOMIC_RELAXED);
+  chanMu.unlock();
+}
+template <class F> void others(F f) {  // each isolate of the reloader's program but itself (chanMu held)
+  for (Iso* i : isos) if (i->root == rl.by->root && i != rl.by) f(i);
+}
+#endif
 }  // namespace
+
+#if !__wasm__
+bool isolatesStop() {
+  if (isolates <= 1) return false;
+  Locked l(chanMu);
+  rl.phase = RL_STOP, rl.by = self(), rl.err.clear();
+  others([](Iso* i) { if (i->vmb) __atomic_fetch_or(&i->vmb->poll, 16u, __ATOMIC_RELAXED); });
+  for (;;) {
+    bool running = false;
+    others([&](Iso* i) { running |= i->state == Iso::RUNNING; });
+    if (!running) return true;
+    pthread_cond_wait(&rlCv, &chanMu.m);
+  }
+}
+void isolatesSync() {
+  Locked code(codeMu);
+  Locked l(chanMu);
+  others([](Iso* i) {
+    if (i->vmb) for (auto& g : globals) if (g.slot >= 0 && g.o) i->vmb->globals[g.slot] = box(g.o);
+  });
+}
+std::string isolatesParts(void* chunk, void* hook) {
+  Locked l(chanMu);
+  rl.phase = RL_PARTS, rl.epoch++, rl.chunk = chunk, rl.hook = hook, rl.pending = 0;
+  others([](Iso* i) {
+    rl.pending++;
+    if (i->state == Iso::PARKED) i->rlParked = false, ready(i);  // stopped, or waiting on a channel: resumed for its part
+  });
+  for (Sched* w : pool) pthread_cond_broadcast(&w->cv);
+  while (rl.pending > 0) pthread_cond_wait(&rlCv, &chanMu.m);
+  return rl.err;
+}
+void isolatesVerdict(bool commit) {
+  Locked l(chanMu);
+  others([&](Iso* i) {
+    if (std::exchange(i->rlParted, false)) i->rlVerdict = commit ? 1 : 2;
+    if (i->rlParked && i->state == Iso::PARKED) i->rlParked = false, ready(i);
+  });
+  rl.phase = RL_NONE, rl.by = nullptr;
+  for (Sched* w : pool) pthread_cond_broadcast(&w->cv);
+}
+void isolateNudge() {
+  Locked l(chanMu);
+  for (Iso* i : isos)
+    if (i == i->root && i->pinned && i->waiting && !i->woken) i->nudged = true, pthread_cond_signal(&i->cv);
+}
+#endif
+
+void isolateReloadPoint() {
+#if !__wasm__
+  reloadPoint();
+#endif
+}
 
 V chanNext(V ch, void* ra) { return take(ch, true, "for ... in a channel", ra); }
 void sharedFree(Obj* o) {
@@ -788,8 +937,10 @@ void isolateYield() {
   chanMu.lock();
   if (m->sched->runq.empty()) return chanMu.unlock();
   m->state = Iso::RUNNABLE, m->sched->runq.push_back(m);  // to the back; this thread's loop takes the front
+  rlLeft();
   chanMu.unlock();
   switchTo(m, nullptr);
+  reloadPoint();
 #endif
 }
 void isolatePoint() {

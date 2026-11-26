@@ -26,8 +26,9 @@ static void findStd() {
 
 static std::string path;
 static pthread_mutex_t watchMu = PTHREAD_MUTEX_INITIALIZER;
-static std::vector<std::string> watched;  // the program file and everything it imports
-static std::vector<std::string> inbox;    // lines typed into a running program (both guarded by watchMu)
+// (leaked: the watcher threads still read them while exit() runs destructors)
+static std::vector<std::string>& watched = *new std::vector<std::string>;  // the program file and everything it imports
+static std::vector<std::string>& inbox = *new std::vector<std::string>;    // lines typed into a running program (both guarded by watchMu)
 static std::string replBuf;               // REPL input so far (more lines may follow)
 static bool inMain;
 static VM* mainVM;  // the watcher threads set its poll flag (vm is each thread's own)
@@ -124,9 +125,20 @@ static int startIsolates(Compiled& c, int n) {  // the program: its top level, t
   return jobs[0].st ? 1 : 0;
 }
 
+static Compiled compileStopped(const std::string& name, const std::string* text) {
+  bool stopped = isolatesStop();  // other isolates run this code: none may run while it is patched
+  try {
+    Compiled c = compile(name, false, true, text);
+    if (stopped) isolatesSync(), isolatesVerdict(true);
+    return c;
+  } catch (...) {
+    if (stopped) isolatesVerdict(true);
+    throw;
+  }
+}
 static void eval(bool more) {  // compile and run replBuf, unless it is unfinished and `more` may follow
   try {
-    Compiled c = compile("<repl>", false, true, &replBuf);
+    Compiled c = compileStopped("<repl>", &replBuf);  // (then run with the others going again: it may wait on them)
     run(c.chunk), jitRetire((u32*)c.chunk);
   } catch (CompileError& e) {
     if (e.atEnd && more) return;
@@ -140,30 +152,46 @@ static void evalInbox() {
   inbox.clear(), pthread_mutex_unlock(&watchMu);
   for (auto& l : lines) replBuf += l, eval(l.size() > 1);  // an empty line gives up on unfinished input
 }
-// Runs at a safepoint (loop back-edge) on the main thread when a watched file changed or a line was typed. Inside
-// a transaction (atomic { }) both wait for it to end.
+// Runs at a safepoint (loop back-edge) on the main thread when a watched file changed or a line was typed, or while
+// it waits on a channel or a task (isolateNudge). Inside a transaction (atomic { }) both wait for it to end.
+// With isolates running, a reload stops them first (each at a poll or where it waits), so no code runs while it is
+// patched; each then runs the new top level and reload() in a transaction of its own, and all of
+// them commit, or all roll back.
 static void hotReload() {
-  if (isolates > 1) return;  // isolates it spawned run the code: it waits for them (reloading across them: phase 4)
-  vm->poll = 0;
+  if (vm != mainVM) return;  // an isolate it spawned: the main thread reloads it (isolatesParts)
+  if (!(__atomic_fetch_and(&vm->poll, ~1u, __ATOMIC_ACQUIRE) & 1)) return;
   if (vm->txn) return void(txnPollLater = true);
   evalInbox();
   if (!__atomic_exchange_n(&fileChanged, 0, __ATOMIC_ACQUIRE)) return;
+  bool stopped = isolatesStop();
   Compiled c = load(true);
-  if (!c.chunk) return;  // compile error: keep running the old code
+  if (!c.chunk) {  // compile error: keep running the old code
+    if (stopped) isolatesVerdict(true);
+    return;
+  }
+  if (stopped) isolatesSync();
   // The new top level and the reload() hook (which migrates state) run as one transaction. If either fails, the
   // reload is undone: the data they changed, then the code. The program goes on as if the file had not changed.
   txnBegin();
   int st = run(c.chunk);
+  Global* r = fnNamed(S_reload);
+  void* hook = r && ((Fn*)r->o)->arity == 0 ? r->stub : nullptr;
+  if (!st && hook) st = run(hook);
+  std::string failed;
+  if (!st && stopped) failed = isolatesParts(c.chunk, hook);
   jitRetire((u32*)c.chunk);
-  if (Global* r = fnNamed(S_reload); !st && r && ((Fn*)r->o)->arity == 0) st = run(r->stub);
-  if (st) {
+  if (st || !failed.empty()) {
     txnAbort();
+    if (!failed.empty()) fprintf(stderr, "[fut] reload failed in %s\n", failed.c_str());
     std::string err;
-    if (revertReload(c.newVars, &err)) fputs("[fut] reload rolled back: the program's data and code are as they were before it\n", stderr);
+    bool back = revertReload(c.newVars, &err);
+    if (stopped) isolatesSync(), isolatesVerdict(false);
+    if (back) fputs("[fut] reload rolled back: the program's data and code are as they were before it\n", stderr);
     else fprintf(stderr, "[fut] reload rolled back its data, but the previous code did not compile again: %s\n", err.c_str());
     return;
   }
   txnCommit();
+  if (stopped) isolatesVerdict(true);
   if (c.mainChanged && inMain) c = {}, longjmp(*errJmp, 2);  // unwind and rerun main()
 }
 static long long stamp() {
@@ -355,7 +383,8 @@ int main(int argc, char** argv) {
     else if (a[0] == '-') return fputs(usage, stderr), 2;
     else path = a;
   }
-  if (testMode && !isolateSeed) isolateSeed = 1;  // a test's isolates interleave the same way every run
+  if (testMode && !isolateSeed) isolateSeed = 1;
+  if (watch) isolateSeed = 0;  // -w: a reload stops pool isolates at their polls (seeded ones share the main thread)  // a test's isolates interleave the same way every run
   rtInit();
   if ((testMode || apiMode || mapMode) && path.empty()) return fputs(usage, stderr), 2;
   if (mapMode) return mapCommand(mapPub, mapJson, mapOnly);
@@ -372,15 +401,18 @@ int main(int argc, char** argv) {
     pthread_t th;
     pthread_create(&th, nullptr, [](void*) -> void* {
       for (long long t = stamp(), n;; usleep(100000))
-        if ((n = stamp()) != t) usleep(30000), t = stamp(), __atomic_store_n(&fileChanged, 1, __ATOMIC_RELAXED), __atomic_store_n(&mainVM->poll, 1, __ATOMIC_RELEASE);
+        if ((n = stamp()) != t) usleep(30000), t = stamp(), __atomic_store_n(&fileChanged, 1, __ATOMIC_RELAXED),
+                                    __atomic_fetch_or(&mainVM->poll, 1u, __ATOMIC_RELEASE), isolateNudge();
     }, nullptr);
+    pthread_detach(th);
     pthread_create(&th, nullptr, [](void*) -> void* {  // a REPL into the running program: lines run at the next safepoint
       char* line = nullptr;
       size_t cap = 0;
-      for (ssize_t n; (n = getline(&line, &cap, stdin)) > 0; __atomic_store_n(&mainVM->poll, 1, __ATOMIC_RELEASE))
+      for (ssize_t n; (n = getline(&line, &cap, stdin)) > 0; __atomic_fetch_or(&mainVM->poll, 1u, __ATOMIC_RELEASE), isolateNudge())
         pthread_mutex_lock(&watchMu), inbox.emplace_back(line, n), pthread_mutex_unlock(&watchMu);
       return nullptr;
     }, nullptr);
+    pthread_detach(th);
   }
   bool loaded = c.chunk;
   int st = loaded ? start(c) : 1;
