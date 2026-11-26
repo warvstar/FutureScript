@@ -59,6 +59,7 @@ fiber(fn(x) { ... })     f.resume()  f.send(v)  f.done()
 channel(n)  cores()      see Isolates
 run(path)  run({source, args, timeout})   fut in a child process -> {code, out, err, timedOut}
 isa(v, C)                is v an instance of class C (by name: one made before a reload counts)
+typeOf(v)                "nil" "bool" "number" "string" "list" "map" "function" "class" "instance" "js value" ...
 todo()                   placeholder body: throws "f() is not implemented yet"
 time()                   seconds since 1970
 json(v)  parseJson(s)    data <-> JSON text (nil is null)

@@ -691,6 +691,7 @@ int printMap(const Compiled&, bool pubOnly, bool json, const std::string& only, 
 std::string quoteJson(std::string_view s, bool shortTab = false);
 std::string toJs(V v);                // raises for what can't cross (an instance, a map with non-string keys, ...)
 V fromJs(const std::string& json);
+V jsRef(u32 id);                      // JavaScript value id's Ref: what an extern's any argument or result crosses as, unencoded
 V jsPinned(int id);                   // the function pinned as id (nil if none)
 int jsPin(V f);                       // pin f for JavaScript: its id
 void jsUnpin(int id);                 // JavaScript dropped it

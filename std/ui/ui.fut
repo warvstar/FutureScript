@@ -43,12 +43,11 @@ extern dom fn measure(any): any
 
 // What kind of child v is: "none" (nil, false, true), "text" (a string or number), "fn", "list" or "node".
 fn kindOf(v) {
-  if v == nil || v == false || v == true { return "none" }
-  if v == str(v) { return "text" }
-  var s = str(v)
-  if s.slice(0, 4) == "<fn " { return "fn" }
-  if s == "<js value>" { return "node" }
-  if s.slice(0, 1) == "[" { return "list" }
+  var t = typeOf(v)
+  if t == "nil" || t == "bool" { return "none" }
+  if t == "function" { return "fn" }
+  if t == "js value" { return "node" }
+  if t == "list" { return "list" }
   return "text"
 }
 
@@ -61,27 +60,40 @@ fn add(p, c) {
   else if k == "fn" { region(p, c) }
 }
 
-// A part of p that shows f()'s result between two markers, and shows it again when what f read changes. Text stays
-// the same node (only its characters change); anything else replaces what was there.
+// A part of p that shows f()'s result, and shows it again when what f read changes. Text is one text node, whose
+// characters change; anything else goes between two markers (made when first needed), replacing what was there.
 fn region(p, f) {
-  var start = anchor()
-  var end = anchor()
-  append(p, start)
-  append(p, end)
-  var shown = {text: nil}
+  var shown = {text: nil, said: nil, start: nil, end: nil}
   r.effect(fn() {
     var v = f()
     var k = kindOf(v)
-    if k == "text" && shown.text != nil { setText(shown.text, str(v)) return }
-    clearBetween(start, end)
+    if k == "text" && shown.text != nil {
+      var t = str(v)
+      if t != shown.said { setText(shown.text, t) shown.said = t }
+      return
+    }
+    if k == "text" && shown.start == nil {  // the first time: no markers
+      shown.said = str(v)
+      shown.text = text(shown.said)
+      append(p, shown.text)
+      return
+    }
+    if shown.start == nil {
+      shown.start = anchor()
+      shown.end = anchor()
+      if shown.text == nil { append(p, shown.start) append(p, shown.end) }
+      else { put(shown.text, shown.start) put(shown.text, shown.end) }
+    }
+    clearBetween(shown.start, shown.end)
     shown.text = nil
     if k == "text" {
-      shown.text = text(str(v))
-      put(end, shown.text)
+      shown.said = str(v)
+      shown.text = text(shown.said)
+      put(shown.end, shown.text)
     } else if k != "none" {
       var frag = fragment()
       add(frag, v)
-      put(end, frag)
+      put(shown.end, frag)
     }
   })
 }
@@ -92,7 +104,14 @@ fn region(p, f) {
 fn prop(n, k, v) {
   if k.slice(0, 2) == "on" { listen(n, k.slice(2, k.len()), v) return }
   if kindOf(v) == "fn" {
-    r.effect(fn() { setProp(n, k, v()) })
+    var last = {set: false, v: nil}
+    r.effect(fn() {
+      var x = v()
+      if last.set && x == last.v { return }  // as it was: the DOM isn't touched
+      setProp(n, k, x)
+      last.set = true
+      last.v = x
+    })
     return
   }
   setProp(n, k, v)
@@ -117,42 +136,106 @@ pub fn mount(target, view: fn): fn {
 }
 
 // A list kept in step with items() (a list), one view per item, reused while the item's key(item) and value stay the
-// same: changing one item redraws that item, and reordering moves nodes rather than redrawing them.
-pub fn each(items: fn, key: fn, view: fn): fn {
-  var shown = {}  // key -> {item, start, end, dispose}
-  r.onCleanup(fn() { for k in shown.keys() { shown[k].dispose() } })
-  return fn() {
+// same: changing one item redraws that item, and reordering moves only the items out of place (those not on the
+// longest run that kept its order).
+pub fn each(items: fn, key: fn, view: fn): any {
+  var frag = fragment()
+  var start = anchor()
+  var end = anchor()
+  append(frag, start)
+  append(frag, end)
+  var st = {keys: [], shown: {}}  // keys in page order; key -> {item, start, end, dispose}
+  r.onCleanup(fn() { for k in st.shown.keys() { st.shown[k].dispose() } })
+  r.effect(fn() {
     var list = items()
-    var holder = fragment()
-    var end = anchor()
-    append(holder, end)
-    r.untrack(fn() { place(list, key, view, shown, end) })
-    return holder
-  }
+    r.untrack(fn() { place(list, key, view, st, start, end) })
+  })
+  return [frag]  // (in a list: no pub function gives a bare fragment, so a "node" is one element, as place() takes it)
 }
-fn place(list, key, view, shown, end) {
+fn place(list, key, view, st, start, end) {
+  var old = st.shown
+  var keys = []
   var next = {}
+  var kept = 0
   for item in list {
     var k = key(item)
-    var old = nil
-    if shown.has(k) { old = shown.remove(k) }
-    if old != nil && old.item == item {
-      moveRange(old.start, old.end, end)
-      next[k] = old
-    } else {
-      if old != nil { old.dispose() removeRange(old.start, old.end) }
-      var frag = fragment()
-      var start = anchor()
-      var stop = anchor()
-      append(frag, start)
-      var dispose = r.root(fn() { add(frag, view(item)) })
-      append(frag, stop)
-      put(end, frag)
-      next[k] = {item: item, start: start, end: stop, dispose: dispose}
-    }
+    if next.has(k) { throw "each: two items have the key {k}" }
+    var e = false  // false: a new item's (made below)
+    if old.has(k) { e = old[k] }
+    if e && e.item != item { e.dispose() removeRange(e.start, e.end) old.remove(k) e = false }
+    if e { kept += 1 }
+    next[k] = e
+    keys.push(k)
   }
-  for k in shown.keys() { shown[k].dispose() removeRange(shown[k].start, shown[k].end) shown.remove(k) }
-  for k in next { shown[k] = next[k] }
+  if kept == 0 && old.len() > 0 {  // nothing stays: everything goes at once
+    for k in old.keys() { old[k].dispose() }
+    clearBetween(start, end)
+  } else {
+    for k in old.keys() { if !next.has(k) { old[k].dispose() removeRange(old[k].start, old[k].end) } }
+  }
+  // what stays put: the longest run of kept items in their old order; the rest move (or are new) into place
+  var was = {}
+  var i = 0
+  for k in st.keys { if next.has(k) && next[k] { was[k] = i i += 1 } }
+  var stay = steady(keys, was)
+  var made = {}  // key -> the new item's nodes, made in order (its view may do things in order), placed below
+  for j in 0..keys.len() {
+    if next[keys[j]] { continue }
+    var item = list[j]
+    var e = {item: item, start: nil, end: nil, dispose: nil}
+    e.dispose = r.root(fn() {
+      var v = view(item)
+      if kindOf(v) == "node" {  // one element: it is its own start and end
+        e.start = v
+        e.end = v
+        made[keys[j]] = v
+        return
+      }
+      var f = fragment()  // anything else goes between two markers
+      e.start = anchor()
+      e.end = anchor()
+      append(f, e.start)
+      add(f, v)
+      append(f, e.end)
+      made[keys[j]] = f
+    })
+    next[keys[j]] = e
+  }
+  var ref = end
+  var j = keys.len() - 1
+  while j >= 0 {
+    var k = keys[j]
+    var e = next[k]
+    if made.has(k) { put(ref, made[k]) }
+    else if !stay.has(k) { moveRange(e.start, e.end, ref) }
+    ref = e.start
+    j -= 1
+  }
+  st.keys = keys
+  st.shown = next
+}
+// The keys (of those in was: key -> old position) on a longest increasing run of old positions, in new order.
+fn steady(keys, was) {
+  var tails = []  // tails[n]: index into keys of the smallest last position of a run of length n + 1
+  var prev = []
+  for i in 0..keys.len() {
+    prev.push(-1)
+    if !was.has(keys[i]) { continue }
+    var p = was[keys[i]]
+    var lo = 0
+    var hi = tails.len()
+    while lo < hi {
+      var mid = floor((lo + hi) / 2)
+      if was[keys[tails[mid]]] < p { lo = mid + 1 } else { hi = mid }
+    }
+    if lo > 0 { prev[i] = tails[lo - 1] }
+    if lo == tails.len() { tails.push(i) } else { tails[lo] = i }
+  }
+  var out = {}
+  if tails.len() == 0 { return out }
+  var at = tails[tails.len() - 1]
+  while at >= 0 { out[keys[at]] = true at = prev[at] }
+  return out
 }
 
 // A text field showing s (a signal), which typing sets.

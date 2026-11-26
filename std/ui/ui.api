@@ -1,4 +1,4 @@
-// The public interface of package ui 0.1.0 (ui.fut), written by `fut api`. `fut test` fails while it is out of date.
+// The public interface of package ui 0.2.0 (ui.fut), written by `fut api`. `fut test` fails while it is out of date.
 
 // f() once, after so many seconds (unless stopped first).
 pub fn after(seconds: num, f: fn): fn
@@ -21,8 +21,9 @@ pub fn check(s: r.Signal, label, props): any
 pub fn classes(parts): str
 
 // A list kept in step with items() (a list), one view per item, reused while the item's key(item) and value stay the
-// same: changing one item redraws that item, and reordering moves nodes rather than redrawing them.
-pub fn each(items: fn, key: fn, view: fn): fn
+// same: changing one item redraws that item, and reordering moves only the items out of place (those not on the
+// longest run that kept its order).
+pub fn each(items: fn, key: fn, view: fn): any
 
 // An element: its tag, its props (a map, or nil), and its children (one child or a list).
 pub fn el(tag: str, props, kids): any

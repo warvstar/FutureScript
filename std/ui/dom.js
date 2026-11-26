@@ -2,10 +2,12 @@
 // document of their own, whose html() a test reads and whose fire() stands in for a user's click or keystroke.
 const doc = globalThis.document ?? fakeDocument();
 
-export const create = (tag) => doc.createElement(tag);
-export const text = (s) => doc.createTextNode(s);
-export const anchor = () => doc.createComment("");
-export const fragment = () => doc.createDocumentFragment();
+// fresh: it makes a new object, so a fut thread calling it from a worker needn't wait for it (see fut.js's flush)
+const fresh = (f) => ((f.fresh = true), f);
+export const create = fresh((tag) => doc.createElement(tag));
+export const text = fresh((s) => doc.createTextNode(s));
+export const anchor = fresh(() => doc.createComment(""));
+export const fragment = fresh(() => doc.createDocumentFragment());
 export const setText = (n, s) => void (n.data = s);
 export const append = (p, c) => void p.appendChild(c);
 export const put = (ref, n) => void ref.parentNode.insertBefore(n, ref);  // n (or a fragment's nodes) just before ref
@@ -38,7 +40,7 @@ export function listen(n, type, f) {
   });
 }
 export const query = (sel) => (sel === "body" ? doc.body : doc.querySelector(sel));
-export function css(s) { const e = doc.createElement("style"); e.textContent = s; (doc.head ?? doc.body).appendChild(e); return e; }
+export const css = fresh((s) => { const e = doc.createElement("style"); e.textContent = s; (doc.head ?? doc.body).appendChild(e); return e; });
 export function base(s) {  // a style sheet under the page's own: first in the head
   const e = doc.createElement("style"), h = doc.head ?? doc.body;
   e.textContent = s;
@@ -88,7 +90,7 @@ export function modal(n, on) {  // a <dialog> shown modally, or closed (once it 
   else if (!on && n.open) n.close();
 }
 export const measure = (n) => ({ top: n.scrollTop ?? 0, height: n.clientHeight ?? 0 });
-export const createSvg = (tag) => doc.createElementNS ? doc.createElementNS("http://www.w3.org/2000/svg", tag) : doc.createElement(tag);
+export const createSvg = fresh((tag) => doc.createElementNS ? doc.createElementNS("http://www.w3.org/2000/svg", tag) : doc.createElement(tag));
 
 // ---- a document for Node: elements, text, comments and fragments; attributes; listeners; outerHTML ----
 function fakeDocument() {

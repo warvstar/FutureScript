@@ -1,0 +1,39 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>bench</title>
+<style>
+body { font: 14px system-ui, sans-serif; margin: 16px; }
+.jumbotron button { margin: 0 6px 12px 0; }
+.table { border-collapse: collapse; }
+.table td { padding: 2px 10px; border-top: 1px solid #ddd; }
+.danger { background: #f2dede; }
+a { cursor: pointer; }
+</style></head>
+<body><div id="main"></div><div id="ui"></div>
+<script type="module">
+// ?app=react|solid|vanilla: dist/<app>.js; ?app=fut: apps/fut.fut, in fut.wasm on this thread (&threads=1: fut-mt.wasm,
+// its program on a worker and the DOM's calls sent to this thread)
+const params = new URLSearchParams(location.search), app = params.get("app");
+if (app != "fut") await import(`/bench/web/dist/${app}.js`);
+else {
+  const decoder = new TextDecoder();
+  const host = { std: "/std", serve: true, write: (fd, b) => console[fd == 2 ? "error" : "log"](decoder.decode(b)) };
+  let fut;
+  if (params.get("threads") == "1") {
+    const { startFut } = await import("/web/browser.js");
+    fut = await startFut({ ...host, wasm: new Uint8Array(await (await fetch("/build/fut-mt.wasm")).arrayBuffer()) });
+  } else {
+    const { createFut } = await import("/web/fut.js");
+    fut = await createFut({ ...host, wasm: await (await fetch("/build/fut.wasm")).arrayBuffer(), read, importModule: (p) => import(p) });
+  }
+  fut.run("/bench/web/apps/fut.fut", true);
+}
+function read(p) {  // fut reads files synchronously
+  const x = new XMLHttpRequest();
+  x.open("GET", p.replace(/^\/+/, "/"), false), x.overrideMimeType("text/plain; charset=x-user-defined");
+  try { x.send(); } catch { return null; }
+  if (x.status != 200) return null;
+  const b = new Uint8Array(x.responseText.length);
+  for (let i = 0; i < b.length; i++) b[i] = x.responseText.charCodeAt(i) & 0xff;
+  return b;
+}
+</script></body></html>

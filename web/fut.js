@@ -59,7 +59,9 @@ export function tryCallBytes(shared) {  // shared: for fut-mt.wasm, whose memory
 // (refOf(value) -> id, refGet(id) -> value). fut functions made by fnOf carry their id under FUT.
 export const MARK = "\0", FUT = Symbol("fut function");
 export function jsonCodec(fnOf, refOf, refGet) {
-  const fromFut = (s) => JSON.parse(s, (k, v) => {
+  const fromFut = (s) => s.charCodeAt(0) == 34 && s.indexOf("\\") < 0 ? s.slice(1, -1)  // a plain string
+    : s.indexOf("\\u0000") < 0 ? JSON.parse(s)  // no references in it
+    : JSON.parse(s, (k, v) => {
     if (!v || typeof v != "object" || Array.isArray(v) || !(MARK in v)) return v;
     return v[MARK] == "fn" ? fnOf(v.id) : v[MARK] == "js" ? refGet(v.id) : Number(v.v);
   });
@@ -129,9 +131,17 @@ export async function createFut(opts) {
   const enc = new TextEncoder(), dec = new TextDecoder();
   const tag = new WebAssembly.Tag({ parameters: ["i64"] });
   let ex, mem, table, spG, held = new Uint8Array(0);
-  const u8 = () => new Uint8Array(mem.buffer), dv = () => new DataView(mem.buffer);
+  let u8v, dvv;  // views of the memory, made again when it grows (a new buffer)
+  const u8 = () => (u8v?.buffer === mem.buffer ? u8v : (u8v = new Uint8Array(mem.buffer)));
+  const dv = () => (dvv?.buffer === mem.buffer ? dvv : (dvv = new DataView(mem.buffer)));
   let shared = false;  // fut-mt.wasm: the memory is shared (and TextDecoder takes no view of shared memory)
-  const cstr = (p) => { const m = u8(); let e = p; while (m[e]) e++; return dec.decode(shared ? m.slice(p, e) : m.subarray(p, e)); };
+  const cstr = (p) => {
+    const m = u8();
+    let e = p, hi = 0;
+    while (m[e]) hi |= m[e++];
+    if (hi < 128 && e - p < 64) return String.fromCharCode.apply(null, m.subarray(p, e));  // short ASCII: no decoder
+    return dec.decode(shared ? m.slice(p, e) : m.subarray(p, e));
+  };
   const write = (fd, s) => opts.write(fd, typeof s == "string" ? enc.encode(s) : s);
   function withStr(s, f) {  // f(pointer to s as a C string)
     const b = enc.encode(s), p = ex.fut_alloc(b.length + 1);
@@ -205,8 +215,19 @@ export async function createFut(opts) {
   // A call the host's main thread runs (opts.main), waiting for it here. A fut function it calls meanwhile
   // (synchronously, as Array.map does) runs here, as if called during an extern call.
   let mainExc = null;  // a fut error from such a function, which fails the call: thrown again here when it does
+  // Calls to the main thread that give nothing back, or a new object (a function the module marks fresh, as std/ui's
+  // create is), don't wait for it: they queue here, and go in order ahead of the next call that waits (mainCall), or
+  // when this thread is about to wait or let go (flush). A fresh call's object gets an id from opts.freshBase (this
+  // thread's own ids, among the main thread's), so fut has it at once.
+  const queued = [];
+  let freshNext = 0;
+  function flush() {
+    if (!queued.length) return;
+    try { mainCall({ op: "flush" }); } catch (e) { write(2, `[fut] ${e.message}\n`); }
+  }
   function mainCall(req) {
     const ch = opts.main;
+    if (queued.length) req.before = queued.splice(0);
     chanPut(ch, CH.REQ, req), opts.main.bell();
     for (;;) {
       let s;
@@ -220,7 +241,7 @@ export async function createFut(opts) {
       }
       let r;
       ex.fut_sync(1);
-      try { r = { value: cstr(withStr(m.json, (p) => ex.fut_apply(m.id, p))) }; } catch (e) {
+      try { r = { value: cstr(withStr(m.json, (p) => ex.fut_apply(m.id, p))) }, flush(); } catch (e) {
         if (e instanceof Restart || e instanceof Exit) throw e;
         r = { err: e instanceof WebAssembly.Exception && e.is(tag) ? cstr(ex.fut_error_line(e.getArg(tag, 0))) : String(e?.message ?? e) };
         if (e instanceof WebAssembly.Exception) mainExc = e;
@@ -239,7 +260,8 @@ export async function createFut(opts) {
       let exports;
       if (proxied(lib)) {  // the page loads it; here, a stand-in for each function it exports
         exports = {};
-        for (const name of mainCall({ op: "load", lib, stamp })) exports[name] = { lib, name };
+        const got = mainCall({ op: "load", lib, stamp });
+        for (const name of got.names) exports[name] = { lib, name, fresh: got.fresh.includes(name) };
       } else if (kind.startsWith("js")) {
         if (!opts.importModule) throw new Error("this host cannot load JavaScript modules");
         exports = await opts.importModule(file, stamp);
@@ -317,6 +339,8 @@ export async function createFut(opts) {
     return (f[FUT] = id), unpin.register(f, id), f;
   }
   const { fromFut, toFut } = jsonCodec(futFn, refOf, (id) => refs.get(id));
+  const byRef = (v) => typeof v == "symbol" || (typeof v == "function" && v[FUT] == null)  // what toFut sends as a Ref
+    || (typeof v == "object" && !Array.isArray(v) && !(MARK in v) && Object.getPrototypeOf(v) !== Object.prototype && Object.getPrototypeOf(v) !== null);
   // A fut function called from JavaScript. During an extern call (fut is waiting for it: a callback, as Array.map
   // makes) it runs right away and returns its result; otherwise it runs at the program's next safepoint, and the
   // call returns a Promise of its result.
@@ -342,6 +366,7 @@ export async function createFut(opts) {
         report(e), c.rej(new Error(errorText(e).split("\n")[0]));
       }
     }
+    flush();  // what a handler did shows now
   }
   async function withStrAsync(s, f) {
     const b = enc.encode(s), p = ex.fut_alloc(b.length + 1);
@@ -354,6 +379,7 @@ export async function createFut(opts) {
     const d = dv();
     return [...sig].map((t, i) => {
       const x = d.getFloat64(args + i * 8, true);
+      if (t == "a" && x < 0) return JSON.stringify({ [MARK]: "js", id: -x });  // a JavaScript value, by id (see ffi)
       return t == "s" || t == "a" || t == "f" ? cstr(x) : t == "i" ? x | 0 : t == "l" ? Math.trunc(x) : x;
     });
   }
@@ -361,7 +387,11 @@ export async function createFut(opts) {
     const sig = cstr(sigP);
     const done = (r) => {
       if (ret == 115 /* s */) return r == null ? -1 : ((held = enc.encode(String(r))), held.length);
-      if (ret == 97 /* a */) return (held = enc.encode(toFut(r))), held.length;
+      if (ret == 97 /* a */) {
+        if (r == null) return -1;
+        if (byRef(r)) return -2 - refOf(r);  // a JavaScript value (a DOM node): its id, without JSON either way
+        return (held = enc.encode(toFut(r))), held.length;
+      }
       return ret == 118 /* v */ ? 0 : Number(r);
     };
     const failed = (e) => {
@@ -375,6 +405,14 @@ export async function createFut(opts) {
     }
     const f = externs[fn];
     if (typeof f != "function") {  // the main thread's (proxied): it reads the arguments, and gives the result, as text
+      const fresh = f.fresh && ret == 97 /* a */ && freshNext < 2 ** 30;
+      if (opts.freshBase && (ret == 118 /* v */ || fresh)) {  // (the root: it flushes when it waits; see flush)  // nothing to wait for: queued (see flush)
+        const c = { lib: f.lib, name: f.name, sig, ret, args: rawArgs(sig, args) };
+        if (fresh) c.id = opts.freshBase + freshNext++;
+        queued.push(c);
+        if (queued.length >= 8192) flush();
+        return fresh ? -2 - c.id : 0;
+      }
       ffiDepth++;
       try {
         const r = mainCall({ op: "call", lib: f.lib, name: f.name, sig, ret, args: rawArgs(sig, args) });
@@ -384,7 +422,7 @@ export async function createFut(opts) {
     const d = dv(), a = [], big = externWasm[fn];
     for (let i = 0; i < sig.length; i++) {
       const x = d.getFloat64(args + i * 8, true), t = sig[i];
-      a.push(t == "s" ? cstr(x) : t == "a" || t == "f" ? fromFut(cstr(x)) : t == "i" ? x | 0 : t == "l" ? (big ? BigInt(Math.trunc(x)) : Math.trunc(x)) : x);
+      a.push(t == "s" ? cstr(x) : t == "a" && x < 0 ? refs.get(-x) : t == "a" || t == "f" ? fromFut(cstr(x)) : t == "i" ? x | 0 : t == "l" ? (big ? BigInt(Math.trunc(x)) : Math.trunc(x)) : x);
     }
     let r;
     ffiDepth++;
@@ -559,6 +597,7 @@ export async function createFut(opts) {
   // failed. A deadlock among them, or one that failed with nothing joining it: "" or the text that fails it now.
   const isolatesFinish = async (failed) => cstr(await finishP(failed ? 1 : 0));
   async function finish(st) {
+    flush();
     const r = await isolatesFinish(st != 0);
     if (!r || st) return st;
     return write(2, "runtime error: " + r + "\n"), 1;
@@ -571,7 +610,7 @@ export async function createFut(opts) {
     return (inMain = false), finish(st);
   }
   // the next event; at once if one came while the last was handled (a poke then found no one waiting)
-  const event = () => (callbacks.length || inbox.length || fileChanged ? Promise.resolve() : new Promise((r) => (wake = r)));
+  const event = () => (flush(), callbacks.length || inbox.length || fileChanged ? Promise.resolve() : new Promise((r) => (wake = r)));
   async function waitChange() {  // typed lines still run meanwhile, so the stopped program's state can be inspected
     for (;;) {
       await event(), await evalInbox();
@@ -631,7 +670,7 @@ export async function createFut(opts) {
       return (held = enc.encode(t.split("\n")[0].replace(/^ {2}at /, ""))), held.length;
     },
     last_trace: () => ((held = enc.encode(lastThrown ? trace(lastThrown) : "")), held.length),
-    sleep: S((s) => new Promise((r) => setTimeout(r, Math.max(0, s * 1000)))),
+    sleep: S((s) => (flush(), new Promise((r) => setTimeout(r, Math.max(0, s * 1000))))),
     poll: S(() => (ffiDepth ? void (pollLater = true) : hostPoll())),  // not inside a callback: after the extern call
     run: S(async (argsP, srcP, timeout) => {  // run(): fut in a child process, if the host can (opts.run)
       const args = cstr(argsP).split("\n"), file = args.pop();

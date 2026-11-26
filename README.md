@@ -11,6 +11,7 @@ python3 build.py test contracts # only the tests whose name contains a word give
 python3 build.py test --debug  # same, under ASan/UBSan
 python3 build.py fuzz 1000     # mutate the tests; any crash or sanitizer report fails
 python3 bench/run.py           # fut (native and wasm) against the same kernels in C (clang -O2) -> bench/results.md
+python3 bench/web/run.py       # std/ui against React, Solid and plain DOM in Chrome (npm install there first) -> bench/web/results.md
 build/fut file.fut             # run
 build/fut test file.fut        # run its `test` blocks (--json: one JSON object per line; --filter text; --timeout s)
 build/fut test --changed f.fut # rerun only the tests an edit can affect; the rest are cached passes
@@ -464,7 +465,7 @@ The binary finds `std/` next to the directory it is in (`build/fut` uses `std/`)
 
 ### Pages
 
-`std/ui` builds a page from functions over `std/reactive` signals. There is no virtual DOM and no re-rendering of a whole view. Each child or prop given as a function is an effect that updates its own nodes: text in place, anything else replaced between two markers.
+`std/ui` builds a page from functions over `std/reactive` signals. There is no virtual DOM and no re-rendering of a whole view. Each child or prop given as a function is an effect that updates its own nodes: text in place, anything else replaced between two markers. A prop whose value comes out the same doesn't touch the DOM.
 
 ```
 import "std/ui"
@@ -481,7 +482,7 @@ ui.mount("#ui", fn() {
 ```
 
 - **Elements:** `ui.el(tag, props, children)`. A child can be text, a number, a node, a list of children, or a function whose result is shown and kept current. Props whose names start with `on` are event handlers, which get `{type, value, checked, key}`. A prop given as a function is kept current. `class` is a keyword, so write it as `"class"`.
-- **Lists:** `ui.each(items, key, view)` keeps one view per item, reused while the item's key and value stay the same. Changing one item redraws only that item, and reordering moves nodes without redrawing them. Signals held inside an item, as `examples/hello-ui.fut` keeps each task's `done` and `effort`, update just their part of that item.
+- **Lists:** `ui.each(items, key, view)` keeps one view per item, reused while the item's key and value stay the same. Changing one item redraws only that item. Reordering moves only the items off the longest run that kept its order (a swap moves two), without redrawing them. Two items with one key are an error. Signals held inside an item, as `examples/hello-ui.fut` keeps each task's `done` and `effort`, update just their part of that item.
 - **Running it:** `node web/serve.mjs`, then open `http://localhost:8000/?file=examples/hello-ui.fut`. The page mounts into `#ui`. Once the program finishes, the page keeps handling its events, and edits reload it. In a file with views, a reload shows the page again with the new code (its `reload()` does, unless the file has its own: call `ui.refresh()` there), keeping state; a view's own state starts again. An edit to a top-level `ui.style(...)` replaces the sheet it added. The timers and effects of the page shown before stop. Under Node, `std/ui/dom.js` uses a small document of its own, so `fut test` can drive a page with `ui.trigger` and read it with `ui.htmlOf` (`tests/specs/hello_ui.fut`).
 
 #### Views and state
@@ -722,7 +723,7 @@ while present() {
 `python3 build.py wasm` compiles the compiler and runtime themselves to `build/fut.wasm` (Homebrew LLVM: `brew install llvm lld wasi-libc wasi-runtimes`). Node 25+ (tested on 26) or Chrome 137+ is needed for JSPI and wasm exceptions. Hosts:
 
 - `node web/run.mjs [-w | -v] file.fut`: the same CLI as `build/fut`, including `-w` hot reload and the live REPL on stdin.
-- `node web/serve.mjs [port]`, then open `http://localhost:8000/?file=path/to/file.fut`: a canvas for `window()`/`present()`, keys and mouse, a REPL box, and hot reload of the file and its imports whenever they are saved. The server makes the page cross-origin isolated, so it runs fut-mt.wasm: isolates in parallel, each thread a worker (`web/browser.js`, `web/fut-worker.js`); `?threads=n` caps the pool, `?threads=0` runs fut.wasm on the page's thread.
+- `node web/serve.mjs [port]`, then open `http://localhost:8000/?file=path/to/file.fut`: a canvas for `window()`/`present()`, keys and mouse, a REPL box, and hot reload of the file and its imports whenever they are saved. The server makes the page cross-origin isolated, so it runs fut-mt.wasm: isolates in parallel, each thread a worker (`web/browser.js`, `web/fut-worker.js`). The program's calls to the page's JavaScript (std/ui's DOM) that return nothing, or a new object (a function marked `fresh`), are queued and sent together, so a page doesn't wait on each one; `?threads=n` caps the pool, `?threads=0` runs fut.wasm on the page's thread.
 
 How it maps:
 - **Code.** Each compile becomes one wasm module, with one function per fut function. It shares the runtime's memory, function table and stack pointer. A stub is a table slot, so patching it is a single `table.set`. Retired slots are cleared and reused; V8 frees a module once nothing references it.
