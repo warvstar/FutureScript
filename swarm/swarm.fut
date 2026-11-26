@@ -388,6 +388,18 @@ fn runTests(dir, only) {
     }
     if !seen && r.code != 0 { n.broken += 1 fails.push(files[k] + ": (file)") bad.push(files[k] + ": exit " + str(r.code) + "\n" + clip(r.err, 1500)) }
   }
+  // Pages (files importing std/ui) compile only in the wasm build, so no native test reaches them: compile each here
+  var pages = lines(sh("grep -l 'import \"std/ui\"' *.fut src/*.fut 2>/dev/null", dir).out)
+  var pc = []
+  for f in pages { pc.push({cmd: ["node", ROOT + "/web/run.mjs", "map", f], cwd: dir, timeout: 120}) }
+  var pr = execAll(pc)
+  for k in 0..pr.len() {
+    if pr[k].code != 0 {
+      n.broken += 1
+      fails.push(pages[k] + ": (file)")
+      bad.push("COMPILE ERROR in the page " + pages[k] + " (std/ui, compiled by the wasm build):\n    " + clip(pr[k].err + pr[k].out, 1200))
+    }
+  }
   var summary = str(n.passed) + " passed, " + str(n.failed) + " failed, " + str(n.errors) + " errors, " + str(n.pending) + " pending, " + str(n.broken) + " broken files"
   var report = summary
   if bad.len() > 0 { report = report + "\n" + clip(bad.join("\n"), 7000) }
