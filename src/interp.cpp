@@ -40,7 +40,7 @@ struct IFn {
   u32 slot = 0;                         // its table slot (line tables, fut_where)
   bool ready = false;
 };
-constexpr int NTRAMP = 8192;
+constexpr int NTRAMP = 4096;  // the whole test suite needs under 1024 at once (retired bodies give theirs back)
 std::vector<IFn*> fns(NTRAMP);  // by trampoline. A retired body is kept: it may be running, or called directly by a
                                 // body of its batch (which then goes on through the stub, as compiled code does)
 std::vector<int> freeK;
@@ -420,10 +420,11 @@ __attribute__((noinline)) L enter(IFn& f, V* w, L a0, L a1, L a2, L a3) {
   interpTop = fr.prev;
   return fr.ret;
 }
-template <int K> L tramp(V* w, void* sp, L a0, L a1, L a2, L a3) {
+__attribute__((noinline)) L entry(int k, V* w, void* sp, L a0, L a1, L a2, L a3) {
   if (sp < getsp()) setsp(sp);  // (lower only: an interpreted caller passes its frame, which is above us)
-  return enter(*fns[K], w, a0, a1, a2, a3);
+  return enter(*fns[k], w, a0, a1, a2, a3);
 }
+template <int K> L tramp(V* w, void* sp, L a0, L a1, L a2, L a3) { return entry(K, w, sp, a0, a1, a2, a3); }  // small: there are NTRAMP
 template <size_t... K> std::vector<u32> trampSlots(std::index_sequence<K...>) { return {wa::slotOf((void*)&tramp<(int)K>)...}; }
 std::vector<u32> tramps;
 }  // namespace
