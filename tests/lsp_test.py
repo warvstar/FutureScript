@@ -106,7 +106,7 @@ def exercise(client, exe, folder, timings):
     }}})
     caps = result["capabilities"]
     assert caps["textDocumentSync"]["change"] == 1 and caps["positionEncoding"] == "utf-16", caps
-    assert caps["documentSymbolProvider"] and caps["hoverProvider"] and "." in caps["completionProvider"]["triggerCharacters"]
+    assert caps["documentSymbolProvider"] and caps["hoverProvider"] and caps["documentFormattingProvider"] and "." in caps["completionProvider"]["triggerCharacters"]
     client.notify("initialized")
     client.send({"id": 18, "method": "textDocument/unknown"})
     assert client.receive(lambda m: m.get("id") == 18)["error"]["code"] == -32601
@@ -204,6 +204,18 @@ def exercise(client, exe, folder, timings):
     client.change(deep, 2, "fn recovered() { return 1 }\n")
     assert client.diagnostics(deep, 2) == []
     assert client.doc("documentSymbol", deep)[0]["name"] == "recovered"
+
+    # Formatting: one whole-buffer edit (its end in UTF-16 units), none for formatted or unlexable text.
+    messy = (folder / "messy.fut").as_uri()
+    client.open(messy, 'fn f(a,b){\nreturn a+b // 🦊\n}')
+    client.diagnostics(messy, 1)
+    [edit] = client.doc("formatting", messy)
+    assert edit["newText"] == "fn f(a, b) {\n  return a + b // 🦊\n}\n", edit
+    assert edit["range"] == {"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 1}}, edit
+    client.change(messy, 2, edit["newText"])
+    assert client.doc("formatting", messy) == []
+    client.change(messy, 3, 'var s = "unclosed')
+    assert client.doc("formatting", messy) == []
 
     if timings:
         for label, uri, version in [("examples/bench.fut", bench_uri, 1), ("buffer importing std/lists", std, 3)]:

@@ -1,5 +1,6 @@
 // The native stdio language server. All source analysis runs in a disposable child of the protocol process.
 #include "compile.h"
+#include "fmt.h"
 #include <charconv>
 #include <chrono>
 #include <filesystem>
@@ -661,6 +662,19 @@ class Server {
     if (result) respond(id, std::move(*result));
     else error(id, -32603, "fut source analysis failed");
   }
+  // textDocument/formatting: the whole buffer through fut fmt, as one edit (none when it's formatted or doesn't lex)
+  void formatting(const Json& params, std::string_view id) {
+    auto it = documents.find(params.get("textDocument").get("uri").string);
+    if (it == documents.end()) { respond(id, "[]"); return; }
+    const std::string& text = it->second.text;
+    auto result = isolated([&]() -> std::string {
+      std::string err, out = formatSource(text, &err);
+      if (!err.empty() || out == text) return "[]";
+      return "[{\"range\":" + Range{{0, 0}, Lines(text).at(text.size())}.json() + ",\"newText\":" + quoteJson(out) + "}]";
+    });
+    if (result) respond(id, std::move(*result));
+    else error(id, -32603, "fut fmt failed");
+  }
   void dispatch(const Json& message) {
     const Json &method = message.get("method"), &id = message.get("id"), &params = message.get("params");
     std::string_view request = id.kind == Json::String || id.kind == Json::Number || id.kind == Json::Null ? id.raw : "";
@@ -683,7 +697,7 @@ class Server {
       relatedInfo = caps.get("publishDiagnostics").get("relatedInformation").isTrue();
       respond(request, "{\"serverInfo\":{\"name\":\"fut\"},\"capabilities\":{\"positionEncoding\":\"utf-16\","
                        "\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":{\"includeText\":true}},"
-                       "\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"hoverProvider\":true,\"documentSymbolProvider\":true}}");
+                       "\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"hoverProvider\":true,\"documentSymbolProvider\":true,\"documentFormattingProvider\":true}}");
     } else if (!initialized) {
       if (!request.empty()) error(request, -32002, "Server not initialized");
     } else if (stopped || name == "initialize") {
@@ -692,6 +706,7 @@ class Server {
       if (name == "shutdown") { stopped = true; respond(request, "null"); }
       else if (name == "textDocument/documentSymbol" || name == "textDocument/hover" || name == "textDocument/completion")
         feature(name, params, request);
+      else if (name == "textDocument/formatting") formatting(params, request);
       else error(request, -32601, "Method not found");
     } else if (name == "textDocument/didOpen" || name == "textDocument/didChange" ||
                name == "textDocument/didSave" || name == "textDocument/didClose")
