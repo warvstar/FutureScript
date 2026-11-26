@@ -244,8 +244,13 @@ void* externLookup(const std::string& lib, const std::string& name, const char**
   if (i == -3) *err = "pending";  // a module the host has not loaded yet
   return i < 0 ? nullptr : (void*)(uintptr_t)(i + 1);
 }
-V vmEnter(void* code, V* args) {  // fut code runs below this C++ frame
-  return ((V(*)(V*, void*, V, V, V, V))code)(args, getsp(), args[0], args[1], args[2], args[3]);
+// Fut code runs below this C++ frame. It lowers __stack_pointer on its way into C++ helpers and never raises it
+// again, so put it back: otherwise each call from C++ starts lower, and a loop of them (expect grows) overflows.
+V vmEnter(void* code, V* args) {
+  void* sp = getsp();
+  V r = ((V(*)(V*, void*, V, V, V, V))code)(args, sp, args[0], args[1], args[2], args[3]);
+  setsp(sp);
+  return r;
 }
 
 // ---------------- errors ----------------

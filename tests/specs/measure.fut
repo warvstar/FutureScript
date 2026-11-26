@@ -8,6 +8,7 @@ class Point {
   var y = 0
   fn init(x, y) { self.x = x  self.y = y }
 }
+fn first(l) { return l[0] }
 fn pairs(n) { var s = 0 for i in 0..n { for j in 0..n { s += i ^ j } } return s }
 
 test "allocs counts objects: lists, strings, instances, closures" {
@@ -24,6 +25,7 @@ test "grows: time" {
   expect grows { n -> squares(n) } like "n"
   expect grows { n -> pairs(n) } like "n^2"
   expect grows { n -> n * 2 } like "1"
+  expect grows { n -> first([n]) } like "1"   // millions of calls from the runtime into the block: none may leak stack
 }
 
 test "grows allocs: exact counts, so a tight tolerance" {

@@ -480,12 +480,27 @@ def runner_modules(exe):
     return r.stdout.splitlines() == want, f"got: {r.stdout!r}\n  stderr: {r.stderr!r}"
 
 
+def runner_spec(exe):
+    """docs/spec.md is executable: each ```fut block must pass `fut test` (its top-level expects are assertions)."""
+    bad, d = [], ROOT / "build" / "spec"
+    d.mkdir(parents=True, exist_ok=True)
+    blocks = re.findall(r"```fut\n(.*?)```", (ROOT / "docs" / "spec.md").read_text(), re.S)
+    for i, b in enumerate(blocks):
+        f = d / f"block{i + 1}.fut"
+        f.write_text(b)
+        r = subprocess.run([*runner(exe), "test", str(f)], capture_output=True, text=True, timeout=60)
+        if r.returncode:
+            bad.append(f"block {i + 1} ({b.splitlines()[0]}): {(r.stdout + r.stderr).strip()}")
+    return not bad and len(blocks) > 5, "\n  ".join(bad) or f"only {len(blocks)} blocks"
+
+
 RUNNER_TESTS = [("fut test --json: statuses, details, output", runner_json),
                 ("packages: names, interfaces, boundaries, versions", runner_packages),
                 ("fut map: packages, files, declarations", runner_map),
                 ("foreign modules: js, wasm, c", runner_modules),
                 ("fut test: tests first, filter, compile error, todo()", runner_text),
-                ("fut api: interfaces written, checked by fut test", runner_api)]
+                ("fut api: interfaces written, checked by fut test", runner_api),
+                ("docs/spec.md: every fut block passes", runner_spec)]
 
 
 def fuzz(exe, n=300, seed=None):

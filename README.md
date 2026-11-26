@@ -24,6 +24,8 @@ node web/serve.mjs             # browser: http://localhost:8000/?file=examples/p
 
 Requires macOS on Apple silicon (arm64, `MAP_JIT`).
 
+Agents: [docs/spec.md](docs/spec.md) is the whole language in about a quarter of the length, and every example in it runs as a test.
+
 ## Language
 
 ```
