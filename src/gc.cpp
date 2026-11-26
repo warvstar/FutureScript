@@ -239,10 +239,6 @@ void collect(Heap& h) {
   scan(g, sp, stackTop);  // the current stack (a fiber's, if one is running)
   if (fiberCur) mark(g, fiberCur), scan(g, (uintptr_t*)fiberMainSp, fiberMainTop);
   for (V v : vm->globals) mark(g, v);
-  if (WASM) {  // natively these are in the image (and another isolate's compile may be adding to them)
-    for (V v : consts) mark(g, v);
-    for (auto& e : globals) mark(g, e.o);
-  }
   isolateMark(markV);
   isolatesMark(markV);
   txnMark(markV);
@@ -313,12 +309,14 @@ void heapFree(Heap* h) {  // an isolate ended: finalize what needs it and give e
   }
   delete h;
 }
-// Wasm runs one isolate, and a compile error there longjmps past destructors: allocate in its heap throughout.
-ImageScope::ImageScope() { if (!WASM && !imaging++) target = imageHeap; }
-ImageScope::~ImageScope() { if (!WASM && !--imaging) target = cur; }
+ImageScope::ImageScope() { if (!imaging++) target = imageHeap; }
+ImageScope::~ImageScope() { if (!--imaging) target = cur; }
+// (wasm: a compile error longjmps past ImageScope's destructor; where it lands puts the depth back)
+int imageDepth() { return imaging; }
+void imageUnwind(int depth) { if ((imaging = depth) == 0) target = cur; }
 bool gcInImage(Obj* o) {
   uintptr_t p = (uintptr_t)o, b = (uintptr_t)base;
-  return !WASM && p >= b && p < b + REGION && owner((p - b) / PAGE) == imageHeap->id;
+  return p >= b && p < b + REGION && owner((p - b) / PAGE) == imageHeap->id;
 }
 void gcOwn(Obj* o) { H().owners.push_back(o); }
 // Objects the running isolate allocated so far. Each takes one cell of its size class, so the runs being bumped

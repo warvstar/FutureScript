@@ -474,7 +474,7 @@ struct Writer {
     Obj* o = obj(v);
     if (auto it = seen.find(o); it != seen.end()) return m.b += 'r', raw(it->second);
     if (o->kind == K::Fn || o->kind == K::Class || (o->kind == K::Str && gcInImage(o))) {
-      if (!WASM && !gcInImage(o)) ERR("@send cannot send %s: it is not compiled code's", typeName(v));
+      if (!gcInImage(o)) ERR("@send cannot send %s: it is not compiled code's", typeName(v));
       return m.b += 'v', raw(v);
     }
     if (o->kind == K::Fiber) ERR("@send cannot send a fiber: it runs on its own isolate's stacks");
@@ -503,7 +503,7 @@ struct Writer {
       }
       case K::Clo: {
         Clo* c = (Clo*)o;
-        if (!WASM && !gcInImage(c->fn)) ERR("@send cannot send this function");
+        if (!gcInImage(c->fn)) ERR("@send cannot send this function");
         m.b += 'c', raw(c->fn), raw(c->n);
         for (u32 k = 0; k < c->n; k++) put(c->env()[k]);
         break;

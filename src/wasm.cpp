@@ -313,15 +313,31 @@ std::string hereWhere() {
   if (int n = host_where(); n > 0) s.resize(n), host_take(s.data());
   return s;
 }
-static jmp_buf* compileJmp;
-static std::string compileErr;
-static bool compileAtEnd;
+static TLS jmp_buf* compileJmp;
+static TLS std::string compileErr;
+static TLS bool compileAtEnd;
 void compileFail(const std::string& msg, bool atEnd) { compileErr = msg, compileAtEnd = atEnd, longjmp(*compileJmp, 1); }
+// Where a compile error lands (no C++ exceptions: a longjmp, past destructors): close what the compile had open
+// since the setjmp, as unwinding would. (The batch and queued table changes are dropped by the caller.)
+struct Guard {
+  jmp_buf* outer = compileJmp;
+#if !ONE_THREAD
+  Locked* locks = lockTop;
+#endif
+  int image = imageDepth();
+  void landed() {
+    compileJmp = outer, imageUnwind(image);
+#if !ONE_THREAD
+    unwindLocks(locks);
+#endif
+  }
+};
 bool guardCompile(void (*f)(void*), void* ctx, std::string* err) {  // a compile outside fut_compile (tier 2, a test body)
-  jmp_buf jb, *outer = compileJmp;
+  jmp_buf jb;
+  Guard g;
   compileJmp = &jb;
-  if (setjmp(jb)) return compileJmp = outer, err ? (void)(*err = compileErr) : batch.clear(), false;
-  f(ctx), compileJmp = outer;
+  if (setjmp(jb)) return g.landed(), err ? (void)(*err = compileErr) : batch.clear(), false;
+  f(ctx), compileJmp = g.outer;
   return true;
 }
 
@@ -478,10 +494,11 @@ EXPORT(fut_free) void futFree(char* p) { free(p); }
 // Compile a file (text null) or REPL input; returns the chunk's slot, 0 after an error (printed), -1 if input ended early,
 // -2 if it needs modules the host has not loaded yet (fut_info(3) lists them).
 EXPORT(fut_compile) int futCompile(const char* path, int reload, int echo, const char* src, int tests) {
-  jmp_buf jb, *outer = compileJmp;
+  jmp_buf jb;
+  Guard g;
   compileJmp = &jb;
   if (setjmp(jb)) {
-    compileJmp = outer, batch.clear(), ops.clear();
+    g.landed(), batch.clear(), ops.clear();
     if (!modulesPending.empty()) return -2;  // the host loads them (fut_info(3)) and compiles again
     if (echo && compileAtEnd) return -1;
     if (tests) return reportCompileError(compileErr), 0;
@@ -489,7 +506,7 @@ EXPORT(fut_compile) int futCompile(const char* path, int reload, int echo, const
   }
   std::string t = src ? src : "";
   last = compile(path, reload, echo, src ? &t : nullptr, tests);
-  compileJmp = outer;
+  compileJmp = g.outer;
   return (int)wa::slotOf(last.chunk);
 }
 // 0: the reload log, 1: the files compiled, 2: the last compile error, 3: the modules it waits for

@@ -24,10 +24,17 @@ constexpr bool WASM = true;  // the WebAssembly build (wasm.cpp, gen_wasm.h)
 #else
 constexpr bool WASM = false;
 #endif
+// ONE_THREAD: the plain wasm build (fut.wasm), where isolates take turns on the one thread. The threads build
+// (fut-mt.wasm: wasm32-wasip1-threads, -pthread) has threads, one web worker each, over shared memory.
+#if __wasm__ && !_REENTRANT
+#define ONE_THREAD 1
+#else
+#define ONE_THREAD 0
+#endif
 // Isolates run on threads of their own; the little state they share (pages, code, symbols, class layouts) is
-// guarded by these. Wasm runs one isolate: nothing to guard.
-// TLS: per isolate (thread). Wasm has one, and no thread exit hooks for TLS destructors: plain globals there.
-#if __wasm__
+// guarded by these. One thread: nothing to guard.
+// TLS: per isolate (thread). One thread: plain globals.
+#if ONE_THREAD
 #define TLS
 struct Mutex { void lock() {} void unlock() {} };
 inline int locksHeld;  // (no locks: isolates take turns on the one thread only where they switch on purpose)
@@ -41,13 +48,34 @@ struct Mutex {
   void lock() { pthread_mutex_lock(&m), locksHeld++; }
   void unlock() { locksHeld--, pthread_mutex_unlock(&m); }
 };
-struct RMutex : Mutex { RMutex() { m = PTHREAD_RECURSIVE_MUTEX_INITIALIZER; } };  // the holder may lock it again
+struct RMutex : Mutex {  // the holder may lock it again
+  RMutex() {
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a), pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE), pthread_mutex_init(&m, &a);
+  }
+};
 #endif
+#if __wasm__ && !ONE_THREAD
+// A compile error in wasm longjmps (no C++ exceptions), past destructors: the locks taken since the setjmp are
+// released where it lands (unwindLocks), as unwinding would.
+struct Locked;
+inline thread_local Locked* lockTop;
+struct Locked {
+  Mutex& m;
+  Locked* prev;
+  explicit Locked(Mutex& m) : m(m), prev(lockTop) { m.lock(), lockTop = this; }
+  ~Locked() { lockTop = prev, m.unlock(); }
+};
+inline void unwindLocks(Locked* to) {
+  while (lockTop != to) { Locked* l = lockTop; lockTop = l->prev, l->m.unlock(); }
+}
+#else
 struct Locked {
   Mutex& m;
   explicit Locked(Mutex& m) : m(m) { m.lock(); }
   ~Locked() { m.unlock(); }
 };
+#endif
 // ISO_LOCAL(var): a TLS variable that is an isolate's state, not its thread's. Isolates take turns on threads
 // (isolate.cpp): switching one out swaps every such variable with its saved copy, and a new isolate starts with
 // each as it was before main(). TLS that is only the thread's (JIT write mode, locksHeld) isn't registered.
@@ -248,6 +276,8 @@ Heap* heapNew(Run* runs);  // runs: the isolate's VM block's, which JIT code bum
 void heapUse(Heap*);       // the current thread's isolate allocates here
 void heapFree(Heap*);
 struct ImageScope { ImageScope(); ~ImageScope(); ImageScope(const ImageScope&) = delete; };
+int imageDepth();
+void imageUnwind(int depth);
 bool gcWanted();           // wasm: a collection waits for the next safepoint
 void gcCollect();
 void isolateMark(void (*mark)(V));  // the isolate's own roots kept by the runtime (rt.cpp)
