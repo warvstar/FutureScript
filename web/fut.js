@@ -285,15 +285,21 @@ export async function createFut(opts) {
     if (!opts.stamp) return;
     for (const [lib, m] of [...modules]) if (opts.stamp(lib.slice(lib.indexOf(":") + 1)) !== m.stamp) await loadModule(lib);
   }
+  // While a compile runs, each file is read once (it may ask for one more than once, and for ones that aren't there:
+  // in a browser, each a request): a file edited meanwhile is the next compile's.
+  let readCache = null;
   async function compileWith(f) {  // f() compiles; when it waits for modules (-2), load them and compile again
     await refreshModules();
-    for (;;) {
-      const s = f();
-      if (s != -2) return s;
-      let any = false;
-      for (const lib of cstr(ex.fut_info(3)).split("\n").filter(Boolean)) if (!modules.has(lib)) await loadModule(lib), (any = true);
-      if (!any) return 0;
-    }
+    readCache = new Map();
+    try {
+      for (;;) {
+        const s = f();
+        if (s != -2) return s;
+        let any = false;
+        for (const lib of cstr(ex.fut_info(3)).split("\n").filter(Boolean)) if (!modules.has(lib)) await loadModule(lib), (any = true);
+        if (!any) return 0;
+      }
+    } finally { readCache = null; }
   }
   // at: the index another thread's host bound it to (this thread binds it the same), else a new one
   function externLookup(lib, name, at) {
@@ -653,7 +659,9 @@ export async function createFut(opts) {
     },
     restart() { throw new Restart(); },
     read(p) {
-      const b = opts.read(cstr(p));
+      const path = cstr(p);
+      let b = readCache?.get(path);
+      if (b === undefined) (b = opts.read(path) ?? null), readCache?.set(path, b);
       return b ? ((held = b), b.length) : -1;
     },
     take(dst) { u8().set(held, dst); },
