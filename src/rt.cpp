@@ -235,13 +235,24 @@ static void render(std::string& out, V v, bool quote, std::unordered_set<Obj*>& 
     Inst* in = as<Inst>(v);
     out += symName(in->cls->name);
     out += '{';
-    const int* names = in->cls->layout.data.load(std::memory_order_acquire);
-    for (u32 i = 0; i < in->nslots; i++) {
-      if (in->slots[i] == ABSENT) continue;
+    // Declared fields first, the base class's before the subclass's (one never assigned shows its default), then
+    // the ones made by assignment, in slot order.
+    std::vector<Class*> chain;
+    for (Class* c = in->cls; c; c = c->super) chain.insert(chain.begin(), c);
+    std::vector<int> names;
+    for (Class* c : chain)
+      for (auto& [f, _] : c->fields) if (std::find(names.begin(), names.end(), f) == names.end()) names.push_back(f);
+    const int* slots = in->cls->layout.data.load(std::memory_order_acquire);
+    for (u32 i = 0; i < in->nslots; i++)
+      if (in->slots[i] != ABSENT && std::find(names.begin(), names.end(), slots[i]) == names.end()) names.push_back(slots[i]);
+    for (int f : names) {
+      V x = NIL;
+      bool method = false;
+      if (!fieldOf(v, f, &x, &method) || method) continue;
       separator();
-      out += symName(names[i]);
+      out += symName(f);
       out += ": ";
-      render(out, in->slots[i], true, active);
+      render(out, x, true, active);
     }
     out += '}';
   }

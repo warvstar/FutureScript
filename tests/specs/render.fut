@@ -19,7 +19,7 @@ test "shortest round-tripping numbers" {
 test "shared rendering of containers and instances" {
   var p = RenderPoint()
   var v = {a: 1, "b c": "s", n: nil, "if": true, point: p}
-  var want = "\{a: 1, \"b c\": \"s\", n: nil, \"if\": true, point: RenderPoint\{x: 1, y: [2]}}"
+  var want = "\{a: 1, \"b c\": \"s\", n: nil, \"if\": true, point: RenderPoint\{x: 1, missing: 3, y: [2]}}"
   expect str(v) == want
   expect "{v}" == want
   expect prints { print(v) } == want + "\n"
@@ -41,7 +41,7 @@ test "cyclic and shared data" {
   p.y = p
   var shared = [2]
   expect prints { print("before") print(c, m, p, [shared, shared]) } ==
-    "before\n[1, <cycle>] \{back: <cycle>} RenderPoint\{x: 1, y: <cycle>} [[2], [2]]\n"
+    "before\n[1, <cycle>] \{back: <cycle>} RenderPoint\{x: 1, missing: 3, y: <cycle>} [[2], [2]]\n"
   var other = [1]
   other.push(other)
   expect c == other
@@ -67,4 +67,19 @@ test "deep nesting is cut off, not a crash, even on a fiber's stack" {
   expect str(deep(5000)).has("[...]")
   var f = fiber(fn(x) { yield str(deep(5000)) })
   expect f.resume().has("[...]")  // where it stops depends on the stack
+}
+
+class RA {
+  var x = 1
+  var y = "s"
+}
+class RB : RA {
+  var x
+  var y
+  var z = nil
+  fn init() { self.z = [2] }
+}
+test "instances show every declared field, a default too, base class first" {
+  expect str(RA()) == "RA\{x: 1, y: \"s\"}"
+  expect str(RB()) == "RB\{x: nil, y: nil, z: [2]}"
 }
