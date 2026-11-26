@@ -20,6 +20,7 @@ node web/run.mjs ...           the same CLI on WebAssembly
 ```fut
 var a = 1; var b = 2               // ; optional. A line starting ( [ - begins a new statement
 expect "{a + b}\{\n" == "3\{\n"     // "{expr}" interpolates, so a literal { is \{ (JSON: "\{\"k\": 1}"); escapes \n \t \0 \" \\
+expect "{3.14159:.2}|{7:>3}|{255:x}|{a=}" == "3.14|  7|ff|a = 1"  // {expr[=][:spec]}, spec: [fill][< > ^][+][0][width][,][.precision][f e x X b o]
 expect 0 && ""                     // only nil, false are falsy
 expect (nil || 2) == 2             // && || return an operand
 expect -7 % 3 == 2 && 7 / 2 == 3.5 // all numbers f64

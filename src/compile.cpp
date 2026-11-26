@@ -261,7 +261,7 @@ struct Compiler : Gen {
     if (!at(T_ID) || cur.sym < NKW) fail("@syntax expected a name");
     return next(), prev.sym;
   }
-  void konst(std::string_view s) { consts.push_back(box(newStr(s))), imm(0, consts.back()); }
+  void konst(std::string_view s, int r = 0) { consts.push_back(box(newStr(s))), imm(r, consts.back()); }
 
   // ---- types: num str bool list map fn any, a class (geom.Shape for a module's) or a named type; a literal ("GET",
   // 3, true, nil); a shape ({name: str, age: num?}); list<T>, map<V>, map<K, V>; a union of them (A | B); `?` after
@@ -624,13 +624,9 @@ struct Compiler : Gen {
         char c = *++p;
         lit += c == 'n' ? '\n' : c == 't' ? '\t' : c == '0' ? '\0' : c;
       } else if (*p == '{') {
-        const char* q = p + 1;
-        for (int d = 1; q < e && (d += (*q == '{') - (*q == '}')); q++) {}
-        if (q >= e) failAt(p, t.line, "@syntax unclosed '{' in string");
         flush(true);  // always start from a string, so `"{x}"` is a string even when x is a number
         int s = slot(), line = t.line + (int)std::count(t.p, p, '\n');
-        st(0, s), subExpr(p + 1, q, line), combine(s, O_ADD);
-        p = q;
+        st(0, s), p = interpolation(p + 1, e, line), combine(s, O_ADD);
       } else lit += *p;
     }
     flush(!any);
@@ -639,16 +635,79 @@ struct Compiler : Gen {
   struct Mark { Lexer lx; Tok cur, prev; const char *prevEnd, *srcStart; std::string file; };  // a place in the source
   Mark mark() { return {lx, cur, prev, prevEnd, srcStart, file}; }
   void rewind(const Mark& m) { lx = m.lx, cur = m.cur, prev = m.prev, prevEnd = m.prevEnd, srcStart = m.srcStart, file = m.file; }
-  template <class Body> void detour(const std::string& f, const char* src, const char* at, int line, Body body) {
+  template <class Body> void detour(const std::string& f, const char* src, const char* at, int line, Body body, const char* end = nullptr) {
     Mark m = mark();
-    file = f, srcStart = src, lx = Lexer{at, line}, next();
+    file = f, srcStart = src, lx = Lexer{at, line}, lx.end = end, next();
     body(), rewind(m);
   }
-  void subExpr(const char* s, const char* e, int line) {  // compile source text [s, e) as one expression
+  FormatSpec formatSpec(const char* start, const char* end, int line) {
+    FormatSpec f;
+    const char* p = start;
+    auto alignment = [](char c) { return c == '<' || c == '>' || c == '^'; };
+    auto bad = [&] {
+      failAt(start, line, "@syntax invalid format spec '%.*s': expected [fill][< > ^][+][0][width][,][.precision][f e x X b o] (width up to %u, precision up to %u)",
+             (int)(end - start), start, (unsigned)UINT16_MAX, (unsigned)FormatSpec::maxPrecision);
+    };
+    auto take = [&](char c) { return p < end && *p == c ? (++p, true) : false; };
+    auto digits = [&](unsigned limit) {
+      unsigned n = 0;
+      while (p < end && dig(*p)) {
+        n = n * 10 + (*p++ - '0');
+        if (n > limit) bad();
+      }
+      return n;
+    };
+    if (end - p >= 2 && alignment(p[1])) {
+      if (*p < ' ' || *p > '~' || *p == '{') bad();
+      f.fill = *p++;
+    }
+    if (p < end && alignment(*p)) f.align = *p++;
+    if (take('+')) f.flags |= FormatSpec::Sign;
+    if (!f.align && p < end && *p == '0') f.flags |= FormatSpec::Zero;
+    f.width = digits(UINT16_MAX);
+    if (take(',')) f.flags |= FormatSpec::Group;
+    if (take('.')) {
+      if (p == end || !dig(*p)) bad();
+      f.precision = digits(FormatSpec::maxPrecision);
+    }
+    if (p < end && *p && strchr("fexXbo", *p)) f.type = *p++;
+    if (p != end) bad();
+    if (f.type && strchr("xXbo", f.type) && (f.precision != FormatSpec::noPrecision || (f.flags & FormatSpec::Group)))
+      failAt(start, line, "@syntax invalid format spec '%.*s': x, X, b and o allow alignment, sign and width",
+             (int)(end - start), start);
+    return f;
+  }
+  const char* interpolation(const char* s, const char* end, int line) {
+    const char* close = nullptr;
     detour(file, srcStart, s, line, [&] {
+      // Nested expressions consume their own colons. Only the suffix left by expr() is format text.
       expr();
-      if (cur.p != e) failAt(cur.p, cur.line, "@syntax expected '}' to end the interpolation");
-    });
+      const char* marker = cur.p;
+      const char* suffix = marker;
+      bool debug = at('=');
+      if (debug) {
+        suffix++;
+        while (suffix < end && strchr(" \t\r\n", *suffix)) suffix++;
+      }
+      if (suffix == end) failAt(s - 1, line, "@syntax unclosed '{' in string");
+      FormatSpec spec;
+      bool formatted = *suffix == ':';
+      if (formatted) {
+        const char* start = suffix + 1;
+        suffix = std::find(start, end, '}');
+        if (suffix == end) failAt(s - 1, line, "@syntax unclosed '{' in string");
+        spec = formatSpec(start, suffix, cur.line + (int)std::count(marker, start, '\n'));
+      }
+      if (*suffix != '}') failAt(suffix, cur.line, "@syntax expected '}' to end the interpolation");
+      if (debug || formatted) {
+        imm(1, std::bit_cast<V>(spec));
+        if (debug) konst(std::string(s, marker) + " = ", 2);
+        else imm(2, NIL);
+        helper(H_FORMAT);
+      }
+      close = suffix;
+    }, end);
+    return close;
   }
   void collect(int base, int n, int h) { addsp(0, base), imm(1, n), helper(h), F->depth = base; }  // list/map from slots
   void mapLit() {  // {key: value, name: value}; a bare name before ':' is a string key

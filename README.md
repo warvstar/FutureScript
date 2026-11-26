@@ -74,6 +74,17 @@ fn reload() { }                      // optional: runs after every hot reload (m
 - **Newline rules:** a `(` or `[` on a new line, or a leading `-`, starts a new statement rather than continuing the previous one.
 - **Not in fut** (for those coming from other languages): a ternary operator, `**`, `?.`, slice syntax (there are `slice` methods), negative indexes, `sort`, varargs, default arguments, chained comparisons (`1 < 2 < 3` is an error), named functions inside functions. `int` takes only numbers.
 
+### Interpolation formats
+
+Use `"{expr:spec}"` to format a value. A spec can contain these parts in order.
+
+- Set a minimum width with `:10`. Numbers align right and other values align left. Use `<`, `>` or `^` before the width to align left, right or center. Put a printable ASCII fill character before the alignment marker, as in `:*>10`. Braces are reserved.
+- Use `+` to show a number's sign and `,` after the width to group thousands. With default alignment, a leading zero in the width (such as `:04`) pads a number with zeros after its sign.
+- Use `:.2` or `:.2f` for two fixed decimal places on numbers. Bare `.N` on a string keeps its first N bytes. Use `e` for scientific notation. Explicit `f` and `e` default to six decimal places.
+- Use `x`, `X`, `b` or `o` for finite whole numbers in hexadecimal, uppercase hexadecimal, binary or octal. These forms accept width and sign options.
+
+For example, `"{3.14159:.2}|{7:>3}|{255:x}"` gives `"3.14|  7|ff"`. Write `"{x=}"` to include the original expression text, giving `"x = 7"` for `x = 7`. A format can follow the debug marker, as in `"{x=:.2}"`. Width is limited to 65,535 bytes and precision to 1,000. Invalid specs raise a `syntax` error at compile time. A spec that cannot format its value raises an `argument` error at run time.
+
 ## Classes
 
 ```

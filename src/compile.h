@@ -21,15 +21,16 @@ struct Lexer {
   int line = 1;
   bool internal = false;  // code the compiler writes: names may contain '@' (the runtime's prop@gen), which users' can't
   const char* err = nullptr;  // a T_ERR token's message
+  const char* end = nullptr;  // outer string's closing quote, while reading an interpolation
   Tok next() {
     Tok k;
     for (;; p++) {
       if (*p == '\n') k.nl = true, line++;
-      else if (*p == '/' && p[1] == '/') while (p[1] && p[1] != '\n') p++;
+      else if (*p == '/' && p[1] == '/') while (p + 1 != end && p[1] && p[1] != '\n') p++;
       else if (*p != ' ' && *p != '\t' && *p != '\r') break;
     }
     k.line = line, k.p = p;
-    if (!*p) return k.t = T_EOF, k;
+    if (p == end || !*p) return k.t = T_EOF, k;
     if (dig(*p)) {
       if (*p == '0' && (p[1] | 32) == 'x' && (dig(p[2]) || ((p[2] | 32) >= 'a' && (p[2] | 32) <= 'f')))  // 0xRRGGBB
         return k.n = (double)strtoull(p, (char**)&p, 16), k.t = T_NUM, k;

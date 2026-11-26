@@ -284,6 +284,61 @@ static long mapFind(Map* m, V k) { u32 s = *mapSlot(m, k); return s && s != ~0u 
 static void rt_throw(V v) { throwValue(v, RA()); }
 
 // ---------------- helpers called from JIT code (see Helper enum) ----------------
+static V rt_format(V v, V packed, V prefix) {
+  FormatSpec f = std::bit_cast<FormatSpec>(packed);
+  bool numeric = isNum(v), precise = f.precision != FormatSpec::noPrecision;
+  bool base = f.type && strchr("xXbo", f.type);
+  if (!numeric && (f.type || f.flags))
+    ERR("@argument this format needs a number, got %s", typeName(v));
+  if (!numeric && precise && !is(v, K::Str))
+    ERR("@argument format precision needs a number or string, got %s", typeName(v));
+  double d = numeric ? num(v) : 0;
+  if (base && (!std::isfinite(d) || std::trunc(d) != d))
+    ERR("@argument format '%c' needs a finite whole number", f.type);
+
+  std::string s;
+  if (base) {
+    int radix = f.type == 'b' ? 2 : f.type == 'o' ? 8 : 16;
+    const char* digits = f.type == 'X' ? "0123456789ABCDEF" : "0123456789abcdef";
+    double n = std::fabs(d);
+    // The radices are powers of two, so every digit of even a large whole double is exact.
+    do {
+      s += digits[(int)std::fmod(n, radix)];
+      n = std::trunc(n / radix);
+    } while (n != 0);
+    if (std::signbit(d)) s += '-';
+    std::reverse(s.begin(), s.end());
+  } else if (numeric && (precise || f.type || ((f.flags & FormatSpec::Group) && std::isfinite(d) && std::trunc(d) == d))) {
+    // At most 309 digits before the decimal point for a finite double.
+    char buf[FormatSpec::maxPrecision + 312];
+    int precision = precise ? f.precision : f.type ? 6 : 0;
+    snprintf(buf, sizeof buf, f.type == 'e' ? "%.*e" : "%.*f", precision, d);
+    s = buf;
+  } else {
+    s = toStr(v);
+    if (precise && s.size() > f.precision) s.resize(f.precision);
+  }
+  if (f.flags & FormatSpec::Group) {
+    size_t first = !s.empty() && s[0] == '-';
+    size_t last = first;
+    while (last < s.size() && s[last] >= '0' && s[last] <= '9') last++;
+    while (last - first > 3) { last -= 3; s.insert(last, 1, ','); }
+  }
+  if ((f.flags & FormatSpec::Sign) && s[0] != '-') s.insert(0, 1, '+');
+  if (s.size() < f.width) {
+    size_t padding = f.width - s.size();
+    char align = f.align ? f.align : numeric ? '>' : '<';
+    if (f.flags & FormatSpec::Zero) s.insert(s[0] == '+' || s[0] == '-', padding, '0');
+    else {
+      size_t left = align == '>' ? padding : align == '^' ? padding / 2 : 0;
+      s.insert(0, left, f.fill);
+      s.append(padding - left, f.fill);
+    }
+  }
+  if (prefix != NIL) return box(newStr(as<Str>(prefix)->sv(), s));
+  return box(newStr(s));
+}
+
 static V rt_binop(V a, V b, uint64_t op) {
   static const char* ops[] = {"+", "-", "*", "/", "%", "==", "!=", "<", "<=", ">", ">=", "&", "|", "^", "<<", ">>"};
   if (op >= O_BAND) {  // integer operators: on whole numbers (exact up to 2^53), computed in 64 bits
@@ -803,6 +858,7 @@ void rtInit() {
                  (void*)rt_map, (void*)rt_closure, (void*)rt_stale, (void*)rt_echo, nullptr, (void*)rt_yield, nullptr, (void*)rt_throw};
   h[H_PRINTARGS] = (void*)rt_printArgs;
   memcpy(vm->helpers, h, sizeof h);  // H_FFI and H_HOT: platformInit
+  vm->helpers[H_FORMAT] = (void*)rt_format;
   identCode = callable<+[](V self) { return self; }>();
   platformInit();
   txnInit();
