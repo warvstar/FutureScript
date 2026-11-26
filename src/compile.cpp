@@ -369,7 +369,7 @@ struct Compiler : Gen {
       next();
       static const char* const kinds[] = {"any", "num", "str", "bool", "list", "map"};
       for (int i = 0; i < 6; i++) if (symName(prev.sym) == kinds[i]) ty.code = TY_ANY + i;
-      for (char et : {'f', 'u', 'i', 'b'}) if (symName(prev.sym) == bufName(et)) ty.code = TY_BUF | uint64_t(et) << 8;
+      for (char et : {'d', 'f', 'u', 'i', 'b'}) if (symName(prev.sym) == bufName(et)) ty.code = TY_BUF | uint64_t(et) << 8;
       for (int n = 2; n <= 4; n++) if (symName(prev.sym) == "vec" + std::to_string(n) + "f") ty.code = TY_BUF | uint64_t('f') << 8 | uint64_t(n) << 16;
       if ((ty.code == TY_LIST || ty.code == TY_MAP) && at('<') && !cur.nl) {  // list<T>, map<V>, map<K, V>
         bool list = ty.code == TY_LIST;

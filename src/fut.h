@@ -219,13 +219,31 @@ struct Shared;
 struct Chan : Obj { static constexpr K KIND = K::Chan; Shared* s; };
 struct Task : Obj { static constexpr K KIND = K::Task; Shared* s; };
 void sharedFree(Obj*);  // the GC found a channel or task handle dead
-// A packed buffer of numbers, for the GPU and C: f32s, u32s, i32s, u8s (et: 'f', 'u', 'i', 'b'). Its length is fixed,
-// and its bytes (malloc'd, never moved) are what a `ptr` argument of an extern fn receives.
-struct Buf : Obj { static constexpr K KIND = K::Buf; char et; size_t n; uint8_t* p; };
-inline size_t bufElem(char et) { return et == 'b' ? 1 : 4; }
+// A buffer (buffer.cpp): numbers packed as C and the GPU want them, f64s, f32s, u32s, i32s, u8s (et: 'd', 'f', 'u',
+// 'i', 'b'), of fixed length, in memory outside every heap (BufData, refcounted), which an isolate reaches through a
+// handle (a Buf, in its heap). p and n are the handle's view of it, which JIT code indexes; a dead handle's are
+// null and 0. Its bytes (never moved) are what a `ptr` argument of an extern fn receives.
+struct BufData;
+struct Buf : Obj { static constexpr K KIND = K::Buf; char et; uint8_t gone; size_t n; uint8_t* p; BufData* s; };
+inline size_t bufElem(char et) { return et == 'd' ? 8 : et == 'b' ? 1 : 4; }
 const char* bufName(char et);  // "f32s"
-Buf* newBuf(char et, size_t n);  // zeroed
-V bufGet(const Buf* b, size_t i);
+V bufGet(const Buf* b, size_t i);  // (i < n)
+Buf* newBuf(char et, size_t n);    // zeroed
+V bufIndex(V b, V i);              // b[i], and b[i] = v (rt_geti, rt_seti)
+V bufStore(V b, V i, V v);
+size_t bufLength(V b);             // len(): raises if it was sent
+Buf* bufLive(V b);                 // b, if it reaches its numbers here; else raises
+uint8_t* bufBytes(V b);            // an extern's ptr argument
+void bufFree(Obj*);                // the GC found a handle dead
+// Sending one moves it: the message takes a reference (bufTake), and once the whole message is made the sender's
+// handle goes dead (bufSent); the receiver gets a handle on the same memory (bufGive). A buffer a spawned isolate's
+// copy of the globals holds is not sent: its copy is a dead handle (bufElsewhere).
+BufData* bufTake(Obj*);
+void bufSent(Obj*);
+V bufGive(BufData*);
+V bufElsewhere();
+void bufRelease(BufData*);
+const void* isolateId();  // the running isolate's identity (isolate.cpp)
 struct Clo : Obj { static constexpr K KIND = K::Clo; Fn* fn; u32 n; V* env() { return (V*)(this + 1); } };
 // A fiber runs a function on a stack of its own; `yield` switches back to whoever resumed it.
 struct Fiber : Obj {
@@ -298,6 +316,7 @@ template <class T> T* make(size_t extra = 0) {
                 T::KIND == K::Chan || T::KIND == K::Task || T::KIND == K::Buf) gcOwn(o);
   return o;
 }
+void bufInit();  // f64s() .. u8s() and their methods (buffer.cpp)
 Str* newStr(std::string_view, std::string_view = {});
 void gcInit();
 inline TLS uintptr_t* stackTop;
@@ -778,6 +797,14 @@ constexpr u32 fmovxd(u32 d, u32 n) { return 0x9e660000 | n << 5 | d; }
 constexpr u32 fcmp(u32 n, u32 m) { return 0x1e602000 | m << 16 | n << 5; }
 constexpr u32 fcmpz(u32 n) { return 0x1e602008 | n << 5; }                            // fcmp d, #0.0
 constexpr u32 fcvtzu(u32 d, u32 n) { return 0x9e790000 | n << 5 | d; }                // x = (uint64) d, truncating
+constexpr u32 scvtf(u32 d, u32 n) { return 0x9e620000 | n << 5 | d; }                 // d = (double) x, signed
+constexpr u32 fcvtzs(u32 d, u32 n) { return 0x9e780000 | n << 5 | d; }                // x = (int64) d, truncating
+constexpr u32 ldrswreg(u32 t, u32 n, u32 m) { return 0xb8a07800 | m << 16 | n << 5 | t; }  // ldrsw t, [n, m, lsl #2]
+constexpr u32 ldrwreg(u32 t, u32 n, u32 m) { return 0xb8607800 | m << 16 | n << 5 | t; }   // ldr w(t), [n, m, lsl #2]
+constexpr u32 ldrbreg(u32 t, u32 n, u32 m) { return 0x38606800 | m << 16 | n << 5 | t; }   // ldrb t, [n, m]
+constexpr u32 strwreg(u32 t, u32 n, u32 m) { return 0xb8207800 | m << 16 | n << 5 | t; }   // str w(t), [n, m, lsl #2]
+constexpr u32 strbreg(u32 t, u32 n, u32 m) { return 0x38206800 | m << 16 | n << 5 | t; }   // strb w(t), [n, m]
+constexpr u32 cmpsxtw(u32 n, u32 m) { return 0xeb20c01f | m << 16 | n << 5; }            // cmp n, w(m), sxtw
 constexpr u32 ucvtf(u32 d, u32 n) { return 0x9e630000 | n << 5 | d; }                 // d = (double) x, unsigned
 constexpr u32 sub(u32 d, u32 n, u32 m) { return 0xcb000000 | m << 16 | n << 5 | d; }
 constexpr u32 ldar(u32 t, u32 n) { return 0xc8dffc00 | n << 5 | t; }  // load-acquire

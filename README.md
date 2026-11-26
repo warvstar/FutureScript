@@ -660,23 +660,27 @@ while present() {                    // show the frame, handle input, wait for t
 `build/fut -w examples/paddle.fut` is a small game to live-code.
 `build/fut examples/flock.fut` is a simulation that runs the same everywhere. Its boids' behaviours are ordinary functions, each run under a step budget, so a behaviour that loops forever (hold space) is cut off on the same tick everywhere. Its test blocks (`fut test examples/flock.fut`, run by both suites) check that a seeded run's state matches a fingerprint, every bit, natively and in wasm.
 
-## Packed buffers
+## Buffers
 
-`f32s`, `u32s`, `i32s` and `u8s` hold numbers packed as the GPU and C want them: 32-bit floats, 32-bit whole numbers (unsigned or signed), or bytes.
+`f64s`, `f32s`, `u32s`, `i32s` and `u8s` hold numbers packed as C and the GPU want them: 64- or 32-bit floats, 32-bit whole numbers (unsigned or signed), or bytes, in memory outside every heap.
 
 ```
 var b = f32s(4)                      // 4 zeros; also f32s([1, 2, 3]) or f32s(another buffer)
 b[0] = 0.1                           // stored as an f32: b[0] is now 0.10000000149011612
-for x in b { }                       // b.len(), b.slice(1, 3) (a copy), b.bytes() (16)
+for x in b { }                       // b.len(), b.slice(1, 3) (a copy), b.bytes() (16), b.fill(x), b.toList()
 u8s(1)[0] = 256                      // error: cannot store 256 in u8s: it holds whole numbers from 0 to 255
 fn sum(xs: f32s): num { ... }        // each is a type too
 extern fn memset(ptr, int, long): ptr
 memset(u8s(8), 0, 8)                 // a ptr parameter gets the buffer's bytes
+var t = spawn work(xs)               // moves xs: using it here raises until it comes back (xs = t.join())
 ```
 
 **Vectors** are `f32s` of 2, 3 or 4: `vec2f(x, y)`, `vec3f(x, y, z)`, `vec4f(x, y, z, w)`, and `vec2f` (etc.) as a type is an `f32s` of that length. `v.x` (`y z w`, or `r g b a`) reads one number; `v.xy`, `v.zyx` make a new vector. `+ - * / %` on `f32s` work elementwise, with an `f32s` of the same length or a number (`v * 2`, `1 - v`), giving a new one. `v.length()`, `v.dot(w)`, `v.normalize()`, `v.cross(w)`.
 
-Their length is fixed. A store is checked: a non-number, or a number a whole-number buffer can't hold, is an error rather than a value wrapped or clipped. `==` is identity and `expect`'s compares the numbers, as for lists. They print as `f32s[1, 0.1]` (an f32 with the fewest digits that give it back). They are copied when sent to another isolate, become arrays of numbers in `json` and for JavaScript, and an `atomic` block that fails puts their contents back. `b[i]` on an `f32s` is compiled inline, like a list's: about 3.7 ns for a load, add and store natively against 9 ns through the runtime (wasm: 10 ns against 37). The other kinds go through the runtime.
+- **Fixed length, checked stores.** A non-number, or a number a whole-number buffer can't hold, is an error rather than a value wrapped or clipped. They print as `f32s[1, 0.1]` (an f32 with the fewest digits that give it back), become arrays of numbers in `json` and for JavaScript, and an `atomic` block that fails puts their contents back.
+- **Compiled inline.** `b[i]` on every type is compiled like a list's (a load widens to a double; a store converts, checking the value fits): on an `f32s`, about 3.7 ns for a load, add and store natively against 9 ns through the runtime (wasm: 10 ns against 37). The collector never scans or moves their numbers.
+- **Sending moves one.** A buffer sent over a channel, passed to `spawn` or returned to `join()` is not copied: the receiver gets the same memory, and the sender's handle is dead (using it raises "was sent to another isolate"). So one isolate at a time uses a buffer, and none can race on it. A spawned isolate's copy of the globals doesn't take their buffers (pass one as an argument). A buffer can't be sent inside `atomic { }`, since a move can't be undone.
+- `==` is identity (two handles on one buffer are equal); `expect a == b` compares what they hold, as for lists.
 
 ## GPU
 

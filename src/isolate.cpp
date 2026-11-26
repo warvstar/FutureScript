@@ -67,10 +67,14 @@ static void release(Shared* s) { if (s && s->rc.fetch_sub(1, std::memory_order_a
 struct Msg {
   std::string b;
   std::vector<Shared*> refs;
+  std::vector<BufData*> bufs;  // buffers it moves (buffer.cpp)
   Msg() = default;
-  Msg(Msg&& o) noexcept : b(std::move(o.b)), refs(std::move(o.refs)) {}
-  Msg& operator=(Msg&& o) noexcept { std::swap(b, o.b), std::swap(refs, o.refs); return *this; }
-  ~Msg() { for (Shared* s : refs) release(s); }
+  Msg(Msg&& o) noexcept : b(std::move(o.b)), refs(std::move(o.refs)), bufs(std::move(o.bufs)) {}
+  Msg& operator=(Msg&& o) noexcept { std::swap(b, o.b), std::swap(refs, o.refs), std::swap(bufs, o.bufs); return *this; }
+  ~Msg() {
+    for (Shared* s : refs) release(s);
+    for (BufData* s : bufs) bufRelease(s);
+  }
 };
 struct ChanState : Shared {
   std::deque<Msg> q;
@@ -397,6 +401,9 @@ Iso* self() {
   if (!me) isolateRoot();
   return me;
 }
+}  // namespace
+const void* isolateId() { return self(); }
+namespace {
 void wake(Iso* i) {  // (chanMu held)
   if (!i->waiting || i->woken) return;
   i->woken = true, i->root->blocked--;
@@ -497,6 +504,9 @@ struct Writer {
   std::unordered_map<Obj*, u32> seen;
   u32 n = 0;
   int depth = 0;
+  bool moving = true;        // false: buffers met go as dead handles (a spawned isolate's copy of the globals)
+  std::vector<Obj*> moved;   // the sender's buffer handles, dead once the message is made (sent())
+  void sent() { for (Obj* o : moved) bufSent(o); }
   template <class T> void raw(T x) { m.b.append((const char*)&x, sizeof x); }
   void put(V v) {
     if (!isObj(v)) return m.b += 'v', raw(v);
@@ -537,23 +547,23 @@ struct Writer {
         for (u32 k = 0; k < c->n; k++) put(c->env()[k]);
         break;
       }
-      case K::Buf: {  // copied, like a list
-        Buf* b = (Buf*)o;
-        m.b += 'P', m.b += b->et, raw((uint64_t)b->n), m.b.append((const char*)b->p, b->n * bufElem(b->et));
-        break;
-      }
       case K::Chan: case K::Task: {
         Shared* s = ((Chan*)o)->s;
         s->rc.fetch_add(1, std::memory_order_relaxed), m.refs.push_back(s);
         m.b += o->kind == K::Chan ? 'C' : 'T', raw((u32)m.refs.size() - 1);
         break;
       }
+      case K::Buf:  // moved (buffer.cpp)
+        if (!moving) { m.b += 'D'; break; }
+        m.bufs.push_back(bufTake(o)), moved.push_back(o);
+        m.b += 'B', raw((u32)m.bufs.size() - 1);
+        break;
       default: ERR("@send cannot send %s", typeName(v));
     }
     depth--;
   }
 };
-Msg encode(V v) { Writer w; w.put(v); return std::move(w.m); }
+Msg encode(V v) { Writer w; w.put(v), w.sent(); return std::move(w.m); }
 
 struct Reader {
   const Msg& m;
@@ -578,14 +588,6 @@ struct Reader {
         V r = keep(l);
         l->v.reserve(n);
         for (u32 i = 0; i < n; i++) { V x = get(); l->v.push_back(x); }
-        return r;
-      }
-      case 'P': {
-        char et = m.b[at++];
-        uint64_t n = raw<uint64_t>();
-        Buf* b = newBuf(et, n);
-        V r = keep(b);
-        memcpy(b->p, m.b.data() + at, n * bufElem(et)), at += n * bufElem(et);
         return r;
       }
       case 'm': {
@@ -615,6 +617,8 @@ struct Reader {
         for (u32 k = 0; k < n; k++) c->env()[k] = get();
         return r;
       }
+      case 'B': { V h = bufGive(m.bufs[raw<u32>()]); return keep(obj(h)); }
+      case 'D': return keep(obj(bufElsewhere()));
       case 'C': case 'T': {
         char t = m.b[at - 1];
         V h = handle(m.refs[raw<u32>()], t == 'C' ? K::Chan : K::Task);
@@ -829,8 +833,9 @@ V n_spawn(V f, V args) {
   Writer w;  // one message, so values the arguments and globals share stay shared
   w.put(f), w.put(args);
   int ng = globalCount();
-  w.raw((u32)ng);
+  w.raw((u32)ng), w.moving = false;
   for (int i = 0; i < ng; i++) w.put(vm->globals[i]);
+  w.sent();
   TaskState* t = new TaskState;  // one reference for the isolate, one for this handle
   t->start = std::move(w.m), t->at = WASM_OR(hereWhere(), codeWhere(ra)), t->allowed = vm->allowed, t->who = vm->who, t->out = outBase();
   V h = handle(t, K::Task);

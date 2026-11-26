@@ -316,18 +316,19 @@ struct Gen : CState {
 
   // ---- fields: an inline cache per site, in the VM block: key = the instance header, val = the slot ----
   // list[i] (r0 = the list, r1 = the index; r2 = the value to store): inline when r0 is a list and 0 <= i < len,
-  // which a NaN (any non-number) fails; a fraction truncates, as in rt_geti. An f32s too (a number stored; a NaN
-  // loaded goes to the helper, which boxes it). Else, and for stores inside a transaction (which save the list or
-  // buffer first), the helper.
+  // which a NaN (any non-number) fails; a fraction truncates, as in rt_geti. A buffer of any type too (buffer.cpp).
+  // Else, and for stores inside a transaction (which save the list or buffer first), the helper.
   void index(bool store) {
     auto idx = [&] { get(R0 + 1), op(F64_REINTERPRET); };
+    auto val = [&] { get(R0 + 2), op(F64_REINTERPRET); };
     open(BLOCK), open(BLOCK);  // $done, $miss
     int done = F->blocks - 1, miss = F->blocks;
     isPtr(0, false), br(BR_IF, miss, UNLIKELY);
     if (store) txnDepth(), br(BR_IF, miss, UNLIKELY);
     idx(), op(F64_CONST), f64(0), op(F64_GE), op(I32_EQZ), br(BR_IF, miss, UNLIKELY);
+    addr(0), mem(store ? I32_LOAD16_U : I32_LOAD8_U, 0, 0), set(T3);  // the kind (a store: and typed, so not typed or FROZEN)
     open(BLOCK);  // $notList
-    addr(0), mem(store ? I32_LOAD16_U : I32_LOAD8_U, 0, 0), i32c((int)K::List), op(I32_NE), br(BR_IF, F->blocks);  // a store: not typed
+    get(T3), i32c((int)K::List), op(I32_NE), br(BR_IF, F->blocks);
     addr(0), mem(I32_LOAD, 2, LIST_V), set(T2);  // T2 = begin
     idx(), addr(0), mem(I32_LOAD, 2, LIST_V + 4);  // the end or the length
     if (!vecCount) get(T2), op(I32_SUB), i32c(3), op(I32_SHR_U);
@@ -337,17 +338,39 @@ struct Gen : CState {
     if (store) get(T), get(R0 + 2), mem(I64_STORE, 3, 0), mv(0, 2);
     else get(T), mem(I64_LOAD, 3, 0), set(R0);
     br(BR, done), close();
-    addr(0), mem(I32_LOAD8_U, 0, 0), i32c((int)K::Buf), op(I32_NE), br(BR_IF, miss, UNLIKELY);
-    addr(0), mem(I32_LOAD8_U, 0, BUF_ET), i32c('f'), op(I32_NE), br(BR_IF, miss, UNLIKELY);
+    // A buffer: below n (a dead handle's is 0); T = its numbers, T2 = the index, T3 = its element type. A load widens
+    // to a double (an f32 NaN goes to the helper, which boxes it); a store of a whole-number type checks the value is
+    // whole and in range (else the helper raises).
+    get(T3), i32c((int)K::Buf), op(I32_NE), br(BR_IF, miss, UNLIKELY);
     if (store) isNumber(2), op(I32_EQZ), br(BR_IF, miss, UNLIKELY);
     idx(), addr(0), mem(I32_LOAD, 2, BUF_N), op(F64_CONVERT_I32_U), op(F64_LT), op(I32_EQZ), br(BR_IF, miss, UNLIKELY);
-    addr(0), mem(I32_LOAD, 2, BUF_P), idx(), op(I32_TRUNC_F64_U), i32c(2), op(I32_SHL), op(I32_ADD), set(T);
-    if (store) get(T), get(R0 + 2), op(F64_REINTERPRET), op(F32_DEMOTE_F64), mem(F32_STORE, 2, 0), mv(0, 2);
-    else {
-      get(T), mem(F32_LOAD, 2, 0), get(T), mem(F32_LOAD, 2, 0), op(F32_EQ), op(I32_EQZ), br(BR_IF, miss, UNLIKELY);  // a NaN: boxed by the helper
-      get(T), mem(F32_LOAD, 2, 0), op(F64_PROMOTE_F32), op(I64_REINTERPRET), set(R0);
+    addr(0), mem(I32_LOAD8_U, 0, BUF_ET), set(T3);
+    addr(0), mem(I32_LOAD, 2, BUF_P), set(T);
+    idx(), op(I32_TRUNC_F64_U), set(T2);
+    for (char et : {'d', 'f', 'i', 'b', 'u'}) {
+      int sh = et == 'd' ? 3 : et == 'b' ? 0 : 2;
+      auto at = [&] { get(T), get(T2); if (sh) i32c(sh), op(I32_SHL); op(I32_ADD); };
+      get(T3), i32c(et), op(I32_EQ), open(IF, VOID);
+      if (et == 'd') {
+        if (store) at(), get(R0 + 2), mem(I64_STORE, 3, 0), mv(0, 2);
+        else at(), mem(I64_LOAD, 3, 0), set(R0);
+      } else if (et == 'f') {
+        if (store) at(), val(), op(F32_DEMOTE_F64), mem(F32_STORE, 2, 0), mv(0, 2);
+        else {
+          at(), mem(F32_LOAD, 2, 0), at(), mem(F32_LOAD, 2, 0), op(F32_EQ), op(I32_EQZ), br(BR_IF, miss, UNLIKELY);
+          at(), mem(F32_LOAD, 2, 0), op(F64_PROMOTE_F32), op(I64_REINTERPRET), set(R0);
+        }
+      } else if (store) {
+        double lo = et == 'i' ? -2147483648.0 : 0, hi = et == 'i' ? 2147483647.0 : et == 'u' ? 4294967295.0 : 255;
+        val(), val(), op(F64_TRUNC), op(F64_NE), br(BR_IF, miss, UNLIKELY);  // a fraction (or NaN)
+        val(), op(F64_CONST), f64(lo), op(F64_LT), br(BR_IF, miss, UNLIKELY);
+        val(), op(F64_CONST), f64(hi), op(F64_GT), br(BR_IF, miss, UNLIKELY);
+        at(), val(), op(et == 'i' ? I32_TRUNC_F64_S : I32_TRUNC_F64_U), mem(et == 'b' ? I32_STORE8 : I32_STORE, sh, 0), mv(0, 2);
+      } else
+        at(), mem(et == 'b' ? I32_LOAD8_U : I32_LOAD, sh, 0), op(et == 'i' ? F64_CONVERT_I32_S : F64_CONVERT_I32_U), op(I64_REINTERPRET), set(R0);
+      br(BR, done), close();
     }
-    br(BR, done), close();
+    close();
     helper(store ? H_SETI : H_GETI), close();
   }
   // x.push(v), x in slot base, v in r0: appended inline when x is an untyped list with spare capacity and no transaction
