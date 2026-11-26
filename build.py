@@ -398,7 +398,7 @@ def runner_packages(exe):
 
 
 def runner_map(exe):
-    """fut map: packages, files and declarations with line ranges; --pub (the interface), --json, a filter."""
+    """fut map: packages, files and declarations with line ranges, contracts noted; --pub (the interface), --json, a filter."""
     d = ROOT / "build" / "map"
     tree(d, PKG_TREE)
     run = lambda *a: subprocess.run([*runner(exe), "map", *a], capture_output=True, text=True, timeout=60)
@@ -406,15 +406,20 @@ def runner_map(exe):
     t, p, j, f, none = run(main), run("--pub", main), run("--json", main), run(main, "geom"), run(main, "nothing")
     recs = [json.loads(l) for l in j.stdout.splitlines() if l.startswith("{")]
     area = next((r for r in recs if r.get("name") == "area"), {})
+    (d / "geom" / "geom.fut").write_text(PKG_TREE["geom/geom.fut"].replace("pub fn area(r) {", "pub fn area(r)\n  requires r >= 0\n{"))
+    (d / "geom" / "vec.fut").write_text(PKG_TREE["geom/vec.fut"].replace("pub class Vec {\n", "pub class Vec {\n  invariant self.x != nil\n"))
+    marked = run(main, "geom").stdout
+    tree(d, PKG_TREE)
     ln = next((r for r in recs if r.get("name") == "len"), {})
-    ok = (t.returncode == 0 and "pkg app 0.0.0  // fut.pkg" in t.stdout and "pkg geom 0.3.0  // ../geom/fut.pkg" in t.stdout
+    ok = (t.returncode == 0 and "pkg app 0.0.0  // fut.pkg" in t.stdout and "pkg geom 0.3.0  // ../geom/fut.pkg, interface ../geom/geom.api" in t.stdout
           and "  geom.fut  // root" in t.stdout and "    fn hidden()" in t.stdout and "      fn len()" in t.stdout
           and "pub class Vec  // 1-4" in t.stdout.replace("   ", " ").replace("  //", "  //")
           and "hidden" not in p.stdout and "util.fut" not in p.stdout and "pub fn area(r)" in p.stdout
           and area.get("package") == "geom" and area.get("line") == 3 and area.get("pub") is True
           and ln.get("in") == "Vec" and ln.get("line") == 3 and ln.get("end") == 3
-          and "pkg app" not in f.stdout and "pkg geom" in f.stdout and none.returncode == 1)
-    return ok, f"text: {t.stdout!r}\n  pub: {p.stdout!r}\n  json: {j.stdout[:400]!r}\n  filtered: {f.stdout!r}"
+          and "pkg app" not in f.stdout and "pkg geom" in f.stdout and none.returncode == 1
+          and re.search(r"pub fn area\(r\) +// 3-5, contract", marked) and re.search(r"pub class Vec +// 1-5, invariant", marked))
+    return ok, f"text: {t.stdout!r}\n  pub: {p.stdout!r}\n  json: {j.stdout[:400]!r}\n  filtered: {f.stdout!r}\n  contracts marked: {marked!r}"
 
 
 def runner_modules(exe):

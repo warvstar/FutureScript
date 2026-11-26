@@ -44,7 +44,7 @@ std::string apiPath(const std::string& file) {
   return (dot == std::string::npos || (slash != std::string::npos && dot < slash) ? file : file.substr(0, dot)) + ".api";
 }
 
-// Declarations read from tokens, without compiling: what interfaces and `fut map` show.
+// Reading declarations from tokens, without compiling.
 struct Scan {
   Lexer L;
   Tok next() { Tok t = L.next(); return t.t == T_ERR ? Tok{T_EOF} : t; }
@@ -85,107 +85,169 @@ struct Scan {
       L = r, e = r.p;
     }
   }
-  std::string clauses(const char* indent) {  // a function's requires and ensures clauses next: one per line, indented
-    std::string o;
+  std::vector<std::string> clauses() {  // a function's requires and ensures clauses next, each on one line
+    std::vector<std::string> o;
     for (;;) {
       Lexer s = L;
       Tok k = next();
       if (!isKw(k, S_requires) && !isKw(k, S_ensures)) return L = s, o;
-      o += indent + squash(k.p, clauseEnd()) + "\n";
+      o.push_back(squash(k.p, clauseEnd()));
     }
   }
 };
-struct Item { std::string name, text; };
-static void itemsOf(const std::string& text, std::vector<Item>& items) {
+// Every declaration in a file, read from tokens without compiling: what interfaces and `fut map` both show, so the
+// two can't disagree. A top-level declaration, then its members (owner: the class or effect they are in), each with
+// the // comments right above it and, for a function or method, its contract (an invariant is a member of its own).
+struct Decl {
+  std::string kind, name, sig, owner, mod;  // owner: the class or effect a member is in; mod: an extern's module
+  bool pub;
+  int line, end;
+  std::string doc;                   // the // lines right above it
+  std::vector<std::string> clauses;  // its requires and ensures, as written (on one line each)
+};
+static std::vector<Decl> declsOf(const std::string& text) {
+  std::vector<Decl> out;
   const char* src = text.c_str();
   Scan S{Lexer{src}};
-  Lexer& L = S.L;
-  auto next = [&] { return S.next(); };
+  auto& L = S.L;
   auto isKw = Scan::isKw;
-  auto params = [&](Tok& t) { return S.params(t); };
-  auto typed = [&](const char* e) { return S.typed(e); };
-  auto effects = [&](const char* e) { return S.effects(e); };
-  auto skipBody = [&](Tok& t) { S.skipBody(t); };
   int depth = 0;
-  for (Tok t = next(); t.t != T_EOF; t = next()) {
+  for (Tok t = S.next(); t.t != T_EOF; t = S.next()) {
     if (t.t == '{') depth++;
     if (t.t == '}') depth--;
-    if (depth || !isKw(t, S_pub)) continue;
-    Lexer save = L;
-    Tok k = next();
-    if (k.t != T_ID || k.nl || !(k.sym == K_fn || k.sym == K_class || k.sym == K_var || k.sym == K_extern || k.sym == S_effect)) { L = save; continue; }
-    Item it;
+    if (depth || t.t != T_ID) continue;
+    bool pub = false;
+    Tok k = t;
+    if (isKw(t, S_pub)) {
+      Lexer save = L;
+      Tok n = S.next();
+      if (n.t != T_ID || n.nl || !(n.sym == K_fn || n.sym == K_class || n.sym == K_var || n.sym == K_extern || n.sym == S_effect || n.sym == K_import)) { L = save; continue; }
+      pub = true, k = n;
+    }
+    const char* from = pub ? t.p : k.p;
     std::string doc = docs(src, t.p, "");
-    if (k.sym == K_var) {
-      Tok n = next();
-      it = {symName(n.sym), "pub " + squash(k.p, typed(L.p))};
-    } else if (k.sym == K_fn) {
-      Tok n = next(), p = next();
-      const char* end = params(p);
-      it = {symName(n.sym), "pub " + squash(k.p, effects(typed(end)))};
-      if (std::string c = S.clauses("  "); !c.empty()) it.text += "\n" + c.substr(0, c.size() - 1);  // its contract
-    } else if (k.sym == K_extern) {
-      Tok n = next();
-      while (n.t != T_EOF && !isKw(n, K_fn)) n = next();
-      Tok nm = next(), p = next();
-      const char* end = params(p);
+    if (isKw(k, K_fn)) {
+      Tok n = S.next(), p = S.next();
+      if (n.t != T_ID || p.t != '(') continue;
+      const char* e = S.effects(S.typed(S.params(p)));
+      auto cl = S.clauses();
+      Tok b = S.next();
+      int end = b.line;
+      if (b.t == '{') S.skipBody(b), end = b.line;
+      out.push_back({"fn", symName(n.sym), squash(from, e), "", "", pub, k.line, end, doc, cl});
+    } else if (isKw(k, K_var)) {
+      Tok n = S.next();
+      if (n.t != T_ID) continue;
+      out.push_back({"var", symName(n.sym), squash(from, S.typed(L.p)), "", "", pub, k.line, k.line, doc, {}});
+    } else if (isKw(k, K_import)) {
+      Tok f = S.next();
+      if (f.t != T_STR) continue;
+      const char* e = f.p + f.len + 1;
       Lexer s = L;
-      if (s.next().t == ':') s.next(), end = s.p, L = s;  // its result type
-      it = {symName(nm.sym), "pub " + squash(k.p, end)};
-    } else if (k.sym == S_effect) {  // an effect: its operations, sorted, with their comments
-      Tok n = next(), b = next();
-      while (b.t != '{' && b.t != T_EOF) b = next();
-      it.name = symName(n.sym), it.text = "pub effect " + symName(n.sym) + " {\n";
-      std::vector<std::pair<std::string, std::string>> opl;
-      for (Tok m = next(); m.t != '}' && m.t != T_EOF; m = next()) {
-        if (!isKw(m, K_fn)) continue;
-        std::string d = docs(src, m.p, "  ");
-        Tok nm = next(), p = next();
-        opl.push_back({symName(nm.sym), d + "  " + squash(m.p, typed(params(p))) + "\n"});
-      }
-      std::stable_sort(opl.begin(), opl.end(), [](auto& a, auto& b) { return before(a.first, b.first); });
-      for (auto& [_, s] : opl) it.text += s;
-      it.text += "}";
-    } else {  // a class: its header, then its fields and methods (each sorted), with their comments
-      Tok n = next(), b = next();
-      while (b.t != '{' && b.t != T_EOF) b = next();
-      it.name = symName(n.sym), it.text = "pub " + squash(k.p, b.p) + " {\n";
-      std::vector<std::pair<std::string, std::string>> fields, methods;
-      std::string invariants;  // in the order written
-      for (Tok m = next(); m.t != '}' && m.t != T_EOF; m = next()) {
-        std::string d = docs(src, m.p, "  ");
-        if (isKw(m, S_invariant)) {
-          invariants += d + "  " + squash(m.p, S.clauseEnd()) + "\n";
+      if (Tok a = s.next(); isKw(a, S_as)) if (Tok n = s.next(); n.t == T_ID) L = s, e = s.p;
+      out.push_back({"import", std::string(f.p, f.len), squash(from, e), "", "", pub, k.line, k.line, doc, {}});
+    } else if (isKw(k, K_extern)) {
+      Tok n = S.next();
+      std::string mod = n.t == T_ID && !isKw(n, K_fn) ? symName(n.sym) : n.t == T_STR ? std::string(n.p, n.len) : "";
+      while (n.t != T_EOF && !isKw(n, K_fn)) n = S.next();
+      Tok nm = S.next(), p = S.next();
+      const char* e = S.params(p);
+      if (Lexer s = L; s.next().t == ':') s.next(), e = s.p, L = s;  // its result type
+      out.push_back({"extern", symName(nm.sym), squash(from, e), "", mod, pub, k.line, k.line, doc, {}});
+    } else if (isKw(k, S_effect) || isKw(k, K_class)) {
+      bool eff = isKw(k, S_effect);
+      Lexer save = L;
+      Tok n = S.next(), b = S.next();
+      if (n.t != T_ID || (eff && b.t != '{')) { L = save; continue; }
+      while (b.t != '{' && b.t != T_EOF) b = S.next();
+      size_t at = out.size();
+      std::string owner = symName(n.sym);
+      out.push_back({eff ? "effect" : "class", owner, squash(from, b.p), "", "", pub, k.line, k.line, doc, {}});
+      for (Tok m = S.next(); m.t != '}' && m.t != T_EOF; m = S.next()) {
+        std::string md = docs(src, m.p, "");
+        if (isKw(m, K_var) && !eff) {
+          Tok f = S.next();
+          S.typed(f.p);
+          if (Lexer s = L; s.next().t == '=') {  // its default, a constant: one token, maybe negated
+            L = s;
+            if (S.next().t == '-') S.next();
+          }
+          out.push_back({"field", symName(f.sym), squash(m.p, L.p), owner, "", pub, m.line, m.line, md, {}});
           continue;
         }
-        if (isKw(m, K_var)) {
-          Tok f = next();
-          typed(f.p);
-          Lexer s = L;
-          if (s.next().t == '=') {  // its default, a constant: one token, maybe negated
-            L = s;
-            if (next().t == '-') next();
-          }
-          fields.push_back({symName(f.sym), d + "  " + squash(m.p, L.p) + "\n"});
+        if (isKw(m, S_invariant) && !eff) {
+          out.push_back({"invariant", "", squash(m.p, S.clauseEnd()), owner, "", pub, m.line, m.line, md, {}});
           continue;
         }
         Tok first = m;
-        if (isKw(m, S_override)) m = next();
+        if (isKw(m, S_override)) m = S.next();
         if (!isKw(m, K_fn)) continue;
-        Tok nm = next(), p = next();
-        const char* end = effects(typed(params(p)));
-        methods.push_back({symName(nm.sym), d + "  " + squash(first.p, end) + "\n" + S.clauses("    ")});
-        Tok body = next();
-        skipBody(body);
+        Tok nm = S.next(), p = S.next();
+        const char* e = S.effects(S.typed(S.params(p)));
+        std::vector<std::string> cl;
+        int end = m.line;
+        if (!eff) {
+          cl = S.clauses();
+          Tok body = S.next();
+          if (body.t == '{') S.skipBody(body), end = body.line;
+        }
+        out.push_back({eff ? "op" : "method", symName(nm.sym), squash(first.p, e), owner, "", pub, first.line, end, md, cl});
       }
-      auto byName = [](auto& a, auto& b) { return before(a.first, b.first); };
+      out[at].end = L.line;
+    } else if (isKw(k, S_test) && !pub) {
+      Lexer save = L;
+      Tok n = S.next();
+      if (n.t != T_STR) { L = save; continue; }
+      Tok b = S.next();
+      int end = b.line;
+      if (b.t == '{') S.skipBody(b), end = b.line;
+      out.push_back({"test", std::string(n.p, n.len), squash(k.p, n.p + n.len + 1), "", "", false, k.line, end, doc, {}});
+    }
+  }
+  return out;
+}
+
+// ---- interfaces: a file's (or package's) pub declarations, rendered from declsOf ----
+struct Item { std::string name, text; };
+static std::string indented(const std::string& doc, const char* in) {  // each line of doc, indented
+  std::string o;
+  for (size_t i = 0; i < doc.size();) {
+    size_t j = doc.find('\n', i);
+    o += in + doc.substr(i, j - i + 1), i = j + 1;
+  }
+  return o;
+}
+static std::string contract(const std::vector<std::string>& clauses, const char* in) {
+  std::string o;
+  for (auto& c : clauses) o += in + c + "\n";
+  return o;
+}
+static void itemsOf(const std::string& text, std::vector<Item>& items) {
+  auto ds = declsOf(text);
+  auto byName = [](auto& a, auto& b) { return before(a.first, b.first); };
+  for (size_t i = 0; i < ds.size(); i++) {
+    const Decl& d = ds[i];
+    if (!d.owner.empty() || !d.pub || d.kind == "import" || d.kind == "test") continue;  // (members: with their owner)
+    Item it{d.name, d.doc + d.sig};
+    if (d.kind == "fn" && !d.clauses.empty()) {
+      std::string c = contract(d.clauses, "  ");
+      it.text += "\n" + c.substr(0, c.size() - 1);
+    } else if (d.kind == "class" || d.kind == "effect") {  // its invariants as written, then fields and methods, each sorted
+      std::string invariants;
+      std::vector<std::pair<std::string, std::string>> fields, methods;
+      for (size_t j = i + 1; j < ds.size() && ds[j].owner == d.name; j++) {
+        const Decl& m = ds[j];
+        std::string line = indented(m.doc, "  ") + "  " + m.sig + "\n";
+        if (m.kind == "invariant") invariants += line;
+        else if (m.kind == "field") fields.push_back({m.name, line});
+        else methods.push_back({m.name, line + contract(m.clauses, "    ")});
+      }
       std::stable_sort(fields.begin(), fields.end(), byName), std::stable_sort(methods.begin(), methods.end(), byName);
-      it.text += invariants;
-      for (auto& [_, s] : fields) it.text += s;
-      for (auto& [_, s] : methods) it.text += s;
+      it.text += " {\n" + invariants;
+      for (auto& [_, l] : fields) it.text += l;
+      for (auto& [_, l] : methods) it.text += l;
       it.text += "}";
     }
-    it.text = doc + it.text;
     items.push_back(std::move(it));
   }
 }
@@ -358,107 +420,6 @@ int writeInterfaces(const Compiled& c, const std::string& program) {  // fut api
 // ---- fut map: every package, file and top-level declaration the program uses, with line ranges ----
 // Generated from the sources each time (never committed, so never stale), in fut's own syntax, for readers who
 // want the layout of a program without reading it: agents deciding where to work, people new to it.
-struct Decl {
-  std::string kind, name, sig, owner, mod;  // owner: the class or effect a member is in; mod: an extern's module
-  bool pub;
-  int line, end;
-};
-static std::vector<Decl> declsOf(const std::string& text) {
-  std::vector<Decl> out;
-  Scan S{Lexer{text.c_str()}};
-  auto& L = S.L;
-  auto isKw = Scan::isKw;
-  int depth = 0;
-  for (Tok t = S.next(); t.t != T_EOF; t = S.next()) {
-    if (t.t == '{') depth++;
-    if (t.t == '}') depth--;
-    if (depth || t.t != T_ID) continue;
-    bool pub = false;
-    Tok k = t;
-    if (isKw(t, S_pub)) {
-      Lexer save = L;
-      Tok n = S.next();
-      if (n.t != T_ID || n.nl || !(n.sym == K_fn || n.sym == K_class || n.sym == K_var || n.sym == K_extern || n.sym == S_effect || n.sym == K_import)) { L = save; continue; }
-      pub = true, k = n;
-    }
-    const char* from = pub ? t.p : k.p;
-    if (isKw(k, K_fn)) {
-      Tok n = S.next(), p = S.next();
-      if (n.t != T_ID || p.t != '(') continue;
-      const char* e = S.effects(S.typed(S.params(p)));
-      S.clauses("");
-      Tok b = S.next();
-      int end = b.line;
-      if (b.t == '{') S.skipBody(b), end = b.line;
-      out.push_back({"fn", symName(n.sym), squash(from, e), "", "", pub, k.line, end});
-    } else if (isKw(k, K_var)) {
-      Tok n = S.next();
-      if (n.t != T_ID) continue;
-      out.push_back({"var", symName(n.sym), squash(from, S.typed(L.p)), "", "", pub, k.line, k.line});
-    } else if (isKw(k, K_import)) {
-      Tok f = S.next();
-      if (f.t != T_STR) continue;
-      const char* e = f.p + f.len + 1;
-      Lexer s = L;
-      if (Tok a = s.next(); isKw(a, S_as)) if (Tok n = s.next(); n.t == T_ID) L = s, e = s.p;
-      out.push_back({"import", std::string(f.p, f.len), squash(from, e), "", "", pub, k.line, k.line});
-    } else if (isKw(k, K_extern)) {
-      Tok n = S.next();
-      std::string mod = n.t == T_ID && !isKw(n, K_fn) ? symName(n.sym) : n.t == T_STR ? std::string(n.p, n.len) : "";
-      while (n.t != T_EOF && !isKw(n, K_fn)) n = S.next();
-      Tok nm = S.next(), p = S.next();
-      const char* e = S.params(p);
-      if (Lexer s = L; s.next().t == ':') s.next(), e = s.p, L = s;
-      out.push_back({"extern", symName(nm.sym), squash(from, e), "", mod, pub, k.line, k.line});
-    } else if (isKw(k, S_effect) || isKw(k, K_class)) {
-      bool eff = isKw(k, S_effect);
-      Lexer save = L;
-      Tok n = S.next(), b = S.next();
-      if (n.t != T_ID || (eff && b.t != '{')) { L = save; continue; }
-      while (b.t != '{' && b.t != T_EOF) b = S.next();
-      size_t at = out.size();
-      out.push_back({eff ? "effect" : "class", symName(n.sym), squash(from, b.p), "", "", pub, k.line, k.line});
-      for (Tok m = S.next(); m.t != '}' && m.t != T_EOF; m = S.next()) {
-        if (isKw(m, K_var) && !eff) {
-          Tok f = S.next();
-          S.typed(f.p);
-          if (Lexer s = L; s.next().t == '=') {
-            L = s;
-            if (S.next().t == '-') S.next();
-          }
-          out.push_back({"field", symName(f.sym), squash(m.p, L.p), symName(n.sym), "", pub, m.line, m.line});
-          continue;
-        }
-        Tok first = m;
-        if (isKw(m, S_override)) m = S.next();
-        if (isKw(m, S_invariant) && !eff) {
-          S.clauseEnd();  // (fut map shows declarations; the .api shows contracts)
-          continue;
-        }
-        if (!isKw(m, K_fn)) continue;
-        Tok nm = S.next(), p = S.next();
-        const char* e = S.effects(S.typed(S.params(p)));
-        if (!eff) S.clauses("");
-        int end = m.line;
-        if (!eff) {
-          Tok body = S.next();
-          if (body.t == '{') S.skipBody(body), end = body.line;
-        }
-        out.push_back({eff ? "op" : "method", symName(nm.sym), squash(first.p, e), symName(n.sym), "", pub, first.line, end});
-      }
-      out[at].end = L.line;
-    } else if (isKw(k, S_test) && !pub) {
-      Lexer save = L;
-      Tok n = S.next();
-      if (n.t != T_STR) { L = save; continue; }
-      Tok b = S.next();
-      int end = b.line;
-      if (b.t == '{') S.skipBody(b), end = b.line;
-      out.push_back({"test", std::string(n.p, n.len), squash(k.p, n.p + n.len + 1), "", "", false, k.line, end});
-    }
-  }
-  return out;
-}
 int printMap(const Compiled& c, bool pubOnly, bool asJson, const std::string& only, const std::string& program) {
   struct Group { const Package* pkg; std::vector<const std::pair<std::string, std::string>*> files; };
   std::vector<Group> groups{{nullptr, {}}};  // first: the files outside any package
@@ -494,9 +455,11 @@ int printMap(const Compiled& c, bool pubOnly, bool asJson, const std::string& on
       for (auto& d : decls.back()) if (d.kind == "extern" && !d.mod.empty()) binds[d.mod].push_back(d.name);
     }
     if (p) {
+      std::string api;  // its interface file: what other packages read instead of its sources
+      for (auto& u : c.apis) if (u.pkg == p->name) api = shown(u.api, program);
       if (asJson) o += "{\"type\":\"package\",\"name\":" + json(p->name) + ",\"version\":" + json(p->version) + ",\"dir\":" + json(shown(p->dir, program)) +
-                       ",\"root\":" + json(shown(p->root, program)) + "}\n";
-      else o += "pkg " + p->name + " " + p->version + "  // " + shown(p->manifest, program) + "\n";
+                       ",\"root\":" + json(shown(p->root, program)) + (api.empty() ? "" : ",\"api\":" + json(api)) + "}\n";
+      else o += "pkg " + p->name + " " + p->version + "  // " + shown(p->manifest, program) + (api.empty() ? "" : ", interface " + api) + "\n";
       for (auto& m : p->mods) {
         std::string t = m.kind == "c" && m.target.find('/') == std::string::npos ? m.target : rel(m.target), b;
         if (asJson) {
@@ -511,15 +474,24 @@ int printMap(const Compiled& c, bool pubOnly, bool asJson, const std::string& on
     std::string ind = p ? "  " : "";
     for (size_t i = 0; i < files.size(); i++) {
       const std::string& f = files[i]->first;
-      std::vector<const Decl*> shownDecls;
-      for (auto& d : decls[i]) if (!pubOnly || d.pub) shownDecls.push_back(&d);
+      std::vector<const Decl*> shownDecls;  // (a class's invariants: noted on the class; the .api lists them)
+      std::unordered_map<std::string, int> invariants;
+      for (auto& d : decls[i]) if (d.kind == "invariant") invariants[d.owner]++;
+      for (auto& d : decls[i]) if ((!pubOnly || d.pub) && d.kind != "invariant") shownDecls.push_back(&d);
+      auto has = [&](const Decl* d) {  // what contract it carries, for the reader to find in the .api or the source
+        std::string h = !d->clauses.empty() ? "contract" : "";
+        if (d->kind == "class" && invariants.count(d->name)) h = "invariant";
+        return h;
+      };
       if (asJson) {
         o += "{\"type\":\"file\"" + (p ? ",\"package\":" + json(p->name) : "") + ",\"file\":" + json(shown(f, program)) + "}\n";
         for (auto* d : shownDecls) {
           o += "{\"type\":\"" + d->kind + "\"" + (p ? ",\"package\":" + json(p->name) : "") + ",\"file\":" + json(shown(f, program)) + ",\"name\":" + json(d->name);
           if (!d->owner.empty()) o += ",\"in\":" + json(d->owner);
           if (!d->mod.empty()) o += ",\"module\":" + json(d->mod);
-          o += std::string(",\"pub\":") + (d->pub ? "true" : "false") + ",\"sig\":" + json(d->sig) + ",\"line\":" + std::to_string(d->line) + ",\"end\":" + std::to_string(d->end) + "}\n";
+          o += std::string(",\"pub\":") + (d->pub ? "true" : "false") + ",\"sig\":" + json(d->sig) + ",\"line\":" + std::to_string(d->line) + ",\"end\":" + std::to_string(d->end);
+          if (std::string h = has(d); !h.empty()) o += h == "contract" ? ",\"contract\":true" : ",\"invariants\":" + std::to_string(invariants[d->name]);
+          o += "}\n";
           n++;
         }
         emit();
@@ -533,7 +505,9 @@ int printMap(const Compiled& c, bool pubOnly, bool asJson, const std::string& on
         std::string l = ind + "  " + (d->owner.empty() ? "" : "  ") + d->sig;
         size_t col = ind.size() + 2 + w + 2;
         l += std::string(l.size() < col ? col - l.size() : 2, ' ');
-        l += "// " + std::to_string(d->line) + (d->end != d->line ? "-" + std::to_string(d->end) : "") + "\n";
+        l += "// " + std::to_string(d->line) + (d->end != d->line ? "-" + std::to_string(d->end) : "");
+        if (std::string h = has(d); !h.empty()) l += ", " + h;
+        l += "\n";
         o += l, n++;
       }
       emit();
