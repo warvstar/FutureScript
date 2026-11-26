@@ -349,7 +349,18 @@ export async function createFut(opts) {
   const refs = new Map(), refIds = new Map();  // id -> value, value -> id: one id per value while fut holds it
   let refNext = 1;  // never reused, so an id names one value
   const refOf = (v) => { let id = refIds.get(v); if (id == null) refIds.set(v, (id = refNext++)), refs.set(id, v); return id; };
-  const unpin = globalThis.FinalizationRegistry ? new FinalizationRegistry((id) => ex.fut_unpin(id)) : { register() {} };  // (older Workers lack it)
+  // A fut function JavaScript dropped is unpinned, but not while a call to it waits in callbacks (its wrapper may be
+  // collected once the call is queued, and the page's drop may come right after its call).
+  const waiting = new Map(), dropped = new Set();  // id -> queued calls to it; ids dropped meanwhile
+  const unpinNow = (id) => (waiting.has(id) ? dropped.add(id) : ex.fut_unpin(id));
+  const awaitCall = (id) => waiting.set(id, (waiting.get(id) ?? 0) + 1);
+  const ran = (id) => {
+    const n = waiting.get(id) - 1;
+    if (n) return void waiting.set(id, n);
+    waiting.delete(id);
+    if (dropped.delete(id)) ex.fut_unpin(id);
+  };
+  const unpin = globalThis.FinalizationRegistry ? new FinalizationRegistry(unpinNow) : { register() {} };  // (older Workers lack it)
   function futFn(id) {
     const f = (...args) => callFut(id, args);
     return (f[FUT] = id), unpin.register(f, id), f;
@@ -369,10 +380,10 @@ export async function createFut(opts) {
       try { return fromFut(cstr(withStr(json, (p) => ex.fut_apply(id, p)))); } finally { ex.fut_sync(-1); }
     }
     if (opts.thread) return Promise.reject(new Error("JavaScript can call a fut function later (not during an extern call) only if the program's main isolate gave it"));
-    return new Promise((res, rej) => (callbacks.push({ id, json, res, rej }), poke()));
+    return new Promise((res, rej) => (awaitCall(id), callbacks.push({ id, json, res, rej }), poke()));
   }
   // The page calls a fut function (browser.js): JSON in and out, as it has its own JavaScript values
-  const callRaw = (id, json) => new Promise((res, rej) => (callbacks.push({ id, json, res, rej, raw: true }), poke()));
+  const callRaw = (id, json) => new Promise((res, rej) => (awaitCall(id), callbacks.push({ id, json, res, rej, raw: true }), poke()));
   async function runCallbacks() {
     for (const c of callbacks.splice(0)) {
       try {
@@ -380,7 +391,7 @@ export async function createFut(opts) {
       } catch (e) {
         if (e instanceof Restart || e instanceof Exit) throw e;
         report(e), c.rej(new Error(errorText(e).split("\n")[0]));
-      }
+      } finally { ran(c.id); }
     }
     flush();  // what a handler did shows now
   }
@@ -755,6 +766,7 @@ export async function createFut(opts) {
     exports: ex,
     memory: mem,
     callRaw,  // (browser.js) the page calls a fut function: JSON text in, a Promise of JSON text
+    unpin: unpinNow,  // (fut-worker.js) the page dropped a fut function it was given
     async compile(file, tests) {  // compile only (errors printed), as test() would if tests: did it compile?
       if (!tests) return (path = file), !!(await load(false));
       withStr("", (p) => ex.fut_tests_begin(1, p));
