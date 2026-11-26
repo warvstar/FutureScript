@@ -1,11 +1,12 @@
 #!/bin/sh
 # Start a swarm run in the background:  swarm/run.sh <scenario> [key file]   (key file default: build/swarm/.key)
 #   Scenarios: swarm/scenarios/<name>.json, or as edited on the dashboard. It sets target, workers, model / models
-#   (per role: worker, planner, approver, reviewer), cap (dollars), minutes (0: none) and cfTests (tests on the Worker).
+#   (per role: worker, planner, approver, reviewer), effort (per role: low, medium, high), cap (dollars), minutes (0: none)
+#   and cfTests (tests on the Worker).
 # Stop it:  touch <run dir>/STOP   (it stops after the current round; spend so far is in <run dir>/status.md)
 # Environment (optional, overrides the scenario): SWARM_DIR (default build/swarm-runs/<scenario>-<time>; an existing
 #   directory resumes its run), SWARM_TARGET, SWARM_WORKERS, SWARM_MODEL, SWARM_MODEL_{WORKER,PLANNER,APPROVER,REVIEWER},
-#   SWARM_CAP, SWARM_MINUTES, SWARM_GLOBAL_CAP (all runs together, default 20), SWARM_CF_URL (tests on that Worker),
+#   SWARM_CAP, SWARM_MINUTES, SWARM_GLOBAL_CAP (all runs together, default 40), SWARM_CF_URL (tests on that Worker),
 #   SWARM_DASH_URL (publish the dashboard to that Worker; its controls then reach the swarm), SWARM_API_URL, SWARM_RESULTS.
 # With SWARM_DASH_URL, a run that ends waits for the dashboard to start the next one; swarm/supervise.sh starts it.
 set -e
