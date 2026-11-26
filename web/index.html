@@ -24,6 +24,14 @@
     font: 12.5px/1.5 ui-monospace, Menlo, monospace; box-shadow: 0 10px 30px rgb(0 0 0 / .4); }
   #problem[hidden] { display: none; }
   #problem button { position: absolute; top: 8px; right: 8px; background: none; border: 0; color: inherit; font: inherit; cursor: pointer; }
+  #state { border-bottom: 1px solid var(--line); margin-bottom: 8px; padding-bottom: 6px; max-height: 45%; overflow: auto; flex: none; }
+  #state[hidden] { display: none; }
+  #state summary { color: var(--dim); cursor: pointer; }
+  #state dl { margin: 4px 0 0; display: grid; grid-template-columns: max-content 1fr; gap: 1px 10px; }
+  #state dt { color: var(--dim); } #state dd { margin: 0; white-space: pre-wrap; word-break: break-word; }
+  #state dd.new { animation: changed 0.8s; }
+  @keyframes changed { from { background: #3a3a1c; } }
+  @media (prefers-reduced-motion: reduce) { #state dd.new { animation: none; } }
   #in { flex: 1; background: none; border: 0; color: var(--fg); font: inherit; outline: none; }
 </style>
 </head>
@@ -34,6 +42,7 @@
   <canvas id="screen" tabindex="0"></canvas>
   <canvas id="gpu" tabindex="0"></canvas>
   <div id="side">
+    <details id="state" open hidden><summary>state</summary><dl></dl></details>
     <pre id="out"></pre>
     <form id="form"><span id="prompt">&gt;</span><input id="in" autocomplete="off" spellcheck="false" autofocus></form>
   </div>
@@ -56,6 +65,23 @@ function write(fd, bytes) {
   if (fd == 2) s.className = "e";
   out.append(s), (out.scrollTop = out.scrollHeight);
 }
+// The state inspector: std/ui reports each named state (a top-level one, or a view's: View.name) as it changes.
+const states = new Map();  // name -> its <dd>
+globalThis.__futState = (name, v) => {
+  const panel = $("state"), dl = panel.querySelector("dl");
+  let dd = states.get(name);
+  if (v.gone) return void (dd && (dd.previousSibling.remove(), dd.remove(), states.delete(name), (panel.hidden = !states.size)));
+  if (!dd) {
+    const dt = document.createElement("dt");
+    dt.textContent = name, (dd = document.createElement("dd")), states.set(name, dd);
+    const top = !name.includes(".");  // top-level states first, then views'
+    const after = top ? [...dl.children].find((e) => e.tagName == "DT" && e.textContent.includes(".")) : null;
+    dl.insertBefore(dt, after), dl.insertBefore(dd, after), (panel.hidden = false);
+  }
+  const text = typeof v.value == "string" ? JSON.stringify(v.value) : JSON.stringify(v.value, null, v.value && typeof v.value == "object" && JSON.stringify(v.value).length > 60 ? 1 : 0);
+  if (dd.textContent == text) return;
+  dd.textContent = text ?? "nil", dd.classList.remove("new"), void dd.offsetWidth, dd.classList.add("new");
+};
 let watched = new Set(), windowOpen = false;
 let gpuPresent = null;  // while std/gpu draws the window: shows its frame (see screen)
 const stamps = new Map();  // path -> how many times it changed: a package's JS modules load again when it moves

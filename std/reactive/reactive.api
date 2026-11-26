@@ -16,6 +16,8 @@ pub fn keepLocals()
 
 pub fn local(key: str, v): Signal
 
+pub fn named(name: str, v): Signal
+
 // Run f before the running effect reruns or is disposed (to undo what it did outside signals).
 pub fn onCleanup(f: fn)
 
@@ -46,3 +48,7 @@ pub fn untrack(f: fn)
 // declaring it. val(x) is x's value if x is a signal, else x; store(old, v) sets old if it is a signal (and keeps it
 // in the field), else v replaces it.
 pub fn val(x)
+
+// f(name, signal, false) for each named state, now and as more are made (a view's own: "View.x", then "View.x#2"
+// for the second made since the page was shown, and so on), and f(name, signal, true) when one goes (its view did).
+pub fn watch(f: fn)

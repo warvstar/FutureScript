@@ -715,7 +715,7 @@ struct State {
         }
         if ((!in && tops.count(name)) || localAt(name, j + 1)) {
           bool local = localAt(name, j + 1);  // a view's or function's own: kept across a reload (_state.local)
-          out += pre + "var " + name + (local ? " = _state.local(\"" + owner(j) + "." + name + "\", " : " = _state.cell(");
+          out += pre + "var " + name + (local ? " = _state.local(\"" + owner(j) + "." + name + "\", " : " = _state.named(\"" + name + "\", ");
           size_t e = j + 2;
           if (is(s, t[e], "=")) { size_t x = exprEnd(e + 1); out += s.substr(t[e].tb, t[e].b - t[e].tb); emit(e + 1, x), e = x; }
           else out += "nil";

@@ -123,11 +123,31 @@ pub fn cell(v): Signal {  // `state x = e`: e's signal if it is one (computed(),
   if isa(v, Signal) { return v }
   return Signal(v)
 }
+// `state x = e` at the top level: as cell(e), under its name, for an inspector (watch()).
+var namedStates = {}  // name -> its signal
+var watcher = nil     // fn(name, signal, gone), or nil
+pub fn named(name: str, v): Signal {
+  var s = cell(v)
+  namedStates[name] = s
+  if watcher != nil { watcher(name, s, false) }
+  return s
+}
+// f(name, signal, false) for each named state, now and as more are made (a view's own: "View.x", then "View.x#2"
+// for the second made since the page was shown, and so on), and f(name, signal, true) when one goes (its view did).
+pub fn watch(f: fn) {
+  watcher = f
+  for k in namedStates.keys() { f(k, namedStates[k], false) }
+  for k in localsMade.keys() {
+    for e in localsMade[k] { if e.live { f(e.name, e.s, false) } }
+  }
+}
+
 // `state x = e` in a function or view: as cell(e), but after a reload (keepLocals()) the key's states take the values
 // those of the page before had, in the order they were made.
 var localsMade = {}  // key -> [{s, live}], in the order made
 var localsKept = {}  // key -> the values before the reload
 var localsTaken = {}  // key -> how many of them are taken
+var localsCount = {}  // key -> how many made since the page was shown (for their names)
 pub fn local(key: str, v): Signal {
   if isa(v, Signal) { return v }
   var s = Signal(v)
@@ -145,9 +165,18 @@ pub fn local(key: str, v): Signal {
     list = live
     localsMade[key] = live
   }
-  var entry = {s: s, live: true}
+  var n = 1
+  if localsCount.has(key) { n = localsCount[key] + 1 }
+  localsCount[key] = n
+  var name = key
+  if n > 1 { name = "{key}#{n}" }
+  var entry = {s: s, live: true, name: name}
   list.push(entry)
-  onCleanup(fn() { entry.live = false })
+  if watcher != nil { watcher(name, s, false) }
+  onCleanup(fn() {
+    entry.live = false
+    if watcher != nil { watcher(name, s, true) }
+  })
   return s
 }
 // Before a page is shown again (a reload): what its own states hold now, for local() to give the next page's.
@@ -160,6 +189,7 @@ pub fn keepLocals() {
   }
   localsMade = {}
   localsTaken = {}
+  localsCount = {}
 }
 pub fn store(old, v) {
   if isa(old, Signal) { old.set(v) return old }

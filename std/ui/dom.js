@@ -179,6 +179,9 @@ export function modal(n, on) {  // a <dialog> shown modally, or closed (once it 
   if (on && !n.open) n.showModal();
   else if (!on && n.open) n.close();
 }
+// The dev page's state inspector (web/index.html defines __futState): each named state's {value}, or {gone: true}.
+export const inspecting = () => (typeof globalThis.__futState == "function" ? 1 : 0);
+export const inspect = (name, v) => void globalThis.__futState?.(name, v);
 export const focus = (n) => void n.focus?.();
 // A menu's button b and its list: the list is a popover b toggles (light dismiss: a click outside or Escape closes it),
 // placed under b; choosing an item closes it; the arrow keys move between its items. Without popovers (or a page), the

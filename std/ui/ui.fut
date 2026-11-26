@@ -51,6 +51,8 @@ extern dom fn readFile(any, str, fn): void
 extern dom fn fileUrl(any): str
 extern dom fn sendFile(any, any, fn, fn): any
 extern dom fn stopUpload(any): void
+extern dom fn inspecting(): int
+extern dom fn inspect(str, any): void
 
 // What kind of child v is: "none" (nil, false, true), "text" (a string or number), "fn", "list" or "node".
 fn kindOf(v) {
@@ -1096,6 +1098,49 @@ pub fn make(tag: str, props, kids): any {
   return n
 }
 
+// ---- the dev page's state inspector (web/index.html): each named state's value, as it changes ----
+
+var watching = false
+var inspected = {}  // name -> the effect's dispose
+fn watchStates() {
+  if watching || inspecting() == 0 { return }
+  watching = true
+  r.watch(fn(name, s, gone) {
+    if inspected.has(name) {
+      var was = inspected[name]
+      if gone && !(was.s == s) { return }  // (a reload's new state of the same name came first)
+      inspected.remove(name)
+      was.stop()
+    }
+    if gone { inspect(name, {gone: true}) return }
+    inspected[name] = {s: s, stop: r.root(fn() { r.effect(fn() { inspect(name, {value: brief(s.get(), 3)}) }) })}
+  })
+}
+fn brief(v, depth) {  // v, cut down to what a glance takes in: 20 items a list or map, 3 levels, 200 characters
+  var t = typeOf(v)
+  if t == "nil" || t == "bool" || t == "number" { return v }
+  if t == "string" { if v.len() > 200 { return v.slice(0, 200) + "…" } return v }
+  if depth == 0 { return "…" }
+  if t == "list" {
+    var out = []
+    for x in v { if out.len() < 20 { out.push(brief(x, depth - 1)) } }
+    if v.len() > 20 { out.push("… {v.len() - 20} more") }
+    return out
+  }
+  if t == "map" {
+    var out = {}
+    var n = 0
+    for k in v.keys() { if n < 20 { out[str(k)] = brief(v[k], depth - 1) } n += 1 }
+    if n > 20 { out["…"] = "{n - 20} more" }
+    return out
+  }
+  if t == "function" { return "fn" }
+  if t == "js value" { return "(a page object)" }
+  var text = str(v)
+  if text.len() > 200 { return text.slice(0, 200) + "…" }
+  return text
+}
+
 var themed = false
 var shown = nil
 var shownView = nil
@@ -1108,6 +1153,7 @@ pub fn refresh() {
 // page shown before (as a reload shows it again) is taken down first: its effects and timers stop.
 pub fn show(view: fn): fn {
   if !themed { themed = true base(THEME) }
+  watchStates()
   r.keepLocals()  // (before the page goes: its states' values, for the new page's)
   if shown != nil { shown() }
   if sheets.len() > 0 {  // the file's top level ran again (else only functions changed: its sheets stay)
