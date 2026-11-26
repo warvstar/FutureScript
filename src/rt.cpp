@@ -753,11 +753,12 @@ char ffiCheck(Ext* e, int i, V v) {
     ERR("@argument %s() argument %d: expected %s, got %s", symName(e->sym).c_str(), i + 1, t == 'f' ? "a function" : t == 's' ? "a string" : "a number", typeName(v));
   return t;
 }
-u32* ffiThunk(void* fn, const std::string& sig, char ret, int sym) {
+void ffiStub(Ext* e) { ERR("@host %s", e->stub); }
+u32* ffiThunk(void* fn, const std::string& sig, char ret, int sym, const std::string& stub) {
   static std::unordered_map<std::string, u32*> made;  // one per function and signature, kept across reloads
-  u32*& t = made[sig + ret + symName(sym) + std::to_string((uintptr_t)fn)];
+  u32*& t = made[sig + ret + symName(sym) + std::to_string((uintptr_t)fn) + stub];
   if (t) return t;
-  Ext* e = new Ext{fn, (int)sig.size(), sym, ret, {}};
+  Ext* e = new Ext{fn, (int)sig.size(), sym, ret, {}, stub.empty() ? nullptr : strdup(stub.c_str())};
   memcpy(e->sig, sig.data(), sig.size());
   return t = ffiCode(e);
 }

@@ -155,7 +155,7 @@ struct Compiler : Gen {
   std::vector<TypedUse> typedUses;
   std::vector<std::pair<int, int>> fnDefs;  // (sym, arity)
   std::vector<int> inits;                   // top-level vars initialised by this chunk
-  struct Extern { int sym; void* fn; std::string sig; char ret; bool pure, rt = false; };  // pure: declared `!`, performs nothing; rt: fn is the runtime's Fn
+  struct Extern { int sym; void* fn; std::string sig; char ret; bool pure, rt = false; std::string stub; };  // pure: declared `!`, performs nothing; rt: fn is the runtime's Fn; stub: what a call raises (a module this build doesn't load)
   std::vector<Extern> externs;
   std::string patched, added, removed, reset;  // for the reload log
   std::unordered_map<std::string, std::vector<int>> pubs;  // file -> its top-level names marked `pub`
@@ -2030,9 +2030,11 @@ struct Compiler : Gen {
   }
   // extern ["library"] fn name(type, ...) [: type] -- a C function (a host function in wasm); types: num int long ptr str (and void)
   // extern [lib] fn name(types): result. lib: a C library ("libm.dylib"; none: the program's own symbols, or on
-  // wasm the host's JavaScript), or a module of this file's package (its fut.pkg lists it: js, wasm or c).
+  // wasm the host's JavaScript), or a module of this file's package (its fut.pkg lists it: js, wasm or c). A module
+  // this build doesn't load (a js or wasm one natively, a c one in wasm) gives a stub: the program compiles, and
+  // its other code runs; a call raises [host].
   void externDecl() {
-    std::string lib, shownLib;
+    std::string lib, shownLib, stub;
     Tok lt = cur;
     const ForeignMod* fm = nullptr;
     if (accept(T_STR)) lib.assign(prev.p, prev.len), shownLib = "'" + lib + "'";
@@ -2042,20 +2044,26 @@ struct Compiler : Gen {
       if (!p) failAt(lt.p, lt.line, "@extern '%s' would be a module of a package, and %s is in no package (a package's fut.pkg lists its modules: js %s ./%s.js)", m.c_str(), ::base(file).c_str(), m.c_str(), m.c_str());
       fm = p->module(m, !WASM);
       if (!fm) failAt(lt.p, lt.line, "@extern package %s has no module '%s': add 'js %s ./file.js' (or wasm, or c) to %s", p->name.c_str(), m.c_str(), m.c_str(), p->manifest.c_str());
-      if (WASM && fm->kind == "c") failAt(lt.p, lt.line, "@extern module %s is a C library (c %s %s), which only the native build loads: add a js or wasm version of it to %s", m.c_str(), m.c_str(), fm->target.c_str(), p->manifest.c_str());
-      if (!WASM && fm->kind != "c") failAt(lt.p, lt.line, "@extern module %s is %s (%s %s %s), which only the wasm build loads: add a C version (c %s <library>) to %s", m.c_str(), fm->kind == "js" ? "JavaScript" : "WebAssembly", fm->kind.c_str(), m.c_str(), ::base(fm->target).c_str(), m.c_str(), p->manifest.c_str());
+      if ((fm->kind == "c") != !WASM) {  // what calling it says ("dom.create() is JavaScript (std/ui's dom.js), ...")
+        bool c = fm->kind == "c", std = inStd(p->dir);
+        stub = m + ".%s() is " + (c ? "a C library" : fm->kind == "js" ? "JavaScript" : "WebAssembly") + " (" + (std ? "std/" : "package ") +
+               p->name + "'s " + (c ? fm->target : ::base(fm->target)) + "), which only the " +
+               (c ? "native build loads: run this with fut" : "wasm build loads: run this in a browser or with node web/run.mjs") +
+               (std ? "" : c ? ", or add a js or wasm version (js " + m + " <file>) to " + p->manifest : ", or add a C version (c " + m + " <library>) to " + p->manifest);
+      }
       lib = fm->kind == "c" ? fm->target : fm->kind + (fm->main ? "+main:" : ":") + fm->target, shownLib = "module " + m + " (" + fm->target + ")";
-      if (fm->kind != "c" && std::find(modFiles.begin(), modFiles.end(), fm->target) == modFiles.end()) modFiles.push_back(fm->target);
+      if (stub.empty() && fm->kind != "c" && std::find(modFiles.begin(), modFiles.end(), fm->target) == modFiles.end()) modFiles.push_back(fm->target);
     }
     if (!atKw(K_fn)) fail("@syntax expected 'fn'");
     next();
     Tok t = cur;
     int s = ident();
+    if (!stub.empty()) stub.replace(stub.find("%s"), 2, symName(s));
     const char* err = nullptr;
     // extern "fut": a function of the runtime's own (fmath.cpp: math with the same results on every platform)
     Global* rtg = lib == "fut" ? findGlobal(intern("fut@" + symName(s))) : nullptr;
     if (lib == "fut" && !rtg) failAt(t.p, t.line, "@extern the runtime has no function '%s'", name(s));
-    void* fn = rtg ? (void*)rtg->o : externLookup(lib, symName(s), &err);
+    void* fn = rtg ? (void*)rtg->o : !stub.empty() ? (void*)1 : externLookup(lib, symName(s), &err);
     if (err && !strcmp(err, "pending")) {  // the host loads it, then compiles again
       if (std::find(modulesPending.begin(), modulesPending.end(), lib) == modulesPending.end()) modulesPending.push_back(lib);
       fn = (void*)1;
@@ -2063,7 +2071,7 @@ struct Compiler : Gen {
     if (!fn) failAt(t.p, t.line, fm && fm->kind != "c" ? "@extern module %s has no function '%s'" : "@extern no C function '%s'", fm ? fm->name.c_str() : name(s), name(s));
     // any: a value copied as JSON (lists and maps; functions and JS objects by reference); fn: a fut function
     // JavaScript can call. Both only into JavaScript; a wasm module's functions take numbers.
-    bool js = WASM && (!fm || fm->kind == "js");
+    bool js = fm ? fm->kind == "js" : WASM;  // (natively, a js module's stub)
     auto type = [&](bool ret) {
       int ty = atKw(K_fn) ? (next(), K_fn) : ident();
       std::string n = ty == K_fn ? "fn" : symName(ty);
@@ -2091,7 +2099,7 @@ struct Compiler : Gen {
     if (rtg && (sig != std::string(((Fn*)rtg->o)->arity, 'd') || ret != 'd' || !pure))
       failAt(t.p, t.line, "@extern the runtime's %s takes %d numbers and returns one, performing nothing: (%s): num !", name(s), ((Fn*)rtg->o)->arity,
              ((Fn*)rtg->o)->arity == 1 ? "num" : "num, num");
-    externs.push_back({qualify(s), fn, sig, ret, pure, rtg != nullptr});
+    externs.push_back({qualify(s), fn, sig, ret, pure, rtg != nullptr, stub});
   }
   // effect Name { fn op(params) [: type] ... }: operations with no body. Code performs one as Name.op(args); the
   // nearest handler for it answers (handle { } with Name.op(params) { }).
@@ -2986,7 +2994,7 @@ struct Compiler : Gen {
     for (auto& e : externs) {
       Fn* f = globalObj<Fn>(e.sym);
       if (e.rt) f->code = ((Fn*)e.fn)->code, f->arity = ((Fn*)e.fn)->arity, f->op = 0;
-      else f->code = ffiThunk(e.fn, e.sig, e.ret, e.sym), f->arity = (int)e.sig.size(), f->op = e.pure ? 0 : OP_EXTERN;  // performs io
+      else f->code = ffiThunk(e.fn, e.sig, e.ret, e.sym, e.stub), f->arity = (int)e.sig.size(), f->op = e.pure ? 0 : OP_EXTERN;  // performs io
     }
     for (auto& d : effDefs) effDefine(d.sym, symName(d.sym), d.ops);
     for (auto& [s, c] : typeDefs) global(s).type = c;  // named types: checks look them up when they run

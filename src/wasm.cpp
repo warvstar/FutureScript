@@ -351,6 +351,7 @@ u32* staleThunk(int sym) {  // rt_stale(sym)
   return jitInstall(k);
 }
 static V rt_ffi(V* w, Ext* e) {
+  if (e->stub) ffiStub(e);
   double a[8] = {};
   std::string json[8];  // any and fn arguments, as JSON text
   for (int i = 0; i < e->n; i++) {

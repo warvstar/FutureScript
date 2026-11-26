@@ -94,6 +94,7 @@ static void rt_hot(void* t, V a1, V a2, V a3, V a4, V a5, V a6, V a7) {  // a ti
 
 // ---------------- C functions (extern fn): the thunk puts an Ext* in x7 and branches here ----------------
 static V rt_ffi(V a0, V a1, V a2, V a3, V a4, V a5, V a6, Ext* e) {
+  if (e->stub) ffiStub(e);
   volatile V a[] = {a0, a1, a2, a3, a4, a5, a6};  // on the stack, so string arguments stay alive
   int64_t x[8] = {};
   double d[8] = {};

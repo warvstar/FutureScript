@@ -457,8 +457,11 @@ u32* staleThunk(int sym);
 void tierUp(void* tier, u32 numArgs);  // compile a hot function again (numArgs: which arguments were numbers)
 extern bool verbose;
 extern bool noTier;  // no tier 2: no code compiled while the program runs (a Cloudflare Worker can't compile any)
-struct Ext { void* fn; int n, sym; char ret, sig[8]; };  // an extern fn. sig/ret: d(ouble) i(nt) l(ong) p(ointer) s(tring) v(oid)
-u32* ffiThunk(void* fn, const std::string& sig, char ret, int sym);  // code calling C function fn (see extern)
+// an extern fn. sig/ret: d(ouble) i(nt) l(ong) p(ointer) s(tring) v(oid); stub: set for a module this build doesn't load
+// (a js module natively): calling it raises this ([host]) instead
+struct Ext { void* fn; int n, sym; char ret, sig[8]; const char* stub; };
+u32* ffiThunk(void* fn, const std::string& sig, char ret, int sym, const std::string& stub = "");  // code calling C function fn (see extern)
+[[noreturn]] void ffiStub(Ext* e);  // raises e->stub
 u32* ffiCode(Ext*);            // the platform's thunk for it
 char ffiCheck(Ext*, int i, V v);  // argument i's type letter; raises if v does not fit it
 V vmCall(void* code, std::initializer_list<V> args = {});

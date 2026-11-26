@@ -20,7 +20,7 @@ WASM_LINK = ["-mexec-model=reactor", "-lsetjmp", "-Wl,--export=__stack_pointer",
 WASM_MT_FLAGS = ["--target=wasm32-wasip1-threads", "-pthread", *WASM_FLAGS[1:]]
 WASM_MT_LINK = [*WASM_LINK, "-Wl,--import-memory,--shared-memory,--max-memory=4294967296", "-Wl,--initial-memory=805306368"]
 NATIVE_ONLY, WASM_ONLY = {"main.cpp", "jit.cpp", "sys.cpp"}, {"wasm.cpp", "interp.cpp"}
-NATIVE_SPECS = {"gpu_test.fut", "gpu_particles.fut", "gpu_shader.fut"}  # specs only the native build runs (std/gpu: Dawn, as a C library)
+NATIVE_SPECS = {"gpu_test.fut", "gpu_particles.fut", "gpu_shader.fut", "ui_native.fut"}  # specs only the native build runs (std/gpu: Dawn, as a C library; ui_native: std/ui's DOM stubs)
 GPU_SPECS = {"gpu_test.fut", "gpu_particles.fut", "gpu_shader.fut"}  # these need build/libfutgpu.dylib (python3 build.py gpu)
 WASM_SPECS = {"hello_ui.fut", "ui_test.fut", "views.fut", "garden.fut", "dashboard.fut", "templates.fut", "components.fut", "keep.fut", "inspect.fut"}  # std/ui is the DOM's (a JavaScript module): the wasm build only
 
@@ -552,7 +552,7 @@ def runner_modules(exe):
     """Foreign modules in a package: on wasm, a JS module (data copied, functions as callbacks, JS objects as
     handles, Promises suspending the caller, exceptions as fut errors) and a wasm module, called from spawned
     isolates too (in fut-mt.wasm, on other threads, each with the module loaded itself); a module declared main
-    (fut.pkg), which Node runs where it is called; natively, a C library, and a clear error for a JS-only module."""
+    (fut.pkg), which Node runs where it is called; natively, a C library, and a JS-only module's stub (it compiles; a call raises)."""
     d = ROOT / "build" / "mods"
     wasmb = bytes.fromhex("0061736d01000000011203" "60027f7f017f60027c7c017c60017e017e" "030403000102" "071303036164640000036d756c00010364626c0002"
                           "0a1903" "0700200020016a0b070020002001a20b0700200020007c0b")
@@ -568,9 +568,10 @@ def runner_modules(exe):
     run = lambda f: subprocess.run([*runner(exe), str(d / "app" / f)], capture_output=True, text=True, timeout=60)
     if exe.suffix != ".wasm":
         (d / "app" / "c.fut").write_text("extern libm fn cbrt(num): num\nprint(cbrt(27))\n")
-        (d / "app" / "j.fut").write_text("extern util fn info(any): any\n")
+        (d / "app" / "j.fut").write_text("extern util fn info(any): any\nprint(\"compiled\")\ninfo(1)\n")  # a stub: raises when called
         c, j = run("c.fut"), run("j.fut")
-        ok = c.stdout == "3\n" and j.returncode != 0 and "only the wasm build loads: add a C version" in j.stderr
+        ok = (c.stdout == "3\n" and j.returncode != 0 and j.stdout == "compiled\n"
+              and "util.info() is JavaScript (package app's util.js), which only the wasm build loads" in j.stderr and "add a C version" in j.stderr)
         return ok, f"c: {c.stdout!r} {c.stderr!r}\n  js: {j.stderr!r}"
     (d / "app" / "main.fut").write_text(
         "extern util fn info(any): any\nextern util fn mapWith(any, fn): any\nextern util fn later(any): any\n"

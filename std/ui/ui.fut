@@ -1,7 +1,8 @@
 // Pages built from functions, kept up to date by std/reactive: a child or prop given as a function shows its
 // current value, and only that part of the page changes when a signal the function read changes. No virtual DOM,
-// no diffing of the whole view: each such function is an effect that updates its own nodes. The wasm build only
-// (the DOM is JavaScript's); under Node, a small document of the module's own stands in, for tests.
+// no diffing of the whole view: each such function is an effect that updates its own nodes. The DOM is JavaScript's,
+// so pages run in the wasm build; under Node, a small document of the module's own stands in, for tests. Natively
+// this file compiles and its pure functions run (fut test on an app's logic); a DOM call raises [host].
 //
 //   var n = r.signal(0)
 //   ui.mount("body", fn() {
