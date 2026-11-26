@@ -2,25 +2,25 @@ Measured on Apple M2 Max; C is clang -O2. Best of 5 runs in one process.
 
 | Benchmark | Implementation | Best (ms) | First run (ms) | vs C |
 |---|---|---:|---:|---:|
-| fib | C | 5.6 | 5.6 | 1.00x |
-| fib | fut | 11.9 | 11.9 | 2.13x |
-| fib | fut wasm | 17.0 | 18.0 | 3.03x |
-| leibniz | C | 44.1 | 45.7 | 1.00x |
-| leibniz | fut | 334.7 | 346.4 | 7.60x |
-| leibniz | fut wasm | 183.0 | 433.7 | 4.15x |
-| nbody | C | 6.7 | 7.1 | 1.00x |
-| nbody | fut | 138.6 | 140.1 | 20.76x |
-| nbody | fut wasm | 141.3 | 147.4 | 21.17x |
-| binarytrees | C | 307.5 | 307.5 | 1.00x |
-| binarytrees | fut | 255.4 | 255.4 | 0.83x |
-| binarytrees | fut wasm | 299.0 | 311.7 | 0.97x |
-| sieve | C | 19.9 | 20.7 | 1.00x |
-| sieve | fut | 197.2 | 219.3 | 9.92x |
-| sieve | fut wasm | 322.9 | 480.2 | 16.24x |
-| maps | C | 157.3 | 175.9 | 1.00x |
-| maps | fut | 252.8 | 252.8 | 1.61x |
-| maps | fut wasm | 337.3 | 392.1 | 2.15x |
-| mandelbrot | C | 96.7 | 97.3 | 1.00x |
-| mandelbrot | C x8 threads | 13.4 | 13.7 | 0.14x |
-| mandelbrot | fut | 554.9 | 555.4 | 5.74x |
-| mandelbrot | fut wasm | 423.8 | 437.9 | 4.38x |
+| fib | C | 5.6 | 5.7 | 1.00x |
+| fib | fut | 11.8 | 12.0 | 2.09x |
+| fib | fut wasm | 16.2 | 17.3 | 2.88x |
+| leibniz | C | 41.7 | 43.4 | 1.00x |
+| leibniz | fut | 333.6 | 335.1 | 8.00x |
+| leibniz | fut wasm | 184.3 | 438.5 | 4.42x |
+| nbody | C | 7.0 | 7.0 | 1.00x |
+| nbody | fut | 137.7 | 138.6 | 19.73x |
+| nbody | fut wasm | 133.6 | 139.8 | 19.15x |
+| binarytrees | C | 311.0 | 313.6 | 1.00x |
+| binarytrees | fut | 257.5 | 259.3 | 0.83x |
+| binarytrees | fut wasm | 302.5 | 316.7 | 0.97x |
+| sieve | C | 20.4 | 20.7 | 1.00x |
+| sieve | fut | 156.1 | 178.7 | 7.67x |
+| sieve | fut wasm | 257.6 | 385.1 | 12.65x |
+| maps | C | 161.2 | 168.1 | 1.00x |
+| maps | fut | 261.7 | 262.1 | 1.62x |
+| maps | fut wasm | 342.6 | 403.2 | 2.12x |
+| mandelbrot | C | 98.3 | 102.8 | 1.00x |
+| mandelbrot | C x8 threads | 13.5 | 13.5 | 0.14x |
+| mandelbrot | fut | 557.3 | 563.7 | 5.67x |
+| mandelbrot | fut wasm | 418.6 | 431.2 | 4.26x |

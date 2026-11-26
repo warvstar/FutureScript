@@ -121,6 +121,8 @@ V fiberResume(V f, V v);
 V rt_yield(V v);
 void sleepFor(double seconds);
 double now();  // seconds, monotonic
+constexpr int LIST_V = offsetof(List, v);  // its std::vector, which JIT code reads: the elements, then the end or the count
+inline bool vecCount;                      // the second word is the element count (wasm's libc++), not an end pointer
 constexpr int INST_SLOTS = offsetof(Inst, slots), CLO_ENV = sizeof(Clo), CLS_IHDR = offsetof(Class, ihdr), CLS_IRUN = offsetof(Class, irun);
 
 inline Obj* obj(V v) { return (Obj*)(v & ADDR); }
@@ -364,7 +366,7 @@ int writeInterfaces(const std::vector<std::pair<std::string, std::string>>& sour
 
 // ---- arm64 encoders (checked against the system assembler) ----
 namespace a64 {
-constexpr u32 SP = 31, EQ = 0, NE = 1, HS = 2, LO = 3, MI = 4, PL = 5, HI = 8, LS = 9, GE = 10, GT = 12;
+constexpr u32 SP = 31, EQ = 0, NE = 1, HS = 2, LO = 3, MI = 4, PL = 5, HI = 8, LS = 9, GE = 10, LT = 11, GT = 12;
 constexpr u32 ldr(u32 t, u32 n, u32 off) { return 0xf9400000 | (off / 8) << 10 | n << 5 | t; }
 constexpr u32 str(u32 t, u32 n, u32 off) { return 0xf9000000 | (off / 8) << 10 | n << 5 | t; }
 constexpr u32 ldrw(u32 t, u32 n, u32 off) { return 0xb9400000 | (off / 4) << 10 | n << 5 | t; }
@@ -410,6 +412,10 @@ constexpr u32 cinc(u32 d, u32 n, u32 c) { return 0x9a800400 | n << 16 | (c ^ 1) 
 constexpr u32 fmovdx(u32 d, u32 n) { return 0x9e670000 | n << 5 | d; }
 constexpr u32 fmovxd(u32 d, u32 n) { return 0x9e660000 | n << 5 | d; }
 constexpr u32 fcmp(u32 n, u32 m) { return 0x1e602000 | m << 16 | n << 5; }
+constexpr u32 fcmpz(u32 n) { return 0x1e602008 | n << 5; }                            // fcmp d, #0.0
+constexpr u32 fcvtzu(u32 d, u32 n) { return 0x9e790000 | n << 5 | d; }                // x = (uint64) d, truncating
+constexpr u32 ucvtf(u32 d, u32 n) { return 0x9e630000 | n << 5 | d; }                 // d = (double) x, unsigned
+constexpr u32 sub(u32 d, u32 n, u32 m) { return 0xcb000000 | m << 16 | n << 5 | d; }
 constexpr u32 fmovi(u32 d, u32 imm8) { return 0x1e601000 | imm8 << 13 | d; }  // fmov d, #imm (see fimm8)
 constexpr u32 FMOV1 = fmovi(1, 0x70);                                            // fmov d1, #1.0
 constexpr u32 farith(int op, u32 d, u32 n, u32 m) {  // fadd/fsub/fmul/fdiv d, n, m (op: O_ADD..O_DIV)

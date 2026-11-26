@@ -273,6 +273,27 @@ struct Gen : CState {
   }
 
   // ---- fields: an inline cache per site, in the VM block: key = the instance header, val = the slot ----
+  // list[i] (r0 = the list, r1 = the index; r2 = the value to store): inline when r0 is a list and 0 <= i < len,
+  // which a NaN (any non-number) fails; a fraction truncates, as in rt_geti. Else, and for stores inside a
+  // transaction (which save the list first), the helper.
+  void index(bool store) {
+    auto idx = [&] { get(R0 + 1), op(F64_REINTERPRET); };
+    open(BLOCK), open(BLOCK);  // $done, $miss
+    isPtr(0, false), br(BR_IF, F->blocks, UNLIKELY);
+    addr(0), mem(I32_LOAD8_U, 0, 0), i32c((int)K::List), op(I32_NE), br(BR_IF, F->blocks, UNLIKELY);
+    if (store) txnDepth(), br(BR_IF, F->blocks, UNLIKELY);
+    idx(), op(F64_CONST), f64(0), op(F64_GE), op(I32_EQZ), br(BR_IF, F->blocks, UNLIKELY);
+    addr(0), mem(I32_LOAD, 2, LIST_V), set(T2);  // T2 = begin
+    idx(), addr(0), mem(I32_LOAD, 2, LIST_V + 4);  // the end or the length
+    if (!vecCount) get(T2), op(I32_SUB), i32c(3), op(I32_SHR_U);
+    op(F64_CONVERT_I32_U);
+    op(F64_LT), op(I32_EQZ), br(BR_IF, F->blocks, UNLIKELY);
+    get(T2), idx(), op(I32_TRUNC_F64_U), i32c(3), op(I32_SHL), op(I32_ADD), set(T);
+    if (store) get(T), get(R0 + 2), mem(I64_STORE, 3, 0), mv(0, 2);
+    else get(T), mem(I64_LOAD, 3, 0), set(R0);
+    br(BR, F->blocks - 1), close();
+    helper(store ? H_SETI : H_GETI), close();
+  }
   void field(int sym, bool store) {  // r0 = object (r2 = value to store); result in r0
     u32 ic = slotOf(&vm.ics[newIC(store)]);
     open(BLOCK), open(BLOCK);  // $done, $miss

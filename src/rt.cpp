@@ -459,6 +459,13 @@ void native(const char* name, void* f, int arity) {
 void method(K k, int sym, void* f, int arity) { consts.push_back(box(growAt(builtins[(int)k], sym) = nativeFn(symName(sym).c_str(), f, arity))); }
 
 void rtInit() {
+  {  // the list fast paths in JIT code read a std::vector directly: its elements, then its end or its length
+    List l;
+    l.v = {1, 2};
+    V* const* p = (V* const*)((char*)&l + LIST_V);
+    vecCount = (uintptr_t)p[1] == 2;
+    if (p[0] != l.v.data() || (!vecCount && p[1] != l.v.data() + 2)) fputs("internal: unexpected std::vector layout\n", stderr), abort();
+  }
   static const char* syms[] = {KEYWORDS(SYM_STR) EXTRA_SYMS(SYM_STR)};
   for (const char* s : syms) intern(s);
   for (V& g : vm.globals) g = NIL;

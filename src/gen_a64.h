@@ -239,6 +239,26 @@ struct Gen : CState {
     return off & 0xfff;
   }
   void isObject(Jumps& miss) { E(mvn(9, 0)), E(tstptr(9)), miss.push_back(E(bcond(NE))), E(andaddr(9, 0)); }  // x9 = address
+  // list[i] (x0 = the list, x1 = the index; x2 = the value to store): inline when x0 is a list and 0 <= i < len,
+  // which a NaN (any non-number) fails; a fraction truncates, as in rt_geti. Else, and for stores inside a
+  // transaction (which save the list first), the helper.
+  void index(bool set) {
+    Jumps miss;
+    isObject(miss);
+    E(ldrb(10, 9)), E(cmpwi(10, (u32)K::List)), miss.push_back(E(bcond(NE)));
+    if (set) E(ldrw(10, 28, 4)), E(cmpwi(10, 0)), miss.push_back(E(bcond(NE)));
+    E(fmovdx(16, 1)), E(fcmpz(16)), miss.push_back(E(bcond(LT)));
+    E(ldr(11, 9, LIST_V)), E(ldr(12, 9, LIST_V + 8));  // the elements; the end or the length
+    if (!vecCount) E(sub(12, 12, 11)), E(lsri(12, 12, 3));
+    E(ucvtf(17, 12));
+    E(fcmp(16, 17)), miss.push_back(E(bcond(PL)));  // not below len (or unordered)
+    E(fcvtzu(10, 16));
+    if (set) E(strreg(2, 11, 10)), E(mov(0, 2));
+    else E(ldrreg(0, 11, 10));
+    int done = E(B);
+    for (int m : miss) patch(m);
+    helper(set ? H_SETI : H_GETI), patch(done);
+  }
   void field(int sym, bool set) {  // x0 = object (x2 = value to store); result in x0
     Jumps miss;
     u32 ic = set ? 3 : 2, lo = icAt(ic, set);

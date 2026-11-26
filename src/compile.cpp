@@ -288,7 +288,7 @@ struct Compiler : Gen {
       case LV_GLOBAL: gmem(0, v.a); break;
       case LV_CAP: capLoad(v.a); break;
       case LV_FIELD: field(v.b, false); break;
-      case LV_INDEX: mv(1, 0), ld(0, v.a), F->depth--, helper(H_GETI); break;  // index in x0, object in slot a
+      case LV_INDEX: mv(1, 0), ld(0, v.a), F->depth--, index(false); break;  // index in x0, object in slot a
     }
     v.k = LV_VAL;
   }
@@ -774,8 +774,8 @@ struct Compiler : Gen {
     } else {  // object in slot v.a, index in x0
       int i = slot();
       st(0, i);
-      if (op >= 0) mv(1, 0), ld(0, v.a), helper(H_GETI);
-      value(), mv(2, 0), ld(0, v.a), ld(1, i), helper(H_SETI), F->depth -= 2;
+      if (op >= 0) mv(1, 0), ld(0, v.a), index(false);
+      value(), mv(2, 0), ld(0, v.a), ld(1, i), index(true), F->depth -= 2;
     }
   }
 
