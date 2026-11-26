@@ -258,7 +258,9 @@ var WORKER_TOOLS = [
   tool("read", "Read a file.", {path: S}, ["path"]),
   tool("write", "Create or replace a whole file.", {path: S, content: S}, ["path", "content"]),
   tool("edit", "Replace exact text in a file: old must occur exactly once.", {path: S, old: S, new: S}, ["path", "old", "new"]),
+  tool("delete", "Delete a file.", {path: S}, ["path"]),
   tool("test", "Run every tests/*_test.fut and report failures.", {}, []),
+  tool("blocked", "Give the task back: it can't be done now (it needs work that isn't on main yet, say). Say what it waits for.", {reason: S}, ["reason"]),
   tool("done", "Submit the task: the harness reruns the tests and a reviewer checks the diff.", {summary: S}, ["summary"])]
 var PLAN_TOOLS = [tool("propose", "Propose the next tasks.", {tasks: {type: "array", items: {type: "object",
   properties: {title: S, detail: S, files: {type: "array", items: S}}, required: ["title", "detail", "files"]}}}, ["tasks"])]
@@ -475,7 +477,16 @@ fn runTool(w, name, inp) {
     return {text: clip(r.out, 14000)}
   }
   if name == "ls" { return {text: clip(sh("git ls-files -co --exclude-standard", wt).out, 6000)} }
-  if !safePath(inp.path) && (name == "read" || name == "write" || name == "edit") { return {text: "path must be relative, inside the repository", err: true} }
+  if !safePath(inp.path) && (name == "read" || name == "write" || name == "edit" || name == "delete") { return {text: "path must be relative, inside the repository", err: true} }
+  if name == "delete" {
+    if readFile(wt + "/" + inp.path) == nil { return {text: "no such file: " + inp.path, err: true} }
+    exec({cmd: ["rm", "-f", "--", inp.path], cwd: wt})
+    return {text: "deleted " + inp.path}
+  }
+  if name == "blocked" {
+    giveUp(w, "the worker says it is blocked: " + clip(inp.reason || "", 600))
+    return {text: "task given back"}
+  }
   if name == "read" {
     var s = readFile(wt + "/" + inp.path)
     if s == nil { return {text: "no such file: " + inp.path, err: true} }
@@ -531,13 +542,22 @@ fn workerRound(w, msg) {  // the reply to a worker's request
   w.steps += 1
   var uses = toolUses(msg)
   if uses.len() == 0 {
+    w.idleReplies = (w.idleReplies || 0) + 1
+    var said = ""
+    for b in msg.content { if b.type == "text" { said += b.text } }
+    if w.idleReplies == 1 || w.idleReplies % 10 == 0 {
+      log("w" + str(w.i) + " replied without a tool (" + str(w.idleReplies) + " in a row, stop: " + str(msg.stop_reason) + "): " + clip(said, 200))
+    }
+    if w.idleReplies >= 5 || w.steps >= MAXSTEPS { return giveUp(w, str(w.idleReplies) + " replies in a row without using a tool") }
     var nudge = "Use the tools to continue, and call done when the task is complete and the tests pass."
     if msg.stop_reason == "max_tokens" { nudge = "Your reply was cut off at the output limit. Work in smaller steps: write files in parts or use edit." }
     w.messages.push({role: "user", content: nudge})
     return nil
   }
+  w.idleReplies = 0
   var results = []
   for u in uses {
+    if w.phase != "work" { break }  // it gave the task back (blocked) or submitted it
     var r = runTool(w, u.name, u.input || {})
     results.push({type: "tool_result", tool_use_id: u.id, content: r.text, is_error: r.err || false})
   }
