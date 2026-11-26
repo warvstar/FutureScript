@@ -259,7 +259,7 @@ var WORKER_TOOLS = [
   tool("write", "Create or replace a whole file.", {path: S, content: S}, ["path", "content"]),
   tool("edit", "Replace exact text in a file: old must occur exactly once.", {path: S, old: S, new: S}, ["path", "old", "new"]),
   tool("delete", "Delete a file.", {path: S}, ["path"]),
-  tool("test", "Run every tests/*_test.fut and report failures.", {}, []),
+  tool("test", "Run the tests and report failures: every tests/*_test.fut, or only the file given as path.", {path: S}, []),
   tool("blocked", "Give the task back: it can't be done now (it needs work that isn't on main yet, say). Say what it waits for.", {reason: S}, ["reason"]),
   tool("done", "Submit the task: the harness reruns the tests and a reviewer checks the diff.", {summary: S}, ["summary"])]
 var PLAN_TOOLS = [tool("propose", "Propose the next tasks.", {tasks: {type: "array", items: {type: "object",
@@ -302,8 +302,9 @@ fn cfRun(dir, files) {  // each test file in its own request to the Worker, all 
   return out
 }
 fn testFiles(dir) { return lines(sh("ls tests/*_test.fut 2>/dev/null", dir).out) }
-fn runTests(dir) {
+fn runTests(dir, only) {
   var files = testFiles(dir)
+  if only { files = [only] }
   if files.len() == 0 { return {ok: true, report: "no test files yet (tests/*_test.fut)", summary: "no tests", n: {passed: 0}} }
   var api = []
   for f in files { api.push({cmd: [FUT, "api", f], cwd: dir, timeout: 60}) }
@@ -362,9 +363,15 @@ fn runTests(dir) {
 }
 
 // ---- tasks ----
-fn ready() {  // queued tasks a worker can take: one given back as blocked waits until something merges
-  var out = []
-  for t in byStatus("queued") { if t.blockedAt == nil || t.blockedAt != ledger.merged { out.push(t) } }
+fn ready() {  // queued tasks a worker can take: one given back as blocked waits until something merges and the tasks
+  var out = []  // in progress when it was given back (one of them may be what it waits for) are finished
+  for t in byStatus("queued") {
+    if t.blockedAt == nil { out.push(t) continue }
+    if t.blockedAt == ledger.merged { continue }
+    var waiting = false
+    for id in t.waitFor || [] { for u in tasks { if u.id == id && u.status == "active" { waiting = true } } }
+    if !waiting { out.push(t) }
+  }
   return out
 }
 fn byStatus(s) {
@@ -510,7 +517,12 @@ fn runTool(w, name, inp) {
     return {text: "deleted " + inp.path}
   }
   if name == "blocked" {
-    w.task.blockedAt = ledger.merged
+    var t = w.task
+    t.blockedAt = ledger.merged
+    t.waitFor = []
+    for u in tasks { if u.status == "active" && u.id != t.id { t.waitFor.push(u.id) } }
+    t.blocked = (t.blocked || 0) + 1
+    if t.blocked < 6 { t.attempts -= 1 }  // waiting on other work is not a failed attempt (up to 5 times)
     giveUp(w, "the worker says it is blocked: " + clip(inp.reason || "", 600))
     return {text: "task given back"}
   }
@@ -533,7 +545,8 @@ fn runTool(w, name, inp) {
     return {text: "edited " + inp.path}
   }
   if name == "test" {
-    var r = runTests(wt)
+    if inp.path && (!safePath(inp.path) || readFile(wt + "/" + inp.path) == nil) { return {text: "no such test file: " + inp.path, err: true} }
+    var r = runTests(wt, inp.path)
     return {text: r.report, err: !r.ok}
   }
   if name == "done" { return submit(w, inp.summary || "") }
@@ -552,7 +565,7 @@ fn submit(w, summary) {
   exec({cmd: ["git", "commit", "-q", "-F", "-"], cwd: w.wt, input: "#" + str(w.task.id) + " " + w.task.title + "\n\n" + summary})
   w.empty = sh("git rev-list --count main..HEAD", w.wt).out.trim() == "0"  // main may already do it: the reviewer decides
   if sh("git rebase -q main", w.wt).code != 0 { return {text: conflicted(w), err: true} }
-  var r = runTests(w.wt)
+  var r = runTests(w.wt, nil)
   if !r.ok { return {text: "not submitted: the tests fail.\n" + r.report, err: true} }
   w.phase = "review"
   w.tests = r.summary
@@ -635,7 +648,7 @@ fn merge(w) {
     log("#" + str(w.task.id) + " conflicts with main; back to w" + str(w.i))
     return nil
   }
-  var r = runTests(w.wt)
+  var r = runTests(w.wt, nil)
   if !r.ok {
     w.phase = "work"
     w.messages.push({role: "user", content: "Approved, but after rebasing onto the latest main the tests fail:\n" + r.report})
@@ -663,7 +676,8 @@ fn context() {
     "\n\nRecent rejections:\n" + recent.join("\n")
 }
 fn planRequest(n) {
-  return request("planner", PLAN_TOOLS, [{role: "user", content: context() + "\n\nPropose " + str(n) + " next tasks."}])
+  return request("planner", PLAN_TOOLS, [{role: "user", content: context() + "\n\n" + str(n) + " workers are waiting for work: propose " + str(n) +
+    " next tasks (fewer only if there are not that many independent ones). None may repeat a task that is done or queued."}])
 }
 fn planned(msg) {
   proposals = []
@@ -714,7 +728,7 @@ fn score() {  // run the hidden acceptance tests against main, in a scratch copy
   var dir = DIR + "/score"
   sh("rm -rf '" + dir + "' && mkdir -p '" + dir + "' && git archive main | tar -x -C '" + dir + "' && rm -rf '" + dir + "/tests' && mkdir '" +
      dir + "/tests' && cp '" + TDIR + "'/accept/*_test.fut '" + dir + "/tests/'", WORK)
-  var r = runTests(dir)
+  var r = runTests(dir, nil)
   accept = {passed: r.n.passed, total: total}
   log("acceptance: " + str(accept.passed) + " of " + str(total))
   return accept
@@ -815,7 +829,7 @@ fn main() {
     ledger.run = {id: (SCENARIO || TARGET) + "-" + sh("date -u +%Y%m%d-%H%M", ROOT).out.trim(), fut: sh("git rev-parse --short HEAD", ROOT).out.trim()}
   }
   ledger.run.scenario = SCENARIO
-  mainTests = runTests(WORK)
+  mainTests = runTests(WORK, nil)
   log("swarm starts: " + TARGET + " (run " + ledger.run.id + "), " + str(NWORKERS) + " workers, models " + json(MODELS) + ", cap $" + str(CAP) +
     ", spent so far $" + str(ledger.spent))
   score()
