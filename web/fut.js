@@ -36,7 +36,8 @@
 //   pending: (with main) an Int32Array the page counts the messages it sent this thread in, unread
 //   screen: (a page) its window, for a JS module that draws it itself (std/gpu, with WebGPU): {take(present): a canvas
 //     in the window's place (null before window()), present() then calling present() instead of showing the pixel
-//     buffer; give(): the window back}. See giveHost.
+//     buffer, and opts.present getting null for rgba (the buffer isn't copied out); give(): the window back}. See
+//     giveHost.
 // The interpreter's try_call(cb, ctx): runs the C++ callback cb(ctx) (a try_table's body) and returns its result, or
 // catches a fut exception, stores its payload (i64) at ctx, puts the stack pointer back and returns -1. Static, so a
 // Worker can upload it compiled.
@@ -144,6 +145,11 @@ export async function createFut(opts) {
   const u8 = () => (u8v?.buffer === mem.buffer ? u8v : (u8v = new Uint8Array(mem.buffer)));
   const dv = () => (dvv?.buffer === mem.buffer ? dvv : (dvv = new DataView(mem.buffer)));
   let shared = false;  // fut-mt.wasm: the memory is shared (and TextDecoder takes no view of shared memory)
+  let taken = false;  // a module draws the window (opts.screen.take): present() doesn't copy out the pixel buffer
+  const screen = opts.screen && {
+    take(present) { const c = opts.screen.take(present); return (taken = !!c), c; },
+    give() { taken = false, opts.screen.give(); },
+  };
   const cstr = (p) => {
     const m = u8();
     let e = p, hi = 0;
@@ -279,7 +285,7 @@ export async function createFut(opts) {
       } else if (kind.startsWith("js")) {
         if (!opts.importModule) throw new Error("this host cannot load JavaScript modules");
         exports = await opts.importModule(file, stamp);
-        giveHost(exports, { memory: mem, screen: opts.screen });
+        giveHost(exports, { memory: mem, screen });
       } else {
         const bytes = opts.read(file);
         if (!bytes) throw new Error("cannot read it");
@@ -729,6 +735,7 @@ export async function createFut(opts) {
     window: (w, h) => (opts.window?.(w, h) ? 1 : 0),
     present: S(async (px, w, h) => {
       flush();  // what the program did on the page (a GPU frame drawn there) comes first
+      if (taken) return (await opts.present(null, w, h)) ? 1 : 0;  // (its present() shows the module's frame)
       const src = new Uint8Array(mem.buffer, px, w * h * 4), rgba = new Uint8ClampedArray(w * h * 4);
       for (let i = 0; i < src.length; i += 4) (rgba[i] = src[i + 2]), (rgba[i + 1] = src[i + 1]), (rgba[i + 2] = src[i]), (rgba[i + 3] = 255);
       return (await opts.present(rgba, w, h)) ? 1 : 0;
