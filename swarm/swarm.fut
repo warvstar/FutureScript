@@ -253,7 +253,7 @@ fn tool(name, desc, props, required) {
 }
 var S = {type: "string"}
 var WORKER_TOOLS = [
-  tool("map", "Every file's declarations (fut map of all.fut). Cheap: look here first.", {}, []),
+  tool("map", "Every module's declarations (fut map over src/*.fut). Cheap: look here first.", {}, []),
   tool("ls", "List the repository's files.", {}, []),
   tool("read", "Read a file.", {path: S}, ["path"]),
   tool("write", "Create or replace a whole file.", {path: S, content: S}, ["path", "content"]),
@@ -372,6 +372,23 @@ fn byStatus(s) {
   for t in tasks { if t.status == s { out.push(t) } }
   return out
 }
+// fut map of every src/*.fut, each on its own, whatever all.fut says: agents let all.fut go stale (modules with clashing
+// names can't all be imported into one file), then took modules that are on main for missing
+fn mapAll(dir) {
+  var files = lines(sh("git ls-files -co --exclude-standard 'src/*.fut'", dir).out)
+  var cmds = []
+  for f in files { cmds.push({cmd: [FUT, "map", f, f], cwd: dir, timeout: 60}) }
+  var out = ""
+  var first = true
+  for r in execAll(cmds) {
+    for l in (r.out + r.err).split("\n") {  // not lines(): the map's indentation is its structure
+      if l.trim() == "" { continue }
+      if l.find("pkg ") == 0 { if !first { continue } first = false }
+      out += l + "\n"
+    }
+  }
+  return {code: 0, out: out, err: ""}
+}
 fn titles(list) {
   var out = []
   for t in list {
@@ -481,8 +498,8 @@ fn giveUp(w, why) {
 fn runTool(w, name, inp) {
   var wt = w.wt
   if name == "map" {
-    var r = exec({cmd: [FUT, "map", "all.fut"], cwd: wt, timeout: 60})
-    if r.code != 0 { return {text: "fut map failed (fix all.fut):\n" + clip(r.err + r.out, 3000), err: true} }
+    var r = mapAll(wt)
+    if r.code != 0 { return {text: "fut map failed:\n" + clip(r.err + r.out, 3000), err: true} }
     return {text: clip(r.out, 14000)}
   }
   if name == "ls" { return {text: clip(sh("git ls-files -co --exclude-standard", wt).out, 6000)} }
@@ -637,7 +654,7 @@ fn merge(w) {
 
 // ---- planning ----
 fn context() {
-  var m = exec({cmd: [FUT, "map", "all.fut"], cwd: WORK, timeout: 60})
+  var m = mapAll(WORK)
   var recent = rejections
   if recent.len() > 12 { recent = recent.slice(recent.len() - 12, recent.len()) }
   return "Project map (main):\n" + clip(m.out + m.err, 14000) + "\n\nmain's tests: " + mainTests.report +
