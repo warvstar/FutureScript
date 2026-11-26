@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Build and test fut.   python3 build.py [build | debug | wasm | test [--debug | --wasm] | fuzz [N] | clean]"""
-import os, random, re, subprocess, sys, time
+import json, os, random, re, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -48,7 +48,8 @@ def runner(exe):
 
 
 def test(exe):
-    """Each tests/*.fut lists `// expect: <line>` for stdout and optionally `// error: <text>` lines for stderr."""
+    """Each tests/*.fut lists `// expect: <line>` for stdout and optionally `// error: <text>` lines for stderr.
+    Each tests/specs/*.fut is run with `fut test` and must pass."""
     failed = 0
     for t in sorted((ROOT / "tests").glob("*.fut")):
         src = t.read_text()
@@ -60,9 +61,15 @@ def test(exe):
         if not ok:
             failed += 1
             print(f"  want: {want}\n  got:  {r.stdout.splitlines()}\n  stderr: {r.stderr.strip()}")
-    for name, fn in HOT_TESTS:
+    for t in sorted((ROOT / "tests" / "specs").glob("*.fut")):  # specs written with test blocks
+        r = subprocess.run([*runner(exe), "test", str(t)], capture_output=True, text=True, timeout=60)
+        print(f"{'ok  ' if r.returncode == 0 else 'FAIL'} specs/{t.name} ({r.stdout.strip().splitlines()[-1] if r.stdout.strip() else 'no output'})")
+        if r.returncode:
+            failed += 1
+            print("  " + (r.stdout + r.stderr).strip().replace("\n", "\n  "))
+    for name, fn in HOT_TESTS + RUNNER_TESTS:
         ok, detail = fn(exe)
-        print(f"{'ok  ' if ok else 'FAIL'} hot reload: {name}")
+        print(f"{'ok  ' if ok else 'FAIL'} {'' if fn in [f for _, f in RUNNER_TESTS] else 'hot reload: '}{name}")
         if not ok:
             failed += 1
             print("  " + detail)
@@ -159,11 +166,55 @@ HOT_TESTS = [("methods, errors, main restart", hot_methods_and_main),
              ("code reclamation", hot_reclaim)]
 
 
+def runner_json(exe):
+    """`fut test --json` on tests/fixtures/runner.fut: each test's status, the failure details, captured output."""
+    r = subprocess.run([*runner(exe), "test", "--json", str(ROOT / "tests" / "fixtures" / "runner.fut")], capture_output=True, text=True, timeout=60)
+    recs = [json.loads(l) for l in r.stdout.splitlines() if l.startswith("{")]
+    tests = {t["name"]: t for t in recs if t["type"] == "test"}
+    status = {n: t["status"] for n, t in tests.items()}
+    want = {"passes": "pass", "fails": "fail", "throws": "pass", "nothing thrown": "fail", "pending": "pending", "errors": "error",
+            "deep": "fail", "caught failure still fails": "fail", "module": "pass"}
+    f, d = tests.get("fails", {}), tests.get("deep", {})
+    ok = (status == want and r.returncode == 1 and "main does not run" not in r.stdout
+          and f.get("output") == "built\n" and f["expect"]["line"] == 15 and f["expect"]["left"] == {"expr": "c.total()", "value": "6"}
+          and tests["nothing thrown"]["expect"]["reason"] == "nothing was thrown"
+          and tests["pending"]["reason"].startswith("undefined name 'discount'")
+          and tests["errors"]["message"] == "number has no field 'b'"
+          and d["expect"]["diff"] == {"at": ".items[0].qty", "what": "3 vs 4"}
+          and recs[-1] == {**recs[-1], "type": "summary", "passed": 3, "failed": 4, "errors": 1, "pending": 1})
+    return ok, f"rc={r.returncode} statuses: {status}\n  stdout: {r.stdout[-1500:]!r}\n  stderr: {r.stderr[-500:]!r}"
+
+
+def runner_text(exe):
+    """`fut test` (text) with a filter; a compile error; spec-first: all pending, then all passing."""
+    d = ROOT / "build" / "spec"
+    d.mkdir(parents=True, exist_ok=True)
+    spec = 'test "doubles" { expect double(2) == 4 }\ntest "halves" { expect half(4) == 2 }\n'
+    (d / "s.fut").write_text(spec)
+    run = lambda *a: subprocess.run([*runner(exe), "test", *a], capture_output=True, text=True, timeout=60)
+    a = run(str(d / "s.fut"))
+    (d / "s.fut").write_text("fn double(n) { return n * 2 }\nfn half(n) { return n / 2 }\n" + spec)
+    b, c = run(str(d / "s.fut")), run("--filter", "dou", str(d / "s.fut"))
+    (d / "s.fut").write_text('test "x" { expect 1 == }\n')
+    e = run("--json", str(d / "s.fut"))
+    err = json.loads(e.stdout.splitlines()[0]) if e.stdout.startswith("{") else {}
+    ok = (a.returncode == 1 and sum(l.startswith("pending ") for l in a.stdout.splitlines()) == 2 and "2 tests: 0 passed, 2 pending" in a.stdout
+          and b.returncode == 0 and b.stdout.startswith("ok      doubles\nok      halves\n2 tests: 2 passed")
+          and c.stdout.startswith("ok      doubles\n1 test: 1 passed")
+          and e.returncode == 2 and err.get("type") == "compile_error" and err.get("line") == 1 and err.get("message") == "unexpected '}'")
+    return ok, f"pending run: {a.stdout!r}\n  passing run: {b.stdout!r}\n  filtered: {c.stdout!r}\n  compile error: {e.stdout!r}"
+
+
+RUNNER_TESTS = [("fut test --json: statuses, details, output", runner_json),
+                ("fut test: spec first, filter, compile error", runner_text)]
+
+
 def fuzz(exe, n=300, seed=None):
     """Mutate the test programs and run them under ASan/UBSan. Errors are fine; crashes and sanitizer reports are not."""
     rng = random.Random(seed if seed is not None else time.time_ns())
-    corpus = [p.read_text() for p in sorted((ROOT / "tests").glob("*.fut")) + sorted((ROOT / "examples").glob("*.fut"))]
-    corpus = [c for c in corpus if "window(" not in c and "extern" not in c]  # no windows; C calls are unchecked
+    corpus = [p.read_text() for p in sorted((ROOT / "tests").glob("*.fut")) + sorted((ROOT / "tests" / "specs").rglob("*.fut"))
+              + sorted((ROOT / "examples").glob("*.fut"))]
+    corpus = [c for c in corpus if "window(" not in c and "extern" not in c and "run(" not in c]  # no windows; C calls are unchecked; no child processes
     toks = ["(", ")", "{", "}", "[", "]", ",", ".", ":", "=", "+=", "-", "*", "/", "%", "==", "<", "&&", "!", "..", "\"",
             "\"{x}\"", "fn", "var", "class", "if", "else", "while", "for", "in", "return", "break", "self", "super", "nil",
             "1", "0", "-1", "x", "f", "fn(a) { return a }", "{a: 1}", "\n"]
@@ -184,10 +235,12 @@ def fuzz(exe, n=300, seed=None):
         f = ROOT / "build" / f"fuzz{k % 64}.fut"
         f.write_text(cases[k])
         try:
-            r = subprocess.run([*runner(exe), str(f)], capture_output=True, text=True, timeout=3, env=env)
+            spec = 'test "' in cases[k]  # a spec's test bodies only compile under `fut test` (each test in its own process)
+            r = subprocess.run([*runner(exe), *(["test", "--timeout", "1"] if spec else []), str(f)], capture_output=True, text=True, timeout=3, env=env)
         except subprocess.TimeoutExpired:
             return None
-        bad = r.returncode < 0 or "Sanitizer" in r.stderr or re.search(r"\.(cpp|h):\d+:\d+: runtime error", r.stderr)
+        bad = (r.returncode < 0 or "Sanitizer" in r.stderr or re.search(r"\.(cpp|h):\d+:\d+: runtime error", r.stderr)
+               or "the test process crashed" in r.stdout)
         if bad:
             (crashes / f"crash{k}.fut").write_text(cases[k])
             return f"case {k}: rc={r.returncode}\n{r.stderr[-1500:]}"

@@ -26,6 +26,7 @@ HOST(yield) void host_yield(Fiber* f);                         // suspending: ba
 HOST(fiber_gone) void host_fiber_gone(Fiber* f);
 HOST(sleep) void host_sleep(double seconds);                   // suspending
 HOST(poll) void host_poll();                                   // suspending: run typed lines, reload changed files
+HOST(run) int host_run(const char* args, const char* source, double timeout);  // run(): the result's length (in take), -1: none
 }
 static void* getsp() { void* p; asm volatile("global.get __stack_pointer\n\tlocal.set %0" : "=r"(p)); return p; }
 static void setsp(void* p) { asm volatile("local.get %0\n\tglobal.set __stack_pointer" : : "r"(p)); }
@@ -67,6 +68,19 @@ size_t jitLive() {
   for (auto& m : mods) n += m.refs ? m.bytes : 0;
   return n;
 }
+// Direct calls: each body has a "replaced" cell (never freed: old code keeps its address), set once its stub leads
+// elsewhere or it is retired; a body whose cell is set sends a direct call on through its stub (Gen::finish).
+static std::map<u32, u32> stubTo;           // stub slot -> the body it leads to
+static std::map<u32, uint8_t*> cells;       // body slot -> its cell
+static uint8_t* newCell() {
+  static uint8_t* p;
+  static size_t left;
+  if (!left) p = (uint8_t*)calloc(4096, 1), left = 4096;
+  return left--, p++;
+}
+static void replaced(u32 body) {
+  if (auto it = cells.find(body); it != cells.end()) *it->second = 1, cells.erase(it);
+}
 static void section(std::vector<uint8_t>& m, uint8_t id, const std::vector<uint8_t>& body) {
   m.push_back(id), wa::uleb(m, body.size()), m.insert(m.end(), body.begin(), body.end());
 }
@@ -78,10 +92,18 @@ void jitCollect() {  // install the batch as one module, then make the queued ta
     if (auto it = lineTabs.find(s); it != lineTabs.end()) mods[it->second.mod].refs--, lineTabs.erase(it);
   }
   retired.clear();
+  std::map<u32, u32> next = stubTo;  // where each stub leads once the queued changes are made
+  for (size_t i = 0; i < ops.size(); i += 2) if (ops[i + 1] >= 0) next[ops[i]] = ops[i + 1];
+  std::map<u32, u32> inBatch;        // body slot -> function index
+  std::vector<u32> bodies;
+  for (size_t i = 0; i < batch.size(); i++) inBatch[batch[i].slot] = (u32)i, bodies.push_back(batch[i].slot);
+  std::vector<uint8_t*> fresh;       // the batch's cells (they go live after the queued changes)
+  for (size_t i = 0; i < batch.size(); i++) fresh.push_back(newCell());
   std::vector<uint8_t> m{0, 'a', 's', 'm', 1, 0, 0, 0}, s;
   if (!batch.empty()) {
-    wa::uleb(s, 1 + NH), funcType(s, "i:l");
+    wa::uleb(s, 2 + NH), funcType(s, FUT_SIG);
     for (int h = 0; h < NH; h++) funcType(s, HSIG[h]);
+    funcType(s, "i:l");
     section(m, 1, s), s.clear();
     wa::uleb(s, 4);
     name(s, "env"), name(s, "memory"), s.insert(s.end(), {2, 0, 0});
@@ -95,7 +117,7 @@ void jitCollect() {  // install the batch as one module, then make the queued ta
     wa::uleb(s, batch.size());
     for (size_t i = 0; i < batch.size(); i++) name(s, std::to_string(batch[i].slot)), s.push_back(0), wa::uleb(s, i);
     section(m, 7, s), s.clear();
-    // Code: each body is its locals (fp; r0..r17; two temporaries) and its instructions. Line tables record module offsets.
+    // Code: each body is its locals (fp; r0..r17; four temporaries; cached locals) and its instructions. Line tables record module offsets.
     // Branch hints (a custom section that must precede the code): by function, offsets within its body.
     std::vector<uint8_t> code, hints, hs;
     u32 hinted = 0;
@@ -103,9 +125,22 @@ void jitCollect() {  // install the batch as one module, then make the queued ta
     int mod = (int)mods.size();
     for (size_t fi = 0; fi < batch.size(); fi++) {
       auto& f = batch[fi];
-      for (auto [at, target] : f.k.rel)  // calls to known functions: their stub's slot, as a padded sleb
-        for (int i = 0, v = (int)slotOf(target); i < 5; i++) f.k.c[at + i] = uint8_t((v >> (7 * i) & 0x7f) | (i < 4 ? 0x80 : 0));
-      std::vector<uint8_t> runs{1, I32, NREG, I64, 2, I32}, locals;  // then the locals' caches, in runs of one type
+      for (size_t r = 0; r < f.k.rel.size(); r++) {  // calls to known functions (see RelKind), as padded LEB128
+        auto [at, target] = f.k.rel[r];
+        u32 stub = slotOf(target);
+        auto body = next.find(stub);
+        auto j = body == next.end() ? inBatch.end() : inBatch.find(body->second);
+        auto leb = [&](int o, u32 v) { for (int i = 0; i < 5; i++) f.k.c[o + i] = uint8_t((v >> (7 * i) & 0x7f) | (i < 4 ? 0x80 : 0)); };
+        switch (r < f.k.relKind.size() ? f.k.relKind[r] : REL_SLOT) {
+          case REL_SLOT: leb(at, stub); break;
+          case REL_OWN: leb(at, slotOf(fresh[fi])); break;
+          case REL_CALL:
+            if (j != inBatch.end()) f.k.c[at] = CALL, leb(at + 1, j->second), f.k.c[at + 6] = f.k.c[at + 7] = f.k.c[at + 8] = NOP;
+            else f.k.c[at] = I32_CONST, leb(at + 1, stub), f.k.c[at + 6] = CALL_INDIRECT, f.k.c[at + 7] = f.k.c[at + 8] = 0;
+            break;
+        }
+      }
+      std::vector<uint8_t> runs{1, I32, NREG, I64, 4, I32}, locals;  // then the locals' caches, in runs of one type
       u32 nruns = 3;
       auto& w = f.k.wlocals;
       for (size_t i = 0, j; i < w.size(); i = j, nruns++) {
@@ -141,28 +176,32 @@ void jitCollect() {  // install the batch as one module, then make the queued ta
     batch.clear();
   }
   if (m.size() > 8 || !ops.empty()) host_install(m.size() > 8 ? m.data() : nullptr, (u32)m.size(), ops.data(), (u32)ops.size() / 2);
+  for (size_t i = 0; i < fresh.size(); i++) cells[bodies[i]] = fresh[i];
+  for (size_t i = 0; i < ops.size(); i += 2) {
+    u32 dst = ops[i];
+    if (ops[i + 1] < 0) { replaced(dst), stubTo.erase(dst); continue; }  // a retired body
+    auto it = stubTo.find(dst);
+    if (it != stubTo.end() && it->second != (u32)ops[i + 1]) replaced(it->second);
+    stubTo[dst] = ops[i + 1];
+  }
   ops.clear();
 }
 static Code thunk(std::initializer_list<uint8_t> c, const char* nm) { Code k; k.c = c, k.name = nm; return k; }
 static void i32(Code& k, int32_t v) { k.c.push_back(wa::I32_CONST), wa::sleb(k.c, v); }
 u32* staleThunk(int sym) {  // rt_stale(sym)
   using namespace wa;
-  Code k = thunk({I64_CONST}, "<stale>");
+  Code k = thunk({LOCAL_GET, SP, GLOBAL_SET, 0, I64_CONST}, "<stale>");  // C++ frames go below the caller's
   wa::sleb(k.c, sym), i32(k, 0), i32(k, (int32_t)slotOf(vm.helpers[H_STALE]));
   k.c.insert(k.c.end(), {CALL_INDIRECT, 1 + H_STALE, 0, UNREACHABLE, ENDOP});
   return jitInstall(k);
 }
-struct Ext { int fn, n, sym; char ret, sig[8]; };  // sig/ret: d(ouble) i(nt) l(ong) p(ointer) s(tring) v(oid)
 static V rt_ffi(V* w, Ext* e) {
   double a[8] = {};
   for (int i = 0; i < e->n; i++) {
     V v = w[i];
-    char t = e->sig[i];
-    if (t == 's' ? !is(v, K::Str) : !isNum(v) || (t != 'd' && !(std::fabs(num(v)) < 9.2e18)))
-      ERR("%s() argument %d: expected %s, got %s", symName(e->sym).c_str(), i + 1, t == 's' ? "a string" : "a number", typeName(v));
-    a[i] = t == 's' ? (double)(uintptr_t)as<Str>(v)->s() : num(v);
+    a[i] = ffiCheck(e, i, v) == 's' ? (double)(uintptr_t)as<Str>(v)->s() : num(v);
   }
-  double r = host_ffi(e->fn, e->sig, a, e->ret);
+  double r = host_ffi((int)(uintptr_t)e->fn - 1, e->sig, a, e->ret);
   if (e->ret == 's') {
     if (r < 0) return NIL;
     std::string s((size_t)r, 0);
@@ -170,27 +209,28 @@ static V rt_ffi(V* w, Ext* e) {
   }
   return e->ret == 'v' ? NIL : box(e->ret == 'i' ? (double)(int32_t)(int64_t)r : r);
 }
-u32* ffiThunk(void* fn, const std::string& sig, char ret, int sym) {  // rt_ffi(window, its Ext)
-  static std::map<std::string, u32*> made;  // one per function and signature, kept across reloads
-  u32*& t = made[sig + ret + symName(sym)];
-  if (t) return t;
-  Ext* e = new Ext{(int)(uintptr_t)fn - 1, (int)sig.size(), sym, ret, {}};
-  memcpy(e->sig, sig.data(), sig.size());
+u32* ffiCode(Ext* e) {  // rt_ffi(window, e)
   using namespace wa;
-  Code k = thunk({LOCAL_GET, 0}, "<extern>");
+  Code k = thunk({LOCAL_GET, SP, GLOBAL_SET, 0, LOCAL_GET, W}, "<extern>");
   i32(k, (int32_t)slotOf(e)), i32(k, (int32_t)slotOf(vm.helpers[H_FFI]));
   k.c.insert(k.c.end(), {CALL_INDIRECT, 1 + H_FFI, 0, ENDOP});
-  return t = jitInstall(k);
+  return jitInstall(k);
+}
+// A C++ function V f(V* window) callable from fut code: a wasm adapter with the fut signature tells C++ where the
+// fut stack is (the caller's sp) and passes the window on.
+void* futAdapter(void* cpp) {
+  using namespace wa;
+  Code k = thunk({LOCAL_GET, SP, GLOBAL_SET, 0, LOCAL_GET, W}, "<native>");
+  i32(k, (int32_t)slotOf(cpp)), k.c.insert(k.c.end(), {CALL_INDIRECT, 1 + NH, 0, ENDOP});
+  return jitInstall(k);
 }
 void* externLookup(const std::string& lib, const std::string& name, const char** err) {
   int i = host_extern(lib.c_str(), name.c_str());
   if (i == -2) *err = "cannot load";
   return i < 0 ? nullptr : (void*)(uintptr_t)(i + 1);
 }
-V vmCall(void* code, std::initializer_list<V> a) {
-  V args[8] = {};
-  std::copy(a.begin(), a.end(), args);
-  return ((V(*)(V*))code)(args);
+V vmEnter(void* code, V* args) {  // fut code runs below this C++ frame
+  return ((V(*)(V*, void*, V, V, V, V))code)(args, getsp(), args[0], args[1], args[2], args[3]);
 }
 
 // ---------------- errors ----------------
@@ -199,31 +239,24 @@ static jmp_buf* compileJmp;
 static std::string compileErr;
 static bool compileAtEnd;
 void compileFail(const std::string& msg, bool atEnd) { compileErr = msg, compileAtEnd = atEnd, longjmp(*compileJmp, 1); }
-bool guardCompile(void (*f)(void*), void* ctx) {  // a compile outside fut_compile (tier 2)
+bool guardCompile(void (*f)(void*), void* ctx, std::string* err) {  // a compile outside fut_compile (tier 2, a test body)
   jmp_buf jb, *outer = compileJmp;
   compileJmp = &jb;
-  if (setjmp(jb)) return compileJmp = outer, batch.clear(), false;
+  if (setjmp(jb)) return compileJmp = outer, err ? (void)(*err = compileErr) : batch.clear(), false;
   f(ctx), compileJmp = outer;
   return true;
 }
 
 // ---------------- fibers: the host switches wasm stacks; we switch the shadow stack, limit and GC roots ----------------
 constexpr size_t FIBER_STACK = 256 << 10;
-Fiber* fiberCur;
-void* fiberMainSp;
-uintptr_t* fiberMainTop;
 static char* mainLimit;
 void fiberFree(Fiber* f) {
   if (f->stack) free(f->stack), f->stack = nullptr, host_fiber_gone(f);
 }
-V newFiber(V fn) {
-  Fn* f = is(fn, K::Clo) ? as<Clo>(fn)->fn : is(fn, K::Fn) ? as<Fn>(fn) : (ERR("fiber() expects a function"), nullptr);
-  if (f->arity - is(fn, K::Clo) > 1) ERR("a fiber's function takes at most one parameter (the first value sent)");
-  Fiber* b = make<Fiber>();
+void fiberStack(Fiber* b) {
   b->stack = (char*)aligned_alloc(16, FIBER_STACK);
   if (!b->stack) ERR("out of memory for fiber stacks");
-  b->fn = fn, b->val = NIL, b->limit = b->stack + (16 << 10), b->top = (uintptr_t*)(b->stack + FIBER_STACK), b->sp = b->top;
-  return box(b);
+  b->limit = b->stack + (16 << 10), b->top = (uintptr_t*)(b->stack + FIBER_STACK), b->sp = b->top;
 }
 static void use(Fiber* f) { fiberCur = f, stackTop = f ? f->top : fiberMainTop, vm.limit = f ? f->limit : mainLimit; }
 static void enter(Fiber* f) { use(f), setsp(f ? f->sp : fiberMainSp); }  // f (null: main) runs again, on its shadow stack
@@ -232,9 +265,7 @@ static void leave() {  // save the running context's shadow stack
   else fiberMainSp = getsp(), fiberMainTop = stackTop, mainLimit = (char*)vm.limit;
 }
 __attribute__((noinline)) static void fiberBody(Fiber* f) {
-  use(f);
-  if (is(f->fn, K::Clo)) f->val = vmCall(as<Clo>(f->fn)->fn->code, {f->fn, f->val});
-  else f->val = vmCall(as<Fn>(f->fn)->code, {f->val});
+  use(f), f->val = fiberCall(f);
   f->state = FIB_DONE, f->fn = NIL;
 }
 EXPORT(fut_fiber_start) void fiberStart(Fiber* f) { setsp(f->top), fiberBody(f); }  // no frame of its own: none on the resumer's stack
@@ -242,35 +273,12 @@ EXPORT(fut_fiber_fail) void fiberFail(Fiber* f, int kind, V v) {  // an error (1
   f->fail = kind, f->val = kind == 3 ? box(newStr((const char*)(uintptr_t)v)) : v, f->state = FIB_DONE, f->fn = NIL;
   if (kind == 3) f->fail = 1;
 }
-V fiberResume(V fv, V v) {
-  Fiber* f = as<Fiber>(fv), *from = fiberCur;
-  if (f->state == FIB_DONE) ERR("resume of a finished fiber");
-  if (f->state == FIB_RUNNING) ERR("resume of a running fiber");
-  int start = f->state == FIB_NEW;
-  f->val = v, f->resumer = from, f->state = FIB_RUNNING;
-  leave(), fiberCur = f;
-  host_resume(f, start);
-  enter(from);
-  if (f->state == FIB_DONE) {
-    fiberFree(f);
-    if (int r = f->fail) {
-      V e = f->val;
-      f->fail = 0, f->val = NIL;
-      if (r == 2) host_restart();
-      throwValue(e, nullptr);  // catchable here; else reported with both traces
-    }
-  }
-  V r = f->val;
-  return f->val = NIL, r;
+void fiberRun(Fiber* f, bool start) {
+  Fiber* from = fiberCur;
+  leave(), fiberCur = f, host_resume(f, start), enter(from);
 }
-V rt_yield(V v) {
-  Fiber* f = fiberCur;
-  if (!f) ERR("yield outside a fiber");
-  f->val = v, f->state = FIB_SUSPENDED;
-  leave(), host_yield(f), enter(f);
-  V r = f->val;  // sent by the next resume
-  return f->val = NIL, r;
-}
+void fiberYield(Fiber* f) { leave(), host_yield(f), enter(f); }
+void restartMain() { host_restart(); }
 
 // ---------------- files, paths, time ----------------
 bool readFile(const std::string& path, std::string& out) {
@@ -293,6 +301,21 @@ std::string canonicalPath(const std::string& p) {  // resolve . and .. (the host
   return r.empty() ? "/" : r;
 }
 void sleepFor(double s) { fflush(stdout), host_sleep(s); }
+// The host runs fut in a child process (Node: web/run.mjs again). args: one per line, the file (empty: source) last.
+// Its answer: "code timedOut outBytes\n" then stdout and stderr.
+bool runProcess(const std::vector<std::string>& args, const std::string& file, const std::string* source, double timeout, ProcResult& r) {
+  std::string a;
+  for (auto& x : args) a += x + "\n";
+  int n = host_run((a + file).c_str(), source ? source->c_str() : nullptr, timeout);
+  if (n < 0) return false;
+  std::string res(n, 0);
+  host_take(res.data());
+  int to = 0;
+  size_t outLen = 0, nl = res.find('\n');
+  if (nl == std::string::npos || sscanf(res.c_str(), "%d %d %zu", &r.code, &to, &outLen) != 3) return false;
+  r.timedOut = to, r.out = res.substr(nl + 1, outLen), r.err = res.substr(nl + 1 + outLen);
+  return true;
+}
 void gcCollect();
 extern bool gcWanted;
 static void safepoint() {  // rt_poll: a collection the allocator asked for, then the host's events
@@ -311,26 +334,30 @@ void platformInit() {
   stackTop = (uintptr_t*)&__stack_high, vm.limit = &__stack_low + (64 << 10);
   vm.helpers[H_FFI] = (void*)rt_ffi, vm.helpers[H_HOT] = (void*)rt_hot;
   undefSlot = wa::slotOf(callable<undefFn>());
+  jitCollect();
+  for (u32 s : freeSlots) ops.push_back((int32_t)s), ops.push_back((int32_t)undefSlot);  // grown before undefFn existed
+  jitCollect();
   pollHook = safepoint;
 }
 
 // ---------------- the host's entry points ----------------
 static std::string text;  // what the last string-returning export returned
 static Compiled last;
-EXPORT(fut_init) void futInit(int v) { verbose = v, rtInit(); }
+EXPORT(fut_init) void futInit(int v) { verbose = v, rtInit(), jitCollect(); }  // installs the natives' adapters
 EXPORT(fut_alloc) char* futAlloc(u32 n) { return (char*)malloc(n); }
 EXPORT(fut_free) void futFree(char* p) { free(p); }
 // Compile a file (text null) or REPL input; returns the chunk's slot, 0 after an error (printed), -1 if input ended early.
-EXPORT(fut_compile) int futCompile(const char* path, int reload, int echo, const char* src) {
+EXPORT(fut_compile) int futCompile(const char* path, int reload, int echo, const char* src, int tests) {
   jmp_buf jb, *outer = compileJmp;
   compileJmp = &jb;
   if (setjmp(jb)) {
     compileJmp = outer, batch.clear(), ops.clear();
     if (echo && compileAtEnd) return -1;
+    if (tests) return reportCompileError(compileErr), 0;
     return fflush(stdout), fprintf(stderr, "%s\n", compileErr.c_str()), 0;
   }
   std::string t = src ? src : "";
-  last = compile(path, reload, echo, src ? &t : nullptr);
+  last = compile(path, reload, echo, src ? &t : nullptr, tests);
   compileJmp = outer;
   return (int)wa::slotOf(last.chunk);
 }
@@ -355,4 +382,11 @@ EXPORT(fut_where) const char* futWhere(int slot, int off) {  // "name (file:line
   return (text = it->second.name + " (" + it->second.file + ":" + std::to_string(line) + ")").c_str();
 }
 EXPORT(fut_live) u32 futLive() { return (u32)jitLive(); }
+// fut test: the host calls the top level, then each test's code, catching errors (see test.cpp for the rest)
+EXPORT(fut_tests_begin) void futTestsBegin(int json, const char* filter) { testsBegin({json != 0, filter}); }
+EXPORT(fut_test_count) int futTestCount() { return (int)last.tests.size(); }
+EXPORT(fut_test_start) int futTestStart(int i) { return (int)wa::slotOf(testStart(last.tests[i])); }
+EXPORT(fut_test_finish) void futTestFinish(int i, int errored, const char* err) { testFinish(last.tests[i], errored, err); }
+EXPORT(fut_test_top_error) void futTestTopError(const char* err) { reportTopError(err); }
+EXPORT(fut_tests_end) int futTestsEnd() { return testsEnd(); }
 EXPORT(fut_poll) u32* futPoll() { return &vm.poll; }

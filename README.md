@@ -4,10 +4,11 @@ A small class-based language written in C++23 with no third-party libraries. A s
 
 ```sh
 python3 build.py               # -> build/fut   (clang++ -std=c++23 -O2, files in parallel, only what changed; no cmake)
-python3 build.py test          # language tests + live hot-reload scenarios
+python3 build.py test          # language tests, tests/specs/*.fut via `fut test`, live hot-reload scenarios
 python3 build.py test --debug  # same, under ASan/UBSan
 python3 build.py fuzz 1000     # mutate the tests; any crash or sanitizer report fails
 build/fut file.fut             # run
+build/fut test file.fut        # run its `test` blocks (--json: one JSON object per line; --filter text; --timeout s)
 build/fut -w file.fut          # run and hot-reload on save (file and its imports); type lines to run them inside it
 build/fut --asm file.fut       # disassemble the generated code (uses clang + otool)
 build/fut                      # REPL
@@ -54,10 +55,10 @@ fn reload() { }                      // optional: runs after every hot reload (m
 
 - **Values:** numbers (f64; whole numbers are exact up to 2^53 and print without a decimal point), strings, `true`/`false`/`nil`, lists, maps, functions and closures, classes and instances. `nil` and `false` are the only falsy values.
 - **Operators:** `+ - * / %`, `== != < <= > >=`, `&& ||` (short-circuit, return the operand), `!`, `= += -= *= /=`. Bitwise `& | ^ ~ << >>` work on whole numbers as 64-bit integers (`1.5 & 1` is an error), with Python's precedence: `2 + 3 & 6` is `(2 + 3) & 6`. `+` with a string on either side concatenates.
-- **Builtins:** `print len str int clock sleep floor sqrt fiber` (`int` truncates toward zero), plus graphics (below).
+- **Builtins:** `print len str int clock sleep floor sqrt fiber run` (`int` truncates toward zero), plus graphics (below).
 - **Numbers:** `12`, `1.5`, `2e3`, `0xff8800`.
 - **Keywords:** `var fn class if else while for in return break continue true false nil self super import extern yield try catch throw` (`as` is special only after an import).
-- **Methods:** `list.push/pop/len`, `map.has/remove/keys/values/len`, `str.len`, `fiber.resume/send/done`.
+- **Methods:** `list.push/pop/len`, `map.has/remove/keys/values/len`, `str.len/has` (`has`: contains a substring), `fiber.resume/send/done`.
 - **Closures:** a closure captures the enclosing variables by value. The closure can still change its own copy, so counters work, but it does not see later changes in the enclosing function.
 - **Interpolation:** expressions inside `{...}` in a string can't contain `"`. Write `\{` for a literal brace.
 - **Newline rules:** a `(` or `[` on a new line, or a leading `-`, starts a new statement rather than continuing the previous one.
@@ -73,6 +74,45 @@ try { risky() } catch { }                            // the name is optional
 ```
 
 `throw` unwinds to the innermost `try` on the current stack, through any number of calls. `return`, `break` and `continue` leave a `try` cleanly. An uncaught error inside a fiber ends the fiber and is thrown again in its resumer, where it can be caught. An uncaught error stops the program with a stack trace (under `-w`, it waits for a fix). Entering a `try` costs a few stores: the handler record lives in the function's frame, and a function containing `try` keeps its locals in memory so a catch sees their latest values.
+
+## Tests
+
+```
+fn total(items) { var s = 0 for i in items { s += i.price * i.qty } return s }
+
+test "total sums price times qty" {
+  expect total([{price: 2, qty: 3}, {price: 5, qty: 1}]) == 11
+  expect total([]) == 0
+}
+test "rejects a negative quantity" {
+  expect throws { total([{price: 1, qty: -1}]) } == "negative qty"
+}
+test "discounts" { expect discount(10, 0.1) == 9 }   // discount isn't written yet: pending
+```
+
+```
+$ build/fut test cart.fut
+ok      total sums price times qty
+FAIL    rejects a negative quantity (cart.fut:7)
+  cart.fut:8: expect throws { ... } == "negative qty"
+    nothing was thrown
+pending discounts (cart.fut:10): undefined name 'discount' at cart.fut:10:27
+3 tests: 1 passed, 1 failed, 1 pending (0.2 ms)
+```
+
+- **`test "name" { ... }`** at the top level declares a test. `fut test file.fut` runs the top-level code once, then every test block in order, including tests in imported files. It does not call `main`. A normal run skips test blocks without compiling them.
+- **`expect a op b`**, where `op` is a comparison, checks the comparison. On failure it reports the expression's source text and the value of each side that isn't a literal. **`expect x`** checks that `x` is truthy, and `expect a == b && c` checks the whole condition. Inside `expect`, `==` and `!=` compare lists and maps by their contents, ignoring key order, and a failure names the first difference (`first difference at .items[0].qty: 3 vs 4`). The language's own `==` still compares lists and maps by identity.
+- **`expect throws { ... }`** passes if the block throws, and `expect throws { ... } == value` also checks the thrown value.
+- **`expect prints { ... } == "text\n"`** checks exactly what `print` wrote inside the block.
+- **`run(file)`** or **`run({source: "...", args: [...], timeout: s})`** runs fut on a program in a child process and returns `{code, out, err, timedOut}`. Use it to check what can't be checked in-process: uncaught errors and their stack traces, compile errors, exit codes, and whether `main` runs. A relative `file` is found next to the program, and `args` go before the file (`args: ["test", "--json"]`). In `source`, write `\{` for a literal brace, because `{...}` interpolates.
+- A failed `expect` throws an error. Outside `fut test` it works as an assertion, with the usual stack trace. A test whose `expect` fails is reported as failed even if its own `try` catches that error.
+- **Pending tests support writing the spec first.** A test that names a function, class or module member that isn't defined yet is reported as pending instead of failing the whole compile. Any other compile error is still an error.
+- **Statuses:** `ok`, `FAIL` (an `expect` failed), `ERROR` (an uncaught runtime error, with its trace) and `pending`. Output that a failing test printed is shown under it. The exit status is 0 only when every test passed: 1 means something failed, errored or is pending, and 2 means a compile error.
+- **`--json`** prints one object per line: `{"type":"test", "name", "file", "line", "status", "ms", "output"}`. A failed test adds `"expect": {"file", "line", "expr", "left": {"expr", "value"}, "right": {...}, "diff": {"at", "what"}, "reason"}`. An error adds `"message"` and `"trace"`, and a pending test adds `"reason"`. A final `{"type":"summary", "passed", "failed", "errors", "pending", "ms"}` follows. A compile error is `{"type":"compile_error", "file", "line", "col", "message", "text"}`, and an error in top-level code is `{"type":"error", "message", "trace"}`.
+- **`--filter text`** runs only the tests whose name contains `text`.
+- **Isolation:** natively, each test runs in its own process, forked after the top-level code has run. A test's changes to globals, a crash or a hang stay inside that test. A test that runs longer than `--timeout` seconds (default 10) is stopped and reported as an error. Under WebAssembly, tests share one process and run in order with no timeout, so tests shouldn't depend on each other's state.
+- `test`, `expect`, `throws` and `prints` are reserved only in these positions, so they stay usable as ordinary names.
+- **This repository's tests:** `tests/specs/*.fut` are specs, run with `fut test`; the programs they `run()` are in `tests/specs/progs/`. A few files in `tests/*.fut` still use `// expect:` comments that the runner compares with stdout: `basics`, `control`, `cond`, `classes`, `err_compile` and `expect`. They test, without using `expect`, the features `expect` itself depends on.
 
 ## Modules
 
@@ -149,12 +189,13 @@ How it maps:
 - **Code.** Each compile becomes one wasm module, with one function per fut function. It shares the runtime's memory, function table and stack pointer. A stub is a table slot, so patching it is a single `table.set`, and a direct call is a `call_indirect` through the slot. Retired slots are cleared and reused; V8 frees a module once nothing references it.
 - **Values and frames.** Values are NaN-boxed exactly as on arm64. Each local's home is a slot in a frame on the C++ shadow stack, which the GC scans. A wasm local caches it, and reads use that cache. Stores write both, except when the value is known to be a number (range counters, `x op= y` on a local that started as a number): those stay in an f64 wasm local, so a loop-carried `s += x` never leaves the FP registers. Temporaries live only in wasm locals, so a collection runs only at safe points (function entry and loop back-edges).
 - **Branch hints.** Type checks, inline-cache hits and safe-point polls carry wasm branch hints (likely / unlikely). Without them V8 treats both arms of an `if` alike, and the helper call on the slow path makes it spill the loop's values around the fast path too. The hints alone take a 20M-iteration float loop from 67 ms to 17 ms.
-- **Tier 2** works as on arm64. A failed entry guard continues in the tier-1 body with a tail call (`return_call_indirect`), which leaves no extra frame.
+- **Tier 2** works as on arm64. A failed entry guard continues in the tier-1 body with a tail call (`return_call_indirect`), which leaves no extra frame. A tier-2 body's recursive calls are direct `call`s (reloading drops the body, so they never need repointing). V8 runs these faster than calls through the table: `fib(32)` 26 → 22 ms. Typed function references (`call_ref` through a global) measured no faster than `call_indirect`.
+- **Inline allocation** works as on arm64. `C(args)` and closures bump their size class's run in the VM block, with no call into the runtime.
 - **try/throw** use wasm exceptions. Uncaught errors print a stack trace mapped from V8's module offsets to fut lines.
 - **Fibers** each get their own shadow stack. The host suspends and resumes their wasm stacks with JSPI (`WebAssembly.Suspending` / `promising`).
 - **`extern fn`** calls JavaScript instead of C. With no library it looks in a small libc shim (`strlen`, `atoi`, `getenv`, ...), then `Math`, then globals. `extern "console" fn log(str): void` names an object.
 
-Performance, as best of 5 runs after warm-up (wasm vs arm64): float loop 17 vs 17 ms, `fib(32)` 26 vs 11 ms, 5M method calls 24 vs 14 ms, 1M allocations 14 vs 4 ms (wasm has no inline allocation yet). The first call of a function runs in V8's baseline compiler, and V8 has no on-stack replacement for wasm, so a long loop in a function called only once (the first run of the float loop: 77 ms) stays at baseline speed. Functions called repeatedly, such as the ones a game loop calls each frame, are optimized after a few calls. In Node, `node --no-liftoff web/run.mjs` optimizes everything up front, at about 200 ms of extra startup.
+Performance, as best of 5 runs after warm-up (wasm vs arm64): float loop 17 vs 17 ms, `fib(32)` 22 vs 12 ms, 5M method calls 24 vs 15 ms, 1M allocations 7 vs 4 ms. The first call of a function runs in V8's baseline compiler, and V8 has no on-stack replacement for wasm, so a long loop in a function called only once (the first run of the float loop: 77 ms) stays at baseline speed. Functions called repeatedly, such as the ones a game loop calls each frame, are optimized after a few calls. In Node, `node --no-liftoff web/run.mjs` optimizes everything up front, at about 200 ms of extra startup.
 
 Other differences from arm64: file changes and typed lines are delivered only while the program waits in `sleep()`, `present()` or a fiber switch, because JS events cannot interrupt running wasm. Compile errors unwind with `setjmp`/`longjmp`, since WASI libc++ has no C++ exceptions.
 
@@ -173,7 +214,8 @@ Other differences from arm64: file changes and typed lines are delivered only wh
 | `web/` | `fut.js` (JS host: instantiation, installs, traces, fibers, driver), `run.mjs` (Node CLI), `serve.mjs` + `index.html` (browser) |
 | `gc.cpp` | Allocator using 64 KB pages with size classes (O(1) "is this a heap pointer?"); mark bitmap, no sweep, conservative over stack and registers |
 | `gfx.cpp` | The window: AppKit through the Objective-C runtime, loaded on first use (a canvas in wasm) |
-| `main.cpp` | Driver: watcher, safepoint reload, `main` restart, REPL, `--asm` |
+| `main.cpp` | Driver: watcher, safepoint reload, `main` restart, REPL, `--asm`, `fut test` |
+| `test.cpp` | `expect`'s check (deep equality, failure details) and the test runner's reporting, text and JSON; shared by both platforms |
 
 **Codegen:**
 - Locals live in callee-saved `x19`–`x25`, then in sp-relative slots. A local whose initial value is a number, and every `for` range counter, lives in `d8`–`d15` instead. Arithmetic on it then stays in the FP unit, so `s += x` in a loop is one `fadd` on the loop-carried path.

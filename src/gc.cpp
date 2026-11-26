@@ -22,7 +22,7 @@ bool gcWanted;
 
 namespace {
 constexpr size_t PAGE = 1 << 16, REGION = (WASM ? 256ull << 20 : 8ull << 30), NPAGES = REGION / PAGE, GRAN = 16, PBITS = PAGE / GRAN;
-constexpr size_t MIN_HEAP = (8 << 20) / PAGE;  // pages
+constexpr size_t MIN_HEAP = (8 << 20) / PAGE;
 constexpr u32 NONE = ~0u;
 struct Page { uint8_t type, cls; bool cold; u32 n; };  // type: 0 free, 1 small, 2 large head, 3 large tail; cold: madvised
 
@@ -197,7 +197,7 @@ void collect() {
       size_t n = 0;
       for (size_t w = i * PBITS / 64; w < (i + 1) * PBITS / 64; w++) n += std::popcount(marks[w]);
       if (!n) p = {}, pool.push_back((u32)i);
-      else if (inUse++, n < PAGE / sizeClasses[p.cls]) avail[p.cls].push_back((u32)i);  // not full
+      else if (inUse++, n < PAGE / sizeClasses[p.cls]) avail[p.cls].push_back((u32)i);
     } else if (p.type == 2) {
       if (marked((Obj*)addr(i))) inUse += p.n;
       else for (size_t j = i, n = p.n; j < i + n; j++) pages[j] = {}, pool.push_back((u32)j);
@@ -218,7 +218,7 @@ bool due() {  // over the limit: collect now (natively), or at the next safepoin
   if (!WASM) return collect(), true;
   return gcWanted = true, vm.poll |= 2, false;
 }
-}  // namespace
+}
 
 void gcInit() {
 #if __wasm__

@@ -65,7 +65,8 @@ struct Gen : CState {
     F->maxfreg = std::max(F->maxfreg, F->nfreg + 1);
     return -(108 + F->nfreg++);
   }
-  int numHome() { return home(); }  // a range loop's variable
+  int numHome() { return home(); }
+  void stn(u32 r, int h) { stl(r, h); }  // a value known to be a number  // a range loop's variable
   static bool isF(int h) { return h <= -100; }
   static u32 dOf(int h) { return u32(-h - 100); }
   static u32 regOf(int h) { return u32(18 - h); }

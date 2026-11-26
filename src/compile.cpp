@@ -28,7 +28,8 @@ static std::unordered_map<std::string, std::string> nsOf;                       
 static std::unordered_map<std::string, std::unordered_map<int, std::string>> aliases;  // file -> its `as` names
 
 struct Compiler : Gen {
-  bool reload = false, echo = false, tiering = false, topTry = false;
+  bool reload = false, echo = false, tiering = false, topTry = false, testing = false;  // testing: compile `test` blocks
+  std::vector<TestCase> tests;
   std::string owner;
   struct Source { std::string text; bool compiled = false; };
   std::unordered_map<std::string, Source> sources;  // by path; nodes are stable, so text pointers stay valid
@@ -43,7 +44,7 @@ struct Compiler : Gen {
   std::vector<int> inits;                   // top-level vars initialised by this chunk
   struct Extern { int sym; void* fn; std::string sig; char ret; };
   std::vector<Extern> externs;
-  std::string patched, added, removed, reset;  // for the reload log
+  std::string patched, added, removed, reset;
 
   static void add(std::string& s, const std::string& n) { s += (s.empty() ? "" : ", ") + n; }
   const char* name(int s) { return symName(s).c_str(); }
@@ -70,7 +71,7 @@ struct Compiler : Gen {
     if (t.t == T_ERR) lexAtEnd = !*l.p, failAt(t.p, t.line, "%s", l.err);
     return t;
   }
-  void next() { prev = cur, cur = lex(lx); }
+  void next() { const char* e = lx.p; prev = cur, cur = lex(lx), prevEnd = e; }
   Tok peek() { Lexer s = lx; Tok t = s.next(); return t.t == T_ERR ? Tok{} : t; }  // lex errors surface on next()
   bool peekIs(int t) { return peek().t == t; }
   bool at(int t) { return cur.t == t; }
@@ -125,12 +126,12 @@ struct Compiler : Gen {
     f->caps.push_back({sym, p});
     return {LV_CAP, (int)f->caps.size() - 1};
   }
-  void load(LV& v) {  // materialise v into x0
+  void load(LV& v) {
     switch (v.k) {
       case LV_LOCAL: ldl(0, v.a); break;
       case LV_GLOBAL: gmem(0, v.a); break;
       case LV_CAP: capLoad(v.a); break;
-      case LV_FIELD: field(v.b, false); break;                                // object in x0
+      case LV_FIELD: field(v.b, false); break;
       case LV_INDEX: mv(1, 0), ld(0, v.a), F->depth--, helper(H_GETI); break;  // index in x0, object in slot a
     }
     v.k = LV_VAL;
@@ -192,14 +193,13 @@ struct Compiler : Gen {
     flush(!any);
   }
   // Parse other source text in the middle of this one (interpolations, imports), then resume.
+  struct Mark { Lexer lx; Tok cur, prev; const char *prevEnd, *srcStart; std::string file; };  // a place in the source
+  Mark mark() { return {lx, cur, prev, prevEnd, srcStart, file}; }
+  void rewind(const Mark& m) { lx = m.lx, cur = m.cur, prev = m.prev, prevEnd = m.prevEnd, srcStart = m.srcStart, file = m.file; }
   template <class Body> void detour(const std::string& f, const char* src, const char* at, int line, Body body) {
-    Lexer sl = lx;
-    Tok sc = cur, sp = prev;
-    std::string sf = file;
-    const char* ss = srcStart;
+    Mark m = mark();
     file = f, srcStart = src, lx = Lexer{at, line}, next();
-    body();
-    lx = sl, cur = sc, prev = sp, file = sf, srcStart = ss;
+    body(), rewind(m);
   }
   void subExpr(const char* s, const char* e, int line) {  // compile source text [s, e) as one expression
     detour(file, srcStart, s, line, [&] {
@@ -395,14 +395,15 @@ struct Compiler : Gen {
           next();
           if (F->top) fail("'return' outside a function");
           F->retNum &= at('}') || at(T_EOF) || cur.nl ? (imm(0, NIL), false) : expr();
-          return leaveTries(0), ret(), false;  // leaving every try
+          return leaveTries(0), ret(), false;
         case K_break: case K_continue:
           next();
           if (!F->loop) failAt(prev.p, prev.line, "'%s' outside a loop", name(prev.sym));
           leaveTries(F->loop->tries), jump(*F->loop, prev.sym == K_break), F->live = false;
           return false;
         case K_class: case K_import: fail("'%s' is only allowed at top level", name(cur.sym));
-        case K_fn: if (!peekIs('(')) fail("named functions are only allowed at top level; use 'var f = fn(...) {...}'");
+        case K_fn: if (!peekIs('(')) fail("named functions are only allowed at top level; use 'var f = fn(...) {...}'"); break;
+        case S_expect: if (isExpect()) return expectStmt(), false;
       }
     LV v = unary();
     int t = cur.t;
@@ -425,13 +426,18 @@ struct Compiler : Gen {
     loopEnd(lp);
   }
   // try { } catch e { }: a throw (or runtime error) inside, at any call depth, continues at the catch with e = the value.
-  void tryStmt() {
+  // A try around the block at cur; `after` runs when the block completes. Leaves the handler open (x0 = the value
+  // thrown): anything in the block may have run.
+  template <class After> TryAt tryBlock(After after) {
     TryAt t = tryBegin();
     F->tries.push_back(t.r), block(), F->tries.pop_back();
-    bool l1 = F->live;
-    tryCatch(t);
-    F->facts.reset(), F->live = true;  // the handler: anything in the try may have run
-    F->depth = t.r;
+    after(), tryCatch(t);
+    F->facts.reset(), F->live = true, F->depth = t.r;
+    return t;
+  }
+  void tryStmt() {
+    bool l1 = true;
+    TryAt t = tryBlock([&] { l1 = F->live; });
     if (!atKw(K_catch)) fail("expected 'catch'");
     next();
     scope([&] {
@@ -442,6 +448,63 @@ struct Compiler : Gen {
       block();
     });
     tryEnd(t), F->live |= l1, F->facts.reset();
+  }
+  static const char* tokStart(const Tok& t) { return t.t == T_STR ? t.p - 1 : t.p; }  // a string token's p is past its quote
+  // expect <condition>: `expect` starts a statement unless a variable or function of that name is in scope.
+  bool isExpect() {
+    if (resolve(F, S_expect).k != LV_NONE || findGlobal(globalSym(S_expect))) return false;
+    Tok n = peek();
+    return !n.nl && n.t != '=' && n.t != '.' && n.t != T_EOF && !(n.t >= T_ADDEQ && n.t <= T_DIVEQ);
+  }
+  void callNative(const char* nm, bool arg) {  // nm(x0) or nm(): a runtime function the compiler calls by name
+    int base = slot();
+    if (arg) st(0, slot());
+    gmem(0, findGlobal(intern(nm))->slot), st(0, base), callWindow(base, arg, 0, false);
+  }
+  // expect a op b | expect x | expect throws { ... } [op value] | expect prints { ... } [op value]. Calls
+  // expect@(site, left, right), which checks and, on failure, raises an error naming the source text and the values.
+  void expectStmt() {
+    int line = cur.line;
+    next();
+    int base = slot(), siteAt = slot();
+    gmem(0, findGlobal(intern("expect@"))->slot), st(0, base);
+    ExpectSite s{file, "", "", "", line};
+    const char* start = tokStart(cur);
+    bool throws = s.throws = atKw(S_throws) && peekIs('{'), prints = atKw(S_prints) && peekIs('{'), lnum = false;
+    int lh = NOH;
+    if (prints) {  // what print() wrote inside, as a string; a throw stops the capture and goes on
+      next();
+      callNative("capture@begin", false);
+      TryAt t = tryBlock([&] { callNative("capture@end", false); });
+      callNative("capture@abort", true), tryEnd(t);
+      s.left = "the output";
+    } else if (throws) {  // the thrown value, else ABSENT
+      next();
+      TryAt t = tryBlock([&] { imm(0, ABSENT); });
+      tryEnd(t);
+      s.left = "the error";
+    } else lnum = operand(&lh), binRest(5, lnum, lh), s.left.assign(start, prevEnd);
+    const char* afterLeft = prevEnd;
+    int ls = slot();
+    st(0, ls);
+    if (int t = cur.t, p = prec(t); p == 3 || p == 4) {
+      next();
+      const char* rs = tokStart(cur);
+      expr(p + 1);
+      s.op = opOf(t), s.right.assign(rs, prevEnd);
+      if (prec(cur.t)) {  // `expect a == b && c`: one condition, checked for truthiness
+        if (throws || prints) fail("expect %s { } compares with one value", throws ? "throws" : "prints");
+        mv(1, 0), ld(0, ls), binop(s.op);
+        bool n = false;
+        int h = NOH;
+        binRest(1, n, h), st(0, ls), s.op = -1, s.left.assign(start, prevEnd), s.right.clear(), imm(0, NIL);
+      }
+    } else if (!throws && !prints) binRest(1, lnum, lh), st(0, ls), s.left.assign(start, prevEnd), imm(0, NIL);
+    else imm(0, NIL);
+    st(0, slot());
+    s.text = throws || prints ? (throws ? "throws { ... }" : "prints { ... }") + std::string(afterLeft, prevEnd) : std::string(start, prevEnd);
+    imm(0, box((double)expectSite(std::move(s)))), st(0, siteAt);
+    callWindow(base, 3, 0, false);
   }
   void ifStmt() {
     Cond no = cond();
@@ -454,40 +517,41 @@ struct Compiler : Gen {
     F->facts = f0, F->live = true;
     if (hasElse) next(), atKw(K_if) ? (next(), ifStmt()) : block();
     ifEnd(e);
-    if (!l1) return;                                         // the then-branch never falls through
+    if (!l1) return;
     if (!F->live) return (void)(F->facts = f1, F->live = true);  // only the then-branch does
     F->facts &= f1;
   }
-  bool hasTry() {  // does the function starting at cur (parameters, then body) contain `try`?
-    Lexer s = lx;
-    int d = 0;
-    for (Tok p = cur; p.t != T_EOF && p.t != T_ERR; p = s.next())
-      if (p.t == '{') d++;
-      else if (p.t == '}' && --d == 0) return false;
-      else if (p.t == T_ID && p.sym == K_try) return true;
-    return false;
-  }
-  bool assignedIn(int sym) {  // might the block starting at cur assign to sym? (conservative token scan)
+  // Does pred(token, the one after) hold anywhere from cur to the end of the first { } block? (`open`: if it never ends)
+  template <class P> bool ahead(bool open, P pred) {
     Lexer s = lx;
     int d = 0;
     for (Tok p = cur, n; p.t != T_EOF && p.t != T_ERR; p = n) {
       if (p.t == '{') d++;
       else if (p.t == '}' && --d == 0) return false;
       n = s.next();
-      if (p.t == T_ID && p.sym == sym && (n.t == '=' || (n.t >= T_ADDEQ && n.t <= T_DIVEQ))) return true;
+      if (pred(p, n)) return true;
     }
-    return true;
+    return open;
+  }
+  static bool tryWord(const Tok& t) { return t.t == T_ID && (t.sym == K_try || t.sym == S_throws || t.sym == S_prints); }
+  bool hasTry() { return ahead(false, [](const Tok& p, const Tok&) { return tryWord(p); }); }
+  bool assignedIn(int sym) {  // might the block starting at cur assign to sym? (conservative)
+    return ahead(true, [&](const Tok& p, const Tok& n) { return p.t == T_ID && p.sym == sym && (n.t == '=' || (n.t >= T_ADDEQ && n.t <= T_DIVEQ)); });
   }
   void forStmt() {  // for x in a..b { }  |  for x in list/map/string/fiber { }
     int nm = ident();
     if (!atKw(K_in)) fail("expected 'in'");
     next();
     scope([&] {
-      expr();
+      bool num = expr();
       Loop lp;
-      if (accept(T_DOTDOT)) {
-        int a = fhome(), b = (helper(H_NUMCHK), stl(0, a), expr(), helper(H_NUMCHK), fhome());
-        stl(0, b);
+      if (accept(T_DOTDOT)) {  // the bounds must be numbers (checked unless known)
+        int a = fhome();
+        if (!num) helper(H_NUMCHK);
+        stn(0, a);
+        if (!expr()) helper(H_NUMCHK);
+        int b = fhome();
+        stn(0, b);
         int v = assignedIn(nm) ? home() : numHome();
         loopTop(lp);
         F->locals.push_back({nm, v, !assignedIn(nm)});
@@ -537,17 +601,20 @@ struct Compiler : Gen {
     f.cls = cls, f.init = init, f.k.name = nm, f.k.file = file;
     Fun* outer = F;
     F = &f, f.noRegs = hasTry();
+    if (cls < 0 && !f.lambda && !f.test) f.stub = stub;
     std::vector<int> homes;
     if (cls >= 0) homes.push_back(f.selfHome = home()), f.locals.push_back({K_self, f.selfHome});
     if (f.lambda) homes.push_back(f.cloHome = home());  // the closure itself, for captured variables
     int first = (int)homes.size();  // the first declared parameter
-    expect('(');
-    if (!accept(')')) {
-      do {
-        int s = ident(), h = home();  // not d8..: arguments arrive, and calls pass them, in x registers
-        f.locals.push_back({s, h}), homes.push_back(h);
-      } while (accept(','));
-      expect(')');
+    if (!f.test) {
+      expect('(');
+      if (!accept(')')) {
+        do {
+          int s = ident(), h = home();  // not d8..: arguments arrive, and calls pass them, in x registers
+          f.locals.push_back({s, h}), homes.push_back(h);
+        } while (accept(','));
+        expect(')');
+      }
     }
     int arity = (int)homes.size();
     if (arity > 64) fail("too many parameters");
@@ -555,10 +622,10 @@ struct Compiler : Gen {
     for (int i = first; i < arity && i < 8; i++)
       if (f.spec >> (i - first) & 1) f.guard.push_back(i), prove(homes[i]);
     Tier* tier = nullptr;
-    if (!f.lambda && !tiering) hotCounter(tier = &tiers[nm], first, homes);
+    if (!f.lambda && !f.test && !tiering) hotCounter(tier = &tiers[nm], first, homes);
     block();
     if (f.live) f.retNum = false;  // can end without a return: returns nil
-    pend.push_back({stub, fn, arity, finish(), owner, f.lambda, {}});
+    pend.push_back({stub, fn, arity, finish(), owner, f.lambda || f.test, {}});  // a test body is installed like a lambda
     if (tier) {
       Span& sp = spans.at(nm);
       pend.back().tier = {nm, std::string(sp.start, sp.end), file, sp.line, cls, cls < 0 ? intern(nm) : -1, init, stub, nullptr, nullptr, fn, false};
@@ -633,6 +700,47 @@ struct Compiler : Gen {
     if (sig.size() > 7) failAt(t.p, t.line, "extern functions take at most 7 parameters");
     externs.push_back({qualify(s), fn, sig, accept(':') ? type(true) : 'v'});
   }
+  void skipBlock() {  // a balanced { ... }, unparsed
+    expect('{');
+    for (int d = 1; d; next()) {
+      if (at(T_EOF)) fail("expected '}'");
+      d += at('{') - at('}');
+    }
+  }
+  // test "name" { body }: when testing, compiled as a function of no parameters, listed in Compiled::tests.
+  // A body naming something not defined yet compiles to nothing and the test is pending (write the spec first).
+  void testDecl() {
+    int line = prev.line;
+    next();
+    std::string nm;
+    for (const char *p = prev.p, *e = p + prev.len; p < e; p++) nm += *p == '\\' && p + 1 < e ? *++p : *p;
+    if (!at('{')) fail("expected '{' after the test's name");
+    Mark body = mark();
+    skipBlock();
+    if (!testing) return;
+    Mark after = mark();
+    rewind(body);
+    TestCase tc{nm, file, "", line, nullptr};
+    Fun f;
+    f.test = true;
+    struct Job { Compiler* c; Fun* f; std::string name; u32* stub; } job{this, &f, "test \"" + nm + "\"", newStub()};
+    Fun* outer = F;
+    size_t np = pend.size();
+    std::string err, so = owner;
+    owner.clear();
+    if (guardCompile([](void* v) { auto& j = *(Job*)v; j.c->function(*j.f, -1, false, j.name, j.stub, nullptr); }, &job, &err)) tc.code = job.stub;
+    else {
+      std::string head = err.substr(0, err.find('\n'));
+      size_t at = head.find(": error: ");
+      std::string msg = at == std::string::npos ? head : head.substr(at + 9), loc = at == std::string::npos ? "" : head.substr(0, at);
+      bool missing = msg.starts_with("undefined name '") || msg.ends_with("' is not defined") || (msg.starts_with("module '") && msg.contains("' has no '"));
+      if (!missing) compileFail(err, false);
+      F = outer, pend.resize(np), hasLit = false, rewind(after);
+      tc.pending = msg + (loc.empty() ? "" : " at " + loc.substr(loc.rfind('/') + 1));
+    }
+    owner = so;
+    tests.push_back(std::move(tc));
+  }
   void declare(const Tok& t, char kind, int arity) {
     Global& g = global(t.sym);
     if (g.kind == 'n') failAt(t.p, t.line, "cannot redefine builtin '%s'", name(t.sym));
@@ -658,16 +766,17 @@ struct Compiler : Gen {
     Lexer L{src};
     int depth = 0, cls = -1;
     bool ext = false;  // after `extern` (a C function: no body)
+    auto params = [&] {
+      Lexer s = L;
+      int n = 0;
+      if (lex(s).t == '(') for (Tok a = lex(s); a.t != ')' && a.t != T_EOF; a = lex(s)) n += a.t == T_ID;
+      return n;
+    };
     for (Tok t = lex(L), p; t.t != T_EOF; p = t, t = lex(L)) {
       bool afterKw = p.t == T_ID && t.t == T_ID;
-      topTry |= t.t == T_ID && t.sym == K_try && open.empty();  // a try in top-level code
+      topTry |= tryWord(t) && open.empty();  // a try in top-level code
       if (t.t == T_ID && t.sym == K_extern && !depth) ext = true;
-      else if (ext && afterKw && p.sym == K_fn) {
-        Lexer s = L;
-        int n = 0;
-        if (lex(s).t == '(') for (Tok a = lex(s); a.t != ')' && a.t != T_EOF; a = lex(s)) n += a.t == T_ID;
-        declare(q(t), 'x', n), ext = false;
-      } else if (t.t == '{') depth++;
+      else if (ext && afterKw && p.sym == K_fn) declare(q(t), 'x', params()), ext = false; else if (t.t == '{') depth++;
       else if (t.t == '}') {
         if (--depth == 0) cls = -1;
         if (!open.empty() && depth == open.back().depth) {
@@ -678,10 +787,7 @@ struct Compiler : Gen {
       } else if (afterKw && p.sym == K_fn && (depth == 0 || (depth == 1 && cls >= 0))) {
         std::string qn = depth ? symName(cls) + "." + symName(t.sym) : symName(qualify(t.sym));
         if (spans.count(qn)) failAt(t.p, t.line, "'%s' is already defined", qn.c_str());
-        Lexer s = L;
-        int n = 0;
-        if (lex(s).t == '(') for (Tok a = lex(s); a.t != ')' && a.t != T_EOF; a = lex(s)) n += a.t == T_ID;
-        spans[qn].arity = n;
+        int n = spans[qn].arity = params();
         open.push_back({qn, p.p, p.line, depth});
         if (!depth) declare(q(t), 'f', n);
       } else if (depth == 0 && afterKw && (p.sym == K_class || p.sym == K_var)) {
@@ -719,6 +825,7 @@ struct Compiler : Gen {
       if (atKw(K_fn)) { next(), fnDecl(); continue; }
       if (atKw(K_class)) { next(), classDecl(); continue; }
       if (atKw(K_extern)) { next(), externDecl(); continue; }
+      if (atKw(S_test) && peekIs(T_STR)) { next(), testDecl(); continue; }
       if (atKw(K_import)) {
         next();
         if (!at(T_STR)) fail("expected a file name");
@@ -787,7 +894,7 @@ struct Compiler : Gen {
   }
   Compiled commit(Code& chunk) {
     Compiled out;
-    out.files = files;
+    out.files = files, out.tests = std::move(tests);
     // A function whose parameter count changed gets a fresh stub; the old stub now traps stale callers.
     std::unordered_map<void*, void*> remap;
     for (auto [s, a] : fnDefs) {
@@ -859,7 +966,7 @@ void tierUp(void* p, u32 numArgs) {
   Tier& t = *(Tier*)p;
   if (t.fast || t.failed || !t.body) return;
   JitBatch writable;
-  static Compiler* c;  // on the heap: a compile error may skip its destructor (wasm longjmps)
+  static Compiler* c;  // on the heap, like `active` below
   for (bool assume : {true, false}) {
     struct { Tier* t; u32 m; bool assume, ok; } job{&t, numArgs, assume, false};
     bool done = guardCompile([](void* v) {
@@ -874,11 +981,12 @@ void tierUp(void* p, u32 numArgs) {
 // The compile in progress lives on the heap: a compile error unwinds past compile() (wasm: by longjmp, which runs
 // no destructors), and the next compile frees what it left.
 static Compiler* active;
-Compiled compile(const std::string& path, bool reload, bool echo, const std::string* text) {
+Compiled compile(const std::string& path, bool reload, bool echo, const std::string* text, bool tests) {
   JitBatch writable;  // nothing JIT-compiled runs during a compile
   delete active;
   Compiler& c = *(active = new Compiler);
-  c.reload = reload, c.echo = echo;
+  c.reload = reload, c.echo = echo, c.testing = tests;
+  if (!echo) mainFile = path;
   std::string& src = c.sources[path].text;
   if (text) src = *text;
   else if (!readFile(path, src)) compileFail("cannot read " + path, false);

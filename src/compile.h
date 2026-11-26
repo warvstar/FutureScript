@@ -89,11 +89,12 @@ struct Fun {  // per-function emission state
   Fun* parent = nullptr;
   int depth = 0, maxd = 0, label = 0, nreg = 0, maxreg = 0, nfreg = 0, maxfreg = 0, scope = 0, cls = -1, selfHome = 0, cloHome = 0;
   int blocks = 0;      // wasm: structured blocks open at this point
+  u32* stub = nullptr; // wasm: a top-level function's stub (direct calls reach its body; see Gen::finish)
   std::vector<int> wloc, wlocf;  // wasm: the i64 / f64 wasm local caching each frame slot used as a home (-1: none)
   std::vector<bool> wnum;         // wasm: homes of locals that start as numbers: cached in f64 locals
   size_t scopeAt = 0;  // first local of the innermost block
   std::vector<int> rets;  // `b` to the shared epilogue
-  bool init = false, top = false, lambda = false, calls = false;
+  bool init = false, top = false, lambda = false, calls = false, test = false;  // test: a `test` block's body (no parameters)
   std::bitset<1024> facts;  // locals proven to hold numbers here, by home + 128 (see proveOperands)
   bool live = true;        // false after return/break/continue, until the next join point
   Loop* loop = nullptr;
@@ -101,6 +102,7 @@ struct Fun {  // per-function emission state
   // declared one); self = the function's own name if its recursive calls are assumed to return numbers,
   // which holds if every return is a proven number (retNum).
   bool tier2 = false, retNum = true;
+  int npar = 0;
   u32 spec = 0;
   int self = -1;
   std::vector<u32> guard;  // registers holding speculated parameters, checked on entry
@@ -114,6 +116,7 @@ struct Fun {  // per-function emission state
 struct CState {
   Lexer lx;
   Tok cur, prev;
+  const char* prevEnd = "";  // just past prev (source text of an expression: its first token's p to here)
   Fun* F = nullptr;
   u32* deopt = nullptr;  // tier 2: the tier-1 body a failed entry guard runs instead
   bool lexAtEnd = false;

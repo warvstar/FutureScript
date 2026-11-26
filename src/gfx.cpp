@@ -3,7 +3,6 @@
 // so programs that never open a window pay nothing for it; in wasm the host draws the buffer on a canvas.
 #include "fut.h"
 #include <algorithm>
-#include <time.h>
 struct Pt { double x, y; };
 static std::vector<u32> px;  // 0x00RRGGBB, top row first
 static int W, H;
@@ -81,14 +80,10 @@ static V n_present() {  // show the frame, handle events, wait for the next 1/60
   void* img = cg<void* (*)(void*)>("CGBitmapContextCreateImage")(ctx);
   msg<void>(layer, "setContents:", (id)img), cg<void (*)(void*)>("CGImageRelease")(img);
   msg<void>(cls("CATransaction"), "flush"), fflush(stdout), gfxPump();
-  static timespec next;
-  timespec now;
-  clock_gettime(CLOCK_MONOTONIC, &now);
-  if ((next.tv_nsec += 16666667) >= 1000000000) next.tv_sec++, next.tv_nsec -= 1000000000;
-  timespec wait{next.tv_sec - now.tv_sec, next.tv_nsec - now.tv_nsec};
-  if (wait.tv_nsec < 0) wait.tv_sec--, wait.tv_nsec += 1000000000;
-  if (wait.tv_sec < 0) next = now;  // fell behind: start counting from here
-  else nanosleep(&wait, nullptr);
+  static double next;
+  double t = now();
+  if ((next += 1 / 60.0) < t) next = t;  // fell behind: start counting from here
+  else sleepFor(next - t);
   return boxb(msg<bool>(win, "isVisible"));
 }
 #endif

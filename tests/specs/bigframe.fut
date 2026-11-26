@@ -1,3 +1,4 @@
+// A function with 600 locals, so a large stack frame.
 fn big() {
   var v0 = 0
   var v1 = 1
@@ -601,4 +602,5 @@ fn big() {
   var v599 = 599
   return v0 + v1 + v599 + v300
 }
-print(big())   // expect: 900
+
+test "a 600-local frame keeps its values" { expect big() == 900 }

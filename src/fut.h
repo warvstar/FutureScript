@@ -91,11 +91,17 @@ enum { FIB_NEW, FIB_SUSPENDED, FIB_RUNNING, FIB_DONE };
 extern Fiber* fiberCur;                       // the running fiber (null: the main stack)
 extern void* fiberMainSp;                     // the main stack while a fiber runs (for the GC)
 extern uintptr_t* fiberMainTop;
-void fiberFree(Fiber*);
-V newFiber(V fn);            // fiber(fn)
-V fiberResume(V f, V v);     // run f until it yields (the yielded value) or returns (its result)
+void fiberFree(Fiber*);      // release its stack (the platform half: jit.cpp / wasm.cpp, as are the next four)
+void fiberStack(Fiber*);     // give a new fiber its stack
+void fiberRun(Fiber*, bool start);  // switch to it; returns when it yields or ends
+void fiberYield(Fiber*);     // switch from it back to its resumer; returns when it is resumed
+[[noreturn]] void restartMain();    // unwind to the driver, which reruns main()
+V fiberCall(Fiber*);         // call its function with the first value sent
+V newFiber(V fn);
+V fiberResume(V f, V v);
 V rt_yield(V v);
 void sleepFor(double seconds);
+double now();  // seconds, monotonic
 constexpr int INST_SLOTS = offsetof(Inst, slots), CLO_ENV = sizeof(Clo), CLS_IHDR = offsetof(Class, ihdr), CLS_IRUN = offsetof(Class, irun);
 
 inline Obj* obj(V v) { return (Obj*)(v & ADDR); }
@@ -123,7 +129,7 @@ extern uintptr_t* stackTop;
   X(true) X(false) X(nil) X(self) X(super) X(import) X(extern) X(yield) X(try) X(catch) X(throw)
 #define SYM_ENUM(k) K_##k,
 #define SYM_STR(k) #k,
-#define EXTRA_SYMS(X) X(init) X(main) X(push) X(pop) X(len) X(has) X(remove) X(keys) X(values) X(reload) X(resume) X(send) X(done) X(as)
+#define EXTRA_SYMS(X) X(init) X(main) X(push) X(pop) X(len) X(has) X(remove) X(keys) X(values) X(reload) X(resume) X(send) X(done) X(as) X(test) X(expect) X(throws) X(prints)
 #define SYM_S(k) S_##k,
 enum { KEYWORDS(SYM_ENUM) NKW, S_FIRST = NKW - 1, EXTRA_SYMS(SYM_S) };
 int intern(std::string_view);
@@ -141,7 +147,11 @@ constexpr int MAXIC = 1 << 19;
 // cur + size <= end. runs[NCLS] stays empty (0, 0): constructors of instances too big for a class point at it.
 struct Run { uintptr_t cur, end; };
 // handler: the innermost active `try` (a record in its JIT frame: prev, sp, fp, x26, handler pc).
+#ifdef __wasm__  // limit, then poll: one i64 load at &limit tests both on a function's entry (gen_wasm.h)
+struct VM { void* limit; u32 poll; void* handler; void* helpers[NH]; Run runs[NCLS + 1]; V globals[MAXG]; IC ics[MAXIC]; };
+#else
 struct VM { u32 poll, pad; void* limit; void* handler; void* helpers[NH]; Run runs[NCLS + 1]; V globals[MAXG]; IC ics[MAXIC]; };
+#endif
 extern VM vm;
 constexpr int HOFF(int h) { return 24 + 8 * h; }
 constexpr int ROFF(int c) { return 24 + 8 * NH + 16 * c; }
@@ -154,23 +164,24 @@ void clearICs();
 
 struct Global { int slot = -1; char kind = 'v'; u32* stub = nullptr; Obj* o = nullptr; bool inited = false; };  // kind: v f c n(ative)
 extern std::deque<Global> globals;  // by symbol (slot -1: not declared); a deque, so references survive growth
-extern std::vector<V> consts;       // GC roots that live forever
-Global& global(int sym);            // declares it
+extern std::vector<V> consts;       // GC roots forever
+Global& global(int sym);
 Global* findGlobal(int sym);
 template <class C> auto& growAt(C& v, size_t i) { return v.size() <= i ? v.resize(i + 1), v[i] : v[i]; }  // v[i], growing v to fit
 
 // ---- JIT ----
 #if __wasm__
-using Word = uint8_t;  // wasm bytecode
+using Word = uint8_t;
 #else
-using Word = u32;      // arm64 instructions
+using Word = u32;
 #endif
 struct Code { std::vector<Word> c; std::vector<std::pair<int, void*>> rel; std::vector<std::pair<int, int>> lines; std::string name, file;
-             std::vector<uint8_t> wlocals; std::vector<std::pair<int, uint8_t>> hints; };  // wasm: extra locals; branch hints
+             std::vector<uint8_t> wlocals, relKind; std::vector<std::pair<int, uint8_t>> hints; };  // wasm: extra locals, rel kinds, branch hints
 u32* jitInstall(Code&);
 struct JitBatch { JitBatch(); ~JitBatch(); };  // hold code writable across many writes; one icache flush at the end
 void jitRetire(u32* body);     // body was replaced; free it once no frame returns into it
 void jitCollect();
+void jitForked();  // in a child after fork(): put this thread's view of JIT memory back in execute mode
 size_t jitLive();  // bytes of machine code currently allocated
 void jitShiftLines(u32* body, int delta);
 u32* newStub();
@@ -178,17 +189,23 @@ void patchStub(u32* stub, void* target);
 u32* staleThunk(int sym);
 void tierUp(void* tier, u32 numArgs);  // compile a hot function again (numArgs: which arguments were numbers)
 extern bool verbose;
+struct Ext { void* fn; int n, sym; char ret, sig[8]; };  // an extern fn. sig/ret: d(ouble) i(nt) l(ong) p(ointer) s(tring) v(oid)
 u32* ffiThunk(void* fn, const std::string& sig, char ret, int sym);  // code calling C function fn (see extern)
+u32* ffiCode(Ext*);            // the platform's thunk for it
+char ffiCheck(Ext*, int i, V v);  // argument i's type letter; raises if v does not fit it
 V vmCall(void* code, std::initializer_list<V> args = {});
+V vmEnter(void* code, V* args);  // args: 8 values
 extern std::string* asmListing;
 
-struct Compiled { void* chunk = nullptr; bool mainChanged = false; std::string log; std::vector<std::string> files; };
+struct TestCase { std::string name, file, pending; int line = 0; void* code = nullptr; };  // a `test "name" { }` block
+struct Compiled { void* chunk = nullptr; bool mainChanged = false; std::string log; std::vector<std::string> files; std::vector<TestCase> tests; };
 struct CompileError : std::runtime_error {  // atEnd: the source ended too early (the REPL reads more)
   bool atEnd;
   CompileError(const std::string& m, bool end) : std::runtime_error(m), atEnd(end) {}
 };
-Compiled compile(const std::string& path, bool reload, bool echo, const std::string* text = nullptr);  // throws
-bool guardCompile(void (*f)(void*), void* ctx);  // f(ctx); false if it failed with a compile error
+// tests: compile `test` blocks into Compiled::tests (otherwise they are skipped)
+Compiled compile(const std::string& path, bool reload, bool echo, const std::string* text = nullptr, bool tests = false);
+bool guardCompile(void (*f)(void*), void* ctx, std::string* err = nullptr);  // f(ctx); false if it failed with a compile error (*err)
 [[noreturn]] void compileFail(const std::string& msg, bool atEnd);  // natively throws CompileError; in wasm, longjmps
 bool readFile(const std::string& path, std::string& out);
 std::string canonicalPath(const std::string& path);
@@ -198,9 +215,10 @@ void platformInit();  // the JIT or wasm half of rtInit (jit.cpp / wasm.cpp)
 // Builtins. native<f>("name") registers a C++ function V f(V...); method<f>(kind, sym) one taking the receiver first.
 // In wasm every callable takes its arguments as a window in memory, so f is wrapped to that form.
 template <class R, class... A> constexpr int nargs(R (*)(A...)) { return sizeof...(A); }
+void* futAdapter(void* cpp);  // wasm: an adapter giving a V f(V* window) the fut calling convention
 template <auto f> void* callable() {
 #if __wasm__
-  return (void*)+[](V* w) -> V { return [&]<size_t... I>(std::index_sequence<I...>) { return f(w[I]...); }(std::make_index_sequence<nargs(f)>{}); };
+  return futAdapter((void*)+[](V* w) -> V { return [&]<size_t... I>(std::index_sequence<I...>) { return f(w[I]...); }(std::make_index_sequence<nargs(f)>{}); });
 #else
   return (void*)f;
 #endif
@@ -214,6 +232,29 @@ std::string toStr(V, bool quote = false);
 const char* typeName(V);
 extern void (*pollHook)();
 extern jmp_buf* errJmp;
+extern std::string* outSink;  // when set, print() appends here instead of writing to stdout (a test's output)
+extern std::string* errSink;  // when set, an uncaught error's message and trace go here instead of to stderr
+
+// ---- tests (test.cpp): `expect` sites, and the runner behind `fut test` ----
+struct ExpectSite { std::string file, text, left, right; int line = 0, op = -1; bool throws = false; };  // op < 0: truthiness
+int expectSite(ExpectSite);  // its number, passed to the expect@ native
+void testInit();
+V binopValue(V a, V b, int op);  // a op b, as the language computes it (raises on bad operands)
+struct TestRun { bool json = false; std::string filter; double timeout = 10; };
+extern std::string mainFile;  // the program's file: run() finds relative files next to it
+void mapPut(Map*, std::string_view key, V v);
+struct ProcResult { int code = 0; std::string out, err; bool timedOut = false; };
+// Run this fut executable with args, then file (or a temporary file holding *source); false if it could not start.
+int reap(int pid, std::vector<std::pair<int, std::string*>> pipes, double timeout, bool& timedOut);  // native only
+bool runProcess(const std::vector<std::string>& args, const std::string& file, const std::string* source, double timeout, ProcResult&);
+void testsBegin(const TestRun&);
+void* testStart(const TestCase&);                         // the code to call, or null (pending or filtered out: reported)
+void testFinish(const TestCase&, bool errored, const std::string& err);  // after a call: err = message + trace
+std::string testReport(const TestCase&, bool errored, const std::string& err, char& code);  // testFinish's two halves:
+void testRecord(char code, const std::string& text);                                         // (an isolated test's child reports)
+int testsEnd();
+void reportCompileError(const std::string& msg);          // fut test: in the chosen format
+void reportTopError(const std::string& msg);
 [[noreturn]] void throwValue(V v, void* ra);  // to the innermost try, else report it (ra: where, for the trace)
 [[noreturn]] void rtError(void* ra, const char* fmt, ...);
 #if __wasm__
@@ -275,4 +316,4 @@ constexpr u32 farith(int op, u32 d, u32 n, u32 m) {  // fadd/fsub/fmul/fdiv d, n
 }
 constexpr u32 stpd(u32 a, u32 b, u32 n, int off) { return 0x6d000000 | u32((off / 8) & 0x7f) << 15 | b << 10 | n << 5 | a; }
 constexpr u32 ldpd(u32 a, u32 b, u32 n, int off) { return 0x6d400000 | u32((off / 8) & 0x7f) << 15 | b << 10 | n << 5 | a; }
-}  // namespace a64
+}

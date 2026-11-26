@@ -1,14 +1,23 @@
 #!/usr/bin/env node
-// Run fut on WebAssembly in Node: node web/run.mjs [-w | -v] [file.fut]   (no file: REPL). Same flags as build/fut.
-import { readFileSync, statSync, writeFileSync, writeSync } from "node:fs";
-import { resolve } from "node:path";
+// Run fut on WebAssembly in Node: node web/run.mjs [-w | -v] [file.fut]   (no file: REPL). Same flags as build/fut,
+// including `node web/run.mjs test [--json] [--filter text] file.fut`.
+import { spawnSync } from "node:child_process";
+import { readFileSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createFut } from "./fut.js";
 
-let file = "", watch = false, verbose = false;
-for (const a of process.argv.slice(2)) {
-  if (a == "-w") watch = verbose = true;
+let file = "", watch = false, verbose = false, json = false, filter = "";
+const argv = process.argv.slice(2), testing = argv[0] == "test";
+for (let i = testing ? 1 : 0; i < argv.length; i++) {
+  const a = argv[i];
+  if (testing && a == "--json") json = true;
+  else if (testing && a == "--filter" && i + 1 < argv.length) filter = argv[++i];
+  else if (testing && a == "--timeout" && i + 1 < argv.length) i++;  // tests share one process here: no per-test timeout
+  else if (a == "-w" && !testing) watch = verbose = true;
   else if (a == "-v") verbose = true;
-  else if (a[0] == "-") process.stderr.write("usage: node web/run.mjs [-w | -v] [file.fut]   (no file: REPL)\n"), process.exit(2);
+  else if (a[0] == "-") process.stderr.write("usage: node web/run.mjs [-w | -v] [file.fut]   (no file: REPL)\n       node web/run.mjs test [--json] [--filter text] file.fut\n"), process.exit(2);
   else file = resolve(a);
 }
 function writeAll(fd, b) {  // stdout may be a non-blocking pipe
@@ -16,7 +25,7 @@ function writeAll(fd, b) {  // stdout may be a non-blocking pipe
     try { o += writeSync(fd, b, o); } catch (e) { if (e.code != "EAGAIN") throw e; }
   }
 }
-let watched = [file], rewatch = () => {};
+let watched = [file], rewatch = () => {}, runs = 0;
 const fut = await createFut({
   wasm: readFileSync(new URL("../build/fut.wasm", import.meta.url)),
   verbose,
@@ -24,6 +33,14 @@ const fut = await createFut({
   write: writeAll,
   getenv: (n) => process.env[n],
   files: (f) => ((watched = f), rewatch()),
+  run(args, file, source, timeout) {  // run(): this script again, in a child process
+    let tmp = null;
+    if (source != null) writeFileSync((tmp = join(tmpdir(), `fut-run-${process.pid}-${runs++}.fut`)), source), (file = tmp);
+    const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), ...args, file], { timeout: timeout * 1000, stdio: ["ignore", "pipe", "pipe"], encoding: "utf8" });
+    if (tmp) unlinkSync(tmp);
+    const timedOut = r.error?.code == "ETIMEDOUT";
+    return { code: r.status ?? 128 + (r.signal == "SIGKILL" ? 9 : r.signal == "SIGTERM" ? 15 : 6), out: r.stdout ?? "", err: r.stderr ?? "", timedOut };
+  },
   dump: process.env.FUT_DUMP && ((n) => (b) => writeFileSync(`${process.env.FUT_DUMP}/m${n++}.wasm`, b))(0),  // debugging: emitted modules
 });
 
@@ -38,6 +55,10 @@ function listen(onLine) {
   process.stdin.on("end", () => onLine(null));
 }
 
+if (testing) {
+  if (!file) process.stderr.write("usage: node web/run.mjs test [--json] [--filter text] file.fut\n"), process.exit(2);
+  process.exit(await fut.test(file, json, filter));
+}
 if (!file) {  // REPL
   listen((l) => { if (l == null) ended = true; else lines.push(l); waiting?.(), (waiting = null); });
   let prompt = "> ";

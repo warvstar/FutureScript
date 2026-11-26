@@ -1,6 +1,9 @@
 // Driver: run a file, hot-patch it on save (-w), dump its machine code (--asm), or start a REPL.
 #include "fut.h"
+#include <poll.h>
 #include <pthread.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -14,14 +17,11 @@ static bool inMain;
 static int fileChanged;
 
 static Compiled load(bool reload) {
-  timespec t0, t1;
-  clock_gettime(CLOCK_MONOTONIC, &t0);
+  double t0 = now();
   try {
     Compiled c = compile(path, reload, false);
     pthread_mutex_lock(&watchMu), watched = c.files, pthread_mutex_unlock(&watchMu);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    if (reload) fprintf(stderr, "[fut] %s (%.2f ms, %zu KB code)\n", c.log.c_str(),
-                        (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) * 1e-6, jitLive() >> 10);
+    if (reload) fprintf(stderr, "[fut] %s (%.2f ms, %zu KB code)\n", c.log.c_str(), (now() - t0) * 1e3, jitLive() >> 10);
     return c;
   } catch (std::exception& e) {
     fflush(stdout);
@@ -75,7 +75,7 @@ static void hotReload() {
   if (!c.chunk) return;  // compile error: keep running the old code
   vmCall(c.chunk), jitRetire((u32*)c.chunk);
   if (Global* r = fnNamed(S_reload); r && ((Fn*)r->o)->arity == 0) vmCall(r->stub);  // user hook: migrate state
-  if (c.mainChanged && inMain) c = {}, longjmp(*errJmp, 2);                       // unwind and rerun main()
+  if (c.mainChanged && inMain) c = {}, longjmp(*errJmp, 2);
 }
 static long long stamp() {
   pthread_mutex_lock(&watchMu);
@@ -89,6 +89,58 @@ static long long stamp() {
 static void waitChange() {  // typed lines still run meanwhile, so the stopped program's state can be inspected
   for (;; gfxPump(), usleep(50000))
     if (__atomic_exchange_n(&vm.poll, 0, __ATOMIC_ACQUIRE) && (evalInbox(), __atomic_exchange_n(&fileChanged, 0, __ATOMIC_ACQUIRE))) return;
+}
+
+// One test in a child process (fork, after the top level ran): its globals, a crash or a hang stay in it.
+// The child sends its report (status letter, then the text) back over a pipe.
+static void isolated(const TestCase& t, void* code, double timeout) {
+  int p[2];
+  fflush(stdout), fflush(stderr);
+  if (pipe(p)) return testFinish(t, true, "cannot create a pipe for the test process\n");
+  pid_t pid = fork();
+  if (pid < 0) return close(p[0]), close(p[1]), testFinish(t, true, "cannot start the test process\n");
+  if (!pid) {
+    jitForked(), close(p[0]);
+    std::string err;
+    errSink = &err;
+    char status;
+    int st = run(code);
+    std::string text = testReport(t, st != 0, err, status);
+    text.insert(text.begin(), status);
+    for (size_t o = 0; o < text.size();) {
+      ssize_t n = write(p[1], text.data() + o, text.size() - o);
+      if (n <= 0) break;
+      o += n;
+    }
+    _exit(0);
+  }
+  close(p[1]);
+  std::string got;
+  bool timedOut = false;
+  int st = reap(pid, {{p[0], &got}}, timeout, timedOut);
+  if (!got.empty()) return testRecord(got[0], got.substr(1));
+  char why[96];
+  if (timedOut) snprintf(why, sizeof why, "timed out after %g s\n", timeout);
+  else if (WIFSIGNALED(st)) snprintf(why, sizeof why, "the test process crashed: %s\n", strsignal(WTERMSIG(st)));
+  else snprintf(why, sizeof why, "the test process exited (status %d) without a report\n", WEXITSTATUS(st));
+  testFinish(t, true, why);
+}
+// fut test: the top level runs once, then each `test` block in order (main() is not called), each in its own process.
+static int runTests(const TestRun& o) {
+  testsBegin(o);
+  Compiled c;
+  try {
+    c = compile(path, false, false, nullptr, true);
+  } catch (std::exception& e) { return reportCompileError(e.what()), 2; }
+  std::string err;
+  errSink = &err;
+  int st = run(c.chunk);
+  jitRetire((u32*)c.chunk);
+  if (st) return errSink = nullptr, reportTopError(err), 1;
+  for (auto& t : c.tests)
+    if (void* code = testStart(t)) isolated(t, code, o.timeout);
+  errSink = nullptr;
+  return testsEnd();
 }
 
 static int repl() {
@@ -113,16 +165,21 @@ static int dumpAsm() {  // assemble the emitted words with clang and disassemble
 }
 
 int main(int argc, char** argv) {
-  bool watch = false, asmMode = false;
-  for (int i = 1; i < argc; i++) {
+  bool watch = false, asmMode = false, testMode = argc > 1 && std::string(argv[1]) == "test";
+  TestRun topts;
+  for (int i = 1 + testMode; i < argc; i++) {
     std::string a = argv[i];
-    if (a == "-w") watch = verbose = true;
+    if (testMode && a == "--json") topts.json = true;
+    else if (testMode && a == "--filter" && i + 1 < argc) topts.filter = argv[++i];
+    else if (testMode && a == "--timeout" && i + 1 < argc && atof(argv[i + 1]) > 0) topts.timeout = atof(argv[++i]);
+    else if (a == "-w" && !testMode) watch = verbose = true;
     else if (a == "-v") verbose = true;
     else if (a == "--asm") asmMode = true;
-    else if (a[0] == '-') return fputs("usage: fut [-w | -v | --asm] [file.fut]   (no file: REPL)\n", stderr), 2;
+    else if (a[0] == '-') return fputs("usage: fut [-w | -v | --asm] [file.fut]   (no file: REPL)\n       fut test [--json] [--filter text] [--timeout s] file.fut\n", stderr), 2;
     else path = a;
   }
   rtInit();
+  if (testMode) return path.empty() ? (fputs("usage: fut test [--json] [--filter text] [--timeout s] file.fut\n", stderr), 2) : runTests(topts);
   if (path.empty()) return repl();
   if (asmMode) return dumpAsm();
   watched = {path};

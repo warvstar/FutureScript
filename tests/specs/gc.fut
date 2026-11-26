@@ -8,11 +8,9 @@ fn trees() {
   for i in 0..2000 { t += check(make(8)) }
   return "{t} {check(long)}"
 }
-print(trees()) // expect: 1022000 8191
 
 // A local that starts as a number lives in a d register; an object put there must still be seen.
 fn dreg() { var s = 0 s = ["kept", 1] var n = 0 for i in 0..600000 { n = [i] } return "{s} {n}" }
-print(dreg()) // expect: ["kept", 1] [599999]
 
 // A class gaining a field after its constructor sites have cached it: later instances get the room inline.
 class Grow { fn init(a) { self.a = a } }
@@ -26,13 +24,9 @@ fn grow() {
   for g in later { s += g.a + g.b }
   return "{s} {first[2].a} {later.len()}"
 }
-print(grow()) // expect: 22050010 2 50
 
 class Empty {}
 fn empties() { var n = 0 for i in 0..400000 { var e = Empty() if e != nil { n += 1 } } return n }
-print(empties()) // expect: 400000
-try { Empty(1) } catch e { print(e) } // expect: Empty takes no arguments (no init)
-try { Node(1) } catch e { print(e) } // expect: init expects 2 arguments, got 1
 
 // Large objects (over 16KB) get pages of their own; keep one while churning many.
 fn bigs() {
@@ -44,7 +38,6 @@ fn bigs() {
   for i in 0..1000 { var tmp = big + str(i) n += tmp.len() }
   return "{keep.len()} {n}"
 }
-print(bigs()) // expect: 32769 32770890
 
 // Closures with many captures, kept across collections.
 fn closures() {
@@ -58,7 +51,6 @@ fn closures() {
   for fk in fs { s += fk() }
   return s
 }
-print(closures()) // expect: 450550
 
 // Objects reachable only from a suspended fiber's stack.
 fn fibers() {
@@ -72,7 +64,6 @@ fn fibers() {
   for i in 0..300000 { var junk = Node(nil, [i]) }
   return fb.resume()
 }
-print(fibers()) // expect: fiber-owned 1
 
 // Maps and lists (they own malloc'd storage) die and are finalized; kept ones keep their contents.
 fn owners() {
@@ -80,4 +71,18 @@ fn owners() {
   for i in 0..300000 { var m = {i: i, l: [i, i]} }
   return "{kept.name} {kept.items}"
 }
-print(owners()) // expect: k [1, 2, 3]
+
+// Each function churns enough to collect many times on its own. Natively every test starts from the heap
+// left by top-level code; under WebAssembly the tests share one heap, in order.
+test "trees built and dropped while one is kept" { expect trees() == "1022000 8191" }
+test "an object in a d register is seen by the collector" { expect dreg() == "[\"kept\", 1] [599999]" }
+test "a class gaining a field after its constructor sites cached it" { expect grow() == "22050010 2 50" }
+test "empty instances" { expect empties() == 400000 }
+test "constructor arity errors" {
+  expect throws { Empty(1) } == "Empty takes no arguments (no init)"
+  expect throws { Node(1) } == "init expects 2 arguments, got 1"
+}
+test "a large object kept while many are churned" { expect bigs() == "32769 32770890" }
+test "closures with many captures kept across collections" { expect closures() == 450550 }
+test "objects reachable only from a suspended fiber" { expect fibers() == "fiber-owned 1" }
+test "maps and lists are finalized; kept ones keep their contents" { expect owners() == "k [1, 2, 3]" }

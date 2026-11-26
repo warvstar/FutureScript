@@ -2,6 +2,13 @@
 #include "fut.h"
 #include <cmath>
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <mach-o/dyld.h>
+#include <poll.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <map>
 #include <libkern/OSCacheControl.h>
 #include <pthread.h>
@@ -25,7 +32,7 @@ static std::string frameDesc(uintptr_t ra) {
   return "  at " + it->second.name + " (" + it->second.file + ":" + std::to_string(line) + ")\n";
 }
 template <class F> static void eachReturnAddress(F f, uintptr_t* fp = (uintptr_t*)__builtin_frame_address(0), uintptr_t* top = stackTop) {
-  for (; fp && fp < top; fp = (uintptr_t*)fp[0]) {  // walk the frame-pointer chain
+  for (; fp && fp < top; fp = (uintptr_t*)fp[0]) {
     f(fp[1]);
     if ((uintptr_t*)fp[0] <= fp) break;
   }
@@ -59,8 +66,8 @@ static std::string fiberTrace;  // frames of a fiber that ended with an error, p
   }
   fiberTrace += trace;
   if (fiberCur) fiberCur->val = v, longjmp(*errJmp, 1);  // ends the fiber; fiberResume throws v in its resumer
-  fflush(stdout);
-  fprintf(stderr, "runtime error: %s\n%s", toStr(v).c_str(), fiberTrace.c_str());
+  if (errSink) *errSink = toStr(v) + "\n" + fiberTrace;
+  else fflush(stdout), fprintf(stderr, "runtime error: %s\n%s", toStr(v).c_str(), fiberTrace.c_str());
   fiberTrace.clear();
   if (errJmp) longjmp(*errJmp, 1);
   exit(1);
@@ -72,16 +79,13 @@ static void rt_hot(void* t, V a1, V a2, V a3, V a4, V a5, V a6, V a7) {  // a ti
 }
 
 // ---------------- C functions (extern fn): the thunk puts an Ext* in x7 and branches here ----------------
-struct Ext { void* fn; int n, sym; char ret, sig[8]; };  // sig/ret: d(ouble) i(nt) l(ong) p(ointer) s(tring) v(oid)
 static V rt_ffi(V a0, V a1, V a2, V a3, V a4, V a5, V a6, Ext* e) {
   volatile V a[] = {a0, a1, a2, a3, a4, a5, a6};  // on the stack, so string arguments stay alive
   int64_t x[8] = {};
   double d[8] = {};
   for (int i = 0, nx = 0, nd = 0; i < e->n; i++) {
     V v = a[i];
-    char t = e->sig[i];
-    if (t == 's' ? !is(v, K::Str) : !isNum(v) || (t != 'd' && !(std::fabs(num(v)) < 9.2e18)))
-      ERR("%s() argument %d: expected %s, got %s", symName(e->sym).c_str(), i + 1, t == 's' ? "a string" : "a number", typeName(v));
+    char t = ffiCheck(e, i, v);
     if (t == 'd') d[nd++] = num(v);
     else x[nx++] = t == 's' ? (int64_t)as<Str>(v)->s() : (int64_t)num(v);
   }
@@ -106,9 +110,6 @@ __attribute__((naked)) static void fiberSwap(void**, void*) {
   asm("sub sp, sp, #160\n" SWAP_REGS("stp") "mov x9, sp\n str x9, [x0]\n mov sp, x1\n" SWAP_REGS("ldp") "add sp, sp, #160\n ret");
 }
 constexpr size_t FIBER_STACK = 1 << 20;  // reserved; pages are only touched as they are used
-Fiber* fiberCur;
-void* fiberMainSp;
-uintptr_t* fiberMainTop;
 static char* mainLimit;
 static jmp_buf* mainErr;
 static void* mainHandler;
@@ -126,55 +127,28 @@ static void fiberStart() {  // the bottom frame of every fiber
   jmp_buf jb;
   errJmp = &jb;
   if (int r = setjmp(jb)) f->fail = r;  // an uncaught error (its value in val) or a main() restart: the resumer re-raises it
-  else if (is(f->fn, K::Clo)) f->val = vmCall(as<Clo>(f->fn)->fn->code, {f->fn, f->val});
-  else f->val = vmCall(as<Fn>(f->fn)->code, {f->val});
+  else f->val = fiberCall(f);
   f->state = FIB_DONE, f->fn = NIL;
   switchTo(f->resumer);
   __builtin_unreachable();
 }
 void fiberFree(Fiber* f) {
-  if (f->stack) munmap(f->stack, FIBER_STACK);
+  if (!f->stack) return;
+  munmap(f->stack, FIBER_STACK), f->stack = nullptr;
   fibers[f->idx] = fibers.back(), fibers[f->idx]->idx = f->idx, fibers.pop_back();
 }
-V newFiber(V fn) {
-  Fn* f = is(fn, K::Clo) ? as<Clo>(fn)->fn : is(fn, K::Fn) ? as<Fn>(fn) : (ERR("fiber() expects a function"), nullptr);
-  if (f->arity - is(fn, K::Clo) > 1) ERR("a fiber's function takes at most one parameter (the first value sent)");
+void fiberStack(Fiber* b) {
   char* s = (char*)mmap(nullptr, FIBER_STACK, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
   if (s == MAP_FAILED) ERR("out of memory for fiber stacks");
-  mprotect(s, 16 << 10, PROT_NONE);  // guard page
-  Fiber* b = make<Fiber>();
-  b->fn = fn, b->val = NIL, b->stack = s, b->limit = s + (64 << 10), b->top = (uintptr_t*)(s + FIBER_STACK);
+  mprotect(s, 16 << 10, PROT_NONE);
+  b->stack = s, b->limit = s + (64 << 10), b->top = (uintptr_t*)(s + FIBER_STACK);
   uintptr_t* sp = b->top - 20;  // a fiberSwap frame: x29 = 0 ends frame walks, x30 = fiberStart
   sp[11] = (uintptr_t)fiberStart;
   b->sp = sp, b->idx = (int)fibers.size(), fibers.push_back(b);
-  return box(b);
 }
-V fiberResume(V fv, V v) {  // run fv until it yields (giving the yielded value) or returns (its result)
-  Fiber* f = as<Fiber>(fv);
-  if (f->state == FIB_DONE) ERR("resume of a finished fiber");
-  if (f->state == FIB_RUNNING) ERR("resume of a running fiber");
-  f->val = v, f->resumer = fiberCur, f->state = FIB_RUNNING;
-  switchTo(f);
-  if (f->state == FIB_DONE) {
-    munmap(f->stack, FIBER_STACK), f->stack = nullptr;
-    if (int r = f->fail) {
-      V e = f->val;
-      f->fail = 0, f->val = NIL;
-      if (r == 1) throwValue(e, __builtin_return_address(0));  // catchable here; else reported with both traces
-      longjmp(*errJmp, r);
-    }
-  }
-  V r = f->val;
-  return f->val = NIL, r;
-}
-V rt_yield(V v) {
-  Fiber* f = fiberCur;
-  if (!f) ERR("yield outside a fiber");
-  f->val = v, f->state = FIB_SUSPENDED;
-  switchTo(f->resumer);
-  V r = f->val;  // sent by the next resume
-  return f->val = NIL, r;
-}
+void fiberRun(Fiber* f, bool) { switchTo(f); }
+void fiberYield(Fiber* f) { switchTo(f->resumer); }
+void restartMain() { longjmp(*errJmp, 2); }
 // ---------------- executable memory ----------------
 static uint8_t* jit;
 static size_t jitUsed;
@@ -192,6 +166,9 @@ JitBatch::~JitBatch() {
   pthread_jit_write_protect_np(1);
   if (dirtyLo < dirtyHi) sys_icache_invalidate(dirtyLo, dirtyHi - dirtyLo);
 }
+// A forked child (fut test runs each test in one) can start with this thread's JIT pages in write mode, so the
+// first instruction fetched from them faults (about 1 fork in 25); set execute mode explicitly.
+void jitForked() { pthread_jit_write_protect_np(writeDepth ? 0 : 1); }
 static void jitWrite(u32* p, const u32* src, size_t n) {
   JitBatch b;
   memcpy(p, src, n * 4);
@@ -285,27 +262,18 @@ u32* newStub() {  // stubs are packed 4 bytes apart and never freed
   patchStub(pool, trap);
   return pool++;
 }
-u32* ffiThunk(void* fn, const std::string& sig, char ret, int sym) {  // x7 = its Ext; b rt_ffi
-  static std::map<std::string, u32*> made;  // one per function and signature, kept across reloads
-  u32*& t = made[sig + ret + symName(sym) + std::to_string((uintptr_t)fn)];
-  if (t) return t;
-  Ext* e = new Ext{fn, (int)sig.size(), sym, ret, {}};
-  memcpy(e->sig, sig.data(), sig.size());
+u32* ffiCode(Ext* e) {  // x7 = e; b rt_ffi
   using namespace a64;
   Code k{{ldr(16, 28, HOFF(H_FFI)), br(16)}, {}, {}, "<extern>", ""};
   for (u32 hw = 4; hw-- > 0;) k.c.insert(k.c.begin(), (hw ? movk : movz)(7, (uintptr_t)e >> (16 * hw) & 0xffff, hw));
-  return t = jitInstall(k);
+  return jitInstall(k);
 }
 u32* staleThunk(int sym) {  // x1 = caller's return address (b from the stub leaves x30 intact)
   using namespace a64;
   Code k{{mov(1, 30), movz(0, sym & 0xffff, 0), movk(0, (u32)sym >> 16, 1), ldr(16, 28, HOFF(H_STALE)), blr(16)}, {}, {}, "<stale>", ""};
   return jitInstall(k);
 }
-V vmCall(void* code, std::initializer_list<V> a) {
-  V args[8] = {};
-  std::copy(a.begin(), a.end(), args);
-  return enter(code, args, &vm);
-}
+V vmEnter(void* code, V* args) { return enter(code, args, &vm); }
 bool readFile(const std::string& path, std::string& out) {
   FILE* f = fopen(path.c_str(), "rb");
   if (!f) return false;
@@ -316,8 +284,8 @@ bool readFile(const std::string& path, std::string& out) {
 
 
 void compileFail(const std::string& msg, bool atEnd) { throw CompileError(msg, atEnd); }
-bool guardCompile(void (*f)(void*), void* ctx) {
-  try { return f(ctx), true; } catch (CompileError&) { return false; }
+bool guardCompile(void (*f)(void*), void* ctx, std::string* err) {
+  try { return f(ctx), true; } catch (CompileError& e) { return err && (*err = e.what(), true), false; }
 }
 std::string canonicalPath(const std::string& p) {
   char* r = realpath(p.c_str(), nullptr);
@@ -350,4 +318,64 @@ void platformInit() {
   for (u32 i = 0; i < 8; i++) e.c.push_back(ldr(i, 10, i * 8));
   for (u32 i : {blr(9), ldp_post(28, 19), ldp_post(26, 27), ldp_post(29, 30), RET}) e.c.push_back(i);
   enter = (V(*)(void*, const V*, VM*))jitInstall(e);
+}
+
+// ---------------- child processes: run(), isolated tests ----------------
+// Read the child's pipes until they all close, or kill it when the timeout passes; returns its wait status.
+int reap(int pid, std::vector<std::pair<int, std::string*>> pipes, double timeout, bool& timedOut) {
+  double end = now() + timeout;
+  for (size_t open = pipes.size(); open;) {
+    double left = end - now();
+    if (left <= 0) { timedOut = true, kill(pid, SIGKILL); break; }
+    std::vector<pollfd> fds;
+    for (auto& p : pipes) fds.push_back({p.first, POLLIN, 0});  // poll skips the closed ones (-1)
+    if (poll(fds.data(), fds.size(), (int)(left * 1000) + 1) <= 0) continue;
+    for (size_t i = 0; i < fds.size(); i++) {
+      if (!fds[i].revents) continue;
+      char b[4096];
+      ssize_t k = read(fds[i].fd, b, sizeof b);
+      if (k > 0) pipes[i].second->append(b, k);
+      else close(fds[i].fd), pipes[i].first = -1, open--;
+    }
+  }
+  for (auto& p : pipes) if (p.first >= 0) close(p.first);
+  int st = 0;
+  return waitpid(pid, &st, 0), st;
+}
+extern char** environ;
+bool runProcess(const std::vector<std::string>& args, const std::string& file, const std::string* source, double timeout, ProcResult& r) {
+  char exe[4096];
+  uint32_t n = sizeof exe;
+  if (_NSGetExecutablePath(exe, &n)) return false;
+  std::string path = file, tmp;
+  if (source) {
+    char t[] = "/tmp/fut-run-XXXXXX.fut";
+    int fd = mkstemps(t, 4);
+    if (fd < 0) return false;
+    bool ok = write(fd, source->data(), source->size()) == (ssize_t)source->size();
+    close(fd), path = tmp = t;
+    if (!ok) return unlink(t), false;
+  }
+  std::vector<std::string> a{exe};
+  a.insert(a.end(), args.begin(), args.end()), a.push_back(path);
+  std::vector<char*> av;
+  for (auto& s : a) av.push_back(s.data());
+  av.push_back(nullptr);
+  int po[2], pe[2];
+  if (pipe(po)) return false;
+  if (pipe(pe)) return close(po[0]), close(po[1]), false;
+  posix_spawn_file_actions_t fa;
+  posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+  posix_spawn_file_actions_adddup2(&fa, po[1], 1), posix_spawn_file_actions_adddup2(&fa, pe[1], 2);
+  for (int fd : {po[0], po[1], pe[0], pe[1]}) posix_spawn_file_actions_addclose(&fa, fd);
+  pid_t pid;
+  int rc = posix_spawn(&pid, exe, &fa, nullptr, av.data(), environ);
+  posix_spawn_file_actions_destroy(&fa);
+  close(po[1]), close(pe[1]);
+  if (rc) return close(po[0]), close(pe[0]), tmp.empty() || unlink(tmp.c_str()), false;
+  int st = reap(pid, {{po[0], &r.out}, {pe[0], &r.err}}, timeout, r.timedOut);
+  r.code = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+  if (!tmp.empty()) unlink(tmp.c_str());
+  return true;
 }

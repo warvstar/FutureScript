@@ -5,6 +5,7 @@
 // createFut(opts) options:
 //   wasm: bytes of fut.wasm           read(path): file bytes or null      write(fd, bytes): stdout (1) / stderr (2)
 //   verbose: bool                     getenv(name): string or undefined   window(w, h): bool, present(rgba, w, h): Promise
+//   run(args, file, source, timeout): {code, out, err, timedOut} -- fut in a child process (run()), if possible
 export class Restart extends Error {}  // unwinds to the driver, which reruns main()
 export class Exit extends Error { constructor(code) { super("exit " + code), (this.code = code); } }
 
@@ -113,14 +114,15 @@ export async function createFut(opts) {
     if (e instanceof RangeError && /call stack/i.test(e.message)) return "stack overflow";
     return "internal error: " + (e?.message ?? e);
   }
-  function report(e) {
+  function errorText(e) {  // the message, a newline, the trace
     let msg, t = "";
     if (e instanceof WebAssembly.Exception && e.is(tag)) {
       const v = e.getArg(tag, 0);
       (msg = str(v)), (t = (fiberTraces.get(v) ?? "") + trace(e));
     } else (msg = describe(e)), opts.verbose && !(e instanceof RangeError) && (t = String(e.stack) + "\n");
-    fiberTraces.clear(), write(2, "runtime error: " + msg + "\n" + t);
+    return fiberTraces.clear(), msg + "\n" + t;
   }
+  const report = (e) => write(2, "runtime error: " + errorText(e));
 
   // ---- the program's events: changed files and typed lines, handled at the next safepoint ----
   let fileChanged = false, inbox = [], replBuf = "", inMain = false, wake = null, path = "", mainChanged = false;
@@ -212,6 +214,14 @@ export async function createFut(opts) {
     resume: S(resume), yield: S(yieldTo), fiber_gone: (f) => fibers.delete(f),
     sleep: S((s) => new Promise((r) => setTimeout(r, Math.max(0, s * 1000)))),
     poll: S(hostPoll),
+    run(argsP, srcP, timeout) {  // run(): fut in a child process, if the host can (opts.run)
+      const args = cstr(argsP).split("\n"), file = args.pop();
+      const r = opts.run?.(args, file, srcP ? cstr(srcP) : null, timeout);
+      if (!r) return -1;
+      const out = enc.encode(r.out), err = enc.encode(r.err), head = enc.encode(`${r.code} ${r.timedOut ? 1 : 0} ${out.length}\n`);
+      held = new Uint8Array(head.length + out.length + err.length);
+      return held.set(head), held.set(out, head.length), held.set(err, head.length + out.length), held.length;
+    },
     window: (w, h) => (opts.window?.(w, h) ? 1 : 0),
     present: S(async (px, w, h) => {
       const src = new Uint8Array(mem.buffer, px, w * h * 4), rgba = new Uint8ClampedArray(w * h * 4);
@@ -239,6 +249,30 @@ export async function createFut(opts) {
           if ((c = load(loaded))) (loaded = true), (st = await start(c));
         }
         return st ? 1 : 0;
+      } catch (e) { if (e instanceof Exit) return e.code; throw e; }
+    },
+    async test(file, json, filter) {  // fut test: the top level, then each test block; exit status
+      path = file;
+      const errorOf = async (slot) => {  // null, or the uncaught error's message and trace
+        try { return await call(slot), null; } catch (e) {
+          if (e instanceof Restart || e instanceof Exit) throw e;
+          return errorText(e);
+        }
+      };
+      try {
+        withStr(filter ?? "", (p) => ex.fut_tests_begin(json ? 1 : 0, p));
+        const c = withStr(path, (p) => ex.fut_compile(p, 0, 0, 0, 1));
+        if (!c) return 2;
+        const top = await errorOf(c);
+        ex.fut_retire(c);
+        if (top != null) return withStr(top, (p) => ex.fut_test_top_error(p)), 1;
+        for (let i = 0, n = ex.fut_test_count(); i < n; i++) {
+          const s = ex.fut_test_start(i);
+          if (!s) continue;
+          const err = await errorOf(s);
+          withStr(err ?? "", (p) => ex.fut_test_finish(i, err != null ? 1 : 0, p));
+        }
+        return ex.fut_tests_end();
       } catch (e) { if (e instanceof Exit) return e.code; throw e; }
     },
     async line(l) {  // REPL without a program: returns the next prompt

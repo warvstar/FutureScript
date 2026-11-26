@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdarg>
+#include <unordered_map>
 #include <time.h>
 
 VM vm;
@@ -11,6 +12,8 @@ std::deque<Global> globals;
 static std::vector<Fn*> builtins[8];  // by object kind, then method sym
 std::vector<V> consts;
 jmp_buf* errJmp;
+std::string *outSink, *errSink;
+std::string mainFile;
 void (*pollHook)();
 std::string* asmListing;
 bool verbose;
@@ -30,7 +33,7 @@ int intern(std::string_view s) {
   for (char c : s) h = (h ^ (uint8_t)c) * 16777619u;
   if (SymSlot& e = symSlot(s, h); e.id >= 0) return e.id;
   else e = {names.emplace_back(s), h, (int)names.size() - 1};
-  if (names.size() * 2 > tab.size())  // grow and reinsert
+  if (names.size() * 2 > tab.size())
     for (auto& e : std::exchange(tab, std::vector<SymSlot>(tab.size() * 2))) if (e.id >= 0) symSlot(e.s, e.h) = e;
   return (int)names.size() - 1;
 }
@@ -110,7 +113,7 @@ static u32* mapSlot(Map* m, V k) {  // k's index slot, else the slot to insert i
 }
 static long mapFind(Map* m, V k) { u32 s = *mapSlot(m, k); return s && s != ~0u ? (long)s - 1 : -1; }
 
-[[noreturn]] void rtError(void* ra, const char* fmt, ...) {  // raise an error with a message string
+[[noreturn]] void rtError(void* ra, const char* fmt, ...) {
   char msg[512];
   va_list ap;
   va_start(ap, fmt);
@@ -173,7 +176,7 @@ static void reshape(Class* c) {
   u32 cap = (u32)std::min<size_t>(c->layout.size(), 0xffff);
   int k = sizeClass(sizeof(Inst) + cap * 8);
   c->ihdr = (uint64_t)K::Inst | (uint64_t)cap << 16 | (uint64_t)c->id << 32;
-  c->irun = ROFF(k), c->isize = k < NCLS ? sizeClasses[k] : 16;  // too big: runs[NCLS] is empty, so 16 never fits
+  c->irun = u32((char*)&vm.runs[k] - (char*)&vm), c->isize = k < NCLS ? sizeClasses[k] : 16;  // too big: runs[NCLS] is empty, so 16 never fits
 }
 static V rt_setf(V o, uint64_t s, V v, IC* ic) {
   if (is(o, K::Map)) return rt_seti(o, mapKey(s), v);
@@ -205,6 +208,10 @@ static void mapSet(Map* m, V k, V v) {
   u32* s = mapSlot(m, k);
   if (*s && *s != ~0u) return void(m->e[*s - 1].second = v);
   m->used += !*s, *s = (u32)m->e.size() + 1, m->e.push_back({k, v});
+}
+void mapPut(Map* m, std::string_view k, V v) {
+  volatile V keep[] = {box(m), v};  // on the stack while the key allocates
+  (void)keep, mapSet(m, box(newStr(k)), v);
 }
 static V rt_geti(V a, V i) {
   if (is(a, K::Map)) {
@@ -293,11 +300,75 @@ static void* rt_prep(V* w, uint64_t n, uint64_t sym, V sup, IC* ic) {
   return f->code;
 }
 static V rt_numchk(V v) { return isNum(v) ? v : (ERR("expected a number, got %s", typeName(v)), v); }
-static void rt_stack() { ERR("stack overflow"); }
+static void rt_poll();
+static void rt_stack() {  // wasm: the entry check also fails while a safepoint is wanted (gen_wasm.h)
+  char here;
+  if (WASM && vm.poll && &here + 256 >= (char*)vm.limit) return rt_poll();
+  ERR("stack overflow");
+}
 static void rt_undef() { ERR("call to undefined function"); }
 static void rt_stale(uint64_t sym, void* ra) {
   rtError(ra, "stale call to '%s': its parameters changed, but this caller is old code that is still running",
           symName(sym).c_str());
+}
+
+// ---------------- fibers and C calls: the parts both platforms share ----------------
+Fiber* fiberCur;
+void* fiberMainSp;
+uintptr_t* fiberMainTop;
+V vmCall(void* code, std::initializer_list<V> a) {
+  V args[8] = {};
+  std::copy(a.begin(), a.end(), args);
+  return vmEnter(code, args);
+}
+V fiberCall(Fiber* f) {
+  return is(f->fn, K::Clo) ? vmCall(as<Clo>(f->fn)->fn->code, {f->fn, f->val}) : vmCall(as<Fn>(f->fn)->code, {f->val});
+}
+V newFiber(V fn) {
+  Fn* f = is(fn, K::Clo) ? as<Clo>(fn)->fn : is(fn, K::Fn) ? as<Fn>(fn) : (ERR("fiber() expects a function"), nullptr);
+  if (f->arity - is(fn, K::Clo) > 1) ERR("a fiber's function takes at most one parameter (the first value sent)");
+  Fiber* b = make<Fiber>();
+  b->fn = fn, b->val = NIL, fiberStack(b);
+  return box(b);
+}
+V fiberResume(V fv, V v) {  // run fv until it yields (giving the yielded value) or returns (its result)
+  Fiber* f = as<Fiber>(fv);
+  if (f->state == FIB_DONE) ERR("resume of a finished fiber");
+  if (f->state == FIB_RUNNING) ERR("resume of a running fiber");
+  bool start = f->state == FIB_NEW;
+  f->val = v, f->resumer = fiberCur, f->state = FIB_RUNNING;
+  fiberRun(f, start);
+  if (f->state == FIB_DONE) {
+    fiberFree(f);
+    if (int r = f->fail) {
+      V e = f->val;
+      f->fail = 0, f->val = NIL;
+      if (r == 2) restartMain();
+      throwValue(e, RA());  // catchable here; else reported with both traces
+    }
+  }
+  return std::exchange(f->val, NIL);
+}
+V rt_yield(V v) {
+  Fiber* f = fiberCur;
+  if (!f) ERR("yield outside a fiber");
+  f->val = v, f->state = FIB_SUSPENDED;
+  fiberYield(f);
+  return std::exchange(f->val, NIL);  // sent by the next resume
+}
+char ffiCheck(Ext* e, int i, V v) {
+  char t = e->sig[i];
+  if (t == 's' ? !is(v, K::Str) : !isNum(v) || (t != 'd' && !(std::fabs(num(v)) < 9.2e18)))
+    ERR("%s() argument %d: expected %s, got %s", symName(e->sym).c_str(), i + 1, t == 's' ? "a string" : "a number", typeName(v));
+  return t;
+}
+u32* ffiThunk(void* fn, const std::string& sig, char ret, int sym) {
+  static std::unordered_map<std::string, u32*> made;  // one per function and signature, kept across reloads
+  u32*& t = made[sig + ret + symName(sym) + std::to_string((uintptr_t)fn)];
+  if (t) return t;
+  Ext* e = new Ext{fn, (int)sig.size(), sym, ret, {}};
+  memcpy(e->sig, sig.data(), sig.size());
+  return t = ffiCode(e);
 }
 static void rt_poll() { if (pollHook) pollHook(); }
 
@@ -307,7 +378,13 @@ static V rt_echo(V v) {
 }
 
 // ---------------- natives ----------------
-static V n_print(V v) { std::string t; auto s = text(v, t); return fwrite(s.data(), 1, s.size(), stdout), putchar('\n'), NIL; }
+static V n_print(V v) {
+  std::string t;
+  auto s = text(v, t);
+  if (outSink) return outSink->append(s).push_back('\n'), NIL;
+  return fwrite(s.data(), 1, s.size(), stdout), putchar('\n'), NIL;
+}
+V binopValue(V a, V b, int op) { return rt_binop(a, b, op); }
 static V n_str(V v) { return is(v, K::Str) ? v : box(newStr(toStr(v))); }
 static V n_len(V v) {
   if (is(v, K::Str)) return box((double)as<Str>(v)->len);
@@ -315,7 +392,8 @@ static V n_len(V v) {
   if (is(v, K::Map)) return box((double)as<Map>(v)->e.size());
   ERR("len() of %s", typeName(v));
 }
-static V n_clock() { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return box(t.tv_sec + t.tv_nsec * 1e-9); }
+double now() { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+static V n_clock() { return box(now()); }
 static V n_sleep(V v) { return sleepFor(NUMARG(v, "sleep")), NIL; }
 static V n_floor(V v) { return box(std::floor(NUMARG(v, "floor"))); }
 static V n_sqrt(V v) { return box(std::sqrt(NUMARG(v, "sqrt"))); }
@@ -374,6 +452,11 @@ void rtInit() {
   method<n_len>(K::Str, S_len), method<n_len>(K::Map, S_len);
   gfxInit();
   method<m_has>(K::Map, S_has), method<m_remove>(K::Map, S_remove);
+  method<+[](V s, V sub) {  // str.has(part): does it contain part?
+    if (!is(sub, K::Str)) ERR("has() on a string expects a string, got %s", typeName(sub));
+    return boxb(as<Str>(s)->sv().find(as<Str>(sub)->sv()) != std::string_view::npos);
+  }>(K::Str, S_has);
   method<+[](V m) { return mapList(m, true); }>(K::Map, S_keys);
   method<+[](V m) { return mapList(m, false); }>(K::Map, S_values);
+  testInit();
 }
