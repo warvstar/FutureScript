@@ -11,22 +11,6 @@ fn acceptSyntax(os, line) {
   return r.code == 2 && r.out == "" && r.err.find("sh: syntax error: ") == 0
 }
 
-fn acceptTick(os, ms) {
-  var r = tick(os, ms)
-  return [r.out, r.err]
-}
-
-fn acceptWins(os) {
-  var r = []
-  for w in wmList(os) { r.push([w.id, w.app, w.title, w.x, w.y, w.w, w.h, w.focused, w.minimized, w.maximized]) }
-  return r
-}
-
-fn acceptCursor(os, t) {
-  var c = termCursor(os, t)
-  return [c.row, c.col]
-}
-
 test "echo and quoting" {
   var os = boot()
   expect acceptSh(os, "echo a   b") == ["a b\n", "", 0]
