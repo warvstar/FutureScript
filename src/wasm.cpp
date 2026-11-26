@@ -506,6 +506,8 @@ EXPORT(fut_pin_fn) int futPinFn(const char* nm) {  // a top-level fn, pinned for
 }
 EXPORT(fut_call) V futCall(int slot) { return vmCall((void*)(uintptr_t)slot); }
 EXPORT(fut_retire) void futRetire(int slot) { jitRetire((u32*)(uintptr_t)slot); }
+EXPORT(fut_replay_begin) void futReplayBegin(const char* log, int record) { replayBegin(log, record); }  // see replay.cpp
+EXPORT(fut_replay_log) const char* futReplayLog() { return (text = replayLog()).c_str(); }
 EXPORT(fut_str) const char* futStr(V v) { return (text = toStr(v)).c_str(); }
 EXPORT(fut_error_line) const char* futErrorLine(V v) { return (text = errorLine(v)).c_str(); }  // with its [code]
 // The program ended (failed: with an error): wait for the isolates it started (stopping them if it failed). "" or

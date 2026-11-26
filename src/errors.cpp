@@ -52,6 +52,7 @@ const ErrCode codes[] = {
     {"channel", "A channel was used after it was closed.", "Stop receiving once recv() reports the end; close a channel once."},
     {"spawn", "spawn was given something it can't run, or the build can't run isolates.", "spawn a fut function (not a builtin), in the native build."},
     {"isolate", "This isolate was stopped because the isolate that started it ended with an error.", "Fix the error the other isolate reported."},
+    {"replay", "A run under fut --replay asked for something other than what the recorded run did at that point, or printed something else.", "The program changed since the recording, or did something the log can't repeat (isolates' timing): record it again."},
     {"js", "A value can't cross to or from JavaScript, or JavaScript threw.", "Pass plain data (numbers, strings, lists, maps with string keys); catch the JS error with try."},
     {"host", "The host couldn't do it: no display, a file that can't be written, a process that can't start.", "Check the environment the message names."},
     {"memory", "Out of memory.", "Allocate less, or free references to what's no longer needed."},

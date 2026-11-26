@@ -419,6 +419,9 @@ template <auto f> void* callable() {
 #endif
 }
 void native(const char* name, void* f, int arity);
+bool replayStart(const char* path, bool record);  // replay.cpp: fut --record / --replay log (native)
+void replayBegin(const std::string& log, bool record);  // the same with the log's text (wasm hosts)
+std::string replayLog();
 void fuelInit();   // fuel.cpp: steps, budget(n, f)
 extern bool stepsOn;  // compile step counting into code: once a program names budget or stepCount (or the host asks)
 u32 budgetDepth();

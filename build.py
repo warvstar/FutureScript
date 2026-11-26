@@ -638,7 +638,7 @@ def runner_codes(exe):
     tested = set(re.findall(r"\[([a-z-]+)\]", "".join((ROOT / "tests" / "specs" / f).read_text() for f in ["codes.fut", "codes_isolates.fut"])))
     exempt = {"not-in-interface": "needs packages: runner_packages checks it", "manifest": "needs a fut.pkg",
               "stale-call": "needs a hot reload", "memory": "needs memory to run out", "js": "needs JavaScript modules",
-              "isolate": "needs one isolate to fail while another runs"}
+              "isolate": "needs one isolate to fail while another runs", "replay": "needs fut --replay: runner_replay checks it"}
     # every error the source raises states its code: a format string passed to ERR, rtError, fail or failAt starts "@code "
     uncoded = []
     for f in sorted((ROOT / "src").glob("*.[ch]*")):
@@ -720,7 +720,37 @@ def runner_fmath(exe):
     return r.returncode == 0, r.stdout
 
 
+REPLAY_SRC = """var t0 = clock()
+var xs = []
+for i in 0..ROLLS { xs.push(floor(random() * 1000)) }
+sleep(0.3)
+print("rolled {xs} after {floor((clock() - t0) * 10) / 10}s")
+try { env(3) } catch e { print(e) }
+"""  # env(3) raises: the log says "!", and the replay runs it again to raise the same way
+
+
+def runner_replay(exe):
+    """fut --record log / --replay log: a replay answers clock, random and the rest from the log (and skips sleeps), so
+    it prints what the recording did; a changed program raises [replay] where it first differs."""
+    if exe.suffix == ".wasm":
+        return True, ""  # (a native CLI option; the runtime part is the same code)
+    d = Path(tempfile.mkdtemp())
+    src, log = d / "r.fut", d / "r.log"
+    src.write_text(REPLAY_SRC.replace("ROLLS", "4"))
+    rec = subprocess.run([str(exe), "--record", str(log), str(src)], capture_output=True, text=True, timeout=60)
+    t = time.time()
+    rep = subprocess.run([str(exe), "--replay", str(log), str(src)], capture_output=True, text=True, timeout=60)
+    fast = time.time() - t < 0.25
+    src.write_text(REPLAY_SRC.replace("ROLLS", "5"))
+    bad = subprocess.run([str(exe), "--replay", str(log), str(src)], capture_output=True, text=True, timeout=60)
+    ok = (rec.stdout and rep.stdout == rec.stdout and "after 0.3s" in rep.stdout and fast and rec.returncode == rep.returncode == 0
+          and "[replay]" in bad.stderr and "operation 6: it calls random(), the recording sleep()" in bad.stderr
+          and "\nenv !\n" in log.read_text() and "must be a string" in rep.stdout)
+    return ok, f"record: {rec.stdout!r} {rec.stderr!r}\n  replay: {rep.stdout!r} {rep.stderr!r} fast={fast}\n  changed: {bad.stderr!r}"
+
+
 RUNNER_TESTS = [("std/math: within 1 ulp of libm, exact cases exact", runner_fmath),
+                ("fut --record / --replay: the same run again, sleeps skipped", runner_replay),
                 ("fut test --json: statuses, details, output", runner_json),
                 ("packages: names, interfaces, boundaries, versions", runner_packages),
                 ("fut map: packages, files, declarations", runner_map),
