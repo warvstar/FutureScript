@@ -4,6 +4,7 @@ A small class-based language written in C++23 with no third-party libraries. A s
 
 ```sh
 python3 build.py               # -> build/fut   (clang++ -std=c++23 -O2, files in parallel, only what changed; no cmake)
+python3 build.py install       # build, then link ~/.local/bin/fut (or a directory given) to build/fut
 python3 build.py test          # language tests, tests/specs/*.fut via `fut test`, live hot-reload scenarios
 python3 build.py test contracts # only the tests whose name contains a word given (all run in parallel, ~7s in all)
 python3 build.py test --debug  # same, under ASan/UBSan

@@ -882,6 +882,22 @@ def isolates(exe, n, only=()):
     return failed
 
 
+def install(where=None):
+    """Build, then link <where>/fut (default ~/.local/bin) to build/fut. A link, not a copy: each rebuild is what
+    runs, and fut finds std/ (and web/) beside the binary's real path."""
+    exe = build()
+    d = Path(where).expanduser() if where else Path.home() / ".local" / "bin"
+    d.mkdir(parents=True, exist_ok=True)
+    link = d / "fut"
+    if link.exists() and not link.is_symlink():
+        sys.exit(f"{link} exists and is not a link; remove it first")
+    if link.is_symlink():
+        link.unlink()
+    link.symlink_to(exe)
+    on = any(Path(p).expanduser().resolve() == d.resolve() for p in os.environ.get("PATH", "").split(os.pathsep) if p)
+    print(f"{link} -> {exe}" + ("" if on else f"\n{d} is not on PATH: add it, e.g. export PATH=\"{d}:$PATH\""))
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "build"
     if cmd == "clean":
@@ -889,6 +905,8 @@ if __name__ == "__main__":
     elif cmd == "test":
         mt = "--wasm-mt" in sys.argv  # the threads build (fut-mt.wasm)
         sys.exit(1 if test(build("--debug" in sys.argv, "--wasm" in sys.argv or mt, threads=mt), [a for a in sys.argv[2:] if not a.startswith("--")]) else 0)
+    elif cmd == "install":
+        install(sys.argv[2] if len(sys.argv) > 2 else None)
     elif cmd == "wasm":
         build(wasm=True, threads="--threads" in sys.argv)
     elif cmd == "tsan":
