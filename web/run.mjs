@@ -10,7 +10,8 @@ import { createFut } from "./fut.js";
 
 let file = "", watch = false, verbose = false, json = false, filter = "", check = false, pub = false, only = "";
 const argv = process.argv.slice(2), testing = argv[0] == "test", api = argv[0] == "api", map = argv[0] == "map", explain = argv[0] == "explain";
-const usage = "usage: node web/run.mjs [-w | -v] [file.fut]   (no file: REPL)\n       node web/run.mjs test [--json] [--filter text] file.fut\n       node web/run.mjs api [--check] file.fut\n       node web/run.mjs map [--pub] [--json] file.fut [package | file]\n       node web/run.mjs explain [code]\n";
+const usage = "usage: node web/run.mjs [-w | -v] [--seed n] [file.fut]   (no file: REPL)\n       node web/run.mjs test [--json] [--filter text] file.fut\n       node web/run.mjs api [--check] file.fut\n       node web/run.mjs map [--pub] [--json] file.fut [package | file]\n       node web/run.mjs explain [code]\n";
+let seed = 0;  // --seed n: which interleaving of a program's isolates (they take turns on the one thread)
 for (let i = testing || api || map ? 1 : 0; i < argv.length && !explain; i++) {
   const a = argv[i];
   if (map && a == "--pub") pub = true;
@@ -21,6 +22,8 @@ for (let i = testing || api || map ? 1 : 0; i < argv.length && !explain; i++) {
   else if (testing && a == "--filter" && i + 1 < argv.length) filter = argv[++i];
   else if (testing && a == "--timeout" && i + 1 < argv.length) i++;  // tests share one process here: no per-test timeout
   else if (testing && a == "--changed") {}  // ... and no traces: every test runs
+  else if (a == "--seed" && i + 1 < argv.length) seed = +argv[++i];
+  else if (a == "--threads" && i + 1 < argv.length) i++;  // (one thread here)
   else if (a == "-w" && !testing) watch = verbose = true;
   else if (a == "-v") verbose = true;
   else if (a[0] == "-") process.stderr.write(usage), process.exit(2);
@@ -36,6 +39,8 @@ const fut = await createFut({
   wasm: readFileSync(new URL("../build/fut.wasm", import.meta.url)),
   std: process.env.FUT_STD || fileURLToPath(new URL("../std", import.meta.url)),
   verbose,
+  seed,
+  exit: (code) => process.exit(code),
   interp: !!process.env.FUT_INTERP,  // FUT_INTERP=1: interpret the compiled code (as a static Cloudflare Worker would)
   read(p) { try { return readFileSync(p); } catch { return null; } },
   save(p, text) { try { return text == null ? rmSync(p) : writeFileSync(p, text), true; } catch { return false; } },

@@ -25,6 +25,7 @@
 using namespace wa;
 bool interpMode;
 void* interpTop;  // the innermost interpreted frame (a Frame), for stack traces; each fiber keeps its own (wasm.cpp)
+u32 tryCallSlot;  // the host's try_call (also wasm.cpp's catchFut)
 namespace {
 using L = uint64_t;
 using I = uint32_t;
@@ -45,7 +46,6 @@ std::vector<IFn*> fns(NTRAMP);  // by trampoline. A retired body is kept: it may
                                 // body of its batch (which then goes on through the stub, as compiled code does)
 std::vector<int> freeK;
 std::map<u32, int> kOfSlot;  // body slot -> trampoline
-u32 tryCallSlot;
 
 [[noreturn]] void bad(const char* what, unsigned x) { fprintf(stderr, "fut interpreter: %s 0x%x\n", what, x), fflush(stderr), __builtin_trap(); }
 inline u32 uleb(const uint8_t* c, u32& pc) {

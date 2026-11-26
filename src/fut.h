@@ -30,6 +30,7 @@ constexpr bool WASM = false;
 #if __wasm__
 #define TLS
 struct Mutex { void lock() {} void unlock() {} };
+inline int locksHeld;  // (no locks: isolates take turns on the one thread only where they switch on purpose)
 using RMutex = Mutex;
 #else
 #define TLS thread_local
@@ -50,9 +51,6 @@ struct Locked {
 // ISO_LOCAL(var): a TLS variable that is an isolate's state, not its thread's. Isolates take turns on threads
 // (isolate.cpp): switching one out swaps every such variable with its saved copy, and a new isolate starts with
 // each as it was before main(). TLS that is only the thread's (JIT write mode, locksHeld) isn't registered.
-#if __wasm__
-#define ISO_LOCAL(var)
-#else
 struct IsoLocal {
   size_t off;
   void (*init)(void* dst, const void* from);  // construct a copy
@@ -78,7 +76,6 @@ template <class T> int isoLocalAdd(void (*swap)(void*), const T& var) {
 #define ISO_LOCAL(var)                                                                                             \
   [[maybe_unused]] static const int isoLocal_##var = isoLocalAdd<std::remove_reference_t<decltype(var)>>(        \
       +[](void* p) { std::swap(var, *(std::remove_reference_t<decltype(var)>*)p); }, var)
-#endif
 inline std::atomic<int> isolates{1};  // running: with more than one, code no frame of this isolate uses may be another's
 struct Run;
 // Compiling and the code region it writes (JIT memory, line tables, stubs, the compiler's tables): one isolate at a
@@ -313,9 +310,14 @@ inline TLS VM* vm;
 VM* vmNew();
 void threadInit();  // a new isolate's thread: its stack bounds (stackTop, vm->limit)
 #if __wasm__
-void vmSwitched();  // vm changed: JIT code reaches it through a wasm global the host holds
+void vmSwitched();       // vm changed: JIT code reaches it through a wasm global the host holds
+void ctxGone(void* ctx);  // a context switched away from for the last time: the host drops its suspended stack
+// Run body(ctx), catching a fut error (a wasm exception, which C++ can't catch: the host's try_call does): true if
+// one was raised, with the value raised in *err and (trace) its frames.
+bool catchFut(void (*body)(void*), void* ctx, V* err, std::string* trace);
 #else
 inline void vmSwitched() {}  // (JIT code has it in x28, loaded on entry)
+inline void ctxGone(void*) {}
 #endif
 void ctxSwap(void** save, void* to);           // save this context's registers and sp in *save, resume `to`
 void* ctxFrame(uintptr_t* top, void (*entry)());  // a context on a fresh stack that starts by calling entry
@@ -426,6 +428,9 @@ inline TLS std::string* errSink;  // when set, an uncaught error's message and t
 inline TLS V* errValue;           // when set, an uncaught error's value goes here, and its trace to *errSink
 void traceAdd(const std::string& frames);  // frames to print after the next uncaught error's own (a failed join)
 std::string codeWhere(void* ra);  // "f (file.fut:12)" for a return address in JIT code, or ""
+#if __wasm__
+std::string hereWhere();  // the innermost fut frame running, as codeWhere gives it (wasm has no return addresses)
+#endif
 void emitOut(std::string_view line);  // print(): to outSink (locked: an isolate's workers share it) or stdout
 
 // ---- isolates and channels (isolate.cpp): spawn, join, channel(n), copying sends ----

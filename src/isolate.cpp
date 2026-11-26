@@ -48,6 +48,11 @@ extern "C" void __sanitizer_finish_switch_fiber(void* fakeStackSave, const void*
 #endif
 #endif
 
+#if __wasm__
+#define WASM_OR(w, n) w
+#else
+#define WASM_OR(w, n) n
+#endif
 struct Iso;
 struct Shared {
   std::atomic<int> rc{1};
@@ -132,7 +137,6 @@ struct Iso {
   std::vector<TaskState*> failures;     // failed, and not joined yet (each holds a reference)
 };
 
-#if !__wasm__
 // ---- isolate-local variables (ISO_LOCAL): their place in each isolate's copy ----
 static size_t isoLocalSize, isoLocalAlign = 16;
 std::vector<IsoLocal>& isoLocals() {
@@ -144,7 +148,6 @@ size_t isoLocalPlace(size_t size, size_t align) {
   size_t o = (isoLocalSize + align - 1) & ~(align - 1);
   return isoLocalSize = o + size, o;
 }
-#endif
 
 namespace {
 Mutex chanMu;
@@ -168,7 +171,6 @@ ISO_LOCAL(errSink);
 ISO_LOCAL(errValue);
 ISO_LOCAL(txnPollLater);
 
-#if !__wasm__
 char* stateNew() {
   char* b = (char*)aligned_alloc(isoLocalAlign, (isoLocalSize + isoLocalAlign) & ~(isoLocalAlign - 1));
   for (auto& l : isoLocals()) l.init(b + l.off, l.def);
@@ -180,7 +182,15 @@ void stateFree(char* b) {
 }
 void stateSwap(char* b) { for (auto& l : isoLocals()) l.swap(b + l.off); }
 
-constexpr size_t ISO_STACK = 8 << 20;  // as the main thread's; reserved, and pages are only touched as they are used
+#if __wasm__
+// The shadow stack (C++ frames that need memory, and fut frames' slots); the host keeps each isolate's wasm stack.
+constexpr size_t ISO_STACK = 256 << 10, ISO_GUARD = 16 << 10;  // as a fiber's
+char* stackNew() { return (char*)aligned_alloc(16, ISO_STACK); }
+void stackFree(char* s) { free(s); }
+#define THREAD  // one thread
+#else
+#define THREAD thread_local
+constexpr size_t ISO_STACK = 8 << 20, ISO_GUARD = 256 << 10;  // as the main thread's; reserved, and pages are only touched as they are used
 std::vector<char*>& spareStacks = *new std::vector<char*>;  // stacks of ended isolates, for the next spawns (under chanMu)
 char* stackNew() {
   {
@@ -208,10 +218,12 @@ void stackFree(char* s) {
 constexpr double SLICE = 0.01;          // a pool isolate's turn, while others wait for a thread
 Sched& pooled = *new Sched;               // a pool program's root has this (each spawned isolate gets a pool thread's)
 std::vector<Sched*>& pool = *new std::vector<Sched*>;  // the pool's threads (under chanMu)
+#endif
 // The thread's own, not an isolate's (so plain thread_local, not ISO_LOCAL):
-thread_local Iso* from;       // the isolate this thread just switched away from: the side switched to finishes it
-thread_local Iso* running;    // the isolate this thread runs
-thread_local void* loopSp;    // a pool thread's own context (its loop), while it runs an isolate
+THREAD Iso* from;       // the isolate this thread just switched away from: the side switched to finishes it
+THREAD Iso* running;    // the isolate this thread runs
+THREAD void* loopSp;    // a pool thread's own context (its loop), while it runs an isolate
+#if !__wasm__
 [[maybe_unused]] thread_local char* loopLo;
 [[maybe_unused]] thread_local size_t loopSize;
 [[maybe_unused]] void threadStack(char*& lo, size_t& size) {
@@ -219,12 +231,13 @@ thread_local void* loopSp;    // a pool thread's own context (its loop), while i
   size = pthread_get_stacksize_np(t), lo = (char*)pthread_get_stackaddr_np(t) - size;
 }
 [[maybe_unused]] thread_local void* loopTsan;
+#endif
 
 void arrived() {  // just switched to: finish with the isolate switched away from
   Iso* f = std::exchange(from, nullptr);
   if (!f) return;
   if (!f->exited) return f->onStack.store(false, std::memory_order_release);
-  stackFree(f->stack), stateFree(f->saved);
+  ctxGone(f->sp), stackFree(f->stack), stateFree(f->saved);
 #ifdef FUT_TSAN
   __tsan_destroy_fiber(f->tsan);
 #endif
@@ -234,7 +247,9 @@ void arrived() {  // just switched to: finish with the isolate switched away fro
 // state already says what becomes of it. Returns when something switches back to m.
 void switchTo(Iso* m, Iso* to) {
   if (to) {
+#if !__wasm__
     while (to->onStack.load(std::memory_order_acquire)) sched_yield();  // its last thread is still leaving it
+#endif
     to->onStack.store(true, std::memory_order_relaxed), to->since.store(now(), std::memory_order_relaxed);
   }
   if (m) stateSwap(m->saved);  // m's variables out, the thread's own in
@@ -251,7 +266,7 @@ void switchTo(Iso* m, Iso* to) {
 #ifdef FUT_ASAN
   __sanitizer_finish_switch_fiber(fake, nullptr, nullptr);
 #endif
-  arrived();
+  arrived(), vmSwitched();
 }
 uint64_t draw(Sched* s) { return s->rng ^= s->rng << 13, s->rng ^= s->rng >> 7, s->rng ^= s->rng << 17; }
 Iso* pick(Sched* s, size_t k) {  // take the k-th runnable isolate (chanMu held)
@@ -271,6 +286,11 @@ struct Reload {
   std::string err;        // the first part that failed
 };
 Reload& rl = *new Reload;
+#if __wasm__
+void rlLeft() {}
+Sched* poolThread() { return nullptr; }  // (never: wasm's programs are all seeded)
+void reloadPoint() {}  // (a reload waits until the program is down to one isolate: fut.js)
+#else
 pthread_cond_t rlCv = PTHREAD_COND_INITIALIZER;  // the reloader waits on it for the others to stop, or to report
 void rlLeft() { if (rl.phase) pthread_cond_broadcast(&rlCv); }  // an isolate stopped running (chanMu held)
 void* ticker(void*) {  // ask isolates that had a whole slice to yield, while another of their thread's waits
@@ -291,10 +311,14 @@ void detached(void* (*f)(void*), void* arg) {
   if (int e = pthread_create(&th, &a, f, arg)) fprintf(stderr, "fut: cannot start a thread (%s)\n", strerror(e)), exit(1);
   pthread_attr_destroy(&a);
 }
+#endif
 void ready(Iso* i) {  // runnable: queue it (chanMu held)
   i->state = Iso::RUNNABLE, i->sched->runq.push_back(i);
+#if !__wasm__
   if (!i->sched->det) pthread_cond_signal(&i->sched->cv);
+#endif
 }
+#if !__wasm__
 void* worker(void* p) {  // a pool thread: runs the isolates given to it, each until it waits, yields or ends
   Sched* w = (Sched*)p;
 #ifdef FUT_TSAN
@@ -324,6 +348,7 @@ Sched* poolThread() {  // the pool thread a new isolate goes to: a new one while
   }
   return best->load++, best;
 }
+#endif
 // m gives up its thread until woken (chanMu held, and held again when it returns): seeded, to the next isolate the
 // generator picks; else back to the pool thread's loop.
 void reloadPoint();
@@ -340,17 +365,23 @@ void park(Iso* m) {
   reloadPoint();  // (resumed, perhaps only to take part in a reload)
   chanMu.lock();
 }
+// (wasm: always seeded, by 1 unless --seed n: there is one thread, and the interleaving might as well be the same
+// every run)
 void schedule(Iso* r) {  // r's program spawns for the first time: how its isolates will run (chanMu held)
   if (r->sched) return;
+#if __wasm__
+  uint64_t seed = isolateSeed ? isolateSeed : 1;
+#else
   if (!isolateSeed) { r->sched = &pooled; return; }
-  r->sched = new Sched{true, isolateSeed, isolateSeed};
-  r->pinned = false, r->saved = stateNew();
+  uint64_t seed = isolateSeed;
   threadStack(r->lo, r->size);
+#endif
+  r->sched = new Sched{true, seed, seed};
+  r->pinned = false, r->saved = stateNew();
 #ifdef FUT_TSAN
   r->tsan = __tsan_get_current_fiber();
 #endif
 }
-#endif
 
 Iso* self() {
   if (!me) isolateRoot();
@@ -361,8 +392,9 @@ void wake(Iso* i) {  // (chanMu held)
   i->woken = true, i->root->blocked--;
 #if !__wasm__
   if (i->pinned) pthread_cond_signal(&i->cv);
-  else if (i->state == Iso::PARKED) ready(i);  // (else it is still running: it woke itself, finding a deadlock)
+  else
 #endif
+  if (i->state == Iso::PARKED) ready(i);  // (else it is still running: it woke itself, finding a deadlock)
 }
 void wakeAll(std::vector<Iso*>& q) { for (Iso* i : q) wake(i); }  // each removes itself when it wakes
 std::string describe(Iso* i) {
@@ -402,8 +434,9 @@ std::string waitFor(std::vector<Iso*>* q, const char* what, void* ra) {
       pthread_cond_wait(&m->cv, &chanMu.m);
     }
   else
-    while (!m->woken) park(m);
 #endif
+  if (!m->pinned)
+    while (!m->woken) park(m);
   m->waiting = false;
   if (q) std::erase(*q, m);
   if (m->stop) return STOPPED;
@@ -645,7 +678,30 @@ V n_channel(V n) {
 }
 
 // ---- isolates ----
-#if !__wasm__
+struct IsoRun { TaskState* t; Msg* result; };
+void isoRun(void* p) {  // the spawned call: its globals and arguments rebuilt here, then the call; its result encoded
+  TaskState* t = ((IsoRun*)p)->t;
+  volatile V a[8] = {};  // on the stack, so the GC sees them
+  bool clo;
+  void* code;
+  {
+    Locked code(codeMu);  // compiled functions and classes, a reload's new ones too (the spawner's copy may predate it)
+    for (auto& g : globals) if (g.slot >= 0 && g.o) vm->globals[g.slot] = box(g.o);
+  }
+  {
+    Reader r(t->start);  // the function, its arguments, then the spawner's globals (rebuilt before any code runs)
+    V f = r.get(), args = r.get();
+    u32 ng = r.raw<u32>();
+    for (u32 i = 0; i < ng; i++) vm->globals[i] = r.get();
+    auto& l = as<List>(args)->v;
+    clo = is(f, K::Clo), code = clo ? as<Clo>(f)->fn->code : as<Fn>(f)->code;
+    a[0] = f;
+    for (size_t i = 0; i < l.size(); i++) a[i + clo] = l[i];
+  }
+  t->start = Msg();  // only this isolate reads it
+  reloadPoint();     // spawned before a reload, and starting during it: its part first
+  *((IsoRun*)p)->result = encode(vmEnter(code, (V*)a));
+}
 void isoEntry() {  // the bottom frame of every spawned isolate's stack
 #ifdef FUT_ASAN
   __sanitizer_finish_switch_fiber(nullptr, nullptr, nullptr);
@@ -653,10 +709,10 @@ void isoEntry() {  // the bottom frame of every spawned isolate's stack
   arrived();
   Iso* m = me = running;
   TaskState* t = m->task;
-  vm = vmNew();
+  vm = vmNew(), vmSwitched();
   Heap* h = heapNew(vm->runs);
   heapUse(h);
-  stackTop = (uintptr_t*)(m->stack + ISO_STACK), vm->limit = m->stack + (256 << 10);
+  stackTop = (uintptr_t*)(m->stack + ISO_STACK), vm->limit = m->stack + ISO_GUARD;
   {
     Locked l(chanMu);
     m->vmb = vm;
@@ -666,36 +722,26 @@ void isoEntry() {  // the bottom frame of every spawned isolate's stack
   outSink = t->out;
   std::string trace;
   V err = NIL;
+  Msg result;
+  IsoRun run{t, &result};
+#if __wasm__
+  bool failed = false;  // fut's errors are wasm exceptions here, which only the host's try_call catches (wasm.cpp)
+  if (catchFut(isoRun, &run, &err, &trace)) {
+    failed = true;
+    std::pair<V, Msg*> e{err, &result};
+    if (catchFut([](void* p) { auto* e = (std::pair<V, Msg*>*)p; *e->second = encode(e->first); }, &e, nullptr, nullptr))
+      result = encode(box(newStr(toStr(err))));  // its error could not be sent itself: its text then
+  }
+#else
   jmp_buf jb;
   errJmp = &jb, errValue = &err, errSink = &trace;
-  Msg result;
   volatile bool failed = false, again = false;
   if (setjmp(jb)) {
     failed = true;
     if (again) result = encode(box(newStr(toStr(err))));  // its error could not be sent itself: its text then
     else again = true, result = encode(err);
-  } else {
-    volatile V a[8] = {};  // on the stack, so the GC sees them
-    bool clo;
-    void* code;
-    {
-      Locked code(codeMu);  // compiled functions and classes, a reload's new ones too (the spawner's copy may predate it)
-      for (auto& g : globals) if (g.slot >= 0 && g.o) vm->globals[g.slot] = box(g.o);
-    }
-    {
-      Reader r(t->start);  // the function, its arguments, then the spawner's globals (rebuilt before any code runs)
-      V f = r.get(), args = r.get();
-      u32 ng = r.raw<u32>();
-      for (u32 i = 0; i < ng; i++) vm->globals[i] = r.get();
-      auto& l = as<List>(args)->v;
-      clo = is(f, K::Clo), code = clo ? as<Clo>(f)->fn->code : as<Fn>(f)->code;
-      a[0] = f;
-      for (size_t i = 0; i < l.size(); i++) a[i + clo] = l[i];
-    }
-    t->start = Msg();  // only this isolate reads it
-    reloadPoint();     // spawned before a reload, and starting during it: its part first
-    result = encode(vmEnter(code, (V*)a));
-  }
+  } else isoRun(&run);
+#endif
   errJmp = nullptr, errValue = nullptr, errSink = nullptr, outSink = nullptr;
   Iso* r = m->root;
   {
@@ -726,12 +772,10 @@ void isoEntry() {  // the bottom frame of every spawned isolate's stack
   switchTo(m, to);  // and whatever runs next frees this stack
   __builtin_unreachable();
 }
-#endif
 V n_spawn(V f, V args) {
   void* ra = RA();
   effRequire(EFF_SPAWN, "spawn", ra);
   if (vm->txn) rtError(ra, "@atomic spawn inside atomic { }: an isolate, once started, can't be taken back (spawn after the block)");
-  if (WASM) rtError(ra, "@spawn spawn needs the native build for now (in wasm, isolates will be web workers)");
   Fn* fn = is(f, K::Clo) ? as<Clo>(f)->fn : is(f, K::Fn) ? as<Fn>(f) : nullptr;
   if (!fn) rtError(ra, "@spawn spawn expects a function to call, got %s", typeName(f));
   if (fn->op || !fn->code) rtError(ra, "@spawn spawn: %s is a builtin; spawn a function that calls it", symName(fn->name).c_str());
@@ -745,9 +789,8 @@ V n_spawn(V f, V args) {
   w.raw((u32)ng);
   for (int i = 0; i < ng; i++) w.put(vm->globals[i]);
   TaskState* t = new TaskState;  // one reference for the isolate, one for this handle
-  t->start = std::move(w.m), t->at = codeWhere(ra), t->allowed = vm->allowed, t->who = vm->who, t->out = outBase();
+  t->start = std::move(w.m), t->at = WASM_OR(hereWhere(), codeWhere(ra)), t->allowed = vm->allowed, t->who = vm->who, t->out = outBase();
   V h = handle(t, K::Task);
-#if !__wasm__
   char* stack = stackNew();
   if (!stack) release(t), rtError(ra, "@memory spawn: out of memory for the isolate's stack");
   Iso* c = new Iso;
@@ -769,7 +812,6 @@ V n_spawn(V f, V args) {
   // Seeded, the run is the same every time, so fut test --changed may reuse its result (if the seed is its default).
   if (traceOn && (!det || isolateSeed != 1)) traceImpure();
   isolatePoint();  // seeded: the new isolate may go first
-#endif
   return h;
 }
 V t_join(V tv) {
@@ -944,7 +986,6 @@ void isolateYield() {
 #endif
 }
 void isolatePoint() {
-#if !__wasm__
   Iso* m = me;
   if (!m || !m->sched || !m->sched->det || locksHeld) return;
   Sched* s = m->sched;
@@ -955,15 +996,12 @@ void isolatePoint() {
   m->state = Iso::RUNNABLE, s->runq.push_back(m);
   chanMu.unlock();
   switchTo(m, to);
-#endif
 }
 std::string isolateSeedNote() {
-#if !__wasm__
   Iso* r = me ? me->root : nullptr;
   if (r && r->sched && r->sched->det)
     return "its isolates ran under seed " + std::to_string(r->sched->seed) + ": --seed " + std::to_string(r->sched->seed) +
            " replays the same interleaving, and other seeds try others\n";
-#endif
   return "";
 }
 void isolateRoot() {

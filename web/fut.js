@@ -17,6 +17,8 @@
 //   importModule(path, stamp): Promise of a JS module's namespace (stamp: change it to load the file again)
 //   stamp(path): anything that changes when the file does (a modification time), for reloading modules
 //   std: the directory of the standard library's packages (import "std/strings")
+//   exit(code): end the process (an isolate called exit(), or failed in the host); default: the error is thrown
+//   seed: the seed that picks how a program's isolates take turns (they share the one thread; default 1)
 // The interpreter's try_call(cb, ctx): runs the C++ callback cb(ctx) (a try_table's body) and returns its result, or
 // catches a fut exception, stores its payload (i64) at ctx, puts the stack pointer back and returns -1. Static, so a
 // Worker can upload it compiled.
@@ -253,6 +255,26 @@ export async function createFut(opts) {
   });
   const yieldTo = (f) => new Promise((res) => { const fb = fibers.get(f); fb.cont = res, fb.back(); });
 
+  // ---- isolates (isolate.cpp): each a wasm stack of its own, on the one thread; a switch suspends the running one
+  // and, once it has suspended, resumes the next (or starts it: a promising call of fut_ctx_start) ----
+  const ctxs = new Map();  // a waiting context (its shadow stack pointer) -> what resumes it
+  let ctxStart, lastThrown = null, trySlot = 0;
+  const tryCallSlot = () => trySlot || (trySlot = table.grow(1, new WebAssembly.Instance(opts.tryModule ?? new WebAssembly.Module(tryCallBytes()), { env }).exports.try_call));
+  const ctxSwitch = (save, to) => new Promise((res) => {
+    ctxs.set(save, res);
+    queueMicrotask(() => {
+      const c = ctxs.get(to);
+      if (c) return ctxs.delete(to), c();
+      // An isolate catches fut's errors itself (catchFut): what escapes is the host's (exit(), a trap). The program
+      // can't go on: its isolates wait on each other.
+      ctxStart(to).catch((e) => {
+        if (!(e instanceof Exit)) report(e);
+        if (opts.exit) return opts.exit(e instanceof Exit ? e.code : 1);
+        setTimeout(() => { throw e; });
+      });
+    });
+  });
+
   // ---- stack traces: V8 names our frames name@slot and gives the module offset; fut_where maps it to a line ----
   function trace(e) {
     const fr = e?.futTrace != null ? e.futTrace.split(/(?<=\n)/).filter(Boolean) : [];
@@ -311,6 +333,8 @@ export async function createFut(opts) {
     await evalInbox();
     await runCallbacks();
     if (!fileChanged) return;
+    // Isolates the program started share its code, but not its globals: a reload waits until they have ended.
+    if (ex.fut_isolates() > 1) return void setTimeout(poke, 50);
     fileChanged = false;
     const c = await load(true);
     if (!c) return;  // compile error: keep running the old code
@@ -336,12 +360,20 @@ export async function createFut(opts) {
       return report(e), 1;
     }
   }
+  // The program ended (st: 0, or 1 after an uncaught error): wait for the isolates it started, stopping them if it
+  // failed. A deadlock among them, or one that failed with nothing joining it: "" or the text that fails it now.
+  const isolatesFinish = async (failed) => cstr(await finishP(failed ? 1 : 0));
+  async function finish(st) {
+    const r = await isolatesFinish(st != 0);
+    if (!r || st) return st;
+    return write(2, "runtime error: " + r + "\n"), 1;
+  }
   async function start(c) {  // the top level, then main() (rerun when a reload changes it)
     let st = await runCode(c);
     ex.fut_retire(c), (inMain = true);
     for (let m; !st && (m = withStr("main", (p) => ex.fut_fn(p))) && (st = await runCode(m)) == 2; st = 0)
       write(2, "[fut] main() changed: restarting it\n");
-    return (inMain = false), st;
+    return (inMain = false), finish(st);
   }
   const event = () => new Promise((r) => (wake = r));
   async function waitChange() {  // typed lines still run meanwhile, so the stopped program's state can be inspected
@@ -378,7 +410,7 @@ export async function createFut(opts) {
     },
     grow: (n, fill) => table.grow(n, table.get(fill)),
     throw(v) {
-      const e = new WebAssembly.Exception(tag, [v], { traceStack: true });
+      const e = (lastThrown = new WebAssembly.Exception(tag, [v], { traceStack: true }));
       if (opts.interp) e.futTrace = cstr(ex.fut_interp_trace());  // interpreted frames aren't V8's: fut_where them now
       throw e;
     },
@@ -394,6 +426,13 @@ export async function createFut(opts) {
     ref_gone(id) { refIds.delete(refs.get(id)), refs.delete(id); },
     resume: S(resume), yield: S(yieldTo), fiber_gone: (f) => fibers.delete(f),
     vm: (p) => void (vmG.value = p),
+    ctx_switch: S(ctxSwitch), ctx_gone: (c) => ctxs.delete(c),
+    trycall: () => tryCallSlot(),
+    where() {  // the innermost fut frame: the first of a trace taken here
+      const t = trace(opts.interp ? { futTrace: cstr(ex.fut_interp_trace()) } : { stack: new Error().stack });
+      return (held = enc.encode(t.split("\n")[0].replace(/^ {2}at /, ""))), held.length;
+    },
+    last_trace: () => ((held = enc.encode(lastThrown ? trace(lastThrown) : "")), held.length),
     sleep: S((s) => new Promise((r) => setTimeout(r, Math.max(0, s * 1000)))),
     poll: S(() => (ffiDepth ? void (pollLater = true) : hostPoll())),  // not inside a callback: after the extern call
     run: S(async (argsP, srcP, timeout) => {  // run(): fut in a child process, if the host can (opts.run)
@@ -423,16 +462,15 @@ export async function createFut(opts) {
   ex = inst.exports, (mem = ex.memory), (table = ex.__indirect_function_table), (spG = ex.__stack_pointer);
   Object.assign(env, { memory: mem, table, sp: spG, tag, vm: vmG });
   const callP = WebAssembly.promising(ex.fut_call), applyP = WebAssembly.promising(ex.fut_apply);
-  fiberStart = WebAssembly.promising(ex.fut_fiber_start);
-  if (opts.interp) {
-    const tm = opts.tryModule ?? new WebAssembly.Module(tryCallBytes());
-    ex.fut_set_trycall(table.grow(1, new WebAssembly.Instance(tm, { env }).exports.try_call));
-  }
+  fiberStart = WebAssembly.promising(ex.fut_fiber_start), ctxStart = WebAssembly.promising(ex.fut_ctx_start);
+  const finishP = WebAssembly.promising(ex.fut_isolates_finish);
+  if (opts.interp) ex.fut_set_trycall(tryCallSlot());
   ex._initialize();
   if (opts.untimed) ex.fut_untimed(1);  // a Worker's clock moves only across I/O: expect grows can't time code there
   if (opts.heapMB) ex.fut_heap(opts.heapMB);  // the heap's size (default 256 MB): a Cloudflare Worker has 128 MB in all
   ex.fut_init((opts.verbose ? 1 : 0) | (opts.noTier ? 2 : 0) | (opts.interp ? 4 : 0)), (pollAt = ex.fut_poll());
-  if (opts.std) withStr(opts.std, (p) => ex.fut_std(p));  // where the standard library's packages are
+  if (opts.std) withStr(opts.std, (p) => ex.fut_std(p));
+  if (opts.seed) ex.fut_seed(opts.seed);  // how a program's isolates interleave (default 1)  // where the standard library's packages are
 
   const pinned = new Map();  // name -> id, for apply()
   let applying = Promise.resolve();  // one apply at a time: they share the main shadow stack
@@ -488,11 +526,14 @@ export async function createFut(opts) {
     },
     async test(file, json, filter) {  // fut test: the top level, then each test block; exit status
       path = file;
-      const errorOf = async (slot) => {  // null, or the uncaught error's message and trace
-        try { return await call(slot), null; } catch (e) {
+      const errorOf = async (slot) => {  // null, or the uncaught error's message and trace (or what its isolates did)
+        let err = null;
+        try { await call(slot); } catch (e) {
           if (e instanceof Restart || e instanceof Exit) throw e;
-          return errorText(e);
+          err = errorText(e);
         }
+        const r = await isolatesFinish(err != null);
+        return err ?? (r ? r + "\n" : null);
       };
       try {
         // The filter is set after the compile: nothing before it may depend on the filter, so the code a test file

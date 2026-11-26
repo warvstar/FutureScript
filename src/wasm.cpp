@@ -9,6 +9,7 @@
 #include "wasm.h"
 #include <cmath>
 #include <map>
+#include <unordered_map>
 
 #define HOST(name) __attribute__((import_module("host"), import_name(#name)))
 #define EXPORT(name) extern "C" __attribute__((export_name(#name)))
@@ -29,6 +30,11 @@ HOST(resume) void host_resume(Fiber* f, int start);            // suspending: ru
 HOST(yield) void host_yield(Fiber* f);                         // suspending: back to f's resumer
 HOST(fiber_gone) void host_fiber_gone(Fiber* f);
 HOST(vm) void host_vm(VM* v);                                  // the running isolate's VM block: JIT code's global 1
+HOST(ctx_switch) void host_ctx_switch(void* save, void* to);   // suspending: this context waits as `save`; `to` runs
+HOST(ctx_gone) void host_ctx_gone(void* ctx);
+HOST(trycall) u32 host_trycall();                             // try_call's table slot (instantiated now, if need be)
+HOST(last_trace) int host_last_trace();                       // the last fut error thrown: its frames' text (in take)
+HOST(where) int host_where();                                 // the innermost fut frame running: "f (file:line)" (in take)
 HOST(sleep) void host_sleep(double seconds);                   // suspending
 HOST(poll) void host_poll();                                   // suspending: run typed lines, reload changed files
 HOST(run) int host_run(const char* args, const char* source, double timeout);  // suspending: run(): the result's length (in take), -1: none
@@ -317,6 +323,11 @@ V vmEnter(void* code, V* args) {
 [[noreturn]] void throwValue(V v, void*) { host_throw(v); }
 void traceAdd(const std::string&) {}  // wasm traces come from the engine
 std::string codeWhere(void*) { return ""; }
+std::string hereWhere() {
+  std::string s;
+  if (int n = host_where(); n > 0) s.resize(n), host_take(s.data());
+  return s;
+}
 static jmp_buf* compileJmp;
 static std::string compileErr;
 static bool compileAtEnd;
@@ -333,6 +344,9 @@ bool guardCompile(void (*f)(void*), void* ctx, std::string* err) {  // a compile
 constexpr size_t FIBER_STACK = 256 << 10;
 static char* mainLimit;
 static std::map<Fiber*, void*> interpTops;  // interpMode: each switched-out context's innermost interpreted frame
+ISO_LOCAL(mainLimit);
+ISO_LOCAL(interpTops);
+ISO_LOCAL(interpTop);
 void fiberFree(Fiber* f) {
   if (interpMode) interpTops.erase(f);
   if (f->stack) free(f->stack), f->stack = nullptr, host_fiber_gone(f);
@@ -367,6 +381,34 @@ void fiberRun(Fiber* f, bool start) {
 }
 void fiberYield(Fiber* f) { leave(), host_yield(f), enter(f); }
 void restartMain() { host_restart(); }
+
+// ---------------- isolates' contexts (isolate.cpp): each its own wasm stack, which the host suspends and resumes ----
+// A context is named by its shadow stack pointer while it waits (a fresh one by the top of its stack), which no other
+// context can have.
+static std::unordered_map<void*, void (*)()> freshCtx;  // made, not yet started: their entry
+void* ctxFrame(uintptr_t* top, void (*entry)()) { return freshCtx[top] = entry, top; }
+void ctxSwap(void** save, void* to) {
+  void* sp = getsp();
+  *save = sp, host_ctx_switch(sp, to), setsp(sp);
+}
+EXPORT(fut_ctx_start) void ctxStart(void* top) {  // the host starts a fresh context: on its own stack, at its entry
+  setsp(top);
+  auto it = freshCtx.find(top);
+  void (*entry)() = it->second;
+  freshCtx.erase(it), entry();
+}
+void ctxGone(void* ctx) { host_ctx_gone(ctx); }
+extern u32 tryCallSlot;  // interp.cpp
+struct TryBox { int64_t payload; void (*body)(void*); void* ctx; };  // payload first: try_call stores it there
+static int tryTramp(TryBox* b) { return b->body(b->ctx), 0; }
+bool catchFut(void (*body)(void*), void* ctx, V* err, std::string* trace) {
+  if (!tryCallSlot) tryCallSlot = host_trycall();
+  TryBox b{0, body, ctx};
+  if (((int (*)(u32, TryBox*))(uintptr_t)tryCallSlot)(wa::slotOf((void*)tryTramp), &b) != -1) return false;
+  if (err) *err = (V)b.payload;
+  if (int n; trace && (n = host_last_trace()) > 0) trace->resize(n), host_take(trace->data());
+  return true;
+}
 
 // ---------------- files, paths, time ----------------
 bool readFile(const std::string& path, std::string& out) {
@@ -440,6 +482,8 @@ EXPORT(fut_init) void futInit(int flags) {  // installs the natives' adapters
   rtInit(), jitCollect(), refRelease = host_ref_gone;
 }
 EXPORT(fut_set_trycall) void futSetTryCall(u32 slot) { interpSetTryCall(slot); }  // the host's try_call (see interp.cpp)
+EXPORT(fut_isolates) int futIsolates() { return isolates; }  // running now: the program's first, and those it spawned
+EXPORT(fut_seed) void futSeed(double seed) { isolateSeed = (uint64_t)seed; }  // --seed n
 EXPORT(fut_heap) void futHeap(u32 mb) { gcRegion(size_t(mb) << 20); }  // before fut_init
 void setUntimed(bool on);  // test.cpp
 EXPORT(fut_untimed) void futUntimed(u32 on) { setUntimed(on); }  // a host whose clock stands still while code runs
@@ -482,6 +526,9 @@ EXPORT(fut_call) V futCall(int slot) { return vmCall((void*)(uintptr_t)slot); }
 EXPORT(fut_retire) void futRetire(int slot) { jitRetire((u32*)(uintptr_t)slot); }
 EXPORT(fut_str) const char* futStr(V v) { return (text = toStr(v)).c_str(); }
 EXPORT(fut_error_line) const char* futErrorLine(V v) { return (text = errorLine(v)).c_str(); }  // with its [code]
+// The program ended (failed: with an error): wait for the isolates it started (stopping them if it failed). "" or
+// what fails it now: a deadlock among them, or one that failed with nothing joining it. (Suspending: call it promising.)
+EXPORT(fut_isolates_finish) const char* futIsolatesFinish(int failed) { return (text = isolatesFinish(failed)).c_str(); }
 EXPORT(fut_where) const char* futWhere(int slot, int off) {  // "name (file:line)" for a frame at module offset off
   auto it = lineTabs.find(slot);
   if (it == lineTabs.end() || it->second.file.empty()) return "";

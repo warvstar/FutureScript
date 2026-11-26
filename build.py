@@ -16,7 +16,7 @@ WASM_FLAGS = ["--target=wasm32-wasip1", "--sysroot=/opt/homebrew/share/wasi-sysr
 WASM_LINK = ["-mexec-model=reactor", "-lsetjmp", "-Wl,--export=__stack_pointer", "-Wl,--export-table", "-Wl,--growable-table",
              "-Wl,-z,stack-size=8388608", "-Wl,--stack-first"]
 NATIVE_ONLY, WASM_ONLY = {"main.cpp", "jit.cpp", "sys.cpp"}, {"wasm.cpp", "interp.cpp"}
-NATIVE_SPECS = {"isolates.fut", "codes_isolates.fut"}  # spawn needs threads: in wasm, isolates will be web workers (docs/isolates.md, phase 5)
+NATIVE_SPECS = set()  # specs only the native build runs
 
 
 def build(debug=False, wasm=False, tsan=False):
