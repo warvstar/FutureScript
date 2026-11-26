@@ -605,6 +605,57 @@ def runner_codes(exe):
     return ok, f"{missing}\n  explain: {e.stdout!r} {e.stderr!r} / {u.returncode}"
 
 
+def runner_worker(exe):
+    """Cloudflare Workers (web/worker.mjs): a serve bundle answers requests and test bundles (in shards, with run()
+    children) pass, all under Node with code generation off as in a Worker; a module that doesn't match fails loudly.
+    With wrangler on PATH, the serve bundle also answers a request in workerd (wrangler dev)."""
+    if exe.suffix != ".wasm":
+        return True, "wasm only"
+    d, w = ROOT / "build" / "worker-check", str(ROOT / "web" / "worker.mjs")
+    shutil.rmtree(d, ignore_errors=True)
+    node = lambda *a: subprocess.run(["node", w, *a], capture_output=True, text=True, timeout=120)
+    b = node("build", str(ROOT / "examples" / "worker" / "hello.fut"), str(d / "serve"))
+    if b.returncode:
+        return False, "build: " + b.stderr
+    r1, r2 = node("run", str(d / "serve"), "/"), node("run", str(d / "serve"), "/echo", "--method", "POST", "--body", "hi")
+    if r1.stdout != '200 application/json\n{"hello":"from fut","hits":1}\n' or '"method":"POST"' not in r2.stdout or '"body":"hi"' not in r2.stdout:
+        return False, f"serve: {r1.stdout!r} {r1.stderr!r}\n  {r2.stdout!r} {r2.stderr!r}"
+    specs = [str(ROOT / "tests" / "specs" / f) for f in ("bits.fut", "try.fut", "err_arity.fut", "imports.fut")]
+    t = node("build", "--tests", "--shards", "2", "--root", str(ROOT / "tests"), str(d / "tests"), *specs)
+    m = json.loads((d / "tests" / "manifest.json").read_text()) if not t.returncode else {}
+    r = node("test", str(d / "tests"), "--json")
+    last = json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else {}
+    if t.returncode or len(m.get("shards", [])) != 2 or r.returncode or last.get("failed") or last.get("errors") or last.get("passed", 0) < 18:
+        return False, f"tests: {t.stdout}{t.stderr}\n  {r.stdout[-800:]}{r.stderr[-800:]}"
+    bj = d / "serve" / "bundle.json"  # a compile that doesn't match what was compiled ahead of time: a clear 500
+    bundle = json.loads(bj.read_text())
+    bundle["serve"]["keys"].reverse()
+    bj.write_text(json.dumps(bundle))
+    bad = node("run", str(d / "serve"), "/")
+    if not bad.stdout.startswith("500") or "not one compiled ahead of time" not in bad.stdout:
+        return False, f"mismatch: {bad.stdout!r} {bad.stderr!r}"
+    if not shutil.which("wrangler"):
+        return True, ""
+    bundle["serve"]["keys"].reverse()
+    bj.write_text(json.dumps(bundle))
+    import socket
+    with socket.socket() as so:
+        so.bind(("127.0.0.1", 0))
+        port = so.getsockname()[1]
+    p = subprocess.Popen(["wrangler", "dev", "--port", str(port)], cwd=d / "serve", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        import urllib.request
+        for _ in range(120):
+            try:
+                body = urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5).read().decode()
+                return body == '{"hello":"from fut","hits":1}', f"wrangler dev: {body!r}"
+            except OSError:
+                time.sleep(0.5)
+        return False, "wrangler dev did not answer"
+    finally:
+        p.terminate()
+
+
 RUNNER_TESTS = [("fut test --json: statuses, details, output", runner_json),
                 ("packages: names, interfaces, boundaries, versions", runner_packages),
                 ("fut map: packages, files, declarations", runner_map),
@@ -614,7 +665,8 @@ RUNNER_TESTS = [("fut test --json: statuses, details, output", runner_json),
                 ("docs/spec.md: every fut block passes", runner_spec),
                 ("error codes: registered, used, raised, explained", runner_codes),
                 ("fut test --changed: reruns what an edit affects", runner_changed),
-                ("std: imports without dep, names, property tests, pure externs", runner_std)]
+                ("std: imports without dep, names, property tests, pure externs", runner_std),
+                ("Cloudflare Workers: serve, test shards, compiled ahead of time", runner_worker)]
 
 
 def fuzz(exe, n=300, seed=None):
