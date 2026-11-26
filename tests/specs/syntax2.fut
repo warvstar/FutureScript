@@ -134,3 +134,15 @@ test "syntax errors suggest fut spellings and preserve ordinary identifiers" {
   fn function(const) { return const }
   expect function(null + and) == 3
 }
+test "keywords are map keys and field names: {class: x}, m.class" {
+  var m = {class: "note", fn: 1, if: 2, nil: 3, true: 4}
+  expect m.class == "note" && m["fn"] == 1 && m.if == 2 && m[nil] == 3 && m[true] == 4
+  m.class = "warn"
+  expect m["class"] == "warn"
+}
+test "a name from a module imported with a name says where it is; two imports can't share a name" {
+  expect run({source: "import \"std/lists\"\nprint(sort([2, 1]))"}).err.has("undefined name 'sort': it is in lists, so write lists.sort [undefined-name]")
+  expect run({source: "import \"std/strings\" as s\nprint(lines(\"a\"))"}).err.has("it is in s, so write s.lines")
+  expect run({source: "import \"std/lists\"\nimport \"std/strings\" as lists\nprint(1)"}).err.has("'lists' already names another import in this file: give one of them a different name with 'as' [import]")
+  expect run({source: "import \"std/lists\"\nimport \"std/lists\"\nprint(lists.sort([2, 1]))"}).out == "[1, 2]\n"
+}

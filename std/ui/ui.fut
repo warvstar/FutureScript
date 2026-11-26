@@ -143,7 +143,7 @@ pub fn hole(marker, c) { addAt(nil, marker, c) }  // a template's place for a ch
 pub fn textAt(t, f: fn) { region(nil, nil, f, t) }  // a template's text, kept current
 
 // Prop k of node n: "on<event>" takes a handler, given {type, value, checked, key, x, y, clientX, clientY, button, ctrl, shift, alt, meta}; a function shows its current
-// result; "class" (a keyword: write {"class": ...}), "id" and other attributes take text (nil or false removes one); "value" and "checked" set the
+// result; "class" (a keyword, which a map key may be: {class: ...}), "id" and other attributes take text (nil or false removes one); "value" and "checked" set the
 // field's state.
 fn prop(n, k, v) {
   if k.slice(0, 2) == "on" { listen(n, k.slice(2, k.len()), v) return }

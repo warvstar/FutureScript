@@ -265,6 +265,13 @@ struct Compiler : Gen {
     else if (word == "let" || word == "const") hint = "declare a variable with 'var'";
     else if (word == "function" || word == "def") hint = "declare a function with 'fn'";
     if (hint) failAt(t.p, t.line, "@undefined-name undefined name '%s': %s", name(s), hint);
+    if (auto f = aliases.find(file); f != aliases.end())  // a pub name of a module or package this file imported with a name
+      for (auto& [a, m] : f->second) {
+        int q = intern(m + "." + word);
+        bool pkg = pkgRootOf.count(m) || surfaceOf.count(m);
+        if (findGlobal(q) && (pkg ? !surfaceOf.count(m) || surfaceOf[m].count(s) : (size_t)q < pubSym.size() && pubSym[q]))
+          failAt(t.p, t.line, "@undefined-name undefined name '%s': it is in %s, so write %s.%s", name(s), name(a), name(a), name(s));
+      }
     failAt(t.p, t.line, "@undefined-name undefined name '%s'", name(s));
   }
   int globalSym(int s) {  // the file's own names first, then its package's, then global (builtins only, in a package)
@@ -789,11 +796,12 @@ struct Compiler : Gen {
     return close;
   }
   void collect(int base, int n, int h) { addsp(0, base), imm(1, n), helper(h), F->depth = base; }  // list/map from slots
-  void mapLit() {  // {key: value, name: value}; a bare name before ':' is a string key
-    int base = F->depth, n = 0;
+  void mapLit() {  // {key: value, name: value}; a bare name before ':' is a string key, keywords too ({class: "x"}),
+    int base = F->depth, n = 0;  // except the ones that are values (true false nil self)
     if (!accept('}')) {
       do {
-        if (at(T_ID) && cur.sym >= NKW && peekIs(':')) next(), konst(symName(prev.sym));
+        bool value = atKw(K_true) || atKw(K_false) || atKw(K_nil) || atKw(K_self);
+        if (at(T_ID) && !value && peekIs(':')) next(), konst(symName(prev.sym));
         else expr();
         st(0, slot()), expect(':'), expr(), st(0, slot()), n++;
       } while (accept(','));
@@ -1102,7 +1110,7 @@ struct Compiler : Gen {
         bool optional = at(T_OPT_DOT);
         next();
         Tok ft = cur;
-        int s = ident();
+        int s = at(T_ID) ? (next(), prev.sym) : ident();  // keywords too: m.class, as {class: ...} writes
         bool own = v.k == LV_LOCAL && F->cls >= 0 && v.a == F->selfHome;  // self.name
         if (own && !tiering && !(at('(') && !cur.nl))
           fieldUses.push_back({F->cls, s, {ft.p, ft.line, file, srcStart}});  // self.name: checked once every class is known
@@ -2462,7 +2470,12 @@ struct Compiler : Gen {
         if (re && !tg.pkg.empty()) failAt(t.p, t.line, "@import 'pub import' re-exports a file of this package; a package's dependencies are not part of its interface");
         if (re && n.t == T_ID) failAt(n.p, n.line, "@import 'pub import' re-exports the file's pub names as they are: leave out 'as'");
         if (re) reexports[path].push_back(ip);
-        if (!tg.pkg.empty()) aliases[path][n.t == T_ID ? n.sym : intern(::base(std::string(t.p, (size_t)t.len)))] = tg.pkg;  // the package's name
+        auto claim = [&](int a, const std::string& m) {  // one name, one module: a second import can't quietly take it
+          auto [it, fresh] = aliases[path].emplace(a, m);
+          if (!fresh && it->second != m)
+            failAt(n.t == T_ID ? n.p : t.p, n.t == T_ID ? n.line : t.line, "@import '%s' already names another import in this file: give one of them a different name with 'as'", symName(a).c_str());
+        };
+        if (!tg.pkg.empty()) claim(n.t == T_ID ? n.sym : intern(::base(std::string(t.p, (size_t)t.len))), tg.pkg);  // the package's name
         if (sources.count(ip) && !nsOf.count(ip)) continue;  // the program's own file: already here, with global names
         std::string& pre = nsOf[ip];
         if (pre.empty()) {  // the file's stem (after its package's prefix), made unique
@@ -2471,7 +2484,7 @@ struct Compiler : Gen {
           while (prefixTaken(pre, ip)) pre += "_";
         }
         if (tg.pkg.empty() && n.t == T_ID) {  // import "file" as name: a module (unless an earlier import already made its pub names global)
-          aliases[path][n.sym] = pre;
+          claim(n.sym, pre);
           if (!sources.count(ip)) isModule[ip] = true;
         } else if (tg.pkg.empty() && isModule[ip]) plainModules[path].push_back(ip);
         if (sources.count(ip)) continue;
