@@ -58,8 +58,12 @@ const std::string& symName(int s) { return nameBlocks[s / NB].load(std::memory_o
 
 static int nextGlobal;
 int globalCount() { return nextGlobal; }
+static void newGlobalSlot(int slot);
 Global& global(int sym) {
-  if (Global& g = growAt(globals, sym); g.slot < 0 && (g.slot = nextGlobal++) >= MAXG) compileFail("too many globals", false);
+  if (Global& g = growAt(globals, sym); g.slot < 0) {
+    if (nextGlobal >= MAXG) compileFail("too many globals", false);
+    g.slot = nextGlobal, newGlobalSlot(g.slot);
+  }
   return globals[sym];
 }
 Global* findGlobal(int sym) { return (size_t)sym < globals.size() && globals[sym].slot >= 0 ? &globals[sym] : nullptr; }
@@ -99,6 +103,15 @@ int newIC(bool set) {
   TSAN_UNSEEN_END();
   return nics++;
 }
+// Each isolate's copy of a new global starts nil (a new isolate's: vmNew, which sets only the slots in use, as most
+// of its 64K are never used). Written from the compiling thread, as newIC's.
+static void newGlobalSlot(int slot) {
+  Locked g(icMu);
+  TSAN_UNSEEN_BEGIN();
+  for (VM* v : vms) v->globals[slot] = NIL;
+  TSAN_UNSEEN_END();
+  nextGlobal = slot + 1;
+}
 void clearSetICs() { Locked g(icMu); for (int i : setICs) vm->ics[i].key = EMPTY; }
 u32 icEpoch = 1;
 void clearICs() {  // a reload: every isolate is stopped
@@ -115,7 +128,7 @@ VM* vmNew() {
 #endif
   Locked g(icMu);
   if (!vms.empty()) memcpy(v->helpers, vms[0]->helpers, sizeof v->helpers);
-  for (V& x : v->globals) x = NIL;
+  for (int i = 0; i < nextGlobal; i++) v->globals[i] = NIL;  // (the rest: newGlobalSlot)
   for (int i = 0; i < nics; i++) v->ics[i].key = EMPTY;
   v->allowed = EFF_BITS, v->hstack = NIL;  // unchecked, no handlers (as effectsInit)
   v->fuel = int64_t(1) << 62;              // no budget (fuel.cpp)
@@ -212,7 +225,7 @@ static void render(std::string& out, V v, bool quote, std::unordered_set<Obj*>& 
     case K::Ref: out += "<js value>"; return;
     case K::Chan: out += "<channel>"; return;
     case K::Task: out += "<task>"; return;
-    case K::Buf: {  // f32s[1, 0.1]: an f32 shown with the fewest digits that give it back
+    case K::Buf: {  // f32s[1, 0.1]: an f32 shown with the fewest digits that give it back (a dead handle: [])
       Buf* b = (Buf*)o;
       out += bufName(b->et), out += '[';
       for (size_t i = 0; i < b->n; i++) {
@@ -294,7 +307,8 @@ std::string toStr(V v, bool quote) {
 }
 static bool equal(V a, V b) {
   if (isNum(a) && isNum(b)) return num(a) == num(b);
-  return a == b || (is(a, K::Str) && is(b, K::Str) && as<Str>(a)->sv() == as<Str>(b)->sv());
+  return a == b || (is(a, K::Str) && is(b, K::Str) && as<Str>(a)->sv() == as<Str>(b)->sv()) ||
+         (is(a, K::Buf) && is(b, K::Buf) && as<Buf>(a)->s && as<Buf>(a)->s == as<Buf>(b)->s);  // handles on one buffer
 }
 V variantField(Inst* in, int s) {
   int i = in->cls->layout.find(s);
@@ -531,59 +545,8 @@ void mapPut(Map* m, std::string_view k, V v) {
   volatile V keep[] = {box(m), v};  // on the stack while the key allocates
   (void)keep, mapSet(m, box(newStr(k)), v);
 }
-// ---- packed buffers ----
-const char* bufName(char et) { return et == 'f' ? "f32s" : et == 'u' ? "u32s" : et == 'i' ? "i32s" : "u8s"; }
-Buf* newBuf(char et, size_t n) {
-  if (n > (1ull << 31)) ERR("@argument %s(): %zu elements is more than a buffer holds (2^31)", bufName(et), n);
-  uint8_t* p = (uint8_t*)calloc(n ? n : 1, bufElem(et));
-  if (!p) ERR("@host %s(): out of memory for %zu elements", bufName(et), n);
-  Buf* b = make<Buf>();
-  return b->et = et, b->n = n, b->p = p, b;
-}
-V bufGet(const Buf* b, size_t i) {
-  switch (b->et) {
-    case 'f': return box((double)((float*)b->p)[i]);
-    case 'u': return box((double)((uint32_t*)b->p)[i]);
-    case 'i': return box((double)((int32_t*)b->p)[i]);
-    default: return box((double)b->p[i]);
-  }
-}
-static void bufSet(Buf* b, size_t i, V v) {
-  if (!isNum(v)) ERR("@type cannot store %s in %s: it holds numbers", typeName(v), bufName(b->et));
-  double d = num(v);
-  if (b->et == 'f') return void(((float*)b->p)[i] = (float)d);
-  double lo = b->et == 'i' ? -2147483648.0 : 0, hi = b->et == 'u' ? 4294967295.0 : b->et == 'i' ? 2147483647.0 : 255;
-  if (!(d >= lo && d <= hi && d == std::trunc(d)))
-    ERR("@type cannot store %s in %s: it holds whole numbers from %.0f to %.0f", toStr(v).c_str(), bufName(b->et), lo, hi);
-  if (b->et == 'u') ((uint32_t*)b->p)[i] = (uint32_t)d;
-  else if (b->et == 'i') ((int32_t*)b->p)[i] = (int32_t)d;
-  else b->p[i] = (uint8_t)d;
-}
-// f32s(n): n zeros; f32s(list) or f32s(buffer): its numbers, each checked as it is stored
-template <char ET> static V n_buf(V a) {
-  if (isNum(a)) {
-    double d = num(a);
-    if (!(d >= 0 && d == std::trunc(d))) ERR("@argument %s() expects a length (a whole number, 0 or more), a list or a buffer, got %s", bufName(ET), toStr(a).c_str());
-    return box(newBuf(ET, (size_t)d));
-  }
-  volatile V held = a;
-  (void)held;
-  if (is(a, K::List)) {
-    auto& l = as<List>(a)->v;
-    Buf* b = newBuf(ET, l.size());
-    for (size_t i = 0; i < l.size(); i++) bufSet(b, i, l[i]);
-    return box(b);
-  }
-  if (is(a, K::Buf)) {
-    Buf* s = as<Buf>(a);
-    Buf* b = newBuf(ET, s->n);
-    for (size_t i = 0; i < s->n; i++) bufSet(b, i, bufGet(s, i));
-    return box(b);
-  }
-  ERR("@argument %s() expects a length, a list or a buffer, got %s", bufName(ET), typeName(a));
-}
 static V rt_geti(V a, V i) {
-  if (is(a, K::Buf)) return bufGet(as<Buf>(a), INDEX(i, as<Buf>(a)->n));
+  if (is(a, K::Buf)) return bufIndex(a, i);
   if (is(a, K::Map)) {
     long e = mapFind(as<Map>(a), i);
     return e < 0 ? NIL : as<Map>(a)->e[e].second;
@@ -593,24 +556,20 @@ static V rt_geti(V a, V i) {
   return char1(a, INDEX(i, as<Str>(a)->len));
 }
 static V rt_seti(V a, V i, V v) {
-  if (is(a, K::Buf)) {
-    size_t at = INDEX(i, as<Buf>(a)->n);
-    touch(obj(a)), bufSet(as<Buf>(a), at, v);
-    return v;
-  }
+  if (is(a, K::Buf)) return touch(obj(a)), bufStore(a, i, v);
   if (is(a, K::Map)) {
-    if (obj(a)->typed) typeWrite(obj(a), i, v, RA());
+    if (obj(a)->typed & 1) typeWrite(obj(a), i, v, RA());
     return touch(obj(a)), mapSet(as<Map>(a), i, v), v;
   }
   if (!is(a, K::List)) ERR("@index cannot assign into %s", typeName(a));
   auto& l = as<List>(a)->v;
   size_t at = INDEX(i, l.size());
-  if (obj(a)->typed) typeWrite(obj(a), NIL, v, RA());
+  if (obj(a)->typed & 1) typeWrite(obj(a), NIL, v, RA());
   return touch(obj(a)), l[at] = v;
 }
 static V rt_iter(V c, uint64_t i) {
   if (is(c, K::List)) return i < as<List>(c)->v.size() ? as<List>(c)->v[i] : END;
-  if (is(c, K::Buf)) return i < as<Buf>(c)->n ? bufGet(as<Buf>(c), i) : END;
+  if (is(c, K::Buf)) return i < bufLive(c)->n ? bufGet(as<Buf>(c), i) : END;
   if (is(c, K::Map)) return i < as<Map>(c)->e.size() ? as<Map>(c)->e[i].first : END;
   if (is(c, K::Chan)) return chanNext(c, RA());  // each value received, until it is closed and drained
   if (is(c, K::Fiber)) {  // each yielded value; the fiber's return value ends the loop
@@ -838,7 +797,7 @@ static V n_len(V v) {
   if (is(v, K::Str)) return box((double)as<Str>(v)->len);
   if (is(v, K::List)) return box((double)as<List>(v)->v.size());
   if (is(v, K::Map)) return box((double)as<Map>(v)->e.size());
-  if (is(v, K::Buf)) return box((double)as<Buf>(v)->n);
+  if (is(v, K::Buf)) return box((double)bufLength(v));
   ERR("@argument len() of %s", typeName(v));
 }
 double now() { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
@@ -914,19 +873,10 @@ static V l_slice(V l, V a, V b) {
   if (i < j) r->v.assign(as<List>(l)->v.begin() + i, as<List>(l)->v.begin() + j);
   return box(r);
 }
-static V b_slice(V v, V a, V z) {  // a copy, like a list's
-  volatile V held = v;
-  (void)held;
-  Buf* s = as<Buf>(v);
-  size_t i = clampIx(a, s->n, "slice()"), j = clampIx(z, s->n, "slice()"), e = bufElem(s->et);
-  Buf* b = newBuf(s->et, i < j ? j - i : 0);
-  if (i < j) memcpy(b->p, s->p + i * e, (j - i) * e);
-  return box(b);
-}
 // Vectors, as gpu fns use them: vec2f(x, y), vec3f, vec4f are f32s of 2, 3 or 4 numbers. v.x (also y z w, or r g b a)
 // reads one; v.xy, v.zyx, ... make a vector of those. Arithmetic on f32s is elementwise, with an f32s of the same
 // length or a number.
-static bool isF32s(V v) { return is(v, K::Buf) && as<Buf>(v)->et == 'f'; }
+static bool isF32s(V v) { return is(v, K::Buf) && bufLive(v)->et == 'f'; }  // (a dead handle raises)
 static V elementwise(V a, V b, int op) {
   static const char* ops[] = {"+", "-", "*", "/", "%"};
   Buf *x = isF32s(a) ? as<Buf>(a) : nullptr, *y = isF32s(b) ? as<Buf>(b) : nullptr;
@@ -973,7 +923,7 @@ static int swizzle(int s, int* at) {
 }
 static V vecField(V o, uint64_t s) {
   int at[4], k = swizzle((int)s, at);
-  Buf* b = as<Buf>(o);
+  Buf* b = bufLive(o);
   if (k < 0 || b->et != 'f') ERR("@no-field %s has no field '%s'", typeName(o), symName(s).c_str());
   for (int i = 0; i < k; i++)
     if ((size_t)at[i] >= b->n) ERR("@no-field .%s of an f32s of %zu: it has no %c", symName(s).c_str(), b->n, symName(s)[i]);
@@ -1070,7 +1020,7 @@ static V n_sleep(V v) { return sleepFor(NUMARG(v, "sleep")), NIL; }
 static V n_floor(V v) { return box(std::floor(NUMARG(v, "floor"))); }
 static V n_sqrt(V v) { return box(std::sqrt(NUMARG(v, "sqrt"))); }
 static V l_push(V l, V v) {
-  if (obj(l)->typed) typeWrite(obj(l), NIL, v, RA());
+  if (obj(l)->typed & 1) typeWrite(obj(l), NIL, v, RA());
   touch(obj(l)), as<List>(l)->v.push_back(v);
   return l;
 }
@@ -1148,12 +1098,9 @@ void rtInit() {
   method<+[](V f) { return boxb(as<Fiber>(f)->state == FIB_DONE); }>(K::Fiber, S_done);
   method<l_push>(K::List, S_push), method<l_pop>(K::List, S_pop), method<n_len>(K::List, S_len);
   method<n_len>(K::Str, S_len), method<n_len>(K::Map, S_len), method<n_len>(K::Buf, S_len);
-  method<b_slice>(K::Buf, intern("slice"));
-  method<+[](V b) { return box((double)(as<Buf>(b)->n * bufElem(as<Buf>(b)->et))); }>(K::Buf, intern("bytes"));
   native<n_vec2>("vec2f"), native<n_vec3>("vec3f"), native<n_vec4>("vec4f");
   method<v_length>(K::Buf, intern("length")), method<v_dot>(K::Buf, intern("dot"));
   method<v_normalize>(K::Buf, intern("normalize")), method<v_cross>(K::Buf, intern("cross"));
-  native<n_buf<'f'>>("f32s"), native<n_buf<'u'>>("u32s"), native<n_buf<'i'>>("i32s"), native<n_buf<'b'>>("u8s");
   gfxInit();
   gpuInit();
   method<m_has>(K::Map, S_has), method<m_remove>(K::Map, S_remove);
@@ -1181,6 +1128,6 @@ void rtInit() {
   method<+[](V m) { return mapList(m, false); }>(K::Map, S_values);
   testInit();
   sysInit();
-  isolatesInit();
+  isolatesInit(), bufInit();
   effectsInit();  // after the natives it marks as operations
 }

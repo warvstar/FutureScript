@@ -187,8 +187,11 @@ fn log(s) {
   events.push(line)
   if events.len() > 40 { events = events.slice(events.len() - 40, events.len()) }
 }
-fn clip(s, n) {
+var CONT_LO = "À".slice(1, 2)   // UTF-8 continuation bytes are 0x80 (À is C3 80) to 0xBF (¿ is C2 BF)
+var CONT_HI = "¿".slice(1, 2)
+fn clip(s, n) {  // indexes count bytes: back up to a character's start, or the API refuses the body as invalid UTF-8
   if s.len() <= n { return s }
+  while n > 0 && s[n] >= CONT_LO && s[n] <= CONT_HI { n -= 1 }
   return s.slice(0, n) + "\n... (" + str(s.len() - n) + " more characters cut)"
 }
 fn sh(cmd, cwd) { return exec({cmd: ["sh", "-c", cmd], cwd: cwd, timeout: 300}) }

@@ -598,6 +598,21 @@ fn main() {
 - **Hot reload.** Under `-w`, a reload stops every isolate at a safe point (a loop iteration or call, or where it waits), patches the code once, then has each run the new top level and `reload()` in its own transaction. If any of them fails, every isolate rolls back and the old code returns, as for a failed reload with one isolate. `main()` reloads even while it waits on a channel or a task.
 - **In wasm** fut.wasm (Node, a browser, a Cloudflare Worker) runs a program's isolates on its one thread, taking turns, seeded as `fut test` runs them natively (by 1, or `--seed n`): the same program interleaves the same way every run. Each isolate is a wasm stack of its own, switched with JSPI. **fut-mt.wasm**, the threads build (`python3 build.py wasm --threads`; `FUT_WASM=build/fut-mt.wasm node web/run.mjs prog.fut`), runs them in parallel as natively: a pool of up to `cores()` threads (`--threads n`), each a Node worker, over one shared memory; `fut test` is seeded there too. It needs shared memory: Node, or a cross-origin isolated page (`web/serve.mjs` sends the headers, and the page then runs fut-mt.wasm, every thread a worker, the main isolate's too; `?threads=0` runs fut.wasm), not a Cloudflare Worker. In fut-mt.wasm a reload under `-w` stops the isolates and reloads each, as natively; in fut.wasm it waits until the isolates `main()` started have ended. See phase 5 in `docs/isolates.md`.
 
+### Parallel for
+
+```
+var img = u8s(w * h)
+parallel for i in 0..w * h { img[i] = pixel(i % w, i / w, scene) }   // every core; then the next line
+```
+
+- **The iterations run on the pool's isolates at once,** a block at a time, and the loop ends when all have. A
+  mandelbrot of 1200×800 into a `u8s` takes 65–95 ms instead of 525 ms on 12 cores (a loaded machine).
+- **Its result is a plain `for`'s, on every run, machine and core count.** The body writes its results to buffers,
+  each only at `[i]`: one it writes (as `name[...] =` in the body) it can't read or write at any other index. What it
+  reads from outside (`scene`, other buffers, the globals) is a frozen copy: changing one raises. It can't assign a
+  variable from outside it, `return` or `break` (compile errors), and it performs no effects (no `print`, `random`,
+  channels). An error is the one at the lowest i that fails: `parallel for, at i = 7: ...`.
+
 ## C functions
 
 ```
@@ -660,23 +675,27 @@ while present() {                    // show the frame, handle input, wait for t
 `build/fut -w examples/paddle.fut` is a small game to live-code.
 `build/fut examples/flock.fut` is a simulation that runs the same everywhere. Its boids' behaviours are ordinary functions, each run under a step budget, so a behaviour that loops forever (hold space) is cut off on the same tick everywhere. Its test blocks (`fut test examples/flock.fut`, run by both suites) check that a seeded run's state matches a fingerprint, every bit, natively and in wasm.
 
-## Packed buffers
+## Buffers
 
-`f32s`, `u32s`, `i32s` and `u8s` hold numbers packed as the GPU and C want them: 32-bit floats, 32-bit whole numbers (unsigned or signed), or bytes.
+`f64s`, `f32s`, `u32s`, `i32s` and `u8s` hold numbers packed as C and the GPU want them: 64- or 32-bit floats, 32-bit whole numbers (unsigned or signed), or bytes, in memory outside every heap.
 
 ```
 var b = f32s(4)                      // 4 zeros; also f32s([1, 2, 3]) or f32s(another buffer)
 b[0] = 0.1                           // stored as an f32: b[0] is now 0.10000000149011612
-for x in b { }                       // b.len(), b.slice(1, 3) (a copy), b.bytes() (16)
+for x in b { }                       // b.len(), b.slice(1, 3) (a copy), b.bytes() (16), b.fill(x), b.toList()
 u8s(1)[0] = 256                      // error: cannot store 256 in u8s: it holds whole numbers from 0 to 255
 fn sum(xs: f32s): num { ... }        // each is a type too
 extern fn memset(ptr, int, long): ptr
 memset(u8s(8), 0, 8)                 // a ptr parameter gets the buffer's bytes
+var t = spawn work(xs)               // moves xs: using it here raises until it comes back (xs = t.join())
 ```
 
 **Vectors** are `f32s` of 2, 3 or 4: `vec2f(x, y)`, `vec3f(x, y, z)`, `vec4f(x, y, z, w)`, and `vec2f` (etc.) as a type is an `f32s` of that length. `v.x` (`y z w`, or `r g b a`) reads one number; `v.xy`, `v.zyx` make a new vector. `+ - * / %` on `f32s` work elementwise, with an `f32s` of the same length or a number (`v * 2`, `1 - v`), giving a new one. `v.length()`, `v.dot(w)`, `v.normalize()`, `v.cross(w)`.
 
-Their length is fixed. A store is checked: a non-number, or a number a whole-number buffer can't hold, is an error rather than a value wrapped or clipped. `==` is identity and `expect`'s compares the numbers, as for lists. They print as `f32s[1, 0.1]` (an f32 with the fewest digits that give it back). They are copied when sent to another isolate, become arrays of numbers in `json` and for JavaScript, and an `atomic` block that fails puts their contents back. `b[i]` on an `f32s` is compiled inline, like a list's: about 3.7 ns for a load, add and store natively against 9 ns through the runtime (wasm: 10 ns against 37). The other kinds go through the runtime.
+- **Fixed length, checked stores.** A non-number, or a number a whole-number buffer can't hold, is an error rather than a value wrapped or clipped. They print as `f32s[1, 0.1]` (an f32 with the fewest digits that give it back), become arrays of numbers in `json` and for JavaScript, and an `atomic` block that fails puts their contents back.
+- **Compiled inline.** `b[i]` on every type is compiled like a list's (a load widens to a double; a store converts, checking the value fits): on an `f32s`, about 3.7 ns for a load, add and store natively against 9 ns through the runtime (wasm: 10 ns against 37). The collector never scans or moves their numbers.
+- **Sending moves one.** A buffer sent over a channel, passed to `spawn` or returned to `join()` is not copied: the receiver gets the same memory, and the sender's handle is dead (using it raises "was sent to another isolate"). So one isolate at a time uses a buffer, and none can race on it. A spawned isolate's copy of the globals doesn't take their buffers (pass one as an argument). A buffer can't be sent inside `atomic { }`, since a move can't be undone.
+- `==` is identity (two handles on one buffer are equal); `expect a == b` compares what they hold, as for lists.
 
 ## GPU
 

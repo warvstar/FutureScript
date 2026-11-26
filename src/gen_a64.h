@@ -297,9 +297,8 @@ struct Gen : CState {
   }
   void isObject(Jumps& miss) { E(mvn(9, 0)), E(tstptr(9)), miss.push_back(E(bcond(NE))), E(andaddr(9, 0)); }  // x9 = address
   // list[i] (x0 = the list, x1 = the index; x2 = the value to store): inline when x0 is a list and 0 <= i < len,
-  // which a NaN (any non-number) fails; a fraction truncates, as in rt_geti. An f32s too (a number stored; a NaN
-  // loaded goes to the helper, which boxes it). Else, and for stores inside a transaction (which save the list or
-  // buffer first), the helper.
+  // which a NaN (any non-number) fails; a fraction truncates, as in rt_geti. A buffer of any type too (buffer.cpp).
+  // Else, and for stores inside a transaction (which save the list or buffer first), the helper.
   void index(bool set) {
     Jumps miss;
     isObject(miss);
@@ -316,18 +315,53 @@ struct Gen : CState {
     else E(ldrreg(0, 11, 10));
     int done = E(B);
     patch(notList);
+    // A buffer (a store: not FROZEN, a number): x10 = the index, below n (a dead handle's is 0); x11 = its numbers.
     E(cmpwi(10, (u32)K::Buf)), miss.push_back(E(bcond(NE)));
-    E(ldrbo(10, 9, BUF_ET)), E(cmpwi(10, 'f')), miss.push_back(E(bcond(NE)));
     if (set) E(ldrw(10, 28, 4)), E(cmpwi(10, 0)), miss.push_back(E(bcond(NE)));
     if (set) E(mvn(12, 2)), E(tstq(12)), miss.push_back(E(bcond(EQ)));  // not a number
     E(fmovdx(16, 1)), E(fcmpz(16)), miss.push_back(E(bcond(LT)));
     E(ldr(12, 9, BUF_N)), E(ucvtf(17, 12)), E(fcmp(16, 17)), miss.push_back(E(bcond(PL)));
-    E(fcvtzu(10, 16)), E(ldr(11, 9, BUF_P));
-    if (set) E(fmovdx(18, 2)), E(fcvtsd(18, 18)), E(strsreg(18, 11, 10)), E(mov(0, 2));
-    else E(ldrsreg(16, 11, 10)), E(fcvtds(16, 16)), E(fcmp(16, 16)), miss.push_back(E(bcond(VS))), E(fmovxd(0, 16));
-    int done2 = E(B);
+    E(fcvtzu(10, 16)), E(ldr(11, 9, BUF_P)), E(ldrbo(12, 9, BUF_ET));
+    if (set) E(fmovdx(18, 2));
+    // Each element type: a load widens to a double (an f32 NaN goes to the helper, which boxes it); a store of a whole
+    // number type converts, and checks the conversion was exact and in range (else the helper raises).
+    Jumps typeMiss, typeDone;
+    for (char et : {'d', 'f', 'i', 'b', 'u'}) {
+      E(cmpwi(12, (u32)et));
+      int next = E(bcond(NE));
+      switch (et) {
+        case 'd':
+          if (set) E(strreg(2, 11, 10)), E(mov(0, 2));
+          else E(ldrreg(0, 11, 10));
+          break;
+        case 'f':
+          if (set) E(fcvtsd(18, 18)), E(strsreg(18, 11, 10)), E(mov(0, 2));
+          else E(ldrsreg(16, 11, 10)), E(fcvtds(16, 16)), E(fcmp(16, 16)), typeMiss.push_back(E(bcond(VS))), E(fmovxd(0, 16));
+          break;
+        case 'i': case 'b':
+          if (set) {
+            E(fcvtzs(13, 18));
+            if (et == 'i') E(cmpsxtw(13, 13)), typeMiss.push_back(E(bcond(NE)));
+            else E(cmpi(13, 255)), typeMiss.push_back(E(bcond(HI)));
+            E(scvtf(17, 13)), E(fcmp(18, 17)), typeMiss.push_back(E(bcond(NE)));  // a fraction, or out of range
+            E(et == 'i' ? strwreg(13, 11, 10) : strbreg(13, 11, 10)), E(mov(0, 2));
+          } else E(et == 'i' ? ldrswreg(13, 11, 10) : ldrbreg(13, 11, 10)), E(scvtf(17, 13)), E(fmovxd(0, 17));
+          break;
+        case 'u':
+          if (set) {
+            E(fcvtzu(13, 18)), E(lsri(14, 13, 32)), E(cmpi(14, 0)), typeMiss.push_back(E(bcond(NE)));
+            E(ucvtf(17, 13)), E(fcmp(18, 17)), typeMiss.push_back(E(bcond(NE)));
+            E(strwreg(13, 11, 10)), E(mov(0, 2));
+          } else E(ldrwreg(13, 11, 10)), E(ucvtf(17, 13)), E(fmovxd(0, 17));
+          break;
+      }
+      typeDone.push_back(E(B));
+      patch(next);
+    }
     for (int m : miss) patch(m);
-    helper(set ? H_SETI : H_GETI), patch(done), patch(done2);
+    for (int m : typeMiss) patch(m);
+    helper(set ? H_SETI : H_GETI), patch(done);
+    for (int d : typeDone) patch(d);
   }
   // x.push(v), x in slot base, v in x0: appended inline when x is an untyped list with spare capacity and no transaction
   // is open (l_push saves the list first); the result is x. Else the method call.

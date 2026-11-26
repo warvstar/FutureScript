@@ -212,7 +212,7 @@ void finalize(Obj* o) {
     case K::Fiber: fiberFree((Fiber*)o); break;
     case K::Ref: refFree((Ref*)o); break;
     case K::Chan: case K::Task: sharedFree(o); break;
-    case K::Buf: free(((Buf*)o)->p); break;
+    case K::Buf: bufFree(o); break;
     default: break;
   }
   o->kind = K::Free;

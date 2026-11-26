@@ -1,6 +1,6 @@
-// Packed buffers: f32s, u32s, i32s and u8s hold numbers as 32-bit floats, 32-bit whole numbers or bytes, for the GPU
-// and C. Their length is fixed; each store is checked (and an f32 rounded), and a `ptr` parameter of an extern fn gets
-// their bytes.
+// Buffers: f64s, f32s, u32s, i32s and u8s hold numbers as 64- or 32-bit floats, 32-bit whole numbers or bytes, for
+// speed, the GPU and C, outside every heap. Their length is fixed; each store is checked (and an f32 rounded), a `ptr`
+// parameter of an extern fn gets their bytes, and sending one to another isolate moves it.
 fn err(f) { try { f() } catch e { return "{e}" } return "" }
 
 test "made from a length, a list or another buffer" {
@@ -57,11 +57,9 @@ test "an atomic block that throws puts its writes back" {
   expect b == u32s([1, 2])
 }
 
-test "sent between isolates, and to JSON, as copies of their numbers" {
-  var c = channel(1)
-  c.send(u8s([1, 2]))
-  expect c.recv() == u8s([1, 2])
+test "JSON gets their numbers" {
   expect json(f32s([1.5, 2])) == "[1.5,2]"
+  expect json(f64s([0.5, 3])) == "[0.5,3]"
 }
 
 test "an f32s in a hot loop: compiled inline, with NaN and the edges still exact" {
@@ -75,4 +73,72 @@ test "an f32s in a hot loop: compiled inline, with NaN and the edges still exact
   expect throws { b[1000] }
   expect throws { b[-1] = 1 }
   expect throws { b[0] = nil }
+}
+
+fn errorOf(f) {
+  try { f() } catch e { return e }
+  return nil
+}
+fn fillWith(b, x) { return b.fill(x) }
+var G = f64s(2)
+fn readG() { return errorOf(fn() { return G[0] }) }
+
+test "f64s hold any number, and fill, toList, bytes" {
+  var b = f64s(3)
+  b[1] = 0.1
+  b[2] += 1
+  expect b[1] == 0.1 && b[2] == 1
+  expect "{b}" == "f64s[0, 0.1, 1]"
+  expect b.toList() == [0, 0.1, 1]
+  expect b.bytes() == 24 && u8s(3).bytes() == 3
+  expect u8s(2).fill(7) == u8s([7, 7])
+  expect err(fn() { i32s(2).fill(0.5) }).has("whole numbers")
+}
+
+test "every type indexes inline in hot loops, reads and checked stores" {
+  var d = f64s(500)
+  var w = i32s(500)
+  var u = u8s(500)
+  var q = u32s(500)
+  var s = 0
+  for k in 0..100 {
+    for i in 0..500 { d[i] = i * 0.5  w[i] = i - 250  u[i] = i % 256  q[i] = i * 8000000 }
+    s = 0
+    for i in 0..500 { s += d[i] + w[i] + u[i] + q[i] }
+  }
+  expect s == 62375 - 250 + 62286 + 998000000000
+  var errs = 0
+  for k in 0..1000 {
+    if errorOf(fn() { u[0] = 256 + k % 3 }) != nil { errs += 1 }
+    if errorOf(fn() { q[0] = -1 - k % 2 }) != nil { errs += 1 }
+    if errorOf(fn() { w[0] = 0.5 }) != nil { errs += 1 }
+  }
+  expect errs == 3000
+  q[0] = 4294967295
+  u[0] = -0
+  expect q[0] == 4294967295 && u[0] == 0
+}
+
+test "sending one moves it: the sender's handle is dead" {
+  var b = f64s([1, 2, 3])
+  var t = spawn fillWith(b, 9)
+  expect errorOf(fn() { return b[0] }).has("was sent to another isolate")
+  expect errorOf(fn() { return b.len() }).has("was sent")
+  var back = t.join()
+  expect back == f64s([9, 9, 9])
+  expect t.join() == back
+  var c = channel(2)
+  var u = u8s([1, 2])
+  c.send({a: u, b: u})
+  var m = c.recv()
+  expect m.a[1] == 2
+  expect errorOf(fn() { c.send(u) }).has("was sent")
+  expect errorOf(fn() { atomic { c.send(m.a) } }).has("can't be sent inside atomic")
+  expect m.a[0] == 1
+}
+
+test "a spawned isolate's globals don't take their buffers" {
+  expect (spawn readG()).join().has("belongs to another isolate")
+  G[0] = 5
+  expect G[0] == 5
 }

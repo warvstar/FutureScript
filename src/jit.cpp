@@ -101,7 +101,7 @@ static V rt_ffi(V a0, V a1, V a2, V a3, V a4, V a5, V a6, Ext* e) {
     V v = a[i];
     char t = ffiCheck(e, i, v);
     if (t == 'd') d[nd++] = num(v);
-    else x[nx++] = t == 's' ? (int64_t)as<Str>(v)->s() : t == 'B' ? (int64_t)as<Buf>(v)->p : t == 'N' ? 0 : (int64_t)num(v);
+    else x[nx++] = t == 's' ? (int64_t)as<Str>(v)->s() : t == 'B' ? (int64_t)bufBytes(v) : t == 'N' ? 0 : (int64_t)num(v);
   }
   // Integer and floating-point arguments use separate registers (x0..x7, d0..d7), so passing all 16 calls any
   // non-variadic C function correctly; it reads the ones it declares.

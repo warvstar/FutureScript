@@ -77,8 +77,9 @@ window(w, h)   present() -> false once closed (once per frame, waits 1/60 s)
 clear(rgb)   rect(x, y, w, h, rgb)   circle(x, y, r, rgb)     rgb = 0xRRGGBB, origin top-left
 key(name) -> bool   "a".."z" "0".."9" space enter escape tab up down left right
 mousex()   mousey()   mousedown() -> bool
-f32s(n | list | buf)  u32s  i32s  u8s   packed numbers (32-bit float / whole / byte), fixed length, also types: b[i] (each
-                         store checked; f32 rounds), for x in b, b.len(), b.slice(a, b), b.bytes(). An extern's ptr param gets the bytes
+f64s(n | list | buf)  f32s  u32s  i32s  u8s   packed numbers (64/32-bit float, 32-bit whole, byte), fixed length, outside the heap,
+                         also types: b[i] (each store checked; f32 rounds), for x in b, len, slice(a, b), bytes(), fill(x), toList().
+                         An extern's ptr param gets the bytes; sending one moves it (the sender's handle dies)
 vec2f(x, y)  vec3f  vec4f   an f32s of 2/3/4, also types; v.x .y .z .w (.r .g .b .a), swizzles v.xy v.zyx -> new;
                          + - * / % on f32s elementwise (with same-length f32s or a number) -> new; v.length() v.dot(w)
                          v.normalize() v.cross(w)
@@ -202,6 +203,13 @@ commit; `recv`/`join`/`spawn` there raise. Unjoined failures fail the program. P
 stops all isolates, then each runs the new top level and `reload()`; all commit or all roll back. Wasm: fut.wasm has one
 thread, always seeded (default 1); fut-mt.wasm (the threads build) has the pool, on workers, and reloads as natively;
 in fut.wasm a reload waits for the isolates to end.
+```
+parallel for i in 0..n { out[i] = f(xs[i]) }   // the iterations on the pool's isolates; ends when all have
+```
+Same result as a plain `for`, every run: whole-number range; the body can't assign outside variables, `return` or
+`break` (compile errors); a buffer it writes (`name[...] = ` in the body itself) it reaches only at `[i]`; what else it
+reads from outside is a frozen copy (changing one raises, globals too); no effects. An error is the lowest failing
+i's: "parallel for, at i = 7: ...". [parallel]
 
 ## Modules, packages
 
