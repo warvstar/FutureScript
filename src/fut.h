@@ -583,7 +583,7 @@ struct PropSite { std::string file, text, discard; int line = 0, expect = -1; bo
 int propSite(PropSite);
 void testInit();
 // The strings and headers are borrowed from the request value.
-struct FetchRequest { std::string_view url, method = "GET", body; Map* headers = nullptr; double timeout = 60; };
+struct FetchRequest { std::string_view url, method = "GET", body; Map* headers = nullptr; double timeout = 60, idleTimeout = 0; };  // idleTimeout 0: none
 std::string_view strViewArg(V, const char* fn, const char* what);
 double numArg(V, const char* fn, const char* what);
 FetchRequest fetchRequest(V, const char* fn);

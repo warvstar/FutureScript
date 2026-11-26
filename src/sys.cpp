@@ -1,6 +1,6 @@
 // The host, for programs that talk to the world (native build; all of it is the io effect):
-//   fetch(req)        HTTP: req is a url or {url, method, headers, body, timeout}; -> {status, body, headers}, or
-//                     {status: 0, error} when nothing came back (a failed request doesn't throw)
+//   fetch(req)        HTTP: req is a url or {url, method, headers, body, timeout, idleTimeout}; -> {status, body,
+//                     headers}, or {status: 0, error} when nothing came back (a failed request doesn't throw)
 //   fetchAll(reqs)    the requests at once (one thread each); -> their results, in order
 //   exec(cmd)         a process: cmd is [argv...] or {cmd: [argv...], cwd, input, timeout}; -> {code, out, err, timedOut}
 //   execAll(cmds)     the processes at once; -> their results, in order
@@ -11,6 +11,8 @@
 #include <curl/curl.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <spawn.h>
 #include <sys/stat.h>
 #include <thread>
@@ -24,10 +26,17 @@ std::string strArg(V v, const char* fn, const char* what) { return std::string(s
 V str(std::string_view s) { return box(newStr(s)); }
 
 // ---- fetch ----
-struct Res { long status = 0; std::string body, error; std::vector<std::pair<std::string, std::string>> headers; };
+struct Res {
+  long status = 0;
+  std::string body, error;
+  std::vector<std::pair<std::string, std::string>> headers;
+  double last = 0;    // when the transfer last moved a byte (request bytes sent, a header or body byte received)
+  curl_off_t up = 0;  // request bytes sent so far
+};
 
-size_t onBody(char* p, size_t n, size_t k, void* s) { return ((std::string*)s)->append(p, n * k), n * k; }
+size_t onBody(char* p, size_t n, size_t k, void* s) { return ((Res*)s)->body.append(p, n * k), ((Res*)s)->last = now(), n * k; }
 size_t onHeader(char* p, size_t n, size_t k, void* s) {
+  ((Res*)s)->last = now();
   std::string_view h(p, n * k);
   if (auto c = h.find(':'); c != std::string_view::npos) {
     std::string name(h.substr(0, c));
@@ -38,6 +47,29 @@ size_t onHeader(char* p, size_t n, size_t k, void* s) {
     ((Res*)s)->headers.push_back({name, std::string(val)});
   }
   return n * k;
+}
+// idleTimeout: libcurl calls this about once a second while it waits, and more often while data moves. Any byte
+// counts as progress, in either direction, headers included; so a server that sends nothing until its whole answer
+// is ready looks idle meanwhile (that is what the option measures: pick a limit above its think time, or stream).
+// CURLOPT_LOW_SPEED_LIMIT/TIME measures much the same, but averages the speed over a few seconds and takes whole
+// seconds.
+struct Idle { Res* r; double limit; bool hit = false; };
+int onProgress(void* p, curl_off_t, curl_off_t, curl_off_t, curl_off_t ulnow) {
+  Idle& i = *(Idle*)p;
+  double t = now();
+  if (ulnow != i.r->up) i.r->up = ulnow, i.r->last = t;
+  return t - i.r->last > i.limit ? (i.hit = true, 1) : 0;
+}
+// Dead peers (a host gone, a NAT entry dropped): TCP keepalive on every connection. The peer's kernel answers the
+// probes however long its server takes, so this never cuts off a slow answer, only a connection nobody holds: idle
+// 30 s, then 3 probes 10 s apart, about a minute in all. (libcurl sends no HTTP/2 PING during a transfer; and a
+// proxy that holds the connection while its upstream is gone answers both, which only idleTimeout can catch.)
+int onSocket(void*, curl_socket_t fd, curlsocktype) {
+#ifdef TCP_KEEPCNT  // CURLOPT_TCP_KEEPCNT is libcurl 8.9+
+  int n = 3;
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &n, sizeof n);
+#endif
+  return CURL_SOCKOPT_OK;
 }
 void perform(const FetchRequest& q, Res& r) {  // on any thread: reads the calling isolate's request while it waits
   CURL* c = curl_easy_init();
@@ -54,12 +86,23 @@ void perform(const FetchRequest& q, Res& r) {  // on any thread: reads the calli
   if (q.body.data()) curl_easy_setopt(c, CURLOPT_POSTFIELDS, q.body.data()), curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)q.body.size());
   if (q.method == "HEAD") curl_easy_setopt(c, CURLOPT_NOBODY, 1L);
   curl_easy_setopt(c, CURLOPT_HTTPHEADER, hs);
-  curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, onBody), curl_easy_setopt(c, CURLOPT_WRITEDATA, &r.body);
+  curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, onBody), curl_easy_setopt(c, CURLOPT_WRITEDATA, &r);
   curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, onHeader), curl_easy_setopt(c, CURLOPT_HEADERDATA, &r);
   curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L), curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
   curl_easy_setopt(c, CURLOPT_TIMEOUT_MS, (long)(q.timeout * 1000)), curl_easy_setopt(c, CURLOPT_ERRORBUFFER, err);
   curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");
-  if (CURLcode rc = curl_easy_perform(c); rc != CURLE_OK) r.error = err[0] ? err : curl_easy_strerror(rc), r.headers.clear();
+  curl_easy_setopt(c, CURLOPT_TCP_KEEPALIVE, 1L), curl_easy_setopt(c, CURLOPT_TCP_KEEPIDLE, 30L), curl_easy_setopt(c, CURLOPT_TCP_KEEPINTVL, 10L);
+  curl_easy_setopt(c, CURLOPT_SOCKOPTFUNCTION, onSocket);
+  Idle idle{&r, q.idleTimeout};
+  if (q.idleTimeout > 0) {
+    curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, onProgress), curl_easy_setopt(c, CURLOPT_XFERINFODATA, &idle);
+    curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+  }
+  r.last = now();
+  if (CURLcode rc = curl_easy_perform(c); rc != CURLE_OK) {
+    if (idle.hit) snprintf(err, sizeof err, "idle timeout: no data for %g s (idleTimeout)", q.idleTimeout);
+    r.error = err[0] ? err : curl_easy_strerror(rc), r.headers.clear();
+  }
   else curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &r.status);
   curl_slist_free_all(hs), curl_easy_cleanup(c);
 }

@@ -1018,18 +1018,19 @@ double numArg(V v, const char* fn, const char* what) {
 FetchRequest fetchRequest(V v, const char* fn) {
   FetchRequest r;
   if (is(v, K::Str)) return r.url = strViewArg(v, fn, "the url"), r;
-  if (!is(v, K::Map)) ERR("@argument %s() expects a url or {url, method, headers, body, timeout}, got %s", fn, typeName(v));
+  if (!is(v, K::Map)) ERR("@argument %s() expects a url or {url, method, headers, body, timeout, idleTimeout}, got %s", fn, typeName(v));
   for (auto& [k, x] : as<Map>(v)->e) {
     std::string_view key = strViewArg(k, fn, "an option name");
     if (key == "url") r.url = strViewArg(x, fn, "url");
     else if (key == "method") r.method = strViewArg(x, fn, "method");
     else if (key == "body") r.body = strViewArg(x, fn, "body");
     else if (key == "timeout") r.timeout = numArg(x, fn, "timeout");
+    else if (key == "idleTimeout") r.idleTimeout = numArg(x, fn, "idleTimeout");
     else if (key == "headers") {
       if (!is(x, K::Map)) ERR("@argument %s(): headers must be a map of strings", fn);
       r.headers = as<Map>(x);
       for (auto& [hk, hv] : r.headers->e) strViewArg(hk, fn, "a header name"), strViewArg(hv, fn, "a header value");
-    } else ERR("@argument %s(): unknown option '%s' (url, method, headers, body, timeout)", fn, key.data());
+    } else ERR("@argument %s(): unknown option '%s' (url, method, headers, body, timeout, idleTimeout)", fn, key.data());
   }
   if (r.url.empty()) ERR("@argument %s(): no url", fn);
   return r;

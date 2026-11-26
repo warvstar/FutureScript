@@ -867,7 +867,50 @@ console.log(st, dom.html(dom.query("body")).length, err.join(""));
     return True, ""
 
 
+def runner_fetch_idle(exe):
+    """fetch's idleTimeout: a server that accepts and then sends nothing fails in about idleTimeout, long before
+    timeout; one that keeps sending (a chunk every 0.3 s for 1.5 s) runs past it; a bad idleTimeout is an error."""
+    import socket, threading
+    stalled = socket.socket()  # listens and never accepts: the kernel completes the connection, nothing answers
+    stalled.bind(("127.0.0.1", 0)), stalled.listen(8)
+    trickle = socket.socket()
+    trickle.bind(("127.0.0.1", 0)), trickle.listen(8)
+    trickle.settimeout(30)
+
+    def serve():
+        try:
+            c, _ = trickle.accept()
+            with c:
+                c.recv(65536)
+                c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n")
+                for ch in b"hello":
+                    time.sleep(0.3)
+                    c.sendall(bytes([ch]))
+        except OSError:
+            pass
+    threading.Thread(target=serve, daemon=True).start()
+    d = ROOT / "build" / "fetchidle"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "idle.fut").write_text(
+        "var t = clock()\n"
+        f"var rs = fetchAll([{{url: \"http://127.0.0.1:{stalled.getsockname()[1]}/\", timeout: 30, idleTimeout: 1}},\n"
+        f"  {{url: \"http://127.0.0.1:{trickle.getsockname()[1]}/\", timeout: 30, idleTimeout: 0.8}}])\n"
+        "var dt = clock() - t\n"
+        "print([rs[0].status, rs[0].error, dt >= 0.9, dt < 4])\n"
+        "print([rs[1].status, rs[1].body])\n")
+    (d / "bad.fut").write_text("fetch({url: \"http://127.0.0.1:9/\", idleTimeout: 0})\n")
+    try:
+        r = subprocess.run([*runner(exe), str(d / "idle.fut")], capture_output=True, text=True, timeout=60)
+        bad = subprocess.run([*runner(exe), str(d / "bad.fut")], capture_output=True, text=True, timeout=60)
+    finally:
+        stalled.close(), trickle.close()
+    want = ['[0, "idle timeout: no data for 1 s (idleTimeout)", true, true]', '[200, "hello"]']
+    ok = r.stdout.splitlines() == want and bad.returncode != 0 and "idleTimeout must be a positive number" in bad.stderr
+    return ok, f"want: {want}\n  got: {r.stdout.splitlines()}\n  stderr: {r.stderr[-800:]!r}\n  bad: {bad.returncode} {bad.stderr[-300:]!r}"
+
+
 RUNNER_TESTS = [("std/math: within 1 ulp of libm, exact cases exact", runner_fmath),
+                ("fetch idleTimeout: a silent server fails fast, a trickling one doesn't", runner_fetch_idle),
                 ("fut --record / --replay: the same run again, sleeps skipped", runner_replay),
                 ("fut test --json: statuses, details, output", runner_json),
                 ("packages: names, interfaces, boundaries, versions", runner_packages),

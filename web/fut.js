@@ -662,13 +662,28 @@ export async function createFut(opts) {
   }
 
   async function httpFetch(f, q) {  // -> {status, body, headers}, or {status: 0, error} when nothing came back
+    // idleTimeout: abort when no data came for that long: the clock restarts at the response and at each body chunk
+    // (fetch() shows nothing finer: not the request's bytes going out, nor a header line by itself)
+    let idle = null, timer = 0, idled = false;
+    const touch = () => { clearTimeout(timer); timer = setTimeout(() => ((idled = true), idle.abort()), q.idleTimeout * 1000); };
     try {
-      const init = { method: q.method ?? "GET", headers: q.headers ?? {}, redirect: "follow", signal: AbortSignal.timeout((q.timeout ?? 60) * 1000) };
+      let signal = AbortSignal.timeout((q.timeout ?? 60) * 1000);
+      if (q.idleTimeout) (idle = new AbortController()), (signal = AbortSignal.any([signal, idle.signal])), touch();
+      const init = { method: q.method ?? "GET", headers: q.headers ?? {}, redirect: "follow", signal };
       if (q.body != null) init.body = q.body;
-      const r = await f(q.url, init), body = init.method == "HEAD" ? "" : await r.text(), headers = {};
+      const r = await f(q.url, init), headers = {};
+      let body = "";
+      if (init.method != "HEAD" && idle && r.body) {
+        touch();
+        const rd = r.body.getReader(), dec = new TextDecoder();
+        for (let c; !(c = await rd.read()).done; ) touch(), (body += dec.decode(c.value, { stream: true }));
+        body += dec.decode();
+      } else if (init.method != "HEAD") body = await r.text();
       r.headers.forEach((v, k) => (headers[k] = v));
       return { status: r.status, body, headers };
-    } catch (e) { return { status: 0, error: String(e?.message ?? e) }; }
+    } catch (e) {
+      return { status: 0, error: idled ? `idle timeout: no data for ${q.idleTimeout} s (idleTimeout)` : String(e?.message ?? e) };
+    } finally { clearTimeout(timer); }
   }
 
   // ---- instantiate ----

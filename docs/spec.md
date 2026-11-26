@@ -66,7 +66,9 @@ json(v)  parseJson(s)    data <-> JSON text (nil is null)
 env(name) -> str | nil
 readFile(path) -> str | nil    writeFile(path, text)   (makes parent dirs)
 exec([argv...])  exec({cmd: [argv...], cwd, input, timeout}) -> {code, out, err, timedOut}
-fetch(url)  fetch({url, method, headers, body, timeout}) -> {status, body, headers}; failure: {status: 0, error}, no throw
+fetch(url)  fetch({url, method, headers, body, timeout, idleTimeout}) -> {status, body, headers}; failure: {status: 0, error}, no throw
+                         timeout: s for the whole request (default 60); idleTimeout: fail after s with no bytes moving
+                         (a server that answers only when done is idle while it works); native: TCP keepalive drops dead peers
 execAll([cmd, ...])  fetchAll([req, ...])   run at once, results in order
                          time/json/parseJson/fetch/fetchAll also in wasm; the other host builtins are native only
 l.push(v) -> l   l.pop() -> v   l.len()   l.slice(a, b)   l.join(sep) -> str
