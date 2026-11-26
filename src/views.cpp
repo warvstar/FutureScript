@@ -344,7 +344,7 @@ struct Views {
   }
   static bool templated(const El& e) {  // fut's own tags that do more than an element, binding and SVG: ui.make
     static const std::set<std::string> own = {"field", "choice", "area", "check", "dialog", "link", "svg", "g", "path", "line",
-      "polyline", "polygon", "rect", "circle", "ellipse", "defs", "linearGradient", "stop", "title", "label", "tabs", "tab", "menu"};
+      "polyline", "polygon", "rect", "circle", "ellipse", "defs", "linearGradient", "stop", "title", "label", "tabs", "tab", "menu", "files"};
     if (e.name == "table") for (auto& a : e.attrs) if (std::get<0>(a) == "rows") return false;  // ui.table's
     return e.bind.empty() && !own.count(e.name);
   }

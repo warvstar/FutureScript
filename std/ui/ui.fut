@@ -46,6 +46,11 @@ extern dom fn template(any): num
 extern dom fn instance(num, num): any
 extern dom fn focus(any): void
 extern dom fn dropdown(any, any): void
+extern dom fn filesFrom(any, any, fn): void
+extern dom fn readFile(any, str, fn): void
+extern dom fn fileUrl(any): str
+extern dom fn sendFile(any, any, fn, fn): any
+extern dom fn stopUpload(any): void
 
 // What kind of child v is: "none" (nil, false, true), "text" (a string or number), "fn", "list" or "node".
 fn kindOf(v) {
@@ -736,6 +741,79 @@ fn drawRow(item, i, height, view, inner) {
   return {item: item, node: slot, dispose: dispose}
 }
 
+// ---- files ----
+
+// A place to choose files, or drop them, setting s (a signal) to the list of them: each {name, size, type, file}. kids:
+// what it says ("Drop photos here, or choose"); props: accept ("image/*", ".csv"), multiple (true: more than one), and
+// the box's own. The box has class "files", and "over" while files are dragged over it.
+pub fn files(s: r.Signal, props, kids): any {
+  var p = orEmpty(props)
+  var input = el("input", {type: "file", "class": "files-input"}, nil)
+  for k in ["accept", "multiple", "disabled"] { if p.has(k) { prop(input, k, p.remove(k)) } }
+  var box = el("label", withClass(p, "files"), [input, kids])
+  filesFrom(box, input, fn(list) { s.set(list) })
+  return box
+}
+
+// Something under way: a file being read or sent. data() (what came of it), error() (nil, or what went wrong),
+// loading() and progress() (0 to 1), each followed as a signal is; stop() gives up on it.
+pub class Task {
+  fn init() {
+    self.value = r.signal(nil)
+    self.err = r.signal(nil)
+    self.busy = r.signal(true)
+    self.part = r.signal(0)
+    self.handle = nil
+  }
+  fn data() { return self.value.get() }
+  fn error() { return self.err.get() }
+  fn loading() { return self.busy.get() }
+  fn progress() { return self.part.get() }
+  fn stop() { if self.handle != nil && self.busy.peek() { stopUpload(self.handle) } }
+  fn end(value, err) {
+    var me = self
+    r.batch(fn() {
+      me.busy.set(false)
+      me.err.set(err)
+      if err == nil { me.value.set(value) me.part.set(1) }
+    })
+  }
+}
+fn reading(file, as) {
+  var t = Task()
+  readFile(file, as, fn(res) { t.end(res["value"], res["error"]) })
+  return t
+}
+// A file's text (file: one of files()'s), as a Task: data() is the text once read.
+pub fn readText(file): Task { return reading(file, "text") }
+// A file as a data: URL (for an image's src), as a Task.
+pub fn readUrl(file): Task { return reading(file, "url") }
+// An address that shows the file at once (an image's preview), without reading it into fut.
+pub fn preview(file): str { return fileUrl(file) }
+
+// Send body to to (a URL, or {url, method, headers}): a file (one of files()'s), or a map of fields (files and text) sent
+// as a form. A Task: progress() as it goes, data() the server's answer (JSON parsed, else text).
+pub fn upload(to, body): Task {
+  var t = Task()
+  t.handle = sendFile(to, body, fn(sent, total) { if total > 0 { t.part.set(sent / total) } }, fn(res) {
+    if res.status >= 200 && res.status < 300 { t.end(decode(res.body), nil) }
+    else if res.status == 0 { t.end(nil, res.error) }
+    else { t.end(nil, "the server answered {res.status}") }
+  })
+  return t
+}
+
+// A size in bytes as people read it: 940 B, 12 KB, 3.4 MB.
+pub fn size(bytes: num): str {
+  if bytes < 1000 { return "{bytes} B" }
+  var units = ["KB", "MB", "GB", "TB"]
+  var v = bytes / 1000
+  var i = 0
+  while v >= 1000 && i < units.len() - 1 { v = v / 1000 i += 1 }
+  if v < 10 { return "{floor(v * 10) / 10} {units[i]}" }
+  return "{floor(v)} {units[i]}"
+}
+
 // ---- tables, tabs and menus ----
 
 fn cell(c, x) {  // column c's value in row x
@@ -928,7 +1006,7 @@ fn flat(k) {  // a view's children as one list
   return out
 }
 
-// An element of a view: an HTML or SVG tag, or one of fut's own (row, column, text, field, choice, area, check, dialog, link, tabs and tab, menu, table rows:), with props
+// An element of a view: an HTML or SVG tag, or one of fut's own (row, column, text, field, choice, area, check, dialog, link, tabs and tab, menu, table rows:, files), with props
 // (bind: a signal the element shows and sets) and children.
 pub fn make(tag: str, props, kids): any {
   var bound = nil
@@ -992,6 +1070,7 @@ pub fn make(tag: str, props, kids): any {
     var rest = list.slice(1, list.len())
     return {id: id, label: list[0], view: fn() { return rest }}
   }
+  if tag == "files" { return files(bound, props, kids) }  // files bind: s accept: "image/*" { "Drop them here" }
   if tag == "menu" {  // menu "Label" { button "Item" on click { ... } ... }
     var list = flat(kids)
     return menu(list[0], list.slice(1, list.len()), props)
@@ -1124,4 +1203,11 @@ dialog::backdrop \{ background: rgb(10 14 20 / .45); }
 .menu-list:not(:popover-open)[popover], .menu-list[hidden] \{ display: none; }
 .menu-list > * \{ text-align: left; border: 0; background: none; padding: 6px 10px; border-radius: calc(var(--radius) - 3px); color: inherit; text-decoration: none; }
 .menu-list > :hover, .menu-list > :focus-visible \{ background: var(--line); outline: none; }
+.files \{ display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; padding: 22px;
+  position: relative; border: 1.5px dashed var(--line); border-radius: var(--radius); color: var(--muted); text-align: center; cursor: pointer;
+  transition: border-color .12s, background .12s; }
+.files:hover, .files:focus-within \{ border-color: var(--accent); }
+.files.over \{ border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); color: var(--fg); }
+.files-input \{ position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+progress \{ accent-color: var(--accent); }
 "

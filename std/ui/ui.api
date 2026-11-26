@@ -1,4 +1,4 @@
-// The public interface of package ui 0.3.0 (ui.fut), written by `fut api`. `fut test` fails while it is out of date.
+// The public interface of package ui 0.4.0 (ui.fut), written by `fut api`. `fut test` fails while it is out of date.
 
 // f() once, after so many seconds (unless stopped first).
 pub fn after(seconds: num, f: fn): fn
@@ -33,6 +33,11 @@ pub fn every(seconds: num, f: fn): fn
 
 // A text field showing s (a signal), which typing sets.
 pub fn field(s: r.Signal, props): any
+
+// A place to choose files, or drop them, setting s (a signal) to the list of them: each {name, size, type, file}. kids:
+// what it says ("Drop photos here, or choose"); props: accept ("image/*", ".csv"), multiple (true: more than one), and
+// the box's own. The box has class "files", and "over" while files are dragged over it.
+pub fn files(s: r.Signal, props, kids): any
 
 pub fn find(selector: str): any
 
@@ -83,7 +88,7 @@ pub fn lineChart(series, opts): any
 // what source read changes. source may be a URL as it is.
 pub fn load(source): Resource
 
-// An element of a view: an HTML or SVG tag, or one of fut's own (row, column, text, field, choice, area, check, dialog, link, tabs and tab, menu, table rows:), with props
+// An element of a view: an HTML or SVG tag, or one of fut's own (row, column, text, field, choice, area, check, dialog, link, tabs and tab, menu, table rows:, files), with props
 // (bind: a signal the element shows and sets) and children.
 pub fn make(tag: str, props, kids): any
 
@@ -104,6 +109,15 @@ pub fn path(): str
 
 // A signal that starts as what was saved under key (else v), and saves each new value: `state theme = ui.persist(...)`.
 pub fn persist(key: str, v): r.Signal
+
+// An address that shows the file at once (an image's preview), without reading it into fut.
+pub fn preview(file): str
+
+// A file's text (file: one of files()'s), as a Task: data() is the text once read.
+pub fn readText(file): Task
+
+// A file as a data: URL (for an image's src), as a Task.
+pub fn readUrl(file): Task
 
 // Show the page again, built by the code as it is now: after a reload (a file with views does this in its reload()
 // unless it has its own). The state is kept; a view's own state starts again.
@@ -132,6 +146,9 @@ pub fn rows(items, height: num, view: fn, props): any
 // page shown before (as a reload shows it again) is taken down first: its effects and timers stop.
 pub fn show(view: fn): fn
 
+// A size in bytes as people read it: 940 B, 12 KB, 3.4 MB.
+pub fn size(bytes: num): str
+
 // A small line of values, no axes: the trend beside a number. values: a list, or a function of one.
 pub fn sparkline(values, props): any
 
@@ -155,10 +172,26 @@ pub fn table(rows, columns, opts): any
 // selected a signal of the shown one's id (nil: the first). The arrow keys move between them, Home and End to the ends.
 pub fn tabs(items, selected, props): any
 
+// Something under way: a file being read or sent. data() (what came of it), error() (nil, or what went wrong),
+// loading() and progress() (0 to 1), each followed as a signal is; stop() gives up on it.
+pub class Task {
+  fn data()
+  fn end(value, err)
+  fn error()
+  fn init()
+  fn loading()
+  fn progress()
+  fn stop()
+}
+
 pub fn textAt(t, f: fn)
 
 pub fn tpl(key: str, desc: fn, wire: fn): any
 
 pub fn trigger(n, event: str, data)
+
+// Send body to to (a URL, or {url, method, headers}): a file (one of files()'s), or a map of fields (files and text) sent
+// as a form. A Task: progress() as it goes, data() the server's answer (JSON parsed, else text).
+pub fn upload(to, body): Task
 
 pub fn wire(n, props)

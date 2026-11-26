@@ -90,3 +90,28 @@ test "a menu opens from its button and closes when an item is chosen" {
   ui.trigger(ui.find("#rename"), "click", nil)
   expect seen.said == "rename" && html("#menu").has("role=\"menu\" hidden>")
 }
+
+state picked = []
+view Uploader {
+  column id: "up" {
+    files bind: picked accept: ".txt" multiple: true id: "drop" { "Drop notes here, or choose" }
+    for f in picked key f.name { p "{f.name} · {ui.size(f.size)}" }
+  }
+}
+
+test "files: dropped files set the list; read one; send one" {
+  ui.mount("#page", Uploader)
+  ui.trigger(ui.find("#drop"), "drop", {files: [{name: "a.txt", size: 2500, type: "text/plain", text: "hello"}, {name: "b.txt", size: 12, type: "text/plain", text: "hi"}]})
+  expect picked.len() == 2 && html("#up").has("<p>a.txt · 2.5 KB</p>") && html("#up").has("<p>b.txt · 12 B</p>")
+  expect html("#up").has("<input type=\"file\" class=\"files-input\" accept=\".txt\" multiple>")
+  var t = ui.readText(picked[0])
+  sleep(0.01)
+  expect !t.loading() && t.data() == "hello" && t.progress() == 1
+  expect ui.readUrl(picked[1]) != nil
+  ui.respond("/notes", "\{\"saved\": 2}")
+  var up = ui.upload("/notes", {note: picked[0], tag: "x"})
+  sleep(0.01)
+  expect up.data().saved == 2 && up.progress() == 1 && up.error() == nil
+  ui.trigger(ui.find("#drop"), "drop", {files: []})
+  expect picked.len() == 2  // nothing dropped: as it was
+}
