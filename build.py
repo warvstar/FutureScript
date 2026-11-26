@@ -797,6 +797,46 @@ def runner_init(exe):
         shutil.rmtree(d, ignore_errors=True)
 
 
+def runner_site(exe):
+    """web/site.mjs: a page's program as a static site. The site's own files (files.json, its JavaScript modules, fut.js
+    and fut.wasm) run it, here under Node with std/ui's document of its own; a program that doesn't compile fails the
+    build."""
+    if exe.suffix != ".wasm" or exe.name == "fut-mt.wasm":
+        return True, "the single-thread wasm build only"
+    d = ROOT / "build" / "site-check"
+    shutil.rmtree(d, ignore_errors=True)
+    b = subprocess.run(["node", str(ROOT / "web" / "site.mjs"), "--title", "Tasks <&>", str(ROOT / "examples" / "views.fut"), str(d / "ok")],
+                       capture_output=True, text=True, timeout=120)
+    if b.returncode:
+        return False, "build: " + b.stderr
+    files = json.loads((d / "ok" / "files.json").read_text())
+    html = (d / "ok" / "index.html").read_text()
+    if "/app/views.fut" not in files or "/std/ui/ui.fut" not in files or not (d / "ok" / "std" / "ui" / "dom.js").exists():
+        return False, f"files: {sorted(files)}"
+    if "<title>Tasks &lt;&amp;&gt;</title>" not in html or '"/app/views.fut"' not in html:
+        return False, "index.html: " + html[:400]
+    run = """
+import { readFileSync } from "node:fs";
+import { createFut } from "%s/fut.js";
+const at = (p) => new URL("%s/" + p, "file://");
+const files = JSON.parse(readFileSync(at("files.json"), "utf8")), enc = new TextEncoder(), err = [];
+const fut = await createFut({ wasm: readFileSync(at("fut.wasm")), std: "/std", verbose: false,
+  read: (p) => (files[p] == null ? null : enc.encode(files[p])), importModule: (p) => import(at(p.slice(1)).href),
+  write: (fd, b) => err.push(Buffer.from(b).toString()) });
+const st = await fut.run("/app/views.fut", false);
+const dom = await import(at("std/ui/dom.js").href);
+console.log(st, dom.html(dom.query("body")).length, err.join(""));
+""" % (d / "ok", d / "ok")
+    r = subprocess.run(["node", "--input-type=module", "-e", run], capture_output=True, text=True, timeout=120)
+    if r.returncode or not r.stdout.startswith("0 ") or int(r.stdout.split()[1]) < 500:
+        return False, f"run: {r.stdout!r} {r.stderr[-1500:]!r}"
+    (d / "bad.fut").write_text('import "std/ui"\nvar x = \n')
+    bad = subprocess.run(["node", str(ROOT / "web" / "site.mjs"), str(d / "bad.fut"), str(d / "bad")], capture_output=True, text=True, timeout=120)
+    if bad.returncode != 2 or "did not compile" not in bad.stderr:
+        return False, f"a broken program: {bad.returncode} {bad.stderr!r}"
+    return True, ""
+
+
 RUNNER_TESTS = [("std/math: within 1 ulp of libm, exact cases exact", runner_fmath),
                 ("fut --record / --replay: the same run again, sleeps skipped", runner_replay),
                 ("fut test --json: statuses, details, output", runner_json),
@@ -810,6 +850,7 @@ RUNNER_TESTS = [("std/math: within 1 ulp of libm, exact cases exact", runner_fma
                 ("error codes: registered, used, raised, explained", runner_codes),
                 ("fut test --changed: reruns what an edit affects", runner_changed),
                 ("std: imports without dep, names, property tests, pure externs", runner_std),
+                ("web/site.mjs: a page as a static site that runs from its own files", runner_site),
                 ("Cloudflare Workers: serve, test shards, compiled ahead of time", runner_worker)]
 
 
