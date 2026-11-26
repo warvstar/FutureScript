@@ -1,4 +1,6 @@
-// A swarm of Claude Haiku agents building a fut project (swarm/target.md), written in fut.
+// A swarm of Claude agents building a fut project (swarm/targets/<target>.md) from scratch, written in fut.
+// It doubles as a benchmark: hidden acceptance tests (swarm/targets/<target>/accept/) score main as it grows,
+// and each run's progress by time and spend goes to swarm/results/<run>.json.
 // Planner -> approver choose the next tasks; workers implement them in their own git worktrees with tools;
 // the harness runs the tests; a reviewer approves each change before it merges into main.
 // Runs until $SWARM_DIR/STOP exists or the budget is spent. Start it with swarm/run.sh.
@@ -8,16 +10,20 @@ var DIR = env("SWARM_DIR")
 var FUT = env("FUT")
 var KEY = env("SWARM_API_KEY")
 var URL = env("SWARM_API_URL") || "https://api.anthropic.com/v1/messages"
-var MODEL = env("SWARM_MODEL") || "claude-haiku-5-5"
+var TARGET = env("SWARM_TARGET") || "fsql"
+var MODEL = env("SWARM_MODEL") || "claude-haiku-5-5"   // every role's default; SWARM_MODEL_<ROLE> overrides one
+var MODELS = {worker: env("SWARM_MODEL_WORKER") || MODEL, planner: env("SWARM_MODEL_PLANNER") || MODEL,
+              approver: env("SWARM_MODEL_APPROVER") || MODEL, reviewer: env("SWARM_MODEL_REVIEWER") || MODEL}
+var MINUTES = parseNum(env("SWARM_MINUTES") || "0")    // run time limit, summed over restarts; 0: none
 var CAP = parseNum(env("SWARM_CAP") || "20")          // dollars, hard: no request starts that could cross it
 var NWORKERS = parseNum(env("SWARM_WORKERS") || "8")
-var MAXTOK = 16000
 var MAXSTEPS = 90
 var MAXCTX = 240000                                     // chars of a worker's conversation (stays under 100K tokens)
 var WORK = DIR + "/work"
 var T0 = time()
 
-var ledger = {spent: 0, calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, rounds: 0, merged: 0, rejected: 0}
+var ledger = {spent: 0, calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, rounds: 0, merged: 0, rejected: 0,
+              elapsed: 0, byModel: {}, run: nil, timeline: []}
 var tasks = []          // {id, title, detail, files, status: queued|active|done|failed, attempts, notes}
 var proposals = []      // from the planner, waiting for the approver
 var rejections = []     // recent: "task: why"
@@ -28,6 +34,9 @@ var planWait = 0        // rounds to wait before planning again
 var nextId = 1
 var COMMON = ""
 var ROLE = {}
+var TDIR = ""           // swarm/targets/<target>
+var lastScore = -1000   // elapsed seconds at the last acceptance run
+var accept = nil        // {passed, total} on main, when the target has acceptance tests
 
 // ---- small helpers ----
 fn log(s) {
@@ -49,19 +58,25 @@ fn lines(s) {
 fn safePath(p) { return p != nil && p != "" && p[0] != "/" && !p.has("..") }
 
 // ---- money ----
-fn price(promptTokens) {
-  if promptTokens > 100000 { return {inp: 0.5, out: 2.5} }   // Haiku 5.5 above 100K prompt tokens
-  return {inp: 0.1, out: 0.5}
+var PRICES = {}         // dollars per million tokens; Haiku 5.5 has a second card for prompts over 100K tokens
+PRICES["claude-haiku-5-5"] = {inp: 0.1, out: 0.5, longInp: 0.5, longOut: 2.5, maxTok: 16000}
+PRICES["claude-sonnet-5-5"] = {inp: 2, out: 10, maxTok: 32000}
+PRICES["claude-opus-5-5"] = {inp: 4, out: 20, maxTok: 32000}
+fn price(model, promptTokens) {
+  var p = PRICES[model]
+  if p.longInp && promptTokens > 100000 { return {inp: p.longInp, out: p.longOut} }
+  return p
 }
-fn charge(u) {
+fn charge(u, model) {
   var inp = u.input_tokens || 0
   var cw = u.cache_creation_input_tokens || 0
   var cr = u.cache_read_input_tokens || 0
   var out = u.output_tokens || 0
-  var p = price(inp + cw + cr)
+  var p = price(model, inp + cw + cr)
   // conservative: cache writes at 1.25x, cache reads at the full input price
   var cost = (inp + cw * 1.25 + cr) * p.inp / 1000000 + out * p.out / 1000000
   ledger.spent += cost
+  ledger.byModel[model] = (ledger.byModel[model] || 0) + cost
   ledger.calls += 1
   ledger.input += inp
   ledger.output += out
@@ -69,20 +84,21 @@ fn charge(u) {
   ledger.cacheWrite += cw
   return cost
 }
-fn worstCase(body) {  // the most a request can cost: ~2.5 chars a token, all of it a cache write, full output
-  var est = body.len() / 2.5
-  var p = price(est)
-  return est * 1.25 * p.inp / 1000000 + MAXTOK * p.out / 1000000
+fn worstCase(r) {  // the most a request can cost: ~2.5 chars a token, all of it a cache write, full output
+  var est = r.body.len() / 2.5
+  var p = price(r.model, est)
+  return est * 1.25 * p.inp / 1000000 + PRICES[r.model].maxTok * p.out / 1000000
 }
 
 // ---- the API ----
-fn request(system, tools, messages) {
-  var body = {model: MODEL, max_tokens: MAXTOK, system: system, messages: messages, cache_control: {type: "ephemeral"}}
+fn request(role, tools, messages) {  // {body, model}
+  var model = MODELS[role]
+  var body = {model: model, max_tokens: PRICES[model].maxTok, system: system(role), messages: messages, cache_control: {type: "ephemeral"}}
   if tools != nil { body.tools = tools }
-  return json(body)
+  return {body: json(body), model: model}
 }
-fn http(body) {
-  return {url: URL, method: "POST", body: body, timeout: 600,
+fn http(r) {
+  return {url: URL, method: "POST", body: r.body, timeout: 600,
           headers: {"x-api-key": KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}}
 }
 fn system(role) {
@@ -116,7 +132,7 @@ var VERDICT_TOOLS = [tool("verdict", "Approve the change for main, or reject it 
 fn testFiles(dir) { return lines(sh("ls tests/*_test.fut 2>/dev/null", dir).out) }
 fn runTests(dir) {
   var files = testFiles(dir)
-  if files.len() == 0 { return {ok: true, report: "no test files yet (tests/*_test.fut)", summary: "no tests"} }
+  if files.len() == 0 { return {ok: true, report: "no test files yet (tests/*_test.fut)", summary: "no tests", n: {passed: 0}} }
   var api = []
   for f in files { api.push({cmd: [FUT, "api", f], cwd: dir, timeout: 60}) }
   execAll(api)
@@ -166,7 +182,7 @@ fn runTests(dir) {
   var report = summary
   if bad.len() > 0 { report = report + "\n" + clip(bad.join("\n"), 7000) }
   if pend.len() > 0 { report = report + "\npending:\n  " + clip(pend.join("\n  "), 1500) }
-  return {ok: n.failed == 0 && n.errors == 0 && n.broken == 0, report: report, summary: summary}
+  return {ok: n.failed == 0 && n.errors == 0 && n.broken == 0, report: report, summary: summary, n: n}
 }
 
 // ---- tasks ----
@@ -199,7 +215,10 @@ fn saveState() {
 }
 fn loadState() {
   var l = readFile(DIR + "/ledger.json")
-  if l { ledger = parseJson(l) }
+  if l {
+    ledger = parseJson(l)
+    for k in ["elapsed", "byModel", "timeline"] { if ledger[k] == nil { ledger[k] = {elapsed: 0, byModel: {}, timeline: []}[k] } }
+  }
   var t = readFile(DIR + "/tasks.json")
   if t {
     var s = parseJson(t)
@@ -364,7 +383,7 @@ fn reviewRequest(w) {
   var diff = sh("git diff main...HEAD", w.wt).out
   var stat = sh("git diff --stat main...HEAD", w.wt).out
   if w.empty { diff = onMain(w) }
-  return request(system("reviewer"), VERDICT_TOOLS, [{role: "user", content: "Task #" + str(w.task.id) + ": " + w.task.title +
+  return request("reviewer", VERDICT_TOOLS, [{role: "user", content: "Task #" + str(w.task.id) + ": " + w.task.title +
     "\n\n" + w.task.detail + "\n\nWorker's summary: " + w.summary + "\n\nTests: " + w.tests + "\n\nDiff stat:\n" + stat +
     "\n\nDiff:\n" + clip(diff, 60000)}])
 }
@@ -421,7 +440,7 @@ fn context() {
     "\n\nRecent rejections:\n" + recent.join("\n")
 }
 fn planRequest(n) {
-  return request(system("planner"), PLAN_TOOLS, [{role: "user", content: context() + "\n\nPropose " + str(n) + " next tasks."}])
+  return request("planner", PLAN_TOOLS, [{role: "user", content: context() + "\n\nPropose " + str(n) + " next tasks."}])
 }
 fn planned(msg) {
   proposals = []
@@ -435,7 +454,7 @@ fn decideRequest() {
     var p = proposals[k]
     list.push("[" + str(k) + "] " + p.title + "\n" + p.detail + "\nfiles: " + (p.files || []).join(", "))
   }
-  return request(system("approver"), DECIDE_TOOLS, [{role: "user", content: context() + "\n\nProposed tasks:\n\n" + list.join("\n\n")}])
+  return request("approver", DECIDE_TOOLS, [{role: "user", content: context() + "\n\nProposed tasks:\n\n" + list.join("\n\n")}])
 }
 fn decided(msg) {
   var ds = nil
@@ -458,10 +477,53 @@ fn decided(msg) {
   if ok == 0 { planWait = 2 }
 }
 
+// ---- the benchmark ----
+fn acceptTotal() {  // the number of acceptance tests, counted in the source so a file that fails to compile still counts
+  var n = 0
+  for f in lines(sh("ls accept/*_test.fut 2>/dev/null", TDIR).out) {
+    for l in readFile(TDIR + "/" + f).split("\n") { if l.trim().find("test \"") == 0 { n += 1 } }
+  }
+  return n
+}
+fn score() {  // run the hidden acceptance tests against main, in a scratch copy the workers never see
+  var total = acceptTotal()
+  if total == 0 { return nil }
+  var dir = DIR + "/score"
+  sh("rm -rf '" + dir + "' && mkdir -p '" + dir + "' && git archive main | tar -x -C '" + dir + "' && rm -rf '" + dir + "/tests' && mkdir '" +
+     dir + "/tests' && cp '" + TDIR + "'/accept/*_test.fut '" + dir + "/tests/'", WORK)
+  var r = runTests(dir)
+  accept = {passed: r.n.passed, total: total}
+  log("acceptance: " + str(accept.passed) + " of " + str(total))
+  return accept
+}
+fn mark() {  // one point on the run's timeline
+  var p = {t: int(ledger.elapsed), spent: int(ledger.spent * 10000) / 10000, merged: ledger.merged, tests: mainTests.n.passed}
+  if accept { p.accept = accept.passed }
+  ledger.timeline.push(p)
+}
+fn at(key, limit) {  // the last timeline point with key <= limit
+  var best = nil
+  for p in ledger.timeline { if p[key] <= limit { best = p } }
+  return best
+}
+fn results() {  // swarm/results/<run>.json: what the run reached, and when
+  var checks = {}
+  for m in [10, 30, 60, 120, 240] { if ledger.elapsed >= m * 60 { checks[str(m) + "m"] = at("t", m * 60) } }
+  for d in [1, 2, 5, 10, 20] { if ledger.spent >= d { checks["$" + str(d)] = at("spent", d) } }
+  var srcLines = parseNum(sh("cat src/*.fut 2>/dev/null | wc -l", WORK).out.trim()) || 0
+  var testLines = parseNum(sh("cat tests/*.fut 2>/dev/null | wc -l", WORK).out.trim()) || 0
+  var out = {run: ledger.run.id, target: TARGET, fut: ledger.run.fut, models: MODELS, workers: NWORKERS, cap: CAP, minutes: MINUTES,
+    elapsed: int(ledger.elapsed), spent: int(ledger.spent * 10000) / 10000, byModel: ledger.byModel, calls: ledger.calls,
+    merged: ledger.merged, rejected: ledger.rejected, failedTasks: byStatus("failed").len(), tests: mainTests.n.passed,
+    accept: accept, srcLines: srcLines, testLines: testLines, checkpoints: checks, timeline: ledger.timeline}
+  writeFile((env("SWARM_RESULTS") || ROOT + "/swarm/results") + "/" + ledger.run.id + ".json", json(out) + "\n")
+}
+
 // ---- the loop ----
 fn setup() {
+  TDIR = ROOT + "/swarm/targets/" + TARGET
   if readFile(WORK + "/README.md") == nil {
-    writeFile(WORK + "/README.md", readFile(ROOT + "/swarm/target.md"))
+    writeFile(WORK + "/README.md", readFile(TDIR + ".md"))
     writeFile(WORK + "/all.fut", "// imports every module, so `fut map all.fut` shows the project\n")
     writeFile(WORK + "/.gitignore", "*.api\n.fut-cache/\n")
     sh("git init -q -b main && git config user.name swarm && git config user.email swarm@localhost && git add -A && git commit -qm 'project start'", WORK)
@@ -473,7 +535,7 @@ fn setup() {
     workers.push(newWorker(i))
   }
   var spec = readFile(ROOT + "/docs/spec.md")
-  COMMON = readFile(ROOT + "/swarm/prompts/common.md").split("\{\{SPEC}}").join(spec).split("\{\{TARGET}}").join(readFile(ROOT + "/swarm/target.md"))
+  COMMON = readFile(ROOT + "/swarm/prompts/common.md").split("\{\{SPEC}}").join(spec).split("\{\{TARGET}}").join(readFile(TDIR + ".md"))
   for r in ["worker", "planner", "approver", "reviewer"] { ROLE[r] = readFile(ROOT + "/swarm/prompts/" + r + ".md") }
 }
 
@@ -481,11 +543,26 @@ fn main() {
   if KEY == nil || DIR == nil || ROOT == nil || FUT == nil { print("set SWARM_API_KEY, SWARM_DIR, SWARM_ROOT and FUT (swarm/run.sh does)") return nil }
   setup()
   loadState()
+  for role in ["worker", "planner", "approver", "reviewer"] {
+    if PRICES[MODELS[role]] == nil { print("no price for model " + MODELS[role] + "; add it to PRICES") return nil }
+  }
+  if ledger.run == nil {
+    ledger.run = {id: TARGET + "-" + sh("date -u +%Y%m%d-%H%M", ROOT).out.trim(), fut: sh("git rev-parse --short HEAD", ROOT).out.trim()}
+  }
   mainTests = runTests(WORK)
-  log("swarm starts: " + str(NWORKERS) + " workers, " + MODEL + ", cap $" + str(CAP) + ", spent so far $" + str(ledger.spent))
+  log("swarm starts: " + TARGET + " (run " + ledger.run.id + "), " + str(NWORKERS) + " workers, models " + json(MODELS) + ", cap $" + str(CAP) +
+    ", spent so far $" + str(ledger.spent))
+  score()
+  mark()
   var backoff = 0
+  var last = time()
   while true {
+    var now = time()
+    ledger.elapsed += now - last
+    last = now
     if readFile(DIR + "/STOP") != nil { log("STOP file: stopping") break }
+    if MINUTES > 0 && ledger.elapsed >= MINUTES * 60 { log("time limit: " + str(MINUTES) + " minutes; stopping") break }
+    var merged = ledger.merged
     ledger.rounds += 1
     // idle workers take queued tasks
     for w in workers {  // a task resumes on the worker whose worktree has it
@@ -502,7 +579,7 @@ fn main() {
     var reqs = []
     var who = []
     for w in workers {
-      if w.phase == "work" { reqs.push(request(system("worker"), WORKER_TOOLS, w.messages)) who.push({kind: "worker", w: w}) }
+      if w.phase == "work" { reqs.push(request("worker", WORKER_TOOLS, w.messages)) who.push({kind: "worker", w: w}) }
       else if w.phase == "review" { reqs.push(reviewRequest(w)) who.push({kind: "review", w: w}) }
     }
     var idle = 0
@@ -524,7 +601,7 @@ fn main() {
       if c <= room { room -= c keep.push(reqs[k]) keepWho.push(who[k]) }
     }
     if keep.len() == 0 {
-      if reqs.len() > 0 { log("budget reached: $" + str(ledger.spent) + " of $" + str(CAP) + "; stopping") saveState() break }
+      if reqs.len() > 0 { log("budget reached: $" + str(ledger.spent) + " of $" + str(CAP) + "; stopping") break }
       saveState()
       sleep(3)
       continue
@@ -544,14 +621,22 @@ fn main() {
         continue
       }
       var msg = parseJson(r.body)
-      charge(msg.usage || {})
+      charge(msg.usage || {}, keep[k].model)
       if h.kind == "worker" { workerRound(h.w, msg) }
       else if h.kind == "review" { reviewed(h.w, msg) }
       else if h.kind == "plan" { planned(msg) }
       else if h.kind == "decide" { decided(msg) }
     }
     if limited { backoff = backoff * 2 + 2 if backoff > 60 { backoff = 60 } sleep(backoff) } else { backoff = 0 }
+    if ledger.merged != merged {
+      if ledger.elapsed - lastScore >= 120 { lastScore = ledger.elapsed score() }
+      mark()
+      results()
+    }
     saveState()
   }
+  score()
+  mark()
+  results()
   saveState()
 }
