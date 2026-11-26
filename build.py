@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Build and test fut.   python3 build.py [build | debug | wasm | test [--debug | --wasm] | fuzz [N] | clean]"""
-import json, os, random, re, shutil, subprocess, sys, time
+"""Build and test fut.   python3 build.py [build | debug | wasm | test [--debug | --wasm] [NAME...] | fuzz [N] | clean]"""
+import json, os, random, re, shutil, subprocess, sys, tempfile, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -26,9 +26,11 @@ def build(debug=False, wasm=False):
     opt = ["-O2", *WASM_FLAGS] if wasm else ["-O1", "-g", "-fsanitize=address,undefined"] if debug else ["-O2"]
     cxx = str(LLVM) if wasm else "clang++"
     skip = NATIVE_ONLY if wasm else WASM_ONLY
-    shared = max(p.stat().st_mtime for p in [*(ROOT / "src").glob("*.h"), Path(__file__)])
+    stamp, flags = objdir / "flags", " ".join([cxx, *FLAGS, *opt])  # a change of flags rebuilds; an edit to this script does not
+    shared = max(p.stat().st_mtime for p in (ROOT / "src").glob("*.h"))
+    fresh = stamp.exists() and stamp.read_text() == flags
     objs = [(c, objdir / (c.stem + ".o")) for c in sorted((ROOT / "src").glob("*.cpp")) if c.name not in skip]
-    stale = [(c, o) for c, o in objs if not o.exists() or o.stat().st_mtime < max(shared, c.stat().st_mtime)]
+    stale = [(c, o) for c, o in objs if not fresh or not o.exists() or o.stat().st_mtime < max(shared, c.stat().st_mtime)]
 
     def cc(job):
         print(("wasm " if wasm else "") + "clang++", job[0].name, flush=True)
@@ -36,6 +38,7 @@ def build(debug=False, wasm=False):
     with ThreadPoolExecutor(len(stale) or 1) as ex:
         if any(list(ex.map(cc, stale))):
             sys.exit(1)
+    stamp.write_text(flags)
     if stale or not out.exists():
         link = WASM_LINK if wasm else ["-lobjc"]
         subprocess.run([cxx, *(o for o in opt if o not in ("-mllvm", "-wasm-enable-sjlj")), *(str(o) for _, o in objs), *link, "-o", str(out)], check=True)
@@ -47,41 +50,57 @@ def runner(exe):
     return ["node", str(ROOT / "web" / "run.mjs")] if exe.suffix == ".wasm" else [str(exe)]
 
 
-def test(exe):
+def test(exe, only=()):
     """Each tests/*.fut lists `// expect: <line>` for stdout and optionally `// error: <text>` lines for stderr.
-    Each tests/specs/*.fut is run with `fut test` and must pass."""
-    failed = 0
-    for t in sorted((ROOT / "tests").glob("*.fut")):
+    Each tests/specs/*.fut is run with `fut test` and must pass. Everything runs at once, one job per core;
+    a hot-reload test that fails under that load (they are timed) is rerun alone before it counts.
+    `only` keeps the jobs whose name contains any of its words."""
+    shutil.rmtree(ROOT / "build" / "hot", ignore_errors=True)
+
+    def program(t):
         src = t.read_text()
         want = re.findall(r"// expect: ?(.*)", src)
         err = re.findall(r"// error: ?(.*)", src)
         r = subprocess.run([*runner(exe), str(t)], capture_output=True, text=True, timeout=60)
         ok = r.stdout.splitlines() == want and (all(e in r.stderr for e in err) and r.returncode != 0 if err else r.returncode == 0)
-        print(f"{'ok  ' if ok else 'FAIL'} {t.name}")
-        if not ok:
-            failed += 1
-            print(f"  want: {want}\n  got:  {r.stdout.splitlines()}\n  stderr: {r.stderr.strip()}")
-    for t in sorted((ROOT / "tests" / "specs").glob("*.fut")):  # specs written with test blocks
+        return t.name, ok, f"want: {want}\n  got:  {r.stdout.splitlines()}\n  stderr: {r.stderr.strip()}"
+
+    def spec(t):  # specs written with test blocks
         r = subprocess.run([*runner(exe), "test", str(t)], capture_output=True, text=True, timeout=60)
-        print(f"{'ok  ' if r.returncode == 0 else 'FAIL'} specs/{t.name} ({r.stdout.strip().splitlines()[-1] if r.stdout.strip() else 'no output'})")
-        if r.returncode:
-            failed += 1
-            print("  " + (r.stdout + r.stderr).strip().replace("\n", "\n  "))
-    for name, fn in HOT_TESTS + RUNNER_TESTS:
+        last = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else "no output"
+        return f"specs/{t.name} ({last})", r.returncode == 0, (r.stdout + r.stderr).strip().replace("\n", "\n  ")
+
+    def check(name, fn):
         ok, detail = fn(exe)
-        print(f"{'ok  ' if ok else 'FAIL'} {'' if fn in [f for _, f in RUNNER_TESTS] else 'hot reload: '}{name}")
+        return name, ok, detail
+
+    jobs = ([("hot reload: " + n, lambda n=n, f=f: check("hot reload: " + n, f)) for n, f in HOT_TESTS]  # the slowest (they sleep) start first
+            + [(t.name, lambda t=t: program(t)) for t in sorted((ROOT / "tests").glob("*.fut"))]
+            + [("specs/" + t.name, lambda t=t: spec(t)) for t in sorted((ROOT / "tests" / "specs").glob("*.fut"))]
+            + [(n, lambda n=n, f=f: check(n, f)) for n, f in RUNNER_TESTS])
+    jobs = [job for name, job in jobs if not only or any(w in name for w in only)]
+    start = time.time()
+    with ThreadPoolExecutor(os.cpu_count() or 8) as ex:
+        results = list(ex.map(lambda job: job(), jobs))
+    hot = {"hot reload: " + n: f for n, f in HOT_TESTS}
+    retried = [name for name, ok, _ in results if not ok and name in hot]
+    results = [check(name, hot[name]) if name in retried else (name, ok, detail) for name, ok, detail in results]
+    failed = 0
+    for name, ok, detail in results:
+        print(f"{'ok  ' if ok else 'FAIL'} {name}")
         if not ok:
             failed += 1
             print("  " + detail)
-    print("all tests passed" if not failed else f"{failed} failed")
+    print(("all tests passed" if not failed else f"{failed} failed") + f" in {time.time() - start:.1f}s"
+          + (f" (rerun alone: {', '.join(retried)})" if retried else ""))
     return failed
 
 
 def live(exe, files, edits, settle=0.4, timeout=6):
     """Run files[0] with -w, apply edits [(file, text)] one at a time while it runs (file "<stdin>" types the
     text into its live REPL); return (stdout, stderr)."""
-    d = ROOT / "build" / "hot"
-    d.mkdir(parents=True, exist_ok=True)
+    (ROOT / "build" / "hot").mkdir(parents=True, exist_ok=True)
+    d = Path(tempfile.mkdtemp(dir=ROOT / "build" / "hot"))  # each test its own directory: they run at once
     for name, text in files.items():
         (d / name).parent.mkdir(parents=True, exist_ok=True)
         (d / name).write_text(text)
@@ -500,7 +519,7 @@ def fuzz(exe, n=300, seed=None):
         if bad:
             (crashes / f"crash{k}.fut").write_text(cases[k])
             return f"case {k}: rc={r.returncode}\n{r.stderr[-1500:]}"
-    with ThreadPoolExecutor(8) as ex:
+    with ThreadPoolExecutor(os.cpu_count() or 8) as ex:
         bad = [b for b in ex.map(one, range(n)) if b]
     for b in bad[:3]:
         print(b)
@@ -513,7 +532,7 @@ if __name__ == "__main__":
     if cmd == "clean":
         subprocess.run(["rm", "-rf", str(ROOT / "build")])
     elif cmd == "test":
-        sys.exit(1 if test(build("--debug" in sys.argv, "--wasm" in sys.argv)) else 0)
+        sys.exit(1 if test(build("--debug" in sys.argv, "--wasm" in sys.argv), [a for a in sys.argv[2:] if not a.startswith("--")]) else 0)
     elif cmd == "wasm":
         build(wasm=True)
     elif cmd == "fuzz":
