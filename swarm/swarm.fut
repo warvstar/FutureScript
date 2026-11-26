@@ -362,6 +362,11 @@ fn runTests(dir) {
 }
 
 // ---- tasks ----
+fn ready() {  // queued tasks a worker can take: one given back as blocked waits until something merges
+  var out = []
+  for t in byStatus("queued") { if t.blockedAt == nil || t.blockedAt != ledger.merged { out.push(t) } }
+  return out
+}
 fn byStatus(s) {
   var out = []
   for t in tasks { if t.status == s { out.push(t) } }
@@ -369,7 +374,11 @@ fn byStatus(s) {
 }
 fn titles(list) {
   var out = []
-  for t in list { out.push("#" + str(t.id) + " " + t.title + " [" + t.files.join(", ") + "]") }
+  for t in list {
+    var line = "#" + str(t.id) + " " + t.title + " [" + t.files.join(", ") + "]"
+    if t.blockedAt != nil && t.notes && t.notes.len() > 0 { line += "\n    last attempt: " + clip(t.notes[t.notes.len() - 1], 400) }
+    out.push(line)
+  }
   if out.len() == 0 { return "(none)" }
   return out.join("\n")
 }
@@ -484,6 +493,7 @@ fn runTool(w, name, inp) {
     return {text: "deleted " + inp.path}
   }
   if name == "blocked" {
+    w.task.blockedAt = ledger.merged
     giveUp(w, "the worker says it is blocked: " + clip(inp.reason || "", 600))
     return {text: "task given back"}
   }
@@ -814,7 +824,7 @@ fn main() {
     for w in workers {
       if w.phase != "idle" || w.i >= NWORKERS { continue }
       var q = []
-      for t in byStatus("queued") { if t.worker == nil || t.worker >= NWORKERS { q.push(t) } }
+      for t in ready() { if t.worker == nil || t.worker >= NWORKERS { q.push(t) } }
       if q.len() > 0 { startTask(w, q[0]) }
     }
     // this round's requests
@@ -828,7 +838,7 @@ fn main() {
     for w in workers { if w.phase == "idle" && w.i < NWORKERS { idle += 1 } }
     if proposals.len() > 0 { reqs.push(decideRequest()) who.push({kind: "decide"}) }
     else if planWait > 0 { planWait -= 1 }
-    else if byStatus("queued").len() < idle + 2 {
+    else if ready().len() < idle + 2 {
       var n = idle + 2
       if n < 3 { n = 3 }
       reqs.push(planRequest(n))

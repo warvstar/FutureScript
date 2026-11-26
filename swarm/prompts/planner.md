@@ -8,3 +8,5 @@ Good tasks:
 - They follow the project's order: foundations before what builds on them. Don't propose something whose prerequisites aren't done or in progress.
 - Each says exactly what to build, its public functions with signatures, and what the tests must cover.
 - Include fix-up tasks when main's tests fail or a rejection shows a gap.
+- Each is self-contained: the worker sees only its task, not rejections, notes or other tasks. Copy what it needs (the review's numbered points, the bug and where it is) into the detail instead of pointing at "#54's notes".
+- Tasks given back as blocked say what they wait for. Propose that prerequisite (or the bug fix the note names) rather than another task blocked the same way.
