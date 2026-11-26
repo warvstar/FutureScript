@@ -72,7 +72,7 @@ fn reload() { }                      // optional: runs after every hot reload (m
 - **Closures:** a closure captures the enclosing variables by value. The closure can still change its own copy, so counters work, but it does not see later changes in the enclosing function.
 - **Interpolation:** expressions inside `{...}` in a string can't contain `"`. Write `\{` for a literal brace.
 - **Newline rules:** a `(` or `[` on a new line, or a leading `-`, starts a new statement rather than continuing the previous one.
-- **Not in fut** (for those coming from other languages): a ternary operator, `**`, `?.`, slice syntax (there are `slice` methods), negative indexes, `sort`, varargs, default arguments, chained comparisons (`1 < 2 < 3` is an error), named functions inside functions. `int` takes only numbers.
+- **Not in fut** (for those coming from other languages): negative indexes (use `l[l.len() - 1]` for the last element), varargs (pass a list), default arguments (pass an options map), and chained comparisons (write `a < b && b < c`). For sorting, `import "std/lists"` and call `lists.sort(l)`. `int` takes only numbers.
 
 ### Interpolation formats
 

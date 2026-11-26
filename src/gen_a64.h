@@ -221,6 +221,7 @@ struct Gen : CState {
     }
     return hasLit = false, no;
   }
+  Cond nonNilCond() { Jumps no; E(cmp(0, 27)), no.push_back(E(bcond(EQ))); return no; }
   Cond truthyCond() { Jumps no; falsy(), no.push_back(E(bcond(EQ))); return no; }
   void thenBegin(Cond&) {}
   int elseBegin(Cond& no, bool hasElse) {

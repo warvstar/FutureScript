@@ -13,8 +13,8 @@ test "in range, including a fraction (truncated) and -0" {
 test "out of range and non-numbers fall through to the error" {
   var l = [1, 2]
   expect throws { get(l, 2) } == "index 2 out of range (len 2)"
-  expect throws { get(l, -1) } == "index -1 out of range (len 2)"
-  expect throws { get(l, -0.5) } == "index -0.5 out of range (len 2)"
+  expect throws { get(l, -1) } == "index -1 out of range (len 2); use l[l.len() - 1] for the last element"
+  expect throws { get(l, -0.5) } == "index -0.5 out of range (len 2); use l[l.len() - 1] for the last element"
   expect throws { get(l, "0") } == "index 0 out of range (len 2)"
   expect throws { get(l, nil) } == "index nil out of range (len 2)"
   expect throws { put(l, 5, 1) } == "index 5 out of range (len 2)"

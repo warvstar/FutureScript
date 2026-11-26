@@ -8,7 +8,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <time.h>
-#if !__wasm__
+#if __wasm__
+extern "C" __attribute__((import_module("host"), import_name("pow"))) double host_pow(double, double);
+#else
 #include <sys/mman.h>
 #endif
 
@@ -453,7 +455,9 @@ static V rt_setf(V o, uint64_t s, V v, IC* ic) {
   if (ic && !vm->txn && (!ty || ty->type == TY_NUM)) *ic = {header(in), i | (ty ? 1ull << 32 : 0) | (inv ? 1ull << 33 : 0)};
   return in->slots[i] = v;
 }
-#define INDEX(i, n) (isNum(i) && num(i) >= 0 && num(i) < (n) ? (size_t)num(i) : (ERR("@index index %s out of range (len %zu)", toStr(i).c_str(), (size_t)(n)), 0))
+#define INDEX(i, n) (isNum(i) && num(i) >= 0 && num(i) < (n) ? (size_t)num(i) : \
+  (ERR("@index index %s out of range (len %zu)%s", toStr(i).c_str(), (size_t)(n), \
+       isNum(i) && num(i) < 0 ? "; use l[l.len() - 1] for the last element" : ""), 0))
 #define NUMARG(v, f) (isNum(v) ? num(v) : (ERR("@argument " f "() expects a number"), 0.0))
 static V char1(V s, size_t i) { return cached(charStrs[(uint8_t)as<Str>(s)->s()[i]], {as<Str>(s)->s() + i, 1}); }
 void mapSet(Map* m, V k, V v) {
@@ -520,6 +524,15 @@ static void* identCode;  // constructor of a class without init: returns self
 // Resolve a call. w[0] is the callee or receiver, w[1..n] the args; on return the JIT loads x0..x7 from w (x8 = w).
 // ic: a method call's cache (key: receiver header), or a constructor site's (key: the class value).
 int invariantSym() { static int s = intern("inv@"); return s; }
+static const char* methodPackage(V receiver, const std::string& method) {
+  static const char* const lists[] = {"all", "any", "contains", "count", "filter", "find", "flatten",
+    "indexOf", "map", "max", "min", "range", "reduce", "reverse", "sort", "sortable", "sortBy", "sum", "unique"};
+  static const char* const strings[] = {"count", "endsWith", "lines", "lower", "padEnd", "padStart",
+    "repeat", "replace", "reverse", "startsWith", "upper", "words"};
+  if (is(receiver, K::List) && std::find(std::begin(lists), std::end(lists), method) != std::end(lists)) return "lists";
+  if (is(receiver, K::Str) && std::find(std::begin(strings), std::end(strings), method) != std::end(strings)) return "strings";
+  return nullptr;
+}
 static void* rt_prep(V* w, uint64_t n, uint64_t sym, V sup, IC* ic) {
   V r = w[0];
   Fn* f = nullptr;
@@ -538,7 +551,13 @@ static void* rt_prep(V* w, uint64_t n, uint64_t sym, V sup, IC* ic) {
       if (ic && is(r, K::Inst) && !sup) *ic = {header(obj(r)), (uint64_t)identCode};
       return identCode;
     }
-    if (!f) ERR("@no-method %s has no method '%s'", typeName(r), symName(sym).c_str());
+    if (!f) {
+      const auto& method = symName(sym);
+      if (const char* pkg = methodPackage(r, method))
+        ERR("@no-method %s has no method '%s'; import \"std/%s\" and use %s.%s%s",
+            typeName(r), method.c_str(), pkg, pkg, method.c_str(), method == "sort" ? "(l)" : "");
+      ERR("@no-method %s has no method '%s'", typeName(r), method.c_str());
+    }
     if (ic && is(r, K::Inst) && f->arity == (int)n + 1) *ic = {header(obj(r)), (uint64_t)f->code};
   } else if (is(r, K::Fn)) {
     f = as<Fn>(r);
@@ -772,6 +791,19 @@ static V l_slice(V l, V a, V b) {
   if (i < j) r->v.assign(as<List>(l)->v.begin() + i, as<List>(l)->v.begin() + j);
   return box(r);
 }
+static V n_slice(V v, V a, V b) {
+  if (is(v, K::Str)) return s_slice(v, a, b);
+  if (is(v, K::List)) return l_slice(v, a, b);
+  ERR("@index cannot slice %s; use a string or list", typeName(v));
+}
+static V n_pow(V a, V b) {
+  if (!isNum(a) || !isNum(b)) ERR("@operand '**' expects numbers, got %s and %s", typeName(a), typeName(b));
+#if __wasm__
+  return box(host_pow(num(a), num(b)));
+#else
+  return box(std::pow(num(a), num(b)));
+#endif
+}
 static V n_parseNum(V s) {  // the number a string spells (surrounding spaces allowed), or nil
   std::string t(svArg(s, "parseNum()"));
   const char* p = t.c_str();
@@ -864,7 +896,11 @@ void rtInit() {
   txnInit();
   typesInit();
   native<n_print>("print"), native<n_str>("str"), native<n_len>("len"), native<n_clock>("clock"), native<n_sleep>("sleep");
-  native<+[](V v) { return box(std::trunc(NUMARG(v, "int"))); }>("int");
+  native<+[](V v) {
+    if (is(v, K::Str)) ERR("@argument int() expects a number; use parseNum(s) to parse a string");
+    return box(std::trunc(NUMARG(v, "int")));
+  }>("int");
+  native<n_slice>("slice@"), native<n_pow>("pow@");
   native<n_floor>("floor"), native<n_sqrt>("sqrt"), native<newFiber>("fiber");
   native<n_time>("time"), native<n_json>("json"), native<n_parseJson>("parseJson");
   method<+[](V f) { return fiberResume(f, NIL); }>(K::Fiber, S_resume), method<fiberResume>(K::Fiber, S_send);

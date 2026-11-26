@@ -23,6 +23,7 @@ expect "{a + b}\{\n" == "3\{\n"     // "{expr}" interpolates, so a literal { is 
 expect "{3.14159:.2}|{7:>3}|{255:x}|{a=}" == "3.14|  7|ff|a = 1"  // {expr[=][:spec]}, spec: [fill][< > ^][+][0][width][,][.precision][f e x X b o]
 expect 0 && ""                     // only nil, false are falsy
 expect (nil || 2) == 2             // && || return an operand
+expect (1 > 0 ? "y" : "n") == "y" && 2 ** 3 == 8 && nil?.x == nil && "abc"[1:] == "bc"
 expect -7 % 3 == 2 && 7 / 2 == 3.5 // all numbers f64
 expect 2 + 3 & 6 == 4              // Python precedence; bitwise needs whole numbers
 expect "a" + 1 == "a1"             // + with a str concatenates
@@ -88,7 +89,7 @@ expect Sq(3).area() == 9
 expect throws { Sq(1).sid = 2 }
 ```
 
-`fn`/`class` declarations are top level only; inside a function use `var g = fn(x) { ... }`. `main()` runs after top level; `reload()` after each hot reload. Arity is checked. Overrides keep param count and types.
+`class` declarations are top level only. A nested `fn g(x) { ... }` declares a local closure that can call itself by name. `main()` runs after top level; `reload()` after each hot reload. Arity is checked. Overrides keep param count and types.
 
 ## Types, effects
 

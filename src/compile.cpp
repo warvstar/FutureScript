@@ -2,6 +2,7 @@
 // gen_a64.h (arm64) natively, gen_wasm.h in the WebAssembly build.
 #include "compile.h"
 #include <functional>
+#include <limits>
 #include <map>
 #include <set>
 #include <unordered_set>
@@ -220,6 +221,12 @@ struct Compiler : Gen {
     if ((size_t)n.sym >= pubSym.size() || !pubSym[n.sym]) failAt(n.p, n.line, "@private '%s' is private to module '%s' (mark it pub there to use it here)", name(prev.sym), name(t.sym));
     return n;
   }
+  static const char* logicHint(const Tok& t) {
+    if (t.t != T_ID) return nullptr;
+    if (symName(t.sym) == "and") return "use '&&'";
+    if (symName(t.sym) == "or") return "use '||'";
+    return nullptr;
+  }
   [[noreturn]] void undefined(const Tok& t) {
     const std::string& full = symName(t.sym);
     int s = intern(full.substr(full.rfind('.') + 1));  // as written: globalSym may have put a package's prefix on it
@@ -228,6 +235,14 @@ struct Compiler : Gen {
     if (const std::string& P = pkgPrefix(file); !P.empty())
       if (Global* g = findGlobal(s); g && g->kind != 'n')
         failAt(t.p, t.line, "@undefined-name undefined name '%s' (package %s sees its own names, its dependencies' through their names, and builtins; not the program's)", name(s), pkgOf(file)->name.c_str());
+    const auto& word = symName(s);
+    const char* hint = logicHint(Tok{.t = T_ID, .sym = s});
+    if (word == "null" || word == "None" || word == "undefined") hint = "use 'nil'";
+    else if (word == "not") hint = "use '!'";
+    else if (word == "elif") hint = "use 'else if'";
+    else if (word == "let" || word == "const") hint = "declare a variable with 'var'";
+    else if (word == "function" || word == "def") hint = "declare a function with 'fn'";
+    if (hint) failAt(t.p, t.line, "@undefined-name undefined name '%s': %s", name(s), hint);
     failAt(t.p, t.line, "@undefined-name undefined name '%s'", name(s));
   }
   int globalSym(int s) {  // the file's own names first, then its package's, then global (builtins only, in a package)
@@ -256,7 +271,12 @@ struct Compiler : Gen {
   bool at(int t) { return cur.t == t; }
   bool atKw(int k) { return cur.t == T_ID && cur.sym == k; }
   bool accept(int t) { return at(t) ? next(), true : false; }
-  void expect(int t) { if (!accept(t)) fail("@syntax expected '%c'", t); }
+  void expect(int t) {
+    if (accept(t)) return;
+    if (const char* hint = logicHint(cur); hint && !cur.nl)
+      fail("@syntax expected '%c'; %s", t, hint);
+    fail("@syntax expected '%c'", t);
+  }
   int ident() {
     if (!at(T_ID) || cur.sym < NKW) fail("@syntax expected a name");
     return next(), prev.sym;
@@ -542,12 +562,13 @@ struct Compiler : Gen {
   // ---- names ----
   LV resolve(Fun* f, int sym) {  // local, else captured from an enclosing function (lambdas), else LV_NONE
     for (auto i = f->locals.rbegin(); i != f->locals.rend(); ++i) if (i->sym == sym) return {LV_LOCAL, i->home, 0, false, i->num || proven(f, i->home)};
-    for (size_t i = 0; i < f->caps.size(); i++) if (f->caps[i].first == sym) return {LV_CAP, (int)i};
+    if (sym == f->lambdaName) return {LV_LOCAL, f->cloHome, 0, true};
+    for (size_t i = 0; i < f->caps.size(); i++) if (f->caps[i].first == sym) return {LV_CAP, (int)i, 0, f->caps[i].second.ro};
     if (!f->parent) return {LV_NONE};
     LV p = resolve(f->parent, sym);
     if (p.k == LV_NONE) return p;
     f->caps.push_back({sym, p});
-    return {LV_CAP, (int)f->caps.size() - 1};
+    return {LV_CAP, (int)f->caps.size() - 1, 0, p.ro};
   }
   void load(LV& v) {
     switch (v.k) {
@@ -722,13 +743,13 @@ struct Compiler : Gen {
     }
     collect(base, n, H_MAP);
   }
-  Fn* lambda(const Tok& t, bool arrow = false) {  // fn(params) { body }: captures enclosing locals by value into the closure
+  Fn* lambda(const Tok& t, bool arrow = false, int sym = -1) {  // fn(params) { body }: captures enclosing locals by value into the closure
     if (tiering) compileFail("tier 2 does not handle lambdas", false);
     Fun f;
-    f.parent = F, f.lambda = true, f.arrow = arrow;
+    f.parent = F, f.lambda = true, f.arrow = arrow, f.lambdaName = sym;
     Fn* fn = make<Fn>();
     consts.push_back(box(fn));
-    fn->code = newStub(), fn->name = intern("fn@" + std::to_string(t.line));
+    fn->code = newStub(), fn->name = sym >= 0 ? sym : intern("fn@" + std::to_string(t.line));
     fn->arity = function(f, -1, false, symName(fn->name), (u32*)fn->code, fn);
     int base = F->depth, n = (int)f.caps.size();
     for (auto& [s, src] : f.caps) { LV v = src; load(v), st(0, slot()); }
@@ -828,9 +849,13 @@ struct Compiler : Gen {
     return {LV_GLOBAL, g->slot, t.sym, g->kind != 'v'};  // b: its symbol, for its type
   }
   LV postfix() {
-    LV v = primary();
+    return postfixRest(primary());
+  }
+  LV postfixRest(LV v) {
     for (;;) {
-      if (accept('.')) {
+      if (at('.') || at(T_OPT_DOT)) {
+        bool optional = at(T_OPT_DOT);
+        next();
         Tok ft = cur;
         int s = ident();
         bool own = v.k == LV_LOCAL && F->cls >= 0 && v.a == F->selfHome;  // self.name
@@ -840,25 +865,52 @@ struct Compiler : Gen {
           if (uint64_t ty = varType(F, v).first)
             typedUses.push_back({ty, s, {ft.p, ft.line, file, srcStart}, at('(') && !cur.nl, varName(v)});
         load(v);
+        Cond no;
+        auto facts = F->facts;
+        bool live = F->live;
+        if (optional) no = nonNilCond(), thenBegin(no);
         v = {LV_FIELD, 0, s}, v.own = own;
         if (at('(') && !cur.nl) next(), s == S_push ? pushCall() : call(s, false), v = {};
+        if (optional) {
+          v = postfixRest(v);
+          load(v), ifEnd(elseBegin(no, false));
+          F->facts = facts, F->live = live;
+          return {};
+        }
       } else if (at('[') && !cur.nl) {
         next(), load(v);
         int t = slot();
-        st(0, t), expr(), expect(']'), v = {LV_INDEX, t};
+        st(0, t);
+        if (at(':')) imm(0, box(0.0));
+        else expr();
+        if (accept(':')) {
+          int a = slot();
+          mv(1, 0), ld(0, t), st(0, a), st(1, slot());
+          if (at(']')) imm(0, box(std::numeric_limits<double>::infinity()));
+          else expr();
+          st(0, slot()), expect(']');
+          internalCall("slice@", t, 3);
+          v = {};
+        } else expect(']'), v = {LV_INDEX, t};
       } else if (at('(') && !cur.nl) next(), load(v), call(0, false), v = {};
       else return v;
     }
   }
   LV unary() {
     if (accept('-')) {
-      if (accept(T_NUM)) return imm(0, box(-prev.n)), NUM;
+      if (at(T_NUM) && !peekIs(T_POW)) return next(), imm(0, box(-prev.n)), NUM;
       bool num = operand();
       return neg(num), num ? NUM : LV{};
     }
     if (accept('!')) return operand(), notOp(), LV{};
     if (accept('~')) return operand(), hasLit = true, lit = -1, binop(O_BXOR), NUM;  // ~x is x ^ -1
-    return postfix();
+    LV v = postfix();
+    if (!accept(T_POW)) return v;
+    load(v);
+    int base = slot();
+    st(0, slot()), operand(), st(0, slot());
+    internalCall("pow@", base, 2);
+    return NUM;
   }
   bool operand(int* h = nullptr) {  // x0 = a unary expression; returns whether it is known to be a number
     LV v = unary();
@@ -867,15 +919,43 @@ struct Compiler : Gen {
     return v.num;
   }
   bool expr(int minp = 1) { int h; bool n = operand(&h); return binRest(minp, n, h), n; }
+  bool ternaryBranch() {
+    if (at(T_EOF) || at('}') || at(']') || at(')') || at(':') || at(',') || at(';'))
+      fail("@syntax write a ternary as 'condition ? yes : no'");
+    return expr();
+  }
+  static bool comparison(int p) { return p == 3 || p == 4; }
+  void singleComparison() {
+    if (comparison(prec(cur.t))) fail("@syntax chained comparison: write a < b && b < c");
+  }
   // Precedence climbing; the left operand is in x0. num/h: whether it is a number / the local it came from.
   void binRest(int minp, bool& num, int& h) {
     for (int t, p; (p = prec(t = cur.t)) && p >= minp && !(t == '-' && cur.nl); h = NOH) {
       next();
-      if (t == T_AND || t == T_OR) {
+      if (t == '?') {
+        Cond no = truthyCond();
+        thenBegin(no);
+        auto facts = F->facts;
+        bool live = F->live;
+        bool yes = ternaryBranch();
+        if (!accept(':')) fail("@syntax write a ternary as 'condition ? yes : no'");
+        int end = elseBegin(no, true);
+        auto thenFacts = F->facts;
+        bool thenLive = F->live;
+        F->facts = facts, F->live = live;
+        bool otherwise = ternaryBranch();
+        ifEnd(end);
+        F->facts &= thenFacts, F->live |= thenLive;
+        num = yes && otherwise;
+      } else if (t == T_AND || t == T_OR) {
         int j = shortBegin(t == T_AND);
         auto f = F->facts;  // the right side may not run
-        expr(p + 1), shortEnd(j), num = false, F->facts = f;
-      } else num = rhs(opOf(t), p, num, h);
+        bool live = F->live;
+        expr(p + 1), shortEnd(j), num = false, F->facts = f, F->live = live;
+      } else {
+        num = rhs(opOf(t), comparison(p) ? 4 : p, num, h);
+        if (comparison(p)) singleComparison();
+      }
     }
   }
   // A right operand that is a local or a number literal (and binds no tighter operator) goes straight
@@ -884,7 +964,7 @@ struct Compiler : Gen {
   int simpleOperand(int p) {
     if (!at(T_NUM) && !(at(T_ID) && cur.sym >= NKW)) return 0;
     Tok n = peek();
-    if (n.t == '.' || ((n.t == '(' || n.t == '[') && !n.nl) || prec(n.t) > p) return 0;
+    if (n.t == '.' || n.t == T_OPT_DOT || n.t == T_POW || ((n.t == '(' || n.t == '[') && !n.nl) || prec(n.t) > p) return 0;
     if (at(T_NUM)) return hasLit = true, lit = cur.n, next(), 2;
     LV v = resolve(F, cur.sym);
     if (v.k != LV_LOCAL) return 0;
@@ -895,10 +975,11 @@ struct Compiler : Gen {
     int lh;
     bool lnum = operand(&lh);
     binRest(5, lnum, lh);
-    if (int t = cur.t, p = prec(t); p == 3 || p == 4) {
+    if (int t = cur.t, p = prec(t); comparison(p)) {
       next();
       int op = opOf(t);
-      bool rnum = right(p, true, lh);
+      bool rnum = right(4, true, lh);
+      singleComparison();
       if (at('{')) {
         int rh = rHome;
         Cond c = compareCond(op, lnum, rnum);
@@ -983,7 +1064,12 @@ struct Compiler : Gen {
           leaveTries(F->loop->tries), jump(*F->loop, prev.sym == K_break), F->live = false;
           return false;
         case K_class: case K_import: fail("@misplaced '%s' is only allowed at top level", name(cur.sym));
-        case K_fn: if (!peekIs('(')) fail("@misplaced named functions are only allowed at top level; use 'var f = fn(...) {...}'"); break;
+        case K_fn:
+          if (peek().t == T_ID) {
+            if (F->top) fail("@misplaced declare a named function at top level or inside another function");
+            return next(), localFunction(), false;
+          }
+          break;
         case S_expect: if (isExpect()) return expectStmt(), false; break;
         case S_atomic: if (peekIs('{') && !peek().nl) return next(), atomicStmt(), false; break;
         case S_handle: if (peekIs('{') && !peek().nl) return next(), handleStmt(), false; break;
@@ -1047,10 +1133,13 @@ struct Compiler : Gen {
     Tok n = peek();
     return !n.nl && n.t != '=' && n.t != '.' && n.t != T_EOF && !(n.t >= T_ADDEQ && n.t <= T_DIVEQ);
   }
+  void internalCall(const char* name, int base, int arity) {
+    gmem(0, findGlobal(intern(name))->slot), st(0, base), callWindow(base, arity, 0, false);
+  }
   void callNative(const char* nm, bool arg) {  // nm(x0) or nm(): a runtime function the compiler calls by name
     int base = slot();
     if (arg) st(0, slot());
-    gmem(0, findGlobal(intern(nm))->slot), st(0, base), callWindow(base, arg, 0, false);
+    internalCall(nm, base, arg);
   }
   // expect grows [allocs] { n -> body } like "n": grows@(site, the body as a closure, the growth, by allocations)
   // runs it for sizes n that double, fits how its time (or allocations) grows, and fails if faster than the growth.
@@ -1107,10 +1196,11 @@ struct Compiler : Gen {
     const char* afterLeft = prevEnd;
     int ls = slot();
     st(0, ls);
-    if (int t = cur.t, p = prec(t); p == 3 || p == 4) {
+    if (int t = cur.t, p = prec(t); comparison(p)) {
       next();
       const char* rs = tokStart(cur);
-      expr(p + 1);
+      expr(5);
+      singleComparison();
       s.op = opOf(t), s.right.assign(rs, prevEnd);
       if (prec(cur.t)) {  // `expect a == b && c`: one condition, checked for truthiness
         if (throws || prints || allocs) fail("@syntax expect %s { } compares with one value", throws ? "throws" : prints ? "prints" : "allocs");
@@ -1230,6 +1320,22 @@ struct Compiler : Gen {
   }
 
   // ---- declarations ----
+  void localFunction() {
+    Tok t = cur;
+    int sym = ident();
+    lambda(t, false, sym);
+    auto it = std::find_if(F->locals.begin() + F->scopeAt, F->locals.end(), [&](auto& l) { return l.sym == sym; });
+    if (it != F->locals.end()) {
+      int h = it->home;
+      *it = {sym, h};
+      return stl(0, h);
+    }
+    int h = home();
+    stl(0, h), F->locals.push_back({sym, h});
+  }
+  [[noreturn]] void defaultArgument(const Tok& t) {
+    failAt(t.p, t.line, "@syntax fut has no default arguments; pass a map of options, e.g. fn f(a, opts: {b: num?})");
+  }
   // Compile `(params) { body }` and queue it to be installed behind `stub`. Returns the arity.
   int function(Fun& f, int cls, bool init, const std::string& nm, u32* stub, Fn* fn) {
     f.cls = cls, f.init = init, f.k.name = nm, f.k.file = file;
@@ -1261,6 +1367,7 @@ struct Compiler : Gen {
           int s = ident(), h = home();  // not d8..: arguments arrive, and calls pass them, in x registers
           f.locals.push_back({s, h}), homes.push_back(h);
           ptys.push_back({s, accept(':') ? type() : Ty{}});
+          if (at('=')) defaultArgument(cur);
           if (Ty& t = ptys.back().second; t.code && t.code != TY_ANY)  // stores to it are checked too
             f.locals.back().ty = t.code, f.locals.back().num = t.code == TY_NUM, f.locals.back().site = typeSite("argument '" + symName(s) + "' of " + display(nm), t.text);
         } while (accept(','));
@@ -1326,11 +1433,11 @@ struct Compiler : Gen {
   // A clause's condition is the rest of its line, up to a '{' or '}' there (a function's body, the class's end).
   static bool clauseEnds(int d, const Tok& p, const Tok& t) { return d == 0 && p.t && (t.t == '{' || t.t == '}' || t.nl || t.t == T_EOF); }
   static int nesting(const Tok& t) { return (t.t == '(' || t.t == '[' || t.t == '{') - (t.t == ')' || t.t == ']' || t.t == '}'); }
-  bool orAhead() {  // does the condition at cur have a `||` outside brackets?
+  bool wholeClause() {  // does an outer || or ternary prevent checking each && part on its own?
     Lexer s = lx;
     Tok p, t = cur;
     for (int d = 0; t.t != T_EOF && t.t != T_ERR && !clauseEnds(d, p, t); p = t, t = s.next(), d += nesting(p))
-      if (d == 0 && t.t == T_OR) return true;
+      if (d == 0 && (t.t == T_OR || t.t == '?')) return true;
     return false;
   }
   // The names a contract's clauses see: self, the function's parameters and, in ensures, result. Code is attributed to
@@ -1343,10 +1450,10 @@ struct Compiler : Gen {
     F->locals = std::move(saved), F->scopeAt = sa, pinLine = 0;
   }
   // One condition, compiled to inline checks: each `&&` part on its own, so a failure names the part and its values
-  // (one check, if the condition has a `||` outside brackets). A false part calls contract@fail, which raises.
+  // (one check, if the condition has a `||` or ternary outside brackets). A false part calls contract@fail, which raises.
   void check(const At& a, const std::string& head, int whoHome = NOH) {  // whoHome: inv@'s who
     detour(a.file, a.src, a.p, a.line, [&] {
-      int more = orAhead() ? 1 : 3;  // the operators one part goes on through (3: not &&)
+      int more = wholeClause() ? 1 : 3;  // the operators one part goes on through (3: not &&)
       for (;;) {
         ExpectSite s{file, "", "", "", cur.line};
         s.contract = head;
@@ -1355,14 +1462,15 @@ struct Compiler : Gen {
         int lh;
         bool lnum = operand(&lh);
         binRest(5, lnum, lh);
-        if (int t = cur.t, p = prec(t); p == 3 || p == 4) {
+        if (int t = cur.t, p = prec(t); comparison(p)) {
           s.left.assign(start, prevEnd), next();
           const char* r0 = tokStart(cur);
           st(0, ls);
-          bool rnum = expr(p + 1);
+          bool rnum = expr(5);
+          singleComparison();
           s.op = opOf(t), s.right.assign(r0, prevEnd);
           st(0, rs), mv(1, 0), ld(0, ls), hasLit = false, binop(s.op, lnum, rnum);
-          if (prec(cur.t) >= more) {  // `a < b == c`: one value, checked for truthiness
+          if (prec(cur.t) >= more) {  // `a < b || c`: one value, checked for truthiness
             bool n = false;
             int h = NOH;
             binRest(more, n, h), st(0, ls), s.op = -1, s.right.clear(), s.left.assign(start, prevEnd);
@@ -1898,6 +2006,7 @@ struct Compiler : Gen {
       for (int d = 1; d > 0; ) {  // a name after `(` or `,` at the parameters' own level (not inside a {shape})
         Tok a = lex(s);
         if (a.t == T_EOF) break;
+        if (d == 1 && a.t == '=') defaultArgument(a);
         if ((d += nesting(a) + (a.t == '<') - (a.t == '>') - 2 * (a.t == T_SHR)) == 1) n += a.t == T_ID && (last == '(' || last == ',');
         last = a.t;
       }

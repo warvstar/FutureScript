@@ -10,8 +10,8 @@
 #include <unordered_map>
 
 // ---------------- lexer ----------------
-enum { T_EOF = 256, T_NUM, T_STR, T_ID, T_EQ, T_NE, T_LE, T_GE, T_DOTDOT, T_AND, T_OR, T_ADDEQ, T_SUBEQ, T_MULEQ, T_DIVEQ, T_SHL, T_SHR, T_ERR };
-inline const char two[][3] = {"==", "!=", "<=", ">=", "..", "&&", "||", "+=", "-=", "*=", "/=", "<<", ">>"};
+enum { T_EOF = 256, T_NUM, T_STR, T_ID, T_EQ, T_NE, T_LE, T_GE, T_DOTDOT, T_AND, T_OR, T_ADDEQ, T_SUBEQ, T_MULEQ, T_DIVEQ, T_SHL, T_SHR, T_POW, T_OPT_DOT, T_ERR };
+inline const char two[][3] = {"==", "!=", "<=", ">=", "..", "&&", "||", "+=", "-=", "*=", "/=", "<<", ">>", "**", "?."};
 struct Tok { int t = 0, line = 0, sym = -1, len = 0; bool nl = false; double n = 0; const char* p = ""; };
 inline bool idc(char c) { return ((c | 32) >= 'a' && (c | 32) <= 'z') || c == '_'; }
 inline bool dig(char c) { return c >= '0' && c <= '9'; }
@@ -52,6 +52,14 @@ struct Lexer {
       k.p++, k.len = int(p++ - k.p);
       return k.t = T_STR, k;
     }
+    if ((*p == '=' || *p == '!') && p[1] == '=' && p[2] == '=') {
+      err = *p == '=' ? "use '==' for equality" : "use '!=' for inequality";
+      return p += 3, k.t = T_ERR, k;
+    }
+    if ((p[0] == '=' && p[1] == '>') || (p[0] == '+' && p[1] == '+')) {
+      err = *p == '=' ? "write a lambda as fn(x) { return x }" : "use '+= 1' to increment";
+      return p += 2, k.t = T_ERR, k;
+    }
     for (int i = 0; i < int(sizeof two / sizeof *two); i++)
       if (p[0] == two[i][0] && p[1] == two[i][1]) return p += 2, k.t = T_EQ + i, k;
     return k.t = *p++, k;
@@ -66,6 +74,7 @@ inline const auto BIN = [] {
                          {'>', 4, O_GT}, {T_GE, 4, O_GE}, {'|', 5, O_BOR}, {'^', 6, O_BXOR}, {'&', 7, O_BAND}, {T_SHL, 8, O_SHL},
                          {T_SHR, 8, O_SHR}, {'+', 9, O_ADD}, {'-', 9, O_SUB}, {'*', 10, O_MUL}, {'/', 10, O_DIV}, {'%', 10, O_MOD}})
     b[t] = {p, o};
+  b['?'] = {1, 0};
   return b;
 }();
 inline int prec(int t) { return t <= T_SHR ? BIN[t].first : 0; }
@@ -109,6 +118,7 @@ struct Fun {  // per-function emission state
   bool tier2 = false, retNum = true;
   int npar = 0;
   u32 spec = 0;
+  int lambdaName = -1;  // a named lambda resolves its own name to the incoming closure
   int self = -1;
   std::vector<u32> guard;  // registers holding speculated parameters, checked on entry
   // A function containing `try` keeps every local in its frame (a throw skips the epilogues of the frames it

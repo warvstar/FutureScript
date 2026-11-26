@@ -365,6 +365,7 @@ export async function createFut(opts) {
   const S = (f) => new WebAssembly.Suspending(f);
   const env = {};
   const host = {
+    pow: libc.pow,
     install(mod, len, ops, nops) {
       if (mod) {
         const bytes = u8().slice(mod, mod + len);

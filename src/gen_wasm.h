@@ -229,6 +229,7 @@ struct Gen : CState {
     else cmp();
     return hasLit = false, Cond{};
   }
+  Cond nonNilCond() { return get(R0), i64c(NIL), op(I64_NE), Cond{}; }
   Cond truthyCond() { return truthy(), Cond{}; }
   void thenBegin(Cond&) { open(IF); }
   int elseBegin(Cond&, bool hasElse) { if (hasElse) op(ELSE); return 0; }
