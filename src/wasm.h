@@ -24,7 +24,7 @@ inline const char* const FUT_SIG = "iillll:l";
 // Helper signatures: parameters, ':' and the result (l: i64, i: i32 pointer; none: void).
 inline const char* const HSIG[NH] = {
     ":", ":", "lll:l", "lli:l", "llli:l", "ll:l", "lll:l", "illli:i", "il:l", "ll:l", "l:l", ":", "il:l", "lli:l",
-    "li:", "l:l", "ii:l", "l:l", "iii:", "l:"};
+    "li:", "l:l", "ii:l", "l:l", "iii:", "l:", "lil:l", "ll:l"};
 inline void uleb(std::vector<uint8_t>& o, uint64_t v) {
   do o.push_back(uint8_t((v & 0x7f) | (v > 0x7f ? 0x80 : 0))), v >>= 7;
   while (v);

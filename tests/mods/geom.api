@@ -1,0 +1,14 @@
+// The public interface of geom.fut, written by `fut api`. `fut test` fails while it is out of date.
+
+pub fn area(r)
+
+pub var calls
+
+pub class Circle {
+  fn area()
+  fn init(r)
+}
+
+pub var PI
+
+pub fn square(x)

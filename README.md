@@ -10,6 +10,7 @@ python3 build.py fuzz 1000     # mutate the tests; any crash or sanitizer report
 build/fut file.fut             # run
 build/fut test file.fut        # run its `test` blocks (--json: one JSON object per line; --filter text; --timeout s)
 build/fut -w file.fut          # run and hot-reload on save (file and its imports); type lines to run them inside it
+build/fut api file.fut         # write each imported file's .api (its pub declarations); `fut test` checks them
 build/fut --asm file.fut       # disassemble the generated code (uses clang + otool)
 build/fut                      # REPL
 python3 build.py wasm          # -> build/fut.wasm (compiler + runtime for WebAssembly)
@@ -35,7 +36,7 @@ class Shape {
 }
 class Rect : Shape {
   fn init(w, h) { super.init("rect") self.w = w self.h = h }
-  fn area() { return self.w * self.h }
+  override fn area() { return self.w * self.h }   // replacing an inherited method says so
 }
 
 fn counter() { var n = 0 return fn() { n += 1 return n } }   // closures
@@ -57,11 +58,29 @@ fn reload() { }                      // optional: runs after every hot reload (m
 - **Operators:** `+ - * / %`, `== != < <= > >=`, `&& ||` (short-circuit, return the operand), `!`, `= += -= *= /=`. Bitwise `& | ^ ~ << >>` work on whole numbers as 64-bit integers (`1.5 & 1` is an error), with Python's precedence: `2 + 3 & 6` is `(2 + 3) & 6`. `+` with a string on either side concatenates.
 - **Builtins:** `print len str int clock sleep floor sqrt fiber run` (`int` truncates toward zero), plus graphics (below).
 - **Numbers:** `12`, `1.5`, `2e3`, `0xff8800`.
-- **Keywords:** `var fn class if else while for in return break continue true false nil self super import extern yield try catch throw` (`as` is special only after an import).
+- **Keywords:** `var fn class if else while for in return break continue true false nil self super import extern yield try catch throw`. `as`, `pub`, `override` and `atomic` are special only where they start an import alias, declaration or block, so they stay usable as names.
 - **Methods:** `list.push/pop/len`, `map.has/remove/keys/values/len`, `str.len/has` (`has`: contains a substring), `fiber.resume/send/done`.
 - **Closures:** a closure captures the enclosing variables by value. The closure can still change its own copy, so counters work, but it does not see later changes in the enclosing function.
 - **Interpolation:** expressions inside `{...}` in a string can't contain `"`. Write `\{` for a literal brace.
 - **Newline rules:** a `(` or `[` on a new line, or a leading `-`, starts a new statement rather than continuing the previous one.
+
+## Classes
+
+```
+class Unit {
+  var hp = 10                        // declared fields, with defaults: a number, string, true, false or nil
+  var name
+  fn init(name) { self.name = name }
+  fn hit(n) { self.hp -= n }
+}
+class Mage : Unit {
+  var mana = 5
+  override fn hit(n) { self.mana -= n }
+}
+```
+
+- **Fields** are created by assignment (`self.w = w`) unless the class declares them. A class that declares a field, or inherits one, is **closed**: it has exactly the declared fields. A typo such as `self.hpp = 3` is a compile error inside the class's own methods and a runtime error elsewhere, instead of silently creating a field that nothing reads. A field never assigned reads as its default. Instances that already exist get the default when hot reload adds a declared field.
+- **`override`** is required on a method that replaces a superclass's method, and is an error on one that doesn't. A subclass method can't silently replace a base method that is added later, and renaming or removing a base method can't leave subclass methods quietly orphaned. An overriding method must take as many parameters as the method it replaces. `init` is exempt.
 
 ## Errors
 
@@ -74,6 +93,25 @@ try { risky() } catch { }                            // the name is optional
 ```
 
 `throw` unwinds to the innermost `try` on the current stack, through any number of calls. `return`, `break` and `continue` leave a `try` cleanly. An uncaught error inside a fiber ends the fiber and is thrown again in its resumer, where it can be caught. An uncaught error stops the program with a stack trace (under `-w`, it waits for a fix). Entering a `try` costs a few stores: the handler record lives in the function's frame, and a function containing `try` keeps its locals in memory so a catch sees their latest values.
+
+## Atomic blocks
+
+```
+fn transfer(from, to, n) {
+  atomic {
+    from.balance -= n
+    to.balance += n
+    if from.balance < 0 { throw "insufficient funds" }   // neither balance changes
+  }
+}
+```
+
+If an error leaves an `atomic` block, everything the block changed that other code can see is put back before the error continues. That covers instance fields, lists, maps, globals and closures' captured variables. The error can be a `throw` or a runtime error, from any depth of calls. Whatever catches it then sees the state as it was before the block. If the block finishes, or leaves by `return`, `break` or `continue`, its changes stay. Blocks nest: an inner block that fails rolls back only its own changes, and an outer block that fails also rolls back what its inner blocks did.
+
+- **Nothing to declare.** Any code can run inside a block, including calls into code that knows nothing about it. The runtime saves each object just before the block first writes to it.
+- **Not rolled back:** the outside world (printed output, files, C calls), and local variables of the running functions, which no other code can see.
+- **Fibers:** a fiber may not `yield` inside its own atomic block, because other code would then see the block half done. A `yield` written directly in the block is a compile error; one reached through a call is a runtime error. A fiber resumed from inside a block may yield, and what it changed belongs to that block.
+- **Cost:** a block copies the globals when it starts, and each object the first time it writes to it. Field stores inside a block skip their inline caches. Hot reloads and typed lines wait until open blocks finish.
 
 ## Tests
 
@@ -107,6 +145,7 @@ pending discounts (cart.fut:10): undefined name 'discount' at cart.fut:10:27
 - **`run(file)`** or **`run({source: "...", args: [...], timeout: s})`** runs fut on a program in a child process and returns `{code, out, err, timedOut}`. Use it to check what can't be checked in-process: uncaught errors and their stack traces, compile errors, exit codes, and whether `main` runs. A relative `file` is found next to the program, and `args` go before the file (`args: ["test", "--json"]`). In `source`, write `\{` for a literal brace, because `{...}` interpolates.
 - A failed `expect` throws an error. Outside `fut test` it works as an assertion, with the usual stack trace. A test whose `expect` fails is reported as failed even if its own `try` catches that error.
 - **Pending tests support writing the spec first.** A test that names a function, class or module member that isn't defined yet is reported as pending instead of failing the whole compile. Any other compile error is still an error.
+- **Interfaces:** `fut test` also fails when a file's `.api` file is missing or out of date (see [Modules](#modules-and-visibility)).
 - **Statuses:** `ok`, `FAIL` (an `expect` failed), `ERROR` (an uncaught runtime error, with its trace) and `pending`. Output that a failing test printed is shown under it. The exit status is 0 only when every test passed: 1 means something failed, errored or is pending, and 2 means a compile error.
 - **`--json`** prints one object per line: `{"type":"test", "name", "file", "line", "status", "ms", "output"}`. A failed test adds `"expect": {"file", "line", "expr", "left": {"expr", "value"}, "right": {...}, "diff": {"at", "what"}, "reason"}`. An error adds `"message"` and `"trace"`, and a pending test adds `"reason"`. A final `{"type":"summary", "passed", "failed", "errors", "pending", "ms"}` follows. A compile error is `{"type":"compile_error", "file", "line", "col", "message", "text"}`, and an error in top-level code is `{"type":"error", "message", "trace"}`.
 - **`--filter text`** runs only the tests whose name contains `text`.
@@ -114,9 +153,48 @@ pending discounts (cart.fut:10): undefined name 'discount' at cart.fut:10:27
 - `test`, `expect`, `throws` and `prints` are reserved only in these positions, so they stay usable as ordinary names.
 - **This repository's tests:** `tests/specs/*.fut` are specs, run with `fut test`; the programs they `run()` are in `tests/specs/progs/`. A few files in `tests/*.fut` still use `// expect:` comments that the runner compares with stdout: `basics`, `control`, `cond`, `classes`, `err_compile` and `expect`. They test, without using `expect`, the features `expect` itself depends on.
 
-## Modules
+## Modules and visibility
 
-`import "path.fut"` merges the file's top-level names into the program. `import "path.fut" as name` keeps them in their own namespace: the file's functions, classes and vars are reached as `name.x`, the module's own code still uses their short names, and two modules may define the same name. A module's `main` is not run. A wrong `name.x` is a compile error. Using `name` alone as a value is an error too, since a module is not a value. Hot reload patches module functions like any other (`patched geom.area`).
+A top-level name in an imported file is private to that file unless it is marked `pub`:
+
+```
+// lib/limits.fut
+fn clamp(x, lo, hi) { ... }          // private: only this file can use it
+pub fn limit(x) { return clamp(x, 0, 10) }
+pub class Range { ... }              // a pub class's fields and methods are public
+pub var calls = 0
+```
+
+`import "path.fut"` makes the file's `pub` names global in the importing program. `import "path.fut" as name` keeps them in a namespace instead: `name.limit(3)`, `name.Range()`, `class C : name.Range`. Either way, a private name used from another file is a compile error that says how to fix it (`'clamp' is private to lib/limits.fut (mark it pub there to use it here)`), and two files may use the same private name. The file you run needs no `pub`. A module's `main` is not run. A wrong `name.x` is a compile error. Using `name` alone as a value is also an error, since a module is not a value. Hot reload patches module functions like any other (`patched geom.area`).
+
+Only the `pub` names of a file are what other files can depend on. Everything else can be renamed, given new parameters or deleted without breaking anyone, which matters when many people or agents change a codebase at once.
+
+### Interface files
+
+`fut api main.fut` writes a `.api` file next to each compiled file that has `pub` declarations. It lists only the signatures, sorted by name, each with the `//` comments right above it, and includes a class's fields and methods:
+
+```
+// The public interface of geom.fut, written by `fut api`. `fut test` fails while it is out of date.
+
+pub class Vec {
+  var x = 0
+  fn add(o)
+  fn init(x, y)
+}
+
+// Where every shape starts.
+pub var origin
+```
+
+`fut test` checks these files. When a file's public interface no longer matches its `.api` file, the run fails and shows what changed:
+
+```
+API     lib/geom.fut: its public interface changed; `fut api main.fut` updates geom.api
+  - Vec: fn add(o)
+  + Vec: fn add(o, scale)
+```
+
+With `--json` this is `{"type":"api", "file", "interface", "status": "missing" | "changed" | "stale", "removed": [...], "added": [...]}`. So a change to what other files depend on never happens by accident: it appears as its own diff, in a small file that is easy to review. Two changes to the same interface conflict there, at merge time, rather than at run time. Edits to private code and to function bodies don't touch the `.api` file. A reader, human or agent, can learn a file's contract from its `.api` without opening the source. `fut api --check main.fut` only reports.
 
 ## Fibers
 
@@ -173,6 +251,7 @@ while present() {                    // show the frame, handle input, wait for t
 - **Stubs.** Every function and method is called through a one-instruction `b body` stub. A reload installs new bodies, then rewrites each stub with a single aligned 4-byte store and an icache flush.
 - **Incremental.** Every function and method is hashed by its source text and by the set of top-level declarations. Unchanged ones are skipped; a function that only moved has its line table shifted instead.
 - **Compile errors** are reported with file:line:col and a caret, and nothing is patched. **Runtime errors** print a stack trace; under `-w`, fut then waits for a fix and reruns `main`.
+- **A failed reload is undone.** The new top level (initializers of new and edited vars) and `reload()` run as one transaction, as if inside `atomic`. If either throws, the data they changed is rolled back. The previous code is then compiled again from the sources it was built from, without being run. The program carries on as though the file had not been saved, after printing the error and `[fut] reload rolled back`. The next save tries again.
 - **State survives.** Globals keep their values. A `var`'s initializer runs again only if the var is new or its declaration line was edited, so changing `var gravity = 0.15` to `0.3` takes effect at once while untouched state is kept. Class method tables are rebuilt in place, so existing instances see new, changed and removed methods. After each patch, `reload()` runs if it is defined.
 - **Running frames.** Frames already running finish in their old code. If `main` itself changed, it is unwound and restarted with globals intact.
 - **Changed parameter counts.** The function gets a new stub, and the old stub is pointed at a trap. Old code that is still running and calls the function gets a clean "stale call" error rather than reading garbage arguments.
@@ -216,7 +295,9 @@ Other differences from arm64: file changes and typed lines are delivered only wh
 | `web/` | `fut.js` (JS host: instantiation, installs, traces, fibers, driver), `run.mjs` (Node CLI), `serve.mjs` + `index.html` (browser) |
 | `gc.cpp` | Allocator using 64 KB pages with size classes (O(1) "is this a heap pointer?"); mark bitmap, no sweep, conservative over stack and registers |
 | `gfx.cpp` | The window: AppKit through the Objective-C runtime, loaded on first use (a canvas in wasm) |
-| `main.cpp` | Driver: watcher, safepoint reload, `main` restart, REPL, `--asm`, `fut test` |
+| `main.cpp` | Driver: watcher, safepoint reload (as a transaction), `main` restart, REPL, `--asm`, `fut test`, `fut api` |
+| `txn.cpp` | Transactions (`atomic`, reloads): an object is copied before its first write, globals at the start; rollback, nesting |
+| `api.cpp` | Public interfaces: a file's `pub` declarations as `.api` text, the check `fut test` runs, `fut api` |
 | `test.cpp` | `expect`'s check (deep equality, failure details) and the test runner's reporting, text and JSON; shared by both platforms |
 
 **Codegen:**
@@ -237,7 +318,7 @@ Other differences from arm64: file changes and typed lines are delivered only wh
 - Arithmetic and comparisons on two numbers run inline. Type checks are skipped for number literals (loaded with `fmov d, #imm` when encodable), for range counters, and for locals already proven to be numbers. A local is proven when an earlier `-`, `*`, `/`, `%`, or a comparison with a number, ran on it, since those raise otherwise. The proof holds until the local is assigned or a loop head is reached, and merges across `if`/`else`.
 - An `if`/`while` condition of the form `a < b` compiles to a compare and a branch, without building a boolean.
 - The prologue is generated after the body, so it saves only the registers the function used, reserves the exact frame size, and checks the stack only when the function makes calls. All returns share one epilogue.
-- Instances keep their fields inline, sized to the class's field count at construction. Their header holds the class id and slot count, so a field or method inline cache hit is one 64-bit (or 32-bit) compare and a load. The caches are cleared on every reload.
+- Instances keep their fields inline, sized to the class's field count at construction. Their header holds the class id and slot count, so a field or method inline cache hit is one 64-bit (or 32-bit) compare and a load. The caches are cleared on every reload, and field-store caches also when a transaction begins (they stay empty until it ends, so each store saves its instance first).
 - `C(args)` for a top-level class allocates inline. The call site caches the class and its `init`. On a hit, it bumps the free run of the instance's size class, writes the header and fills the slots, then calls `init`, with no call into the runtime. Closures are allocated the same way.
 
 **Memory:**

@@ -6,6 +6,7 @@
 //   wasm: bytes of fut.wasm           read(path): file bytes or null      write(fd, bytes): stdout (1) / stderr (2)
 //   verbose: bool                     getenv(name): string or undefined   window(w, h): bool, present(rgba, w, h): Promise
 //   run(args, file, source, timeout): {code, out, err, timedOut} -- fut in a child process (run()), if possible
+//   save(path, text): bool -- write a file (text null: remove it), for `fut api`
 export class Restart extends Error {}  // unwinds to the driver, which reruns main()
 export class Exit extends Error { constructor(code) { super("exit " + code), (this.code = code); } }
 
@@ -128,9 +129,9 @@ export async function createFut(opts) {
   let fileChanged = false, inbox = [], replBuf = "", inMain = false, wake = null, path = "", mainChanged = false;
   const poke = () => { if (ex) dv().setUint32(pollAt, dv().getUint32(pollAt, true) | 1, true); wake?.(), (wake = null); };
   let pollAt = 0;
-  async function call(slot) {  // run code; on an error the shadow stack pointer is put back
-    const sp = spG.value;
-    try { return await callP(slot); } catch (e) { spG.value = sp; throw e; }
+  async function call(slot) {  // run code; on an error the shadow stack pointer is put back, and transactions opened since roll back
+    const sp = spG.value, txn = ex.fut_txn_depth();
+    try { return await callP(slot); } catch (e) { spG.value = sp, ex.fut_txn_unwind(txn); throw e; }
   }
   async function evalRepl(more) {  // compile and run replBuf, unless it is unfinished and `more` may follow
     const s = withStr(replBuf, (p) => withStr("<repl>", (n) => ex.fut_compile(n, 0, 1, p)));
@@ -153,16 +154,25 @@ export async function createFut(opts) {
     if (reload) write(2, `[fut] ${cstr(ex.fut_info(0))} (${(performance.now() - t0).toFixed(2)} ms, ${ex.fut_live() >> 10} KB code)\n`);
     return s;
   }
-  async function hostPoll() {  // at a safepoint: typed lines, then a reload if a file changed
+  async function hostPoll() {  // at a safepoint (not inside atomic { }): typed lines, then a reload if a file changed
     await evalInbox();
     if (!fileChanged) return;
     fileChanged = false;
     const c = load(true);
     if (!c) return;  // compile error: keep running the old code
     const restart = mainChanged && inMain;
-    await call(c), ex.fut_retire(c);
-    const r = withStr("reload", (p) => ex.fut_fn(p));
-    if (r) await call(r);  // user hook: migrate state
+    // The new top level and the reload() hook (which migrates state) run as one transaction. If either fails, the
+    // reload is undone: the data they changed, then the code. The program goes on as if the file had not changed.
+    ex.fut_txn_begin();
+    try {
+      await call(c);
+      const r = withStr("reload", (p) => ex.fut_fn(p));
+      if (r) await call(r);
+    } catch (e) {
+      if (e instanceof Restart || e instanceof Exit) throw e;
+      return report(e), ex.fut_retire(c), ex.fut_reload_failed();
+    }
+    ex.fut_retire(c), ex.fut_txn_commit();
     if (restart) throw new Restart();
   }
   async function runCode(slot) {  // 0 ok, 1 runtime error, 2 restart requested
@@ -209,6 +219,7 @@ export async function createFut(opts) {
       return b ? ((held = b), b.length) : -1;
     },
     take(dst) { u8().set(held, dst); },
+    save: (p, t) => (opts.save?.(cstr(p), t ? cstr(t) : null) ? 1 : 0),
     extern: (lib, name) => externLookup(cstr(lib), cstr(name)),
     ffi,
     resume: S(resume), yield: S(yieldTo), fiber_gone: (f) => fibers.delete(f),
@@ -265,15 +276,23 @@ export async function createFut(opts) {
         if (!c) return 2;
         const top = await errorOf(c);
         ex.fut_retire(c);
-        if (top != null) return withStr(top, (p) => ex.fut_test_top_error(p)), 1;
+        // a public interface out of date fails the run too (reported last, by the status)
+        const api = (st) => (withStr(path, (p) => ex.fut_api(json ? 1 : 0, p)) ? Math.max(st, 1) : st);
+        if (top != null) return withStr(top, (p) => ex.fut_test_top_error(p)), api(1);
         for (let i = 0, n = ex.fut_test_count(); i < n; i++) {
           const s = ex.fut_test_start(i);
           if (!s) continue;
           const err = await errorOf(s);
           withStr(err ?? "", (p) => ex.fut_test_finish(i, err != null ? 1 : 0, p));
         }
-        return ex.fut_tests_end();
+        return api(ex.fut_tests_end());
       } catch (e) { if (e instanceof Exit) return e.code; throw e; }
+    },
+    api(file, check) {  // fut api [--check]: write (or just report) each compiled file's .api; exit status
+      path = file;
+      if (!withStr(path, (p) => ex.fut_compile(p, 0, 0, 0, 0))) return 2;
+      const n = withStr(path, (p) => ex.fut_api(check ? 0 : 2, p));
+      return check && n ? 1 : 0;
     },
     async line(l) {  // REPL without a program: returns the next prompt
       (replBuf += l), await evalRepl(l.length > 1);

@@ -39,19 +39,23 @@ int intern(std::string_view s) {
 }
 const std::string& symName(int s) { return names[s]; }
 
+static int nextGlobal;
+int globalCount() { return nextGlobal; }
 Global& global(int sym) {
-  static int next = 0;
-  if (Global& g = growAt(globals, sym); g.slot < 0 && (g.slot = next++) >= MAXG) compileFail("too many globals", false);
+  if (Global& g = growAt(globals, sym); g.slot < 0 && (g.slot = nextGlobal++) >= MAXG) compileFail("too many globals", false);
   return globals[sym];
 }
 Global* findGlobal(int sym) { return (size_t)sym < globals.size() && globals[sym].slot >= 0 ? &globals[sym] : nullptr; }
 static Fn* builtin(K k, uint64_t s) { return s < builtins[(int)k].size() ? builtins[(int)k][s] : nullptr; }
 static int nics;
 static constexpr uint64_t EMPTY = ~0ull;  // matches no header
-int newIC() {
+static std::vector<int> setICs;
+int newIC(bool set) {
   if (nics == MAXIC) compileFail("too many inline caches", false);
+  if (set) setICs.push_back(nics);
   return vm.ics[nics].key = EMPTY, nics++;
 }
+void clearSetICs() { for (int i : setICs) vm.ics[i].key = EMPTY; }
 u32 icEpoch = 1;
 void clearICs() {
   icEpoch++;
@@ -168,11 +172,13 @@ static V rt_getf(V o, uint64_t s, IC* ic) {
       if (ic) *ic = {header(in), i};
       return in->slots[i];
     }
+    if (const V* d = in->cls->declared((int)s)) return *d;  // never assigned (or declared since it was made): the default
+    if (in->cls->closed()) ERR("%s has no field '%s'", symName(in->cls->name).c_str(), symName(s).c_str());
   }
   ERR("%s has no field '%s'", typeName(o), symName(s).c_str());
 }
 // What JIT constructors read from a class: a new instance has room for every field the class has had so far.
-static void reshape(Class* c) {
+void reshape(Class* c) {
   u32 cap = (u32)std::min<size_t>(c->layout.size(), 0xffff);
   int k = sizeClass(sizeof(Inst) + cap * 8);
   c->ihdr = (uint64_t)K::Inst | (uint64_t)cap << 16 | (uint64_t)c->id << 32;
@@ -182,6 +188,9 @@ static V rt_setf(V o, uint64_t s, V v, IC* ic) {
   if (is(o, K::Map)) return rt_seti(o, mapKey(s), v);
   if (!is(o, K::Inst)) ERR("cannot set field '%s' on %s", symName(s).c_str(), typeName(o));
   Inst* in = as<Inst>(o);
+  touch(in);  // in a transaction: saved before its first change (the cache isn't filled, so every store comes here)
+  if (in->cls->closed() && !in->cls->declared((int)s))
+    ERR("%s has no field '%s' (its fields are declared: add 'var %s' to the class)", symName(in->cls->name).c_str(), symName(s).c_str(), symName(s).c_str());
   auto& l = in->cls->layout;
   u32 i = u32(std::find(l.begin(), l.end(), (int)s) - l.begin());
   if (i == l.size()) l.push_back((int)s), reshape(in->cls);
@@ -194,7 +203,7 @@ static V rt_setf(V o, uint64_t s, V v, IC* ic) {
     else gcOwn(in);  // the GC frees the slots when the instance dies
     in->slots = s, in->nslots = (uint16_t)n;
   }
-  if (ic) *ic = {header(in), i};
+  if (ic && !vm.txn) *ic = {header(in), i};
   return in->slots[i] = v;
 }
 #define INDEX(i, n) (isNum(i) && num(i) >= 0 && num(i) < (n) ? (size_t)num(i) : (ERR("index %s out of range (len %zu)", toStr(i).c_str(), (size_t)(n)), 0))
@@ -223,10 +232,11 @@ static V rt_geti(V a, V i) {
   return char1(a, INDEX(i, as<Str>(a)->len));
 }
 static V rt_seti(V a, V i, V v) {
-  if (is(a, K::Map)) return mapSet(as<Map>(a), i, v), v;
+  if (is(a, K::Map)) return touch(obj(a)), mapSet(as<Map>(a), i, v), v;
   if (!is(a, K::List)) ERR("cannot assign into %s", typeName(a));
   auto& l = as<List>(a)->v;
-  return l[INDEX(i, l.size())] = v;
+  size_t at = INDEX(i, l.size());
+  return touch(obj(a)), l[at] = v;
 }
 static V rt_iter(V c, uint64_t i) {
   if (is(c, K::List)) return i < as<List>(c)->v.size() ? as<List>(c)->v[i] : END;
@@ -352,6 +362,7 @@ V fiberResume(V fv, V v) {  // run fv until it yields (giving the yielded value)
 V rt_yield(V v) {
   Fiber* f = fiberCur;
   if (!f) ERR("yield outside a fiber");
+  if (txnOpenIn(f)) ERR("yield inside atomic { }: other code would run while it is half done (yield after it ends)");
   f->val = v, f->state = FIB_SUSPENDED;
   fiberYield(f);
   return std::exchange(f->val, NIL);  // sent by the next resume
@@ -397,10 +408,11 @@ static V n_clock() { return box(now()); }
 static V n_sleep(V v) { return sleepFor(NUMARG(v, "sleep")), NIL; }
 static V n_floor(V v) { return box(std::floor(NUMARG(v, "floor"))); }
 static V n_sqrt(V v) { return box(std::sqrt(NUMARG(v, "sqrt"))); }
-static V l_push(V l, V v) { as<List>(l)->v.push_back(v); return l; }
+static V l_push(V l, V v) { touch(obj(l)), as<List>(l)->v.push_back(v); return l; }
 static V l_pop(V l) {
   auto& v = as<List>(l)->v;
   if (v.empty()) ERR("pop() from empty list");
+  touch(obj(l));
   V x = v.back();
   return v.pop_back(), x;
 }
@@ -409,6 +421,7 @@ static V m_remove(V m, V k) {  // the last entry moves into the hole
   Map* p = as<Map>(m);
   long i = mapFind(p, k);
   if (i < 0) return NIL;
+  touch(p);
   V v = p->e[i].second;
   *mapSlot(p, k) = ~0u;
   if (i + 1 != (long)p->e.size()) p->e[i] = p->e.back(), *mapSlot(p, p->e[i].first) = (u32)i + 1;
@@ -443,6 +456,7 @@ void rtInit() {
   gcInit();
   identCode = callable<+[](V self) { return self; }>();
   platformInit();
+  txnInit();
   native<n_print>("print"), native<n_str>("str"), native<n_len>("len"), native<n_clock>("clock"), native<n_sleep>("sleep");
   native<+[](V v) { return box(std::trunc(NUMARG(v, "int"))); }>("int");
   native<n_floor>("floor"), native<n_sqrt>("sqrt"), native<newFiber>("fiber");

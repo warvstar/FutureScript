@@ -1,0 +1,9 @@
+// The public interface of geom.fut, written by `fut api`. `fut test` fails while it is out of date.
+
+pub var origin
+
+pub class Vec {
+  fn add(o)
+  fn init(x, y)
+  fn str()
+}

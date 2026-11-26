@@ -38,7 +38,7 @@ template <class F> static void eachReturnAddress(F f, uintptr_t* fp = (uintptr_t
   }
 }
 // Jump into a try's handler in its JIT frame: restore sp, fp, the pinned registers, x0 = the error value.
-struct Handler { Handler* prev; void *sp, *fp, *limit, *pc; };
+struct Handler { Handler* prev; void *sp, *fp, *limit, *pc; uint64_t txn; };  // txn: transactions open at its entry
 #if __has_feature(address_sanitizer)
 extern "C" void __asan_handle_no_return();  // the frames we jump past must not stay poisoned
 #else
@@ -50,7 +50,8 @@ __attribute__((naked)) static void enterHandler(Handler*, V, VM*) {
 }
 static std::string fiberTrace;  // frames of a fiber that ended with an error, printed if nothing catches it
 [[noreturn]] void throwValue(V v, void* ra) {
-  if (auto* h = (Handler*)vm.handler) vm.handler = h->prev, fiberTrace.clear(), __asan_handle_no_return(), enterHandler(h, v, &vm);
+  if (auto* h = (Handler*)vm.handler)  // the transactions opened inside the try roll back before its handler runs
+    vm.handler = h->prev, txnUnwind((u32)h->txn), fiberTrace.clear(), __asan_handle_no_return(), enterHandler(h, v, &vm);
   // Uncaught: the site that failed, then every JIT frame found by walking the frame-pointer chain.
   std::vector<std::string> fr;
   if (auto d = frameDesc((uintptr_t)ra); !d.empty()) fr.push_back(d);
@@ -280,6 +281,13 @@ bool readFile(const std::string& path, std::string& out) {
   fseek(f, 0, SEEK_END), out.resize(ftell(f)), rewind(f);
   out.resize(fread(out.data(), 1, out.size(), f)), fclose(f);
   return true;
+}
+bool saveFile(const std::string& path, const std::string* text) {
+  if (!text) return remove(path.c_str()) == 0;
+  FILE* f = fopen(path.c_str(), "wb");
+  if (!f) return false;
+  bool ok = fwrite(text->data(), 1, text->size(), f) == text->size();
+  return fclose(f) == 0 && ok;
 }
 
 

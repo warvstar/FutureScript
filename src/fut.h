@@ -60,9 +60,18 @@ struct Class : Obj {
   Class* super;
   std::vector<std::pair<int, Fn*>> methods;  // few per class, and looked up only on inline-cache misses
   std::vector<int> layout;                    // field syms; the index is the slot, shared by all instances
+  std::vector<std::pair<int, V>> fields;      // fields declared in the class body (`var hp = 10`) and their defaults
   Fn* find(int s) {
     for (Class* c = this; c; c = c->super)
       for (auto [m, f] : c->methods) if (m == s) return f;
+    return nullptr;
+  }
+  // A class that declares fields, or inherits declared ones, is closed: it has exactly those fields. A field
+  // never assigned reads as its default. Open classes (no declarations) get fields by assignment.
+  bool closed() { for (Class* c = this; c; c = c->super) if (!c->fields.empty()) return true; return false; }
+  const V* declared(int s) {
+    for (Class* c = this; c; c = c->super)
+      for (auto& [f, d] : c->fields) if (f == s) return &d;
     return nullptr;
   }
 };
@@ -129,7 +138,7 @@ extern uintptr_t* stackTop;
   X(true) X(false) X(nil) X(self) X(super) X(import) X(extern) X(yield) X(try) X(catch) X(throw)
 #define SYM_ENUM(k) K_##k,
 #define SYM_STR(k) #k,
-#define EXTRA_SYMS(X) X(init) X(main) X(push) X(pop) X(len) X(has) X(remove) X(keys) X(values) X(reload) X(resume) X(send) X(done) X(as) X(test) X(expect) X(throws) X(prints)
+#define EXTRA_SYMS(X) X(init) X(main) X(push) X(pop) X(len) X(has) X(remove) X(keys) X(values) X(reload) X(resume) X(send) X(done) X(as) X(test) X(expect) X(throws) X(prints) X(pub) X(override) X(atomic)
 #define SYM_S(k) S_##k,
 enum { KEYWORDS(SYM_ENUM) NKW, S_FIRST = NKW - 1, EXTRA_SYMS(SYM_S) };
 int intern(std::string_view);
@@ -137,7 +146,7 @@ const std::string& symName(int);
 
 // ---- the VM block pinned in x28; JIT code reaches helpers and globals with one ldr ----
 enum Helper { H_POLL, H_STACK, H_BINOP, H_GETF, H_SETF, H_GETI, H_SETI, H_PREP, H_LIST, H_ITER, H_NUMCHK, H_UNDEF,
-              H_MAP, H_CLOSURE, H_STALE, H_ECHO, H_FFI, H_YIELD, H_HOT, H_THROW, NH };
+              H_MAP, H_CLOSURE, H_STALE, H_ECHO, H_FFI, H_YIELD, H_HOT, H_THROW, H_CAPSET, H_TXUNWIND, NH };
 enum Op { O_ADD, O_SUB, O_MUL, O_DIV, O_MOD, O_EQ, O_NE, O_LT, O_LE, O_GT, O_GE, O_BAND, O_BOR, O_BXOR, O_SHL, O_SHR };
 constexpr int MAXG = 1 << 16;
 // Per-site inline cache. key: the receiver's header word (methods compare only its class id); val: slot or code.
@@ -146,11 +155,12 @@ constexpr int MAXIC = 1 << 19;
 // The free cells allocation is bumping through, per size class: JIT code allocates with cur += size while
 // cur + size <= end. runs[NCLS] stays empty (0, 0): constructors of instances too big for a class point at it.
 struct Run { uintptr_t cur, end; };
-// handler: the innermost active `try` (a record in its JIT frame: prev, sp, fp, x26, handler pc).
+// handler: the innermost active `try` (a record in its JIT frame: prev, sp, fp, x26, handler pc, txn at entry).
+// txn: how many transactions are open (see txn.cpp); JIT code reads it (arm64: at +4).
 #ifdef __wasm__  // limit, then poll: one i64 load at &limit tests both on a function's entry (gen_wasm.h)
-struct VM { void* limit; u32 poll; void* handler; void* helpers[NH]; Run runs[NCLS + 1]; V globals[MAXG]; IC ics[MAXIC]; };
+struct VM { void* limit; u32 poll; void* handler; u32 txn; void* helpers[NH]; Run runs[NCLS + 1]; V globals[MAXG]; IC ics[MAXIC]; };
 #else
-struct VM { u32 poll, pad; void* limit; void* handler; void* helpers[NH]; Run runs[NCLS + 1]; V globals[MAXG]; IC ics[MAXIC]; };
+struct VM { u32 poll, txn; void* limit; void* handler; void* helpers[NH]; Run runs[NCLS + 1]; V globals[MAXG]; IC ics[MAXIC]; };
 #endif
 extern VM vm;
 constexpr int HOFF(int h) { return 24 + 8 * h; }
@@ -158,9 +168,10 @@ constexpr int ROFF(int c) { return 24 + 8 * NH + 16 * c; }
 constexpr int GOFF(int g) { return ROFF(NCLS + 1) + 8 * g; }
 constexpr u32 VM_HANDLER = 16;
 constexpr u32 IOFF(int i) { return (GOFF(MAXG) + 15) / 16 * 16 + 16 * i; }
-int newIC();
+int newIC(bool set = false);  // set: a field store's, which must miss while a transaction is open
 extern u32 icEpoch;  // bumped whenever method tables may have changed
 void clearICs();
+void reshape(Class*);  // after its layout grew: what JIT constructors allocate for it
 
 struct Global { int slot = -1; char kind = 'v'; u32* stub = nullptr; Obj* o = nullptr; bool inited = false; };  // kind: v f c n(ative)
 extern std::deque<Global> globals;  // by symbol (slot -1: not declared); a deque, so references survive growth
@@ -198,7 +209,15 @@ V vmEnter(void* code, V* args);  // args: 8 values
 extern std::string* asmListing;
 
 struct TestCase { std::string name, file, pending; int line = 0; void* code = nullptr; };  // a `test "name" { }` block
-struct Compiled { void* chunk = nullptr; bool mainChanged = false; std::string log; std::vector<std::string> files; std::vector<TestCase> tests; };
+struct Compiled {
+  void* chunk = nullptr;
+  bool mainChanged = false;
+  std::string log;
+  std::vector<std::string> files;
+  std::vector<std::pair<std::string, std::string>> sources;  // each file compiled and its text
+  std::vector<TestCase> tests;
+  std::vector<int> newVars;  // top-level vars it initialized for the first time
+};
 struct CompileError : std::runtime_error {  // atEnd: the source ended too early (the REPL reads more)
   bool atEnd;
   CompileError(const std::string& m, bool end) : std::runtime_error(m), atEnd(end) {}
@@ -206,8 +225,12 @@ struct CompileError : std::runtime_error {  // atEnd: the source ended too early
 // tests: compile `test` blocks into Compiled::tests (otherwise they are skipped)
 Compiled compile(const std::string& path, bool reload, bool echo, const std::string* text = nullptr, bool tests = false);
 bool guardCompile(void (*f)(void*), void* ctx, std::string* err = nullptr);  // f(ctx); false if it failed with a compile error (*err)
+// A hot reload whose top level or reload() failed: forget the vars it added and compile the sources it replaced
+// again, without running them (its data was rolled back already). False if that failed (*err).
+bool revertReload(const std::vector<int>& newVars, std::string* err);
 [[noreturn]] void compileFail(const std::string& msg, bool atEnd);  // natively throws CompileError; in wasm, longjmps
 bool readFile(const std::string& path, std::string& out);
+bool saveFile(const std::string& path, const std::string* text);  // null text: remove the file
 std::string canonicalPath(const std::string& path);
 void* externLookup(const std::string& lib, const std::string& name, const char** err);  // an extern's function
 void rtInit();
@@ -255,6 +278,31 @@ void testRecord(char code, const std::string& text);                            
 int testsEnd();
 void reportCompileError(const std::string& msg);          // fut test: in the chosen format
 void reportTopError(const std::string& msg);
+// ---- transactions (txn.cpp): atomic { } and hot reloads ----
+void txnInit();
+void txnBegin();
+void txnCommit();
+void txnAbort();                // roll back the innermost
+void txnUnwind(u32 depth);      // roll back until depth are open
+void txnTouch(Obj*);            // o is about to change: save it, unless the innermost transaction has already
+inline void touch(Obj* o) { if (vm.txn) txnTouch(o); }
+bool txnOpenIn(Fiber*);         // does f have a transaction open? (it may not yield)
+void txnMark(void (*mark)(V));  // GC roots: what rollbacks would put back
+extern bool txnPollLater;       // a reload or typed line waits for the transactions to end
+int globalCount();              // global slots in use
+
+// ---- public interfaces (api.cpp): each file's `pub` declarations, kept in a .api file next to it ----
+struct ApiIssue {
+  std::string file, api, status;           // status: "missing" (no .api yet), "changed", "stale" (nothing is pub now)
+  std::vector<std::string> removed, added;  // declarations, one per line
+  std::string want;                         // the .api text it should have
+};
+std::string interfaceOf(const std::string& path, const std::string& text);  // "" if it declares nothing pub
+std::string apiPath(const std::string& file);                               // geom.fut -> geom.api
+std::vector<ApiIssue> checkInterfaces(const std::vector<std::pair<std::string, std::string>>& sources);
+int reportInterfaces(const std::vector<ApiIssue>&, bool json, const std::string& program);  // fut test; the number
+int writeInterfaces(const std::vector<std::pair<std::string, std::string>>& sources, const std::string& program);  // fut api; the number
+
 [[noreturn]] void throwValue(V v, void* ra);  // to the innermost try, else report it (ra: where, for the trace)
 [[noreturn]] void rtError(void* ra, const char* fmt, ...);
 #if __wasm__

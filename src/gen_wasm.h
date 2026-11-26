@@ -229,12 +229,19 @@ struct Gen : CState {
   void jump(Loop& lp, bool brk) { br(BR, brk ? lp.depth : lp.depth + 2); }
   void leaveTries(size_t) {}  // wasm try blocks are structured: leaving one needs nothing
   // block $done { block $catch (result i64) { try_table (catch $fut -> $catch) { body } br $done } e = it; reset sp; ... }
+  // A frame slot keeps vm.txn at entry: the handler rolls back the transactions opened since (rt_txunwind).
   TryAt tryBegin() {
     TryAt t{F->depth};
+    slot(), base(t.r), txnDepth(), op(I64_EXTEND_U), mem(I64_STORE, 3, off(t.r));
     open(BLOCK), open(BLOCK, I64), open(TRY_TABLE), u(1), b(0), u(0), u(0);  // one catch: tag 0, label 0
     return t;
   }
-  void tryCatch(TryAt&) { close(), br(BR, F->blocks - 1), close(), set(R0); }
+  void txnDepth() { i32c(0), mem(I32_LOAD, 2, slotOf(&vm.txn)); }
+  void tryCatch(TryAt& t) {
+    close(), br(BR, F->blocks - 1), close(), set(R0);
+    txnDepth(), base(t.r), mem(I64_LOAD, 3, off(t.r)), op(I32_WRAP), op(I32_GT_U), open(IF, VOID, UNLIKELY);
+    ld(1, t.r), helper(H_TXUNWIND), close();
+  }
   void tryEnd(TryAt&) { close(); }
   void rangeTest(Loop& lp, int a, int b, int v) {  // a < b, else exit; v = a (counter, end and v are numbers)
     get(wl(a)), get(wl(b)), op(F64_LT), op(I32_EQZ), br(BR_IF, lp.depth, UNLIKELY);
@@ -255,7 +262,7 @@ struct Gen : CState {
 
   // ---- fields: an inline cache per site, in the VM block: key = the instance header, val = the slot ----
   void field(int sym, bool store) {  // r0 = object (r2 = value to store); result in r0
-    u32 ic = slotOf(&vm.ics[newIC()]);
+    u32 ic = slotOf(&vm.ics[newIC(store)]);
     open(BLOCK), open(BLOCK);  // $done, $miss
     isPtr(0, false), br(BR_IF, F->blocks, UNLIKELY);
     addr(0), mem(I64_LOAD, 3, 0), i32c(0), mem(I64_LOAD, 3, ic), op(I64_NE), br(BR_IF, F->blocks, UNLIKELY);
@@ -267,7 +274,11 @@ struct Gen : CState {
   }
   void capAddr() { base(F->cloHome), mem(I64_LOAD, 3, off(F->cloHome)), op(I32_WRAP); }  // this closure object
   void capLoad(int i) { capAddr(), mem(I64_LOAD, 3, CLO_ENV + 8 * i), set(R0); }
-  void capStore(int i) { capAddr(), get(R0), mem(I64_STORE, 3, CLO_ENV + 8 * i); }
+  void capStore(int i) {  // inside a transaction, rt_capset saves the closure first
+    txnDepth(), open(IF, VOID, UNLIKELY);
+    capAddr(), op(I64_EXTEND_U), set(R0 + 1), karg(2, i), helper(H_CAPSET);
+    op(ELSE), capAddr(), get(R0), mem(I64_STORE, 3, CLO_ENV + 8 * i), close();
+  }
 
   // ---- calls: the arguments are in consecutive frame slots (the window); the callee gets its address, this frame
   // as its stack pointer, and the first NA of the n values in the window as parameters (the last may be in r0) ----

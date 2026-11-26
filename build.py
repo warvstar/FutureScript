@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Build and test fut.   python3 build.py [build | debug | wasm | test [--debug | --wasm] | fuzz [N] | clean]"""
-import json, os, random, re, subprocess, sys, time
+import json, os, random, re, shutil, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -124,9 +124,9 @@ def hot_imports_stale_hook(exe):
             "    if r != last { print(r) last = r }\n"
             "    sleep(0.01) } }\n"
             "fn main() { spin() }\n")
-    out, err = live(exe, {"m.fut": main, "lib.fut": "fn f(a) { return a }\n"},
-                    [("lib.fut", "fn f(a) { return a + 1 }\n"), ("m.fut", main),
-                     ("lib.fut", "fn f(a, b) { return b }\n"), ("m.fut", main.replace("f(1)", "f(1, 7)")),
+    out, err = live(exe, {"m.fut": main, "lib.fut": "pub fn f(a) { return a }\n"},
+                    [("lib.fut", "pub fn f(a) { return a + 1 }\n"), ("m.fut", main),
+                     ("lib.fut", "pub fn f(a, b) { return b }\n"), ("m.fut", main.replace("f(1)", "f(1, 7)")),
                      ("m.fut", main.replace("f(1)", "f(1, 7)") + "\n")], timeout=1)
     # lib change -> patch + hook; no-op save; arity change alone fails to compile (m.fut still calls f(1));
     # fixing the caller patches it, but spin()'s running frame is old code -> stale-call error; the next
@@ -160,7 +160,20 @@ def hot_reclaim(exe):
     return ok, f"code sizes KB: {sizes}\n  stderr tail: {err[-300:]!r}"
 
 
+def hot_reload_rollback(exe):
+    """A reload whose new top level fails is undone: the data it changed and its code. The next good reload
+    initializes the var the failed one added."""
+    head = "var hp = 10\nvar hist = []\n"
+    main = "fn main() { var last = 0\n  while true { var v = tick()\n    if v != last { print(\"v{v} hp{hp}\") last = v }\n    if v == 3 { return }\n    sleep(0.01) } }\n"
+    bad = head + "fn fail() { hp = 0 hist.push(1) throw \"migration failed\" }\nvar boom = fail()\nfn tick() { return 2 }\n" + main
+    good = head + "var boom = 5\nfn tick() { return boom - 2 + len(hist) }\n" + main
+    out, err = live(exe, {"t.fut": head + "fn tick() { return 1 }\n" + main}, [("t.fut", bad), ("t.fut", good)])
+    ok = out.split() == ["v1", "hp10", "v3", "hp10"] and "migration failed" in err and "reload rolled back" in err
+    return ok, f"stdout: {out!r}\n  stderr: {err!r}"
+
+
 HOT_TESTS = [("methods, errors, main restart", hot_methods_and_main),
+             ("a failed reload rolls back", hot_reload_rollback),
              ("imports, no-op, hook, stale arity", hot_imports_stale_hook),
              ("live REPL, var reset", hot_repl_and_reset),
              ("code reclamation", hot_reclaim)]
@@ -205,8 +218,39 @@ def runner_text(exe):
     return ok, f"pending run: {a.stdout!r}\n  passing run: {b.stdout!r}\n  filtered: {c.stdout!r}\n  compile error: {e.stdout!r}"
 
 
+def runner_api(exe):
+    """Interfaces: `fut test` fails until `fut api` writes the .api file, then again when a pub signature changes
+    (text and JSON, with the declarations removed and added); private edits and comments elsewhere don't count."""
+    d = ROOT / "build" / "api"
+    shutil.rmtree(d, ignore_errors=True), d.mkdir(parents=True)
+    lib = "// Squares a number.\npub fn sq(x) { return x * x }\nfn helper() { return 1 }\npub class P {\n  var x = 0\n  fn init(x) { self.x = x }\n}\n"
+    (d / "lib.fut").write_text(lib)
+    (d / "main.fut").write_text('import "lib.fut"\ntest "sq" { expect sq(3) == 9 }\n')
+    run = lambda *a: subprocess.run([*runner(exe), *a], capture_output=True, text=True, timeout=60)
+    main = str(d / "main.fut")
+    a = run("test", main)
+    w = run("api", main)
+    api = (d / "lib.api").read_text() if (d / "lib.api").exists() else ""
+    b = run("test", main)
+    (d / "lib.fut").write_text(lib.replace("fn helper()", "fn helper(y)"))  # private: not part of the interface
+    c = run("test", main)
+    (d / "lib.fut").write_text(lib.replace("pub fn sq(x) { return x * x }", "pub fn sq(x, y) { return x * y }"))
+    (d / "main.fut").write_text('import "lib.fut"\ntest "sq" { expect sq(3, 3) == 9 }\n')
+    e, j, k = run("test", main), run("test", "--json", main), run("api", "--check", main)
+    rec = next((json.loads(l) for l in j.stdout.splitlines() if '"type":"api"' in l), {})
+    ok = (a.returncode == 1 and "API     lib.fut: has pub declarations but no lib.api yet" in a.stdout
+          and w.returncode == 0 and "wrote lib.api" in w.stdout
+          and "// Squares a number.\npub fn sq(x)\n" in api and "pub class P {\n  var x = 0\n  fn init(x)\n}" in api and "helper" not in api
+          and b.returncode == 0 and "API" not in b.stdout and c.returncode == 0
+          and e.returncode == 1 and "its public interface changed" in e.stdout and "  - fn sq(x)\n  + fn sq(x, y)\n" in e.stdout
+          and rec.get("status") == "changed" and rec.get("removed") == ["fn sq(x)"] and rec.get("added") == ["fn sq(x, y)"]
+          and k.returncode == 1 and "- fn sq(x)" in k.stdout)
+    return ok, f"missing: {a.stdout!r}\n  api: {w.stdout!r} -> {api!r}\n  after: {b.stdout!r}\n  private edit: {c.stdout!r}\n  changed: {e.stdout!r}\n  json: {j.stdout!r}\n  check: {k.stdout!r}"
+
+
 RUNNER_TESTS = [("fut test --json: statuses, details, output", runner_json),
-                ("fut test: spec first, filter, compile error", runner_text)]
+                ("fut test: spec first, filter, compile error", runner_text),
+                ("fut api: interfaces written, checked by fut test", runner_api)]
 
 
 def fuzz(exe, n=300, seed=None):

@@ -1,0 +1,11 @@
+// The public interface of shapes.fut, written by `fut api`. `fut test` fails while it is out of date.
+
+pub class Shape {
+  fn area()
+  fn name()
+}
+
+pub class Square : Shape {
+  override fn area()
+  fn init(s)
+}

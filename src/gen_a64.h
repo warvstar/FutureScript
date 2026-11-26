@@ -190,14 +190,15 @@ struct Gen : CState {
   }
   void jump(Loop& lp, bool brk) { (brk ? lp.brk : lp.cont).push_back(E(B)); }
   void leaveTries(size_t k) { if (F->tries.size() > k) ld(9, F->tries[k]), E(str(9, 28, VM_HANDLER)); }  // unlink tries k..
-  // try { } catch e { }: the record (prev, sp, fp, x26, handler pc) lives in five frame slots and is linked
-  // into vm.handler; a throw (or runtime error) unlinks it and jumps to the handler with x0 = the value.
+  // try { } catch e { }: the record (prev, sp, fp, x26, handler pc, vm.txn) lives in six frame slots and is
+  // linked into vm.handler; a throw (or runtime error) unlinks it, rolls back the transactions opened since, and
+  // jumps to the handler with x0 = the value.
   TryAt tryBegin() {
     if (!F->noRegs) fail("internal: try in a function not prepared for it");
     TryAt t{F->depth};
-    for (int i = 0; i < 5; i++) slot();
+    for (int i = 0; i < 6; i++) slot();
     addsp(9, t.r), E(ldr(10, 28, VM_HANDLER)), E(str(10, 9, 0)), E(addi(10, SP, 0)), E(str(10, 9, 8));
-    E(str(29, 9, 16)), E(str(26, 9, 24));
+    E(str(29, 9, 16)), E(str(26, 9, 24)), E(ldrw(10, 28, 4)), E(str(10, 9, 40));
     t.pc = E(ADR | 10);
     E(str(10, 9, 32)), E(str(9, 28, VM_HANDLER));
     return t;
@@ -229,15 +230,15 @@ struct Gen : CState {
   }
 
   // ---- inline caches live in the VM block: r = its 4KB page (one instruction), lo = its offset there ----
-  u32 icAt(u32 r) {
-    u32 off = IOFF(newIC());
+  u32 icAt(u32 r, bool set = false) {
+    u32 off = IOFF(newIC(set));
     E(addhi(r, 28, off >> 12));
     return off & 0xfff;
   }
   void isObject(Jumps& miss) { E(mvn(9, 0)), E(tstptr(9)), miss.push_back(E(bcond(NE))), E(andaddr(9, 0)); }  // x9 = address
   void field(int sym, bool set) {  // x0 = object (x2 = value to store); result in x0
     Jumps miss;
-    u32 ic = set ? 3 : 2, lo = icAt(ic);
+    u32 ic = set ? 3 : 2, lo = icAt(ic, set);
     isObject(miss);
     E(ldr(10, 9, 0)), E(ldr(11, ic, lo)), E(cmp(10, 11)), miss.push_back(E(bcond(NE)));  // same class and slot count
     E(ldr(11, ic, lo + 8)), E(ldr(10, 9, INST_SLOTS));
@@ -250,7 +251,13 @@ struct Gen : CState {
   }
   void cloEnv() { ldl(9, F->cloHome), E(andaddr(9, 9)); }  // x9 = this closure object
   void capLoad(int i) { cloEnv(), E(ldr(0, 9, CLO_ENV + 8 * i)); }
-  void capStore(int i) { cloEnv(), E(str(0, 9, CLO_ENV + 8 * i)); }
+  void capStore(int i) {  // inside a transaction, rt_capset saves the closure first
+    cloEnv(), E(ldrw(16, 28, 4));
+    int fast = E(cbzw(16));
+    E(mov(1, 9)), E(movz(2, i, 0)), helper(H_CAPSET);
+    int done = E(B);
+    patch(fast), E(str(0, 9, CLO_ENV + 8 * i)), patch(done);
+  }
 
   // ---- calls: arguments go to consecutive slots (the "window"); x0..x7 carry the first 8, x8 points at all ----
   void args(int base, int n) {  // x0..x7 = the first 8; x8 = the window, read only for parameters past the 8th

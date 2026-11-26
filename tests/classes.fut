@@ -5,7 +5,7 @@ class Shape {
 }
 class Rect : Shape {
   fn init(w, h) { super.init("rect") self.w = w self.h = h }
-  fn area() { return self.w * self.h }
+  override fn area() { return self.w * self.h }
 }
 class Square : Rect {
   fn init(s) { super.init(s, s) self.name = "square" }

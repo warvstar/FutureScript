@@ -32,9 +32,10 @@ static Compiled load(bool reload) {
 static int run(void* code) {  // 0 ok, 1 runtime error, 2 restart requested
   jmp_buf jb, *outer = errJmp;
   void* handler = vm.handler;  // REPL lines typed into a running program must not land in its try blocks
+  u32 txn = vm.txn;            // an uncaught error rolls back the transactions opened since
   int st = 0;
   errJmp = &jb, vm.handler = nullptr;
-  if (int r = setjmp(jb)) st = r;
+  if (int r = setjmp(jb)) st = r, txnUnwind(txn);
   else vmCall(code);
   errJmp = outer, vm.handler = handler;
   return st;
@@ -66,16 +67,30 @@ static void evalInbox() {
   inbox.clear(), pthread_mutex_unlock(&watchMu);
   for (auto& l : lines) replBuf += l, eval(l.size() > 1);  // an empty line gives up on unfinished input
 }
-// Runs at a safepoint (loop back-edge) on the main thread when a watched file changed or a line was typed.
+// Runs at a safepoint (loop back-edge) on the main thread when a watched file changed or a line was typed. Inside
+// a transaction (atomic { }) both wait for it to end.
 static void hotReload() {
   vm.poll = 0;
+  if (vm.txn) return void(txnPollLater = true);
   evalInbox();
   if (!__atomic_exchange_n(&fileChanged, 0, __ATOMIC_ACQUIRE)) return;
   Compiled c = load(true);
   if (!c.chunk) return;  // compile error: keep running the old code
-  vmCall(c.chunk), jitRetire((u32*)c.chunk);
-  if (Global* r = fnNamed(S_reload); r && ((Fn*)r->o)->arity == 0) vmCall(r->stub);  // user hook: migrate state
-  if (c.mainChanged && inMain) c = {}, longjmp(*errJmp, 2);
+  // The new top level and the reload() hook (which migrates state) run as one transaction. If either fails, the
+  // reload is undone: the data they changed, then the code. The program goes on as if the file had not changed.
+  txnBegin();
+  int st = run(c.chunk);
+  jitRetire((u32*)c.chunk);
+  if (Global* r = fnNamed(S_reload); !st && r && ((Fn*)r->o)->arity == 0) st = run(r->stub);
+  if (st) {
+    txnAbort();
+    std::string err;
+    if (revertReload(c.newVars, &err)) fputs("[fut] reload rolled back: the program's data and code are as they were before it\n", stderr);
+    else fprintf(stderr, "[fut] reload rolled back its data, but the previous code did not compile again: %s\n", err.c_str());
+    return;
+  }
+  txnCommit();
+  if (c.mainChanged && inMain) c = {}, longjmp(*errJmp, 2);  // unwind and rerun main()
 }
 static long long stamp() {
   pthread_mutex_lock(&watchMu);
@@ -136,11 +151,22 @@ static int runTests(const TestRun& o) {
   errSink = &err;
   int st = run(c.chunk);
   jitRetire((u32*)c.chunk);
-  if (st) return errSink = nullptr, reportTopError(err), 1;
+  // A public interface out of date fails the run too, reported last so it is what the reader sees with the status.
+  auto api = [&](int st) { return reportInterfaces(checkInterfaces(c.sources), o.json, path) ? std::max(st, 1) : st; };
+  if (st) return errSink = nullptr, reportTopError(err), api(1);
   for (auto& t : c.tests)
     if (void* code = testStart(t)) isolated(t, code, o.timeout);
   errSink = nullptr;
-  return testsEnd();
+  return api(testsEnd());
+}
+// fut api [--check] file.fut: write (or with --check, just report) the .api file of each file it compiles
+static int apiCommand(bool check) {
+  Compiled c;
+  try {
+    c = compile(path, false, false);
+  } catch (std::exception& e) { return fflush(stdout), fprintf(stderr, "%s\n", e.what()), 2; }
+  if (check) return reportInterfaces(checkInterfaces(c.sources), false, path) ? 1 : 0;
+  return writeInterfaces(c.sources, path), 0;
 }
 
 static int repl() {
@@ -166,20 +192,29 @@ static int dumpAsm() {  // assemble the emitted words with clang and disassemble
 
 int main(int argc, char** argv) {
   bool watch = false, asmMode = false, testMode = argc > 1 && std::string(argv[1]) == "test";
+  bool apiMode = argc > 1 && std::string(argv[1]) == "api", apiCheck = false;
   TestRun topts;
-  for (int i = 1 + testMode; i < argc; i++) {
+  const char* usage = "usage: fut [-w | -v | --asm] [file.fut]   (no file: REPL)\n       fut test [--json] [--filter text] [--timeout s] file.fut\n"
+                      "       fut api [--check] file.fut\n";
+  for (int i = 1 + (testMode || apiMode); i < argc; i++) {
     std::string a = argv[i];
-    if (testMode && a == "--json") topts.json = true;
+    if (apiMode) {
+      if (a == "--check") apiCheck = true;
+      else if (a[0] == '-') return fputs(usage, stderr), 2;
+      else path = a;
+    } else if (testMode && a == "--json") topts.json = true;
     else if (testMode && a == "--filter" && i + 1 < argc) topts.filter = argv[++i];
     else if (testMode && a == "--timeout" && i + 1 < argc && atof(argv[i + 1]) > 0) topts.timeout = atof(argv[++i]);
     else if (a == "-w" && !testMode) watch = verbose = true;
     else if (a == "-v") verbose = true;
     else if (a == "--asm") asmMode = true;
-    else if (a[0] == '-') return fputs("usage: fut [-w | -v | --asm] [file.fut]   (no file: REPL)\n       fut test [--json] [--filter text] [--timeout s] file.fut\n", stderr), 2;
+    else if (a[0] == '-') return fputs(usage, stderr), 2;
     else path = a;
   }
   rtInit();
-  if (testMode) return path.empty() ? (fputs("usage: fut test [--json] [--filter text] [--timeout s] file.fut\n", stderr), 2) : runTests(topts);
+  if ((testMode || apiMode) && path.empty()) return fputs(usage, stderr), 2;
+  if (testMode) return runTests(topts);
+  if (apiMode) return apiCommand(apiCheck);
   if (path.empty()) return repl();
   if (asmMode) return dumpAsm();
   watched = {path};

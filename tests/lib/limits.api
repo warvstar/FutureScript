@@ -1,0 +1,5 @@
+// The public interface of limits.fut, written by `fut api`. `fut test` fails while it is out of date.
+
+pub fn limit(x)
+
+pub fn limitCalls()

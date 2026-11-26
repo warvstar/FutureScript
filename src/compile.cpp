@@ -17,15 +17,38 @@ static uint64_t fnv(const char* a, const char* b) {
 struct Tier { std::string name, text, file; int line = 0, cls = -1, sym = -1; bool init = false; u32 *stub = nullptr, *body = nullptr, *fast = nullptr; Fn* fn = nullptr; bool failed = false; };
 static std::unordered_map<std::string, Tier> tiers;  // by owner; nodes are stable, so tier-1 code embeds their address
 struct Pend { u32* stub; Fn* fn; int arity; Code k; std::string owner; bool lambda; Tier tier; };  // body to install + stub to repoint
-struct ClassDef { int sym, super; std::vector<std::pair<int, Fn*>> methods; };
+struct At { const char* p; int line; std::string file; const char* src; };  // a place in the source, for errors found later
+struct Member { int sym; bool over; At at; };                                // a method as written (for the override check)
+struct ClassDef {
+  int sym, super;
+  std::vector<std::pair<int, Fn*>> methods;
+  std::vector<Member> written;
+  std::vector<std::pair<int, V>> fields;  // declared: `var name [= constant]`
+};
+struct FieldUse { int cls, sym; At at; };  // `self.name` in a method: checked against declared fields
 struct Span { const char *start = nullptr, *end = nullptr; int line = 0, endLine = 0, arity = 0; };  // a fn/method in the source
 struct Rec { uint64_t text, env; int line, arity; u32* body; std::vector<u32*> lambdas; bool repl; };  // what is installed now
 static std::unordered_map<std::string, Rec> recs;
 static std::unordered_map<int, uint64_t> varText;  // top-level var -> hash of its declaration's source
 static std::map<std::pair<int, int>, Fn*> methodFns;  // (class sym, method sym): one Fn per method, kept across reloads
-// Modules: a file imported `as` a name declares its top-level names as "prefix.name" (prefix: the file's stem).
-static std::unordered_map<std::string, std::string> nsOf;                             // module path -> prefix
+// Files: every imported file has a prefix (its stem, made unique). Its private top-level names are "prefix.name",
+// so two files' private names never clash and other files can't reach them. A file imported `as` a name (a module)
+// declares all its names that way, and other files reach its `pub` ones as alias.name. In a file imported plainly,
+// `pub` names are global. The program's own file has no prefix: its names are global.
+static std::unordered_map<std::string, std::string> nsOf;                             // imported file -> prefix
+static std::unordered_map<std::string, bool> isModule;                                // imported file -> imported `as`
 static std::unordered_map<std::string, std::unordered_map<int, std::string>> aliases;  // file -> its `as` names
+static std::string base(const std::string& path) { return path.substr(path.rfind('/') + 1); }
+// The sources of the code running now, and of the code the last compile replaced (what a failed reload goes back
+// to); while revertReload compiles, files are read from `overlay` rather than from disk.
+using Sources = std::vector<std::pair<std::string, std::string>>;
+static Sources installed, replaced;
+static const Sources* overlay;
+static bool readSource(const std::string& path, std::string& out) {
+  if (!overlay) return readFile(path, out);
+  for (auto& [f, text] : *overlay) if (f == path) return out = text, true;
+  return false;
+}
 
 struct Compiler : Gen {
   bool reload = false, echo = false, tiering = false, topTry = false, testing = false;  // testing: compile `test` blocks
@@ -40,25 +63,41 @@ struct Compiler : Gen {
   uint64_t envHash = 1469598103934665603ull;
   std::vector<Pend> pend;
   std::vector<ClassDef> classes;
+  std::vector<FieldUse> fieldUses;
   std::vector<std::pair<int, int>> fnDefs;  // (sym, arity)
   std::vector<int> inits;                   // top-level vars initialised by this chunk
   struct Extern { int sym; void* fn; std::string sig; char ret; };
   std::vector<Extern> externs;
-  std::string patched, added, removed, reset;
+  std::string patched, added, removed, reset;  // for the reload log
+  std::unordered_map<std::string, std::vector<int>> pubs;  // file -> its top-level names marked `pub`
+  std::vector<char> pubSym;                                 // by (prefixed) symbol: declared `pub`
+  std::unordered_map<int, std::string> privateIn;           // a private name (as written) -> a file declaring it
 
   static void add(std::string& s, const std::string& n) { s += (s.empty() ? "" : ", ") + n; }
   const char* name(int s) { return symName(s).c_str(); }
-  int qualify(int s) {  // a name declared at the top level of the current file
+  bool isPub(int s) {  // s (as written) is declared `pub` in the current file
+    auto it = pubs.find(file);
+    return it != pubs.end() && std::find(it->second.begin(), it->second.end(), s) != it->second.end();
+  }
+  int qualify(int s) {  // the symbol of a name declared at the top level of the current file
     auto it = nsOf.find(file);
-    return it == nsOf.end() ? s : intern(it->second + "." + symName(s));
+    if (it == nsOf.end() || (!isModule[file] && isPub(s))) return s;
+    return intern(it->second + "." + symName(s));
   }
   Tok topName(Tok t) {  // the top-level name t (just read) refers to; reads `.name` after a module alias
     const std::string* m = moduleAlias(t.sym);
     if (!m) return t.sym = globalSym(t.sym), t;
     if (!accept('.')) failAt(t.p, t.line, "'%s' is a module: use %s.name", name(t.sym), name(t.sym));
     Tok n = cur;
-    if (!findGlobal(n.sym = intern(*m + "." + symName(ident())))) failAt(n.p, n.line, "module '%s' has no '%s'", name(t.sym), name(prev.sym));
+    n.sym = intern(*m + "." + symName(ident()));
+    if ((size_t)n.sym >= declKind.size() || !declKind[n.sym]) failAt(n.p, n.line, "module '%s' has no '%s'", name(t.sym), name(prev.sym));
+    if ((size_t)n.sym >= pubSym.size() || !pubSym[n.sym]) failAt(n.p, n.line, "'%s' is private to module '%s' (mark it pub there to use it here)", name(prev.sym), name(t.sym));
     return n;
+  }
+  [[noreturn]] void undefined(const Tok& t) {
+    if (auto it = privateIn.find(t.sym); it != privateIn.end() && it->second != file)
+      failAt(t.p, t.line, "'%s' is private to %s (mark it pub there to use it here)", name(t.sym), ::base(it->second).c_str());
+    failAt(t.p, t.line, "undefined name '%s'", name(t.sym));
   }
   int globalSym(int s) { int q = qualify(s); return q != s && findGlobal(q) ? q : s; }  // own module first, then global
   const std::string* moduleAlias(int s) {
@@ -93,7 +132,7 @@ struct Compiler : Gen {
     auto had = F->facts;
     F->facts.reset();
     if (F->tier2) for (auto& l : F->locals) if (tracked(l.home) && had[l.home + 128] && !assignedIn(l.sym)) prove(l.home);
-    lp.tries = F->tries.size(), loopBegin(lp);
+    lp.tries = F->tries.size(), lp.atomics = F->atomics, loopBegin(lp);
   }
 
   void combine(int s, int op) { mv(1, 0), ld(0, s), F->depth--, binop(op); }  // left in slot s, right in x0
@@ -252,6 +291,7 @@ struct Compiler : Gen {
       case K_nil: return imm(0, NIL), LV{};
       case K_fn: return lambda(t), LV{};
       case K_yield:  // yield [value]: suspend this fiber; evaluates to the value the next resume sends
+        if (F->atomics) failAt(t.p, t.line, "'yield' inside atomic { }: other code would run while it is half done (yield after it ends)");
         at('}') || at(')') || at(']') || at(',') || at(T_EOF) || cur.nl ? imm(0, NIL) : (void)expr();
         return helper(H_YIELD), LV{};
       case K_self: {
@@ -271,7 +311,7 @@ struct Compiler : Gen {
     if (LV v = resolve(F, t.sym); v.k != LV_NONE) return v;
     t = topName(t);
     Global* g = findGlobal(t.sym);
-    if (!g) failAt(t.p, t.line, "undefined name '%s'", name(t.sym));
+    if (!g) undefined(t);
     if (g->kind == 'f' && at('(') && !cur.nl) return next(), directCall(t, *g), t.sym == F->self ? NUM : LV{};
     if (g->kind == 'c' && at('(') && !cur.nl) return next(), construct(*g), LV{};
     return {LV_GLOBAL, g->slot, 0, g->kind != 'v'};
@@ -280,7 +320,10 @@ struct Compiler : Gen {
     LV v = primary();
     for (;;) {
       if (accept('.')) {
+        Tok ft = cur;
         int s = ident();
+        if (v.k == LV_LOCAL && F->cls >= 0 && v.a == F->selfHome && !tiering && !(at('(') && !cur.nl))
+          fieldUses.push_back({F->cls, s, {ft.p, ft.line, file, srcStart}});  // self.name: checked once every class is known
         load(v);
         v = {LV_FIELD, 0, s};
         if (at('(') && !cur.nl) next(), call(s, false), v = {};
@@ -395,15 +438,18 @@ struct Compiler : Gen {
           next();
           if (F->top) fail("'return' outside a function");
           F->retNum &= at('}') || at(T_EOF) || cur.nl ? (imm(0, NIL), false) : expr();
-          return leaveTries(0), ret(), false;
+          for (int i = 0; i < F->atomics; i++) callNative("atomic@end", true);  // passes x0 through
+          return leaveTries(0), ret(), false;  // leaving every try
         case K_break: case K_continue:
           next();
           if (!F->loop) failAt(prev.p, prev.line, "'%s' outside a loop", name(prev.sym));
+          for (int i = F->atomics; i > F->loop->atomics; i--) callNative("atomic@end", true);
           leaveTries(F->loop->tries), jump(*F->loop, prev.sym == K_break), F->live = false;
           return false;
         case K_class: case K_import: fail("'%s' is only allowed at top level", name(cur.sym));
         case K_fn: if (!peekIs('(')) fail("named functions are only allowed at top level; use 'var f = fn(...) {...}'"); break;
-        case S_expect: if (isExpect()) return expectStmt(), false;
+        case S_expect: if (isExpect()) return expectStmt(), false; break;
+        case S_atomic: if (peekIs('{') && !peek().nl) return next(), atomicStmt(), false; break;
       }
     LV v = unary();
     int t = cur.t;
@@ -448,6 +494,14 @@ struct Compiler : Gen {
       block();
     });
     tryEnd(t), F->live |= l1, F->facts.reset();
+  }
+  // atomic { }: its changes to state other code can see (fields, lists, maps, globals, captured variables) all
+  // happen, or none do: an error leaving it rolls them back (txn.cpp) before whatever catches the error runs.
+  // It commits wherever control leaves it normally: its end, return, break or continue.
+  void atomicStmt() {
+    callNative("atomic@begin", false);
+    F->atomics++, block(), F->atomics--;
+    if (F->live) callNative("atomic@end", true);
   }
   static const char* tokStart(const Tok& t) { return t.t == T_STR ? t.p - 1 : t.p; }  // a string token's p is past its quote
   // expect <condition>: `expect` starts a statement unless a variable or function of that name is in scope.
@@ -649,6 +703,24 @@ struct Compiler : Gen {
     Fun f;
     owner = q, fnDefs.push_back({s, function(f, -1, false, q, global(s).stub, nullptr)});
   }
+  // A field's default: the class keeps it and every instance shares it, so it is a constant (a list or map
+  // default would be one object shared by all; such fields are set in init).
+  V constant() {
+    const char* why = "a field's default must be a number, string, true, false or nil (set other values in init)";
+    if (accept('-')) return at(T_NUM) ? (next(), box(-prev.n)) : (fail("%s", why), NIL);
+    if (accept(T_NUM)) return box(prev.n);
+    if (atKw(K_true) || atKw(K_false) || atKw(K_nil)) return next(), prev.sym == K_true ? TRUE_ : prev.sym == K_false ? FALSE_ : NIL;
+    if (!at(T_STR)) fail("%s", why);
+    std::string s;
+    for (const char *p = cur.p, *e = p + cur.len; p < e; p++) {
+      if (*p == '{') fail("a field's default can't interpolate: set it in init");
+      if (*p != '\\' || p + 1 == e) { s += *p; continue; }
+      char c = *++p;
+      s += c == 'n' ? '\n' : c == 't' ? '\t' : c == '0' ? '\0' : c;
+    }
+    next();
+    return consts.push_back(box(newStr(s))), consts.back();
+  }
   void classDecl() {
     ClassDef cd{qualify(ident()), -1, {}};
     if (accept(':')) {
@@ -658,13 +730,25 @@ struct Compiler : Gen {
     }
     expect('{');
     while (!accept('}')) {
-      if (!atKw(K_fn)) fail("expected 'fn' in class body");
+      if (atKw(S_pub)) fail("a class's fields and methods are public when the class is: put 'pub' before 'class'");
+      if (atKw(K_var)) {  // var name [= constant]: a declared field
+        next();
+        int s = ident();
+        for (auto& [x, d] : cd.fields) if (x == s) failAt(prev.p, prev.line, "duplicate field '%s'", name(s));
+        cd.fields.push_back({s, accept('=') ? constant() : NIL});
+        continue;
+      }
+      bool over = atKw(S_override) && peek().t == T_ID && peek().sym == K_fn;
+      if (over) next();
+      if (!atKw(K_fn)) fail("expected 'fn', 'override fn' or 'var' in class body");
       next();
+      Tok mt = cur;
       int m = ident();
       for (auto& [x, f] : cd.methods) if (x == m) failAt(prev.p, prev.line, "duplicate method '%s'", name(m));
+      for (auto& [x, d] : cd.fields) if (x == m) failAt(prev.p, prev.line, "'%s' is already a field", name(m));
       Fn*& f = methodFns[{cd.sym, m}];
       if (!f) f = make<Fn>(), f->code = newStub(), f->name = m, consts.push_back(box(f));
-      cd.methods.push_back({m, f});
+      cd.methods.push_back({m, f}), cd.written.push_back({m, over, {mt.p, mt.line, file, srcStart}});
       std::string q = symName(cd.sym) + "." + symName(m);
       if (unchanged(q)) continue;
       Fun fun;
@@ -760,7 +844,14 @@ struct Compiler : Gen {
     std::string savedFile = file;
     const char* savedStart = srcStart;
     file = path, srcStart = src, aliases[path].clear();
-    auto q = [&](Tok t) { return t.sym = qualify(t.sym), t; };
+    bool pubNext = false;  // after `pub`: the next top-level declaration is public
+    auto q = [&](Tok t) {  // a top-level name as declared: note whether it is public, then its symbol
+      if (pubNext) pubs[path].push_back(t.sym);
+      else if (nsOf.count(path)) privateIn.emplace(t.sym, path);
+      t.sym = qualify(t.sym);
+      if (pubNext) growAt(pubSym, t.sym) = true;
+      return pubNext = false, t;
+    };
     struct Open { std::string q; const char* start; int line, depth; };
     std::vector<Open> open;
     Lexer L{src};
@@ -775,7 +866,11 @@ struct Compiler : Gen {
     for (Tok t = lex(L), p; t.t != T_EOF; p = t, t = lex(L)) {
       bool afterKw = p.t == T_ID && t.t == T_ID;
       topTry |= tryWord(t) && open.empty();  // a try in top-level code
-      if (t.t == T_ID && t.sym == K_extern && !depth) ext = true;
+      if (t.t == T_ID && t.sym == S_pub && !depth) {
+        Lexer s = L;
+        Tok n = lex(s);
+        pubNext = n.t == T_ID && !n.nl && (n.sym == K_fn || n.sym == K_class || n.sym == K_var || n.sym == K_extern);
+      } else if (t.t == T_ID && t.sym == K_extern && !depth) ext = true;
       else if (ext && afterKw && p.sym == K_fn) declare(q(t), 'x', params()), ext = false; else if (t.t == '{') depth++;
       else if (t.t == '}') {
         if (--depth == 0) cls = -1;
@@ -785,34 +880,39 @@ struct Compiler : Gen {
           open.pop_back();
         }
       } else if (afterKw && p.sym == K_fn && (depth == 0 || (depth == 1 && cls >= 0))) {
-        std::string qn = depth ? symName(cls) + "." + symName(t.sym) : symName(qualify(t.sym));
+        Tok d = depth ? t : q(t);
+        std::string qn = depth ? symName(cls) + "." + symName(t.sym) : symName(d.sym);
         if (spans.count(qn)) failAt(t.p, t.line, "'%s' is already defined", qn.c_str());
         int n = spans[qn].arity = params();
         open.push_back({qn, p.p, p.line, depth});
-        if (!depth) declare(q(t), 'f', n);
+        if (!depth) declare(d, 'f', n);
       } else if (depth == 0 && afterKw && (p.sym == K_class || p.sym == K_var)) {
-        declare(q(t), p.sym == K_class ? 'c' : 'v', 0);
-        if (p.sym == K_class) cls = qualify(t.sym);
+        Tok d = q(t);
+        declare(d, p.sym == K_class ? 'c' : 'v', 0);
+        if (p.sym == K_class) cls = d.sym;
+      } else if (depth == 1 && cls >= 0 && afterKw && p.sym == K_var) {  // a declared field: methods compile against them
+        envHash = (envHash ^ (uint64_t(cls) << 32 | uint64_t(t.sym) << 2 | 1)) * 1099511628211ull;
       } else if (depth == 0 && t.t == T_STR && p.t == T_ID && p.sym == K_import) {
         std::string ip = resolvePath({t.p, (size_t)t.len});
+        if (sources.count(ip) && !nsOf.count(ip)) continue;  // the program's own file: already here, with global names
+        std::string& pre = nsOf[ip];
+        if (pre.empty()) {  // the file's stem, made unique
+          pre = ip.substr(ip.rfind('/') + 1), pre = pre.substr(0, pre.find('.'));
+          for (bool clash = true; clash;) {
+            clash = false;
+            for (auto& [f, p2] : nsOf) clash |= f != ip && p2 == pre;
+            if (clash) pre += "_";
+          }
+        }
         Lexer s = L;
         if (Tok a = lex(s); a.t == T_ID && a.sym == S_as) {  // import "file" as name: a module
           Tok n = lex(s);
           if (n.t != T_ID || n.sym < NKW) failAt(n.p, n.line, "expected a module name after 'as'");
-          std::string& pre = nsOf[ip];
-          if (pre.empty()) {  // the file's stem, made unique
-            pre = ip.substr(ip.rfind('/') + 1), pre = pre.substr(0, pre.find('.'));
-            for (bool clash = true; clash;) {
-              clash = false;
-              for (auto& [f, p2] : nsOf) clash |= f != ip && p2 == pre;
-              if (clash) pre += "_";
-            }
-          }
-          aliases[path][n.sym] = pre;
+          aliases[path][n.sym] = pre, isModule[ip] = true;
         }
         if (sources.count(ip)) continue;
         std::string& text = sources[ip].text;
-        if (!readFile(ip, text)) failAt(t.p, t.line, "cannot read '%s'", ip.c_str());
+        if (!readSource(ip, text)) failAt(t.p, t.line, "cannot read '%s'", ip.c_str());
         files.push_back(ip), prescan(ip, text.c_str());
       }
     }
@@ -820,8 +920,14 @@ struct Compiler : Gen {
   }
 
   // ---- top level ----
+  bool atPub() {  // `pub` before a top-level declaration (the prescan noted it); elsewhere `pub` is an ordinary name
+    if (!atKw(S_pub)) return false;
+    Tok n = peek();
+    return n.t == T_ID && !n.nl && (n.sym == K_fn || n.sym == K_class || n.sym == K_var || n.sym == K_extern);
+  }
   void topLevel() {
     while (!at(T_EOF)) {
+      if (atPub()) next();
       if (atKw(K_fn)) { next(), fnDecl(); continue; }
       if (atKw(K_class)) { next(), classDecl(); continue; }
       if (atKw(K_extern)) { next(), externDecl(); continue; }
@@ -862,8 +968,60 @@ struct Compiler : Gen {
     Fun top;
     top.top = true, top.noRegs = topTry, top.k.name = "<top>", top.k.file = path, F = &top;
     topLevel();
+    checkClasses();
     Code chunk = finish();
     return commit(chunk);
+  }
+
+  // ---- checks that need every class: overrides, and `self.name` against declared fields ----
+  // A class as this compile defines it, else as the running program has it (a class defined at the REPL may
+  // extend one from the program).
+  struct ClassView { int super = -1; std::vector<std::pair<int, int>> methods; const std::vector<std::pair<int, V>>* fields = nullptr; };
+  bool view(int sym, ClassView& v) {
+    for (auto& cd : classes)
+      if (cd.sym == sym) {
+        v = {cd.super, {}, &cd.fields};
+        for (auto& [m, f] : cd.methods) v.methods.push_back({m, spans.at(symName(sym) + "." + symName(m)).arity});
+        return true;
+      }
+    Global* g = findGlobal(sym);
+    if (!g || !g->o || g->o->kind != K::Class) return false;
+    Class* c = (Class*)g->o;
+    v = {c->super ? (int)c->super->name : -1, {}, &c->fields};
+    for (auto& [m, f] : c->methods) v.methods.push_back({m, f->arity - 1});  // a method's Fn counts self
+    return true;
+  }
+  [[noreturn]] void failHere(const At& a, const char* fmt, const std::string& x, const std::string& y = "", const std::string& z = "", const std::string& w = "") {
+    file = a.file, srcStart = a.src, lexAtEnd = false;
+    failAt(a.p, a.line, fmt, x.c_str(), y.c_str(), z.c_str(), w.c_str());
+  }
+  static std::string params(int n) { return std::to_string(n) + (n == 1 ? " parameter" : " parameters"); }
+  void checkClasses() {
+    // Methods: one that replaces a superclass's method says `override`, and takes the same parameters; one
+    // that says `override` replaces something. So adding a method to a base class can't silently capture a
+    // subclass's unrelated method of the same name, and renaming one can't silently orphan an override.
+    for (auto& cd : classes)
+      for (auto& w : cd.written) {
+        if (w.sym == S_init) continue;  // constructors don't override
+        ClassView v;
+        int owner = -1, arity = -1;
+        for (int s = cd.super; s >= 0 && owner < 0 && view(s, v); s = v.super)
+          for (auto [m, a] : v.methods) if (m == w.sym) owner = s, arity = a;
+        std::string m = symName(w.sym), q = symName(cd.sym) + "." + m;
+        if (owner < 0 && w.over) failHere(w.at, "'%s' is marked override, but no superclass of %s has a method '%s'", m, symName(cd.sym), m);
+        if (owner < 0) continue;
+        if (!w.over) failHere(w.at, "'%s' overrides %s: write 'override fn %s' if that is intended", m, symName(owner) + "." + m, m);
+        if (int mine = spans.at(q).arity; mine != arity)
+          failHere(w.at, "'%s' takes %s, but %s, which it overrides, takes %s", m, params(mine), symName(owner) + "." + m, params(arity));
+      }
+    // Fields: in a class that declares its fields (or inherits declared ones), self.name must be one of them.
+    for (auto& u : fieldUses) {
+      ClassView v;
+      bool closed = false, found = false;
+      for (int s = u.cls; s >= 0 && view(s, v); s = v.super)
+        for (auto& [f, d] : *v.fields) closed = true, found |= f == u.sym;
+      if (closed && !found) failHere(u.at, "%s has no field '%s' (declare it in the class: var %s)", symName(u.cls), symName(u.sym), symName(u.sym));
+    }
   }
 
   // Tier 2: compile t's source again with its numeric parameters proven (behind an entry guard that falls
@@ -895,6 +1053,7 @@ struct Compiler : Gen {
   Compiled commit(Code& chunk) {
     Compiled out;
     out.files = files, out.tests = std::move(tests);
+    for (auto& f : files) out.sources.push_back({f, sources.at(f).text});
     // A function whose parameter count changed gets a fresh stub; the old stub now traps stale callers.
     std::unordered_map<void*, void*> remap;
     for (auto [s, a] : fnDefs) {
@@ -948,9 +1107,12 @@ struct Compiler : Gen {
     for (auto& cd : classes) {
       Class* c = globalObj<Class>(cd.sym);
       c->super = cd.super >= 0 ? (Class*)global(cd.super).o : nullptr;
-      c->methods = cd.methods;
+      c->methods = cd.methods, c->fields = cd.fields;
+      size_t n = c->layout.size();
+      for (auto& [f, d] : cd.fields) if (std::find(c->layout.begin(), c->layout.end(), f) == c->layout.end()) c->layout.push_back(f);
+      if (c->layout.size() != n) reshape(c);  // new instances get room for every declared field
     }
-    for (int s : inits) global(s).inited = true;
+    for (int s : inits) if (!global(s).inited) global(s).inited = true, out.newVars.push_back(s);
     clearICs();  // method tables or arities may have changed
     fix(chunk);
     out.chunk = jitInstall(chunk);
@@ -958,6 +1120,7 @@ struct Compiler : Gen {
     out.log = patched.empty() && added.empty() && removed.empty() && reset.empty() ? "no code changes" : "";
     for (auto [label, list] : {std::pair{"patched ", &patched}, {"added ", &added}, {"removed ", &removed}, {"reset ", &reset}})
       if (!list->empty()) out.log += (out.log.empty() ? "" : "; ") + (label + *list);
+    if (!echo) replaced = std::move(installed), installed = out.sources;
     return out;
   }
 };
@@ -989,8 +1152,21 @@ Compiled compile(const std::string& path, bool reload, bool echo, const std::str
   if (!echo) mainFile = path;
   std::string& src = c.sources[path].text;
   if (text) src = *text;
-  else if (!readFile(path, src)) compileFail("cannot read " + path, false);
+  else if (!readSource(path, src)) compileFail("cannot read " + path, false);
   Compiled out = c.run(path, src.c_str());
   delete active, active = nullptr;
   return out;
+}
+bool revertReload(const std::vector<int>& newVars, std::string* err) {
+  for (int v : newVars) global(v).inited = false;  // if they come back, they are initialized then
+  Sources to = replaced;
+  if (to.empty()) return *err = "nothing to go back to", false;
+  overlay = &to;
+  Compiled c;
+  auto f = [](void* p) { auto& [c, to] = *(std::pair<Compiled*, Sources*>*)p; *c = compile(to->front().first, true, false); };
+  std::pair<Compiled*, Sources*> ctx{&c, &to};
+  bool ok = guardCompile(f, &ctx, err);
+  overlay = nullptr;
+  if (ok) jitRetire((u32*)c.chunk);  // the old top level does not run again: the data is as it was
+  return ok;
 }

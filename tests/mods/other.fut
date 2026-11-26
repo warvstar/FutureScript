@@ -1,1 +1,1 @@
-fn square(x) { return "other square" }
+pub fn square(x) { return "other square" }

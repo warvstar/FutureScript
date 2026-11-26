@@ -19,6 +19,7 @@ HOST(throw) [[noreturn]] void host_throw(V v);
 HOST(restart) [[noreturn]] void host_restart();                // unwind to the host, which reruns main()
 HOST(read) int host_read(const char* path);                    // a file's size (the host holds it), or -1
 HOST(take) void host_take(char* dst);                          // copy out what the host holds
+HOST(save) int host_save(const char* path, const char* text);  // write a file (text null: remove it); 0 if it failed
 HOST(extern) int host_extern(const char* lib, const char* name);  // a host function's index, -1: none, -2: no such library
 HOST(ffi) double host_ffi(int fn, const char* sig, const double* args, int ret);  // a string result: its length (in take)
 HOST(resume) void host_resume(Fiber* f, int start);            // suspending: run f until it yields, returns or fails
@@ -287,6 +288,7 @@ bool readFile(const std::string& path, std::string& out) {
   out.resize(n), host_take(out.data());
   return true;
 }
+bool saveFile(const std::string& path, const std::string* text) { return host_save(path.c_str(), text ? text->c_str() : nullptr); }
 std::string canonicalPath(const std::string& p) {  // resolve . and .. (the host gives absolute paths)
   std::vector<std::string> parts;
   for (size_t i = 0, j; i <= p.size(); i = j + 1) {
@@ -322,7 +324,7 @@ static void safepoint() {  // rt_poll: a collection the allocator asked for, the
   u32 p = vm.poll;
   vm.poll = 0;
   if (gcWanted) gcCollect();
-  if (p & 1) host_poll();
+  if (p & 1) vm.txn ? void(txnPollLater = true) : host_poll();  // reloads and typed lines wait for transactions to end
 }
 static V undefFn() { ERR("call to undefined function"); }
 static void rt_hot(void* t, V* args, int n) {  // a tier-1 body reached its call count
@@ -389,4 +391,20 @@ EXPORT(fut_test_start) int futTestStart(int i) { return (int)wa::slotOf(testStar
 EXPORT(fut_test_finish) void futTestFinish(int i, int errored, const char* err) { testFinish(last.tests[i], errored, err); }
 EXPORT(fut_test_top_error) void futTestTopError(const char* err) { reportTopError(err); }
 EXPORT(fut_tests_end) int futTestsEnd() { return testsEnd(); }
+// The last compile's interfaces: mode 0 reports them as text, 1 as JSON, 2 writes them (fut api); the number
+EXPORT(fut_api) int futApi(int mode, const char* program) {
+  return mode == 2 ? writeInterfaces(last.sources, program) : reportInterfaces(checkInterfaces(last.sources), mode == 1, program);
+}
 EXPORT(fut_poll) u32* futPoll() { return &vm.poll; }
+// Transactions, for the host: a hot reload's top level and reload() hook run inside one (see hostPoll in fut.js),
+// and an error that reaches the host rolls back those opened since the call began.
+EXPORT(fut_txn_depth) u32 futTxnDepth() { return vm.txn; }
+EXPORT(fut_txn_begin) void futTxnBegin() { txnBegin(); }
+EXPORT(fut_txn_commit) void futTxnCommit() { txnCommit(); }
+EXPORT(fut_txn_unwind) void futTxnUnwind(u32 depth) { txnUnwind(depth); }
+EXPORT(fut_reload_failed) void futReloadFailed() {  // roll back the reload's transaction, then its code
+  txnAbort();
+  std::string err;
+  if (revertReload(last.newVars, &err)) fputs("[fut] reload rolled back: the program's data and code are as they were before it\n", stderr);
+  else fprintf(stderr, "[fut] reload rolled back its data, but the previous code did not compile again: %s\n", err.c_str());
+}

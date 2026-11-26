@@ -2,7 +2,7 @@
 import "../mods/geom.fut" as geom
 import "../mods/other.fut" as o
 fn square(x) { return "app square" }
-class Ring : geom.Circle { fn area() { return super.area() - 1 } }
+class Ring : geom.Circle { override fn area() { return super.area() - 1 } }
 
 test "module functions, and same names in the program and other modules" {
   expect geom.area(1) == 3.14159
