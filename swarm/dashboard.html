@@ -81,21 +81,64 @@ tr:last-child td { border-bottom: 0; }
 .log { max-height: 340px; overflow: auto; white-space: pre-wrap; word-break: break-word; margin: 0; color: var(--text-secondary); }
 .log div { padding: 2px 0; border-bottom: 1px solid var(--grid); }
 .empty { color: var(--text-muted); font-size: 13px; padding: 16px 0; text-align: center; }
-.ctl { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 10px; }
-.ctl h3 { margin: 0 0 10px; font-size: 13px; font-weight: 600; }
-.form { display: grid; grid-template-columns: auto 1fr; gap: 8px 10px; align-items: center; font-size: 13px; }
-.form label { color: var(--text-secondary); white-space: nowrap; }
+.ctl { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; align-items: start; }
+@media (max-width: 900px) { .ctl { grid-template-columns: 1fr; } }
+.card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 12px; }
+.card-head h3 { margin: 0; font-size: 15px; font-weight: 650; }
+.access { display: flex; align-items: center; gap: 10px 14px; flex-wrap: wrap; margin-bottom: 10px; padding: 10px 14px; }
+.access .what { font-weight: 600; display: inline-flex; align-items: center; gap: 7px; }
+.access form { display: flex; gap: 8px; margin-left: auto; flex: 1 1 280px; max-width: 420px; }
+.access .err { color: var(--critical); font-size: 12px; flex-basis: 100%; }
+.meter-top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: 13px; color: var(--text-secondary); }
+.meter-top b { font-size: 18px; color: var(--text-primary); font-variant-numeric: tabular-nums; }
+.note { font-size: 12px; color: var(--text-muted); margin-top: 6px; }
+.fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 14px; }
+.fields .wide { grid-column: 1 / -1; }
+.field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--text-secondary); min-width: 0; }
+.affix { display: flex; align-items: center; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-0); }
+.affix span { padding: 0 8px; color: var(--text-muted); font-size: 13px; }
+.affix input { border: 0; background: none; padding-left: 0; }
+.affix span:last-child { padding-left: 0; }
+.affix input:only-of-type:first-child { padding-left: 8px; }
+.team { margin-top: 14px; border-top: 1px solid var(--grid); padding-top: 12px; }
+.team-title { font-size: 12px; color: var(--text-secondary); margin-bottom: 6px; }
+.role { display: grid; grid-template-columns: 110px 1fr; align-items: center; gap: 10px; padding: 3px 0; font-size: 13px; }
+.role small { display: block; color: var(--text-muted); font-size: 11px; }
 input, select, textarea { font: inherit; font-size: 13px; color: var(--text-primary); background: var(--surface-0); border: 1px solid var(--border);
-  border-radius: 6px; padding: 5px 8px; min-width: 0; width: 100%; }
-textarea { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; min-height: 150px; resize: vertical; }
-.btns { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; align-items: center; }
+  border-radius: 6px; padding: 6px 8px; min-width: 0; width: 100%; }
+input:focus-visible, select:focus-visible, .btn:focus-visible, .sc-row:focus-visible { outline: 2px solid var(--series-1); outline-offset: 1px; }
+input:disabled, select:disabled { color: var(--text-secondary); }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; align-items: center; }
+.actions .spacer { flex: 1; }
 .btn { font: inherit; font-size: 13px; border: 1px solid var(--border); background: var(--surface-1); color: var(--text-primary);
-  border-radius: 7px; padding: 6px 12px; cursor: pointer; }
+  border-radius: 7px; padding: 6px 12px; cursor: pointer; white-space: nowrap; }
+.btn:hover:not(:disabled) { background: var(--track); }
 .btn.primary { background: var(--series-1); border-color: var(--series-1); color: #fff; }
-.btn:disabled { opacity: .5; cursor: default; }
-.msg { font-size: 12px; color: var(--text-secondary); }
-.check { display: flex; gap: 6px; align-items: center; font-size: 13px; color: var(--text-secondary); }
+.btn.primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--series-1); }
+.btn.danger { color: var(--critical); border-color: color-mix(in srgb, var(--critical) 45%, var(--border)); }
+.btn.link { border: 0; background: none; padding: 6px 4px; color: var(--text-secondary); text-decoration: underline; text-underline-offset: 3px; }
+.btn.link.danger { color: var(--critical); }
+.btn:disabled { opacity: .45; cursor: default; }
+.say { font-size: 12px; margin-top: 10px; min-height: 18px; color: var(--text-secondary); display: flex; align-items: center; gap: 6px; }
+.say.ok { color: var(--good); } .say.err { color: var(--critical); }
+.banner { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-0);
+  font-size: 13px; margin-bottom: 12px; }
+.banner .spacer { flex: 1; }
+.sclist { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.sc-row { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; text-align: left; border: 0; border-bottom: 1px solid var(--grid);
+  background: none; color: var(--text-primary); font: inherit; padding: 8px 10px; cursor: pointer; }
+.sc-row:last-child { border-bottom: 0; }
+.sc-row:hover { background: var(--surface-0); }
+.sc-row[aria-selected="true"] { background: var(--track); box-shadow: inset 3px 0 0 var(--series-1); }
+.sc-row .n { font-weight: 600; font-size: 13px; display: flex; gap: 8px; align-items: center; }
+.sc-row .s { font-size: 12px; color: var(--text-muted); }
+.sc-row.new .n { font-weight: 500; color: var(--text-secondary); }
+.tag { font-size: 11px; font-weight: 500; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-secondary); }
+.editor { margin-top: 4px; }
+.check { display: flex; gap: 8px; align-items: center; font-size: 13px; color: var(--text-secondary); margin-top: 12px; }
 .check input { width: auto; }
+.msg { font-size: 12px; color: var(--text-secondary); }
+@media (max-width: 560px) { .fields { grid-template-columns: 1fr 1fr; } .role { grid-template-columns: 90px 1fr; } }
 </style>
 </head>
 <body>
@@ -111,7 +154,8 @@ const dur = (s) => { s = Math.round(s || 0); const h = Math.floor(s / 3600), m =
 const pct = (a, b) => (b ? Math.round(100 * a / b) : 0);
 const store = { get(k, d) { try { return localStorage.getItem(k) ?? d; } catch { return d; } }, set(k, v) { try { localStorage.setItem(k, v); } catch {} } };
 let xKey = store.get("swarm.x", "t"), taskFilter = store.get("swarm.tasks", "active");
-let dirty = false, editing = store.get("swarm.scenario", ""), message = "";
+let dirty = false, editing = store.get("swarm.scenario", "") || null;  // null: not chosen yet, "": a new scenario
+let runSay = null, nextSay = null, accessErr = "", sentRev = 0, draft = null;  // draft: the scenario form's values while edited
 const served = location.protocol.startsWith("http");  // from the Worker: the controls can write to its KV
 async function refresh() {  // new data every 15 s, unless a form is being edited
   if (dirty || document.activeElement?.matches("input, select, textarea")) return;
@@ -141,7 +185,7 @@ function tiles() {
       <div class="value">${a ? a.passed : "–"}<small> / ${a ? a.total : "–"}</small></div>
       <div class="bar"><i style="width:${a ? pct(a.passed, a.total) : 0}%"></i></div></div>
     <div class="card tile"><div class="label">Spent</div>
-      <div class="value">${money(D.spent)}<small> / ${money(D.cap)}</small></div>
+      <div class="value">${money(D.spent)}</div><div class="note">of ${money(D.cap)} cap</div>
       <div class="bar"><i style="width:${capPct}%"></i></div></div>
     <div class="card tile"><div class="label">Elapsed</div><div class="value">${dur(D.elapsed)}</div><div class="note">${timeNote}</div></div>
     <div class="card tile"><div class="label">Tasks merged</div><div class="value">${D.merged}</div>
@@ -268,17 +312,19 @@ function runsBlock() {
     <th class="num">Src lines</th><th>fut</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
-// ---- controls: they write the swarm's control document (and the scenarios) to the Worker's KV; the swarm reads it ----
+// ---- controls: they write the swarm's control document (and the scenarios) to the Worker's KV; the swarm reads it
+// every 10 s and applies it (D.control is what it applied last) ----
 const token = () => store.get("swarm.token", "");
+const unlocked = () => !!token();
+const ROLES = [["worker", "writes the code"], ["planner", "proposes tasks"], ["approver", "accepts tasks"], ["reviewer", "reviews each diff"]];
+const modelName = (m) => (m || "").replace(/^claude-/, "").replace(/-(\d+)-(\d+)$/, " $1.$2").replace(/^./, (c) => c.toUpperCase());
 async function kv(key, value) {
   const headers = { authorization: "Bearer " + token() };
-  if (value === undefined) {
-    const r = await fetch("/kv/" + key, { headers, cache: "no-store" });
-    if (!r.ok) throw new Error(r.status == 401 ? "the write token is wrong" : "read failed: " + r.status);
-    return r.json();
-  }
-  const r = await fetch("/kv/" + key, { method: "PUT", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify(value) });
-  if (!r.ok) throw new Error(r.status == 401 ? "the write token is wrong" : "write failed: " + r.status);
+  const r = value === undefined ? await fetch("/kv/" + key, { headers, cache: "no-store" })
+    : await fetch("/kv/" + key, { method: "PUT", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify(value) });
+  if (r.status == 401) { store.set("swarm.token", ""), (accessErr = "That token was refused. Unlock again with the Worker's FUT_TOKEN."); throw new Error("the token was refused"); }
+  if (!r.ok) throw new Error((value === undefined ? "read" : "write") + " failed: HTTP " + r.status);
+  return value === undefined ? r.json() : null;
 }
 async function control(change) {  // read, change, write back with the next revision
   const c = (await kv("control")) || {};
@@ -286,75 +332,182 @@ async function control(change) {  // read, change, write back with the next revi
   change(c);
   c.rev = (c.rev || 0) + 1;
   await kv("control", c);
+  D.control = { ...(D.control || {}), next: c.next };
+  return c.rev;
 }
-async function act(what, f) {
-  message = what + "…", render();
-  try { await f(); message = what + ": saved. The swarm applies it within a minute.", dirty = false; }
-  catch (e) { message = what + " failed: " + e.message; }
+async function act(set, busy, f) {  // set(msg): runSay or nextSay
+  set({ text: busy + "…" }), render();
+  try { set({ text: await f(), kind: "ok" }), (dirty = false); }
+  catch (e) { set({ text: e.message, kind: "err" }); }
   render();
 }
-const num = (id) => { const v = $("#" + id).value.trim(); return v == "" ? undefined : +v; };
+const setRun = (m) => (runSay = m), setNext = (m) => (nextSay = m);
+const val = (id) => { const v = $("#" + id)?.value.trim(); return v == "" || v == null ? undefined : +v; };
+const say = (m) => `<div class="say ${m?.kind || ""}" role="status" aria-live="polite">${m ? esc(m.text) : ""}</div>`;
+const opts = (sel, extra = "") => extra + D.knownModels.map((m) => `<option value="${esc(m)}" ${m == sel ? "selected" : ""}>${esc(modelName(m))}</option>`).join("");
+function summary(sc) {
+  const models = [...new Set([sc.model, ...Object.values(sc.models || {})].filter(Boolean))].map(modelName).join(" + ");
+  return [sc.target, (sc.workers || 8) + " workers", "$" + (sc.cap ?? "–") + " cap", sc.minutes ? sc.minutes + " min" : "no time limit", models].join(" · ");
+}
+
+function accessBar() {
+  if (unlocked()) return `<div class="card access"><span class="what"><span class="dot" style="background:var(--good)"></span>Controls unlocked</span>
+    <span class="muted" style="font-size:12px">The token is kept in this browser only.</span><span style="flex:1"></span><button class="btn link" id="b-lock">Lock</button></div>`;
+  return `<div class="card access"><span class="what"><span class="dot" style="background:var(--text-muted)"></span>Read-only</span>
+    <span class="muted" style="font-size:12px">Anyone with the link can watch. Changing the swarm needs the Worker's token.</span>
+    <form id="unlock" autocomplete="off"><input id="f-token" type="password" placeholder="FUT_TOKEN" aria-label="Worker token"><button class="btn primary">Unlock</button></form>
+    ${accessErr ? `<div class="err" role="alert">${esc(accessErr)}</div>` : ""}</div>`;
+}
+
+function runCard() {
+  const live = !D.stopped, can = live && unlocked(), dis = can ? "" : "disabled", st = statusOf();
+  const pending = sentRev && (D.control?.rev || 0) < sentRev;
+  const capPct = Math.min(100, pct(D.spent, D.cap));
+  const team = ROLES.map(([r, what]) => `<div class="role"><label for="f-m-${r}">${r}<small>${what}</small></label><select id="f-m-${r}" ${dis}>${opts(D.models[r])}</select></div>`).join("");
+  return `<div class="card"><div class="card-head"><h3>This run</h3><span class="pill"><span class="dot" style="background:${st.color}"></span>${esc(st.text)}</span></div>
+    <div class="meter-top"><span><b>${money(D.spent)}</b> spent</span><span>of ${money(D.cap)} cap</span></div>
+    <div class="bar"><i style="width:${capPct}%"></i></div>
+    <div class="note">All runs together: ${money(D.globalSpent)} of the ${money(D.globalCap)} hard cap · running ${dur(D.elapsed)}</div>
+    <div class="fields">
+      <label class="field">Workers<input id="f-workers" type="number" inputmode="numeric" min="1" max="32" value="${D.nworkers}" ${dis}></label>
+      <label class="field">Budget cap<span class="affix"><span>$</span><input id="f-cap" type="number" inputmode="decimal" step="0.5" min="0" value="${D.cap}" ${dis}></span></label>
+      <label class="field">Time limit<span class="affix"><input id="f-min" type="number" inputmode="numeric" min="0" value="${D.minutes || ""}" placeholder="none" ${dis}><span>min</span></span></label>
+    </div>
+    <div class="team"><div class="team-title">Team</div>${team}</div>
+    <div class="actions"><button class="btn primary" id="b-apply" disabled>Apply changes</button><button class="btn link" id="b-discard" hidden>Discard</button>
+      <span class="spacer"></span><button class="btn" id="b-pause" ${dis}>${D.paused ? "Resume" : "Pause"}</button><button class="btn danger" id="b-stop" ${dis}>Stop run</button></div>
+    ${say(pending ? { text: "Sent. The swarm picks changes up within about 10 seconds." } : runSay)}
+    ${live ? "" : `<div class="note">This run is over. Start the next one from the scenarios.</div>`}</div>`;
+}
+
+function scenarioForm(sc, name) {
+  const can = unlocked(), dis = can ? "" : "disabled", m = sc.models || {};
+  const same = (r) => `<option value="" ${m[r] ? "" : "selected"}>Same as workers</option>`;
+  const team = ROLES.map(([r, what]) => `<div class="role"><label for="s-m-${r}">${r}<small>${what}</small></label>
+    <select id="s-m-${r}" ${dis}>${r == "worker" ? opts(sc.model || D.knownModels[0]) : same(r) + D.knownModels.map((x) => `<option value="${esc(x)}" ${x == m[r] ? "selected" : ""}>${esc(modelName(x))}</option>`).join("")}</select></div>`).join("");
+  return `<div class="editor"><div class="fields">
+      <label class="field">Name<input id="s-name" value="${esc(name)}" placeholder="e.g. fsql-sonnet" pattern="[A-Za-z0-9_\\-][A-Za-z0-9._\\-]*" ${dis}></label>
+      <label class="field">Project<select id="s-target" ${dis}>${D.targets.map((t) => `<option ${t == sc.target ? "selected" : ""}>${esc(t)}</option>`).join("")}</select></label>
+      <label class="field">Workers<input id="s-workers" type="number" min="1" max="32" value="${sc.workers ?? 8}" ${dis}></label>
+      <label class="field wide">Description<input id="s-desc" value="${esc(sc.description || "")}" placeholder="what this run compares" ${dis}></label>
+      <label class="field">Budget cap<span class="affix"><span>$</span><input id="s-cap" type="number" step="0.5" min="0" value="${sc.cap ?? 5}" ${dis}></span></label>
+      <label class="field">Time limit<span class="affix"><input id="s-min" type="number" min="0" value="${sc.minutes || ""}" placeholder="none" ${dis}><span>min</span></span></label>
+    </div>
+    <div class="team"><div class="team-title">Team</div>${team}</div>
+    <label class="check"><input type="checkbox" id="s-cf" ${sc.cfTests ? "checked" : ""} ${dis}>Run the tests on the Cloudflare Worker (slower than local for CPU-heavy suites)</label></div>`;
+}
+
+function nextCard() {
+  const names = Object.keys(D.scenarios || {}).sort(), live = !D.stopped, can = unlocked();
+  if (editing == null || (editing != "" && !names.includes(editing))) editing = names.includes(D.control?.next) ? D.control.next : names.includes(D.scenario) ? D.scenario : names[0] || "";
+  const sc = draft || D.scenarios?.[editing] || { description: "", target: D.targets[0], workers: 8, model: D.knownModels[0], cap: 5, minutes: 60 };
+  const queued = D.control?.next;
+  const rows = names.map((n) => `<button class="sc-row" role="option" data-sc="${esc(n)}" aria-selected="${n == editing}">
+      <span class="n">${esc(n)}${n == D.scenario && live ? '<span class="tag">running</span>' : ""}${n == queued ? '<span class="tag">queued next</span>' : ""}</span>
+      <span class="s">${esc(D.scenarios[n].description || summary(D.scenarios[n]))}</span></button>`).join("");
+  const start = live ? `<button class="btn danger" id="b-now" ${can ? "" : "disabled"}>Stop this run and start</button>
+      <button class="btn primary" id="b-next" ${can ? "" : "disabled"}>Queue next</button>`
+    : `<button class="btn primary" id="b-now" ${can ? "" : "disabled"}>Start this run</button>`;
+  return `<div class="card"><div class="card-head"><h3>Next run</h3><span class="muted" style="font-size:12px">${names.length} scenario${names.length == 1 ? "" : "s"}</span></div>
+    ${queued ? `<div class="banner"><span class="dot" style="background:var(--series-1)"></span><span>Queued next: <b>${esc(queued)}</b>${live ? ", when this run ends" : ""}</span><span class="spacer"></span>
+      <button class="btn link" id="b-unqueue" ${can ? "" : "disabled"}>Cancel</button></div>` : ""}
+    <div class="sclist" role="listbox" aria-label="Scenarios">${rows}
+      <button class="sc-row new" role="option" data-sc="" aria-selected="${editing == ""}"><span class="n">+ New scenario</span></button></div>
+    ${scenarioForm(sc, editing)}
+    <div class="actions"><button class="btn" id="b-save" disabled>Save</button>${editing ? `<button class="btn link danger" id="b-del" ${can ? "" : "disabled"}>Delete</button>` : ""}
+      <span class="spacer"></span>${start}</div>
+    ${say(nextSay)}</div>`;
+}
+
 function controlsBlock() {
   if (!served || !D.dash) return `<div class="card"><div class="msg">Controls work on the dashboard the Worker serves (SWARM_DASH_URL).</div></div>`;
-  const live = !D.stopped, opts = (sel) => D.knownModels.map((m) => `<option ${m == sel ? "selected" : ""}>${esc(m)}</option>`).join("");
-  const names = Object.keys(D.scenarios || {}).sort();
-  if (!names.includes(editing)) editing = D.scenario && names.includes(D.scenario) ? D.scenario : names[0] || "";
-  const sc = D.scenarios?.[editing];
-  return `<div class="ctl">
-    <div class="card"><h3>This run${live ? "" : " (over)"}</h3>
-      <div class="form">
-        <label for="f-workers">Workers</label><input id="f-workers" type="number" min="1" max="32" value="${D.nworkers}" ${live ? "" : "disabled"}>
-        <label for="f-cap">Cap ($)</label><input id="f-cap" type="number" step="0.5" min="0" value="${D.cap}" ${live ? "" : "disabled"}>
-        <label for="f-min">Time limit (min)</label><input id="f-min" type="number" min="0" value="${D.minutes}" ${live ? "" : "disabled"}>
-        ${["worker", "planner", "approver", "reviewer"].map((r) => `<label for="f-m-${r}">${r}</label><select id="f-m-${r}" ${live ? "" : "disabled"}>${opts(D.models[r])}</select>`).join("")}
-      </div>
-      <div class="btns"><button class="btn primary" id="b-apply" ${live ? "" : "disabled"}>Apply</button>
-        <button class="btn" id="b-pause" ${live ? "" : "disabled"}>${D.paused ? "Resume" : "Pause"}</button>
-        <button class="btn" id="b-stop" ${live ? "" : "disabled"}>Stop run</button></div>
-      <div class="msg" style="margin-top:8px">All runs together: ${money(D.globalSpent)} of ${money(D.globalCap)} (a hard cap).</div></div>
-    <div class="card"><h3>Scenarios</h3>
-      <div class="form"><label for="f-sc">Scenario</label><select id="f-sc">${names.map((n) => `<option ${n == editing ? "selected" : ""}>${esc(n)}</option>`).join("")}<option value="">new…</option></select>
-        <label for="f-name">Name</label><input id="f-name" value="${esc(editing)}" placeholder="letters, digits, . _ -"></div>
-      <textarea id="f-json" style="margin-top:8px" spellcheck="false">${esc(JSON.stringify(sc ?? { description: "", target: D.targets[0], workers: 8, model: D.knownModels[0], cap: 5, minutes: 60 }, null, 2))}</textarea>
-      <div class="msg">target: ${D.targets.map(esc).join(", ")} · models: ${D.knownModels.map(esc).join(", ")} · optional: models {role: model}, cfTests</div>
-      <div class="btns"><button class="btn" id="b-save">Save scenario</button>
-        <button class="btn primary" id="b-next">Run it next</button>
-        <label class="check"><input type="checkbox" id="f-stopfirst" ${live ? "checked" : "disabled"}> stop this run first</label></div></div>
-    <div class="card"><h3>Write access</h3>
-      <div class="form"><label for="f-token">Token</label><input id="f-token" type="password" value="${esc(token())}" placeholder="the Worker's FUT_TOKEN" autocomplete="off"></div>
-      <div class="msg" style="margin-top:8px">Kept in this browser only. Anyone can view this page; changes need the token.</div>
-      ${message ? `<div class="msg" style="margin-top:10px"><b>${esc(message)}</b></div>` : ""}</div>
-  </div>`;
+  return accessBar() + `<div class="ctl">${runCard()}${nextCard()}</div>`;
 }
+
 function scenarioFromForm() {
-  const name = $("#f-name").value.trim();
-  if (!/^[A-Za-z0-9_-][A-Za-z0-9._-]*$/.test(name)) throw new Error("name: letters, digits, . _ -");
-  const sc = JSON.parse($("#f-json").value);
-  if (!D.targets.includes(sc.target)) throw new Error("no target " + sc.target);
-  for (const m of [sc.model, ...Object.values(sc.models || {})]) if (m && !D.knownModels.includes(m)) throw new Error("no price for model " + m);
+  const name = $("#s-name").value.trim();
+  if (!/^[A-Za-z0-9_-][A-Za-z0-9._-]*$/.test(name)) throw new Error("Give the scenario a name: letters, digits, . _ -");
+  const sc = { description: $("#s-desc").value.trim(), target: $("#s-target").value, workers: val("s-workers") ?? 8, model: $("#s-m-worker").value,
+    cap: val("s-cap") ?? 5, minutes: val("s-min") ?? 0 };
+  const models = {};
+  for (const [r] of ROLES.slice(1)) if ($("#s-m-" + r).value) models[r] = $("#s-m-" + r).value;
+  if (Object.keys(models).length) sc.models = models;
+  if ($("#s-cf").checked) sc.cfTests = true;
+  if (!(sc.workers >= 1 && sc.workers <= 32)) throw new Error("Workers: 1 to 32");
+  if (!(sc.cap > 0)) throw new Error("The budget cap must be above $0");
   return [name, sc];
 }
+async function saveScenario() {
+  const [name, sc] = scenarioFromForm(), all = (await kv("scenarios")) || {};
+  if (JSON.stringify(all[name]) != JSON.stringify(sc)) all[name] = sc, await kv("scenarios", all);
+  D.scenarios = all, editing = name, draft = null, store.set("swarm.scenario", name);
+  return name;
+}
+function runChanged() {
+  if (D.stopped) return false;
+  const same = val("f-workers") == D.nworkers && val("f-cap") == D.cap && (val("f-min") ?? 0) == (D.minutes || 0);
+  return !same || ROLES.some(([r]) => $("#f-m-" + r).value != D.models[r]);
+}
 function wireControls() {
-  for (const el of document.querySelectorAll(".ctl input, .ctl select, .ctl textarea")) el.addEventListener("input", () => (dirty = true));
-  $("#f-token")?.addEventListener("change", (e) => (store.set("swarm.token", e.target.value.trim()), (dirty = false)));
-  $("#f-sc")?.addEventListener("change", (e) => { editing = e.target.value, store.set("swarm.scenario", editing), dirty = false, render(); });
-  $("#b-apply")?.addEventListener("click", () => act("Apply", () => control((c) => {
+  $("#unlock")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const t = $("#f-token").value.trim();
+    if (!t) return;
+    store.set("swarm.token", t), (accessErr = "");
+    try { await kv("control"); } catch (err) { accessErr ||= err.message; }
+    render();
+  });
+  $("#b-lock")?.addEventListener("click", () => { store.set("swarm.token", ""), (runSay = nextSay = null), render(); });
+  // this run
+  const syncRun = () => { const c = runChanged(); $("#b-apply").disabled = !c || !unlocked(); $("#b-discard").hidden = !c; dirty = c; };
+  for (const el of document.querySelectorAll("#f-workers, #f-cap, #f-min, [id^=f-m-]")) el.addEventListener("input", syncRun);
+  $("#b-discard")?.addEventListener("click", () => { dirty = false, render(); });
+  $("#b-apply")?.addEventListener("click", () => act(setRun, "Sending", async () => {
     const models = {};
-    for (const r of ["worker", "planner", "approver", "reviewer"]) models[r] = $("#f-m-" + r).value;
-    c.run = D.run.id, c.live = { workers: num("f-workers"), cap: num("f-cap"), minutes: num("f-min"), models }, c.stop = false;
-  })));
-  $("#b-pause")?.addEventListener("click", () => act(D.paused ? "Resume" : "Pause", () => control((c) => { c.run = D.run.id, c.pause = !D.paused; })));
-  $("#b-stop")?.addEventListener("click", () => confirm("Stop this run? It ends after the current round.") && act("Stop", () => control((c) => { c.run = D.run.id, c.stop = true; })));
-  $("#b-save")?.addEventListener("click", () => act("Save scenario", async () => {
-    const [name, sc] = scenarioFromForm(), all = (await kv("scenarios")) || {};
-    all[name] = sc, await kv("scenarios", all), D.scenarios = all, editing = name, store.set("swarm.scenario", name);
+    for (const [r] of ROLES) models[r] = $("#f-m-" + r).value;
+    sentRev = await control((c) => { c.run = D.run.id, c.live = { workers: val("f-workers"), cap: val("f-cap"), minutes: val("f-min") ?? 0, models }, c.stop = false; });
+    return "Sent. The swarm picks changes up within about 10 seconds.";
   }));
-  $("#b-next")?.addEventListener("click", () => act("Run next", async () => {
-    const [name, sc] = scenarioFromForm(), all = (await kv("scenarios")) || {};
-    if (JSON.stringify(all[name]) != JSON.stringify(sc)) all[name] = sc, await kv("scenarios", all), D.scenarios = all;
-    const stopFirst = $("#f-stopfirst")?.checked;
-    await control((c) => { c.next = name; if (stopFirst && !D.stopped) c.run = D.run.id, c.stop = true; });
+  $("#b-pause")?.addEventListener("click", () => act(setRun, D.paused ? "Resuming" : "Pausing", async () => {
+    sentRev = await control((c) => { c.run = D.run.id, c.pause = !D.paused; });
+    return D.paused ? "Resume sent." : "Pause sent: workers stop after their current step.";
   }));
+  $("#b-stop")?.addEventListener("click", () => confirm(`Stop ${D.run.id}? It ends after the current round, and the dashboard then waits for the next run.`) &&
+    act(setRun, "Stopping", async () => { sentRev = await control((c) => { c.run = D.run.id, c.stop = true; }); return "Stop sent: the run ends after this round."; }));
+  // next run
+  for (const b of document.querySelectorAll("[data-sc]")) b.addEventListener("click", () => {
+    if (dirty && draft && !confirm("Discard your unsaved changes to this scenario?")) return;
+    editing = b.dataset.sc, draft = null, dirty = false, nextSay = null, editing && store.set("swarm.scenario", editing), render();
+  });
+  const syncNext = () => {
+    let changed = true;
+    try { const [n, sc] = scenarioFromForm(); changed = n != editing || JSON.stringify(sc) != JSON.stringify(D.scenarios?.[editing]); } catch {}
+    $("#b-save").disabled = !changed || !unlocked();
+    dirty = changed;
+  };
+  for (const el of document.querySelectorAll(".editor input, .editor select")) el.addEventListener("input", syncNext);
+  $("#b-save")?.addEventListener("click", () => act(setNext, "Saving", async () => "Saved " + (await saveScenario()) + "."));
+  $("#b-del")?.addEventListener("click", () => confirm(`Delete the scenario ${editing}?`) && act(setNext, "Deleting", async () => {
+    const all = (await kv("scenarios")) || {}, n = editing;
+    delete all[n], await kv("scenarios", all), (D.scenarios = all), (editing = ""), (draft = null);
+    return "Deleted " + n + ".";
+  }));
+  $("#b-next")?.addEventListener("click", () => act(setNext, "Queueing", async () => {
+    const n = await saveScenario();
+    await control((c) => { c.next = n; });
+    return `${n} starts when this run ends.`;
+  }));
+  $("#b-now")?.addEventListener("click", () => {
+    let n;
+    try { n = scenarioFromForm()[0]; } catch (e) { return (nextSay = { text: e.message, kind: "err" }), render(); }
+    if (!D.stopped && !confirm(`Stop ${D.run.id} now and start ${n}? The current run ends after this round.`)) return;
+    act(setNext, "Starting", async () => {
+      const name = await saveScenario();
+      await control((c) => { c.next = name; if (!D.stopped) c.run = D.run.id, c.stop = true; });
+      return D.stopped ? `${name} starts within about 10 seconds.` : `This run stops after its round, then ${name} starts.`;
+    });
+  });
+  $("#b-unqueue")?.addEventListener("click", () => act(setNext, "Cancelling", async () => { await control((c) => { c.next = null; }); return "Nothing queued."; }));
 }
 
 function render() {
