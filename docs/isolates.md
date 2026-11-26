@@ -1,6 +1,6 @@
 # Isolates and channels
 
-Status: phases 1 (the runtime split per isolate), 2 (spawn, join, channels), 3 (the scheduler: isolate stacks, a thread pool with preemption, seeded runs) and 4 (hot reload across isolates) are done. The README has the language as built; `src/isolate.cpp` has the runtime. Phase 5 (wasm workers) is next. This is how fut gets parallelism: many isolates run at once, each owning its own heap,
+Status: phases 1 (the runtime split per isolate), 2 (spawn, join, channels), 3 (the scheduler: isolate stacks, a thread pool with preemption, seeded runs) and 4 (hot reload across isolates) are done, and so is the first step of 5 (isolates in wasm, on one thread). The README has the language as built; `src/isolate.cpp` has the runtime. The rest of phase 5 (wasm isolates in parallel, on workers) is next. This is how fut gets parallelism: many isolates run at once, each owning its own heap,
 and they share data only by sending it over channels. There is no shared mutable memory, so there are no locks,
 no memory orderings and no data races to write. Read this before you add any global state to the runtime.
 
@@ -140,9 +140,8 @@ Code is shared, so a reload must reach every isolate at once:
 
 - Each isolate is a Web Worker (or a Node worker thread) instantiating the same module over one shared
   `WebAssembly.Memory`.
-- **The VM block.** JIT wasm code reaches the VM block by absolute address today (17 sites of `slotOf(&vm...)` in
-  `gen_wasm.h`). Each isolate's block lives at a different address, so those sites load the base from a per-instance
-  wasm global and add an offset. This should cost little: V8 keeps such a global in a register.
+- **The VM block.** Done in step one: JIT wasm code reads the running isolate's VM block from wasm global 1 once per
+  frame, into a local, and reaches its fields as offsets from it.
 - **JIT modules.** Each one is instantiated in every worker, because each worker has its own function table
   (shared tables aren't standardized). A compiled `WebAssembly.Module` can be posted to workers. Reload installs
   the new module in each worker at its stop.
@@ -175,7 +174,9 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
    - Work: stop the world, then the two-phase commit.
    - Test: the hot-reload suite with workers running (`build.py`'s `hot_isolates`).
 5. **Wasm workers.**
-   - Work: the VM base global, per-worker instantiation, JSPI on the main thread, COOP/COEP.
+   - Step one, done: isolates in wasm on one thread (the VM base global; contexts switched with JSPI; seeded).
+   - Step two: per-worker instantiation over shared memory (a threads build), the table log, blocking on the
+     browser's main thread, COOP/COEP.
 6. **Shared buffers and `parallel for`, for C-like throughput.**
    - Work: typed buffers (`f64buffer(n)` and the like) live outside every heap, so all isolates read and write them
      directly. Sending a buffer moves its ownership instead of copying it.
@@ -272,3 +273,26 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
 - **Limits.** Code replaced while other isolates exist is kept until the program is down to one isolate:
   `jitCollect` looks only at the reloading thread's stacks, so it can't tell whether a stopped isolate's frame
   will return into old code. Walking the stopped isolates' stacks (and their fibers') would allow freeing it.
+
+## Phase 5, step one as built: isolates in wasm, on one thread
+
+- **Seeded, always.** Wasm has one thread here, so every program's isolates take turns on it as a seeded program's
+  do natively (`--seed n`, default 1): at each channel or task operation, `spawn` and `print`, the generator picks
+  which runnable isolate goes on. A wasm program interleaves the same way every run, in `fut test` or not. An
+  isolate that never reaches such a point keeps the thread (there is no preemption on one thread).
+- **Contexts.** Each isolate is a wasm stack of its own: `ctxSwap` saves its shadow stack pointer and calls the
+  host's suspending `ctx_switch`, which parks the running stack under that name and, once it has suspended
+  (a microtask), resumes the next, or starts it (a promising call of `fut_ctx_start`, which runs `isoEntry` on a
+  fresh 256 KB shadow stack). Switching is never nested: each switch suspends one stack and resumes another from
+  the event loop. ISO_LOCAL works as natively; wasm.cpp's `mainLimit` and `interpTops` and interp.cpp's
+  `interpTop` are isolate-local too. `vmSwitched` tells the host the new VM block after each switch.
+- **Errors.** A fut error is a wasm exception, which C++ can't catch, so `isoEntry` runs the spawned call under
+  the host's `try_call` (`catchFut`; instantiated on first use, as the interpreter's already was) and asks the host
+  for the error's trace. `spawn` records its site from the engine's stack (`hereWhere`), since wasm has no return
+  addresses; a deadlock report names each wait, but not where it is.
+- **Ending.** fut.js waits for a program's isolates when it ends, and after each test (`fut_isolates_finish`, a
+  promising call), as main.cpp does natively.
+- **Limits.** A file reload under `-w` waits until the isolates the program started have ended: other isolates
+  share its code but have globals of their own, which nothing copies into them yet (natively, phase 4 does). A
+  call that waits on the host (`sleep`, `fetch`) holds up every isolate. A Worker built ahead of time can't compile
+  `try_call`, so `spawn` there needs it shipped, as the interpreter Worker does.
