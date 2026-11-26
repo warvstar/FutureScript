@@ -391,11 +391,11 @@ pkg app 0.0.0  // fut.pkg
   main.fut
     import "geom"  // 1
     fn main()      // 3-9
-pkg geom 0.3.0  // ../geom/fut.pkg, interface ../geom/geom.api
+pkg geom 0.3.0  // ../geom/fut.pkg
   js draw draw.js  // line, fill
   geom.fut  // root
     pub import "./vec.fut"  // 1
-    pub fn area(r)          // 3-5, contract
+    pub fn area(r)          // 3-5
     fn hidden()             // 6
   vec.fut
     pub class Vec    // 1-4
@@ -403,7 +403,7 @@ pkg geom 0.3.0  // ../geom/fut.pkg, interface ../geom/geom.api
       fn len()       // 3
 ```
 
-Private names are included. A declaration with a [contract](#contracts) says so (`contract`, or `invariant` on a class), and each package names its `.api`: the map says where things are, and the `.api` what a package promises, so an agent finds its way with the map, edits its own package's source, and reads its dependencies' `.api` files rather than their sources. Both come from the same reading of the source, so they always agree. `--pub` shows only what other packages can use: each package's interface, and the `pub` names of files in no package. `--json` prints one object per line (`{"type":"fn", "package", "file", "name", "in", "pub", "sig", "line", "end"}`, with `"contract": true` or a class's `"invariants": n`, plus `package` (with its `api`), `module` and `file` records). A last argument keeps one package (`fut map main.fut geom`) or one file.
+Private names are included; contracts are not (the source and the `.api` have them). The map and the `.api` come from the same reading of the source, so they always agree. `--pub` shows only what other packages can use: each package's interface, and the `pub` names of files in no package. `--json` prints one object per line (`{"type":"fn", "package", "file", "name", "in", "pub", "sig", "line", "end"}`, plus `package`, `module` and `file` records). A last argument keeps one package (`fut map main.fut geom`) or one file.
 
 ## Fibers
 

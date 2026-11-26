@@ -455,11 +455,9 @@ int printMap(const Compiled& c, bool pubOnly, bool asJson, const std::string& on
       for (auto& d : decls.back()) if (d.kind == "extern" && !d.mod.empty()) binds[d.mod].push_back(d.name);
     }
     if (p) {
-      std::string api;  // its interface file: what other packages read instead of its sources
-      for (auto& u : c.apis) if (u.pkg == p->name) api = shown(u.api, program);
       if (asJson) o += "{\"type\":\"package\",\"name\":" + json(p->name) + ",\"version\":" + json(p->version) + ",\"dir\":" + json(shown(p->dir, program)) +
-                       ",\"root\":" + json(shown(p->root, program)) + (api.empty() ? "" : ",\"api\":" + json(api)) + "}\n";
-      else o += "pkg " + p->name + " " + p->version + "  // " + shown(p->manifest, program) + (api.empty() ? "" : ", interface " + api) + "\n";
+                       ",\"root\":" + json(shown(p->root, program)) + "}\n";
+      else o += "pkg " + p->name + " " + p->version + "  // " + shown(p->manifest, program) + "\n";
       for (auto& m : p->mods) {
         std::string t = m.kind == "c" && m.target.find('/') == std::string::npos ? m.target : rel(m.target), b;
         if (asJson) {
@@ -474,24 +472,15 @@ int printMap(const Compiled& c, bool pubOnly, bool asJson, const std::string& on
     std::string ind = p ? "  " : "";
     for (size_t i = 0; i < files.size(); i++) {
       const std::string& f = files[i]->first;
-      std::vector<const Decl*> shownDecls;  // (a class's invariants: noted on the class; the .api lists them)
-      std::unordered_map<std::string, int> invariants;
-      for (auto& d : decls[i]) if (d.kind == "invariant") invariants[d.owner]++;
+      std::vector<const Decl*> shownDecls;  // (declarations only: contracts are in the source and the .api)
       for (auto& d : decls[i]) if ((!pubOnly || d.pub) && d.kind != "invariant") shownDecls.push_back(&d);
-      auto has = [&](const Decl* d) {  // what contract it carries, for the reader to find in the .api or the source
-        std::string h = !d->clauses.empty() ? "contract" : "";
-        if (d->kind == "class" && invariants.count(d->name)) h = "invariant";
-        return h;
-      };
       if (asJson) {
         o += "{\"type\":\"file\"" + (p ? ",\"package\":" + json(p->name) : "") + ",\"file\":" + json(shown(f, program)) + "}\n";
         for (auto* d : shownDecls) {
           o += "{\"type\":\"" + d->kind + "\"" + (p ? ",\"package\":" + json(p->name) : "") + ",\"file\":" + json(shown(f, program)) + ",\"name\":" + json(d->name);
           if (!d->owner.empty()) o += ",\"in\":" + json(d->owner);
           if (!d->mod.empty()) o += ",\"module\":" + json(d->mod);
-          o += std::string(",\"pub\":") + (d->pub ? "true" : "false") + ",\"sig\":" + json(d->sig) + ",\"line\":" + std::to_string(d->line) + ",\"end\":" + std::to_string(d->end);
-          if (std::string h = has(d); !h.empty()) o += h == "contract" ? ",\"contract\":true" : ",\"invariants\":" + std::to_string(invariants[d->name]);
-          o += "}\n";
+          o += std::string(",\"pub\":") + (d->pub ? "true" : "false") + ",\"sig\":" + json(d->sig) + ",\"line\":" + std::to_string(d->line) + ",\"end\":" + std::to_string(d->end) + "}\n";
           n++;
         }
         emit();
@@ -505,9 +494,7 @@ int printMap(const Compiled& c, bool pubOnly, bool asJson, const std::string& on
         std::string l = ind + "  " + (d->owner.empty() ? "" : "  ") + d->sig;
         size_t col = ind.size() + 2 + w + 2;
         l += std::string(l.size() < col ? col - l.size() : 2, ' ');
-        l += "// " + std::to_string(d->line) + (d->end != d->line ? "-" + std::to_string(d->end) : "");
-        if (std::string h = has(d); !h.empty()) l += ", " + h;
-        l += "\n";
+        l += "// " + std::to_string(d->line) + (d->end != d->line ? "-" + std::to_string(d->end) : "") + "\n";
         o += l, n++;
       }
       emit();
