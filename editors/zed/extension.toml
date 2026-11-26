@@ -4,10 +4,10 @@ description = "Language support for fut."
 version = "0.1.0"
 schema_version = 1
 
-# For a local checkout, set repository and rev as described in editors/README.md.
+# This checkout; bump rev to a commit with the grammar change after regenerating it (editors/README.md).
 [grammars.fut]
-repository = "file:///path/to/futurescript"
-rev = "GRAMMAR_COMMIT"
+repository = "file:///Users/robertstewart/dev/futurescript"
+rev = "09e3577f5cc9e42a4cc686a5219cd39846f0309e"
 path = "editors/tree-sitter-fut"
 
 [language_servers.fut]
