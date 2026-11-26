@@ -769,18 +769,46 @@ struct Compiler : Gen {
     }
     collect(base, n, H_MAP);
   }
-  Fn* lambda(const Tok& t, bool arrow = false, int sym = -1) {  // fn(params) { body }: captures enclosing locals by value into the closure
+  Fn* lambda(const Tok& t, bool arrow = false, int sym = -1, int parVar = -1) {  // fn(params) { body }: captures enclosing locals by value into the closure
     if (tiering) compileFail("tier 2 does not handle lambdas", false);
     Fun f;
-    f.parent = F, f.lambda = true, f.arrow = arrow, f.lambdaName = sym;
+    f.parent = F, f.lambda = true, f.arrow = arrow, f.lambdaName = sym, f.parVar = parVar;
     Fn* fn = make<Fn>();
     consts.push_back(box(fn));
-    fn->code = newStub(), fn->name = sym >= 0 ? sym : intern("fn@" + std::to_string(t.line));
+    fn->code = newStub(), fn->name = sym >= 0 ? sym : intern((parVar >= 0 ? "parallel@" : "fn@") + std::to_string(t.line));
     fn->arity = function(f, -1, false, symName(fn->name), (u32*)fn->code, fn);
+    parWrites = std::move(f.parWrites);
     int base = F->depth, n = (int)f.caps.size();
     for (auto& [s, src] : f.caps) { LV v = src; load(v), st(0, slot()); }
     closure(fn, base, n);
     return fn;
+  }
+
+  // parallel for i in a..b { body }: parallel@(a, b, body, writes) runs body(i) for each i on isolates of the pool
+  // and returns when all have (isolate.cpp). The body is a lambda of i. It may not assign a variable from outside
+  // it (its result would depend on which isolate ran which i); `writes` lists the outside variables it writes as
+  // name[...] = (the buffers each iteration may reach only at [i]), as [code, name, ...] (see Fun::parWrites).
+  std::vector<std::pair<int, std::string>> parWrites;
+  void parallelFor() {
+    Tok kw = prev;
+    if (F->atomics) failAt(kw.p, kw.line, "@atomic parallel for inside atomic { }: its isolates can't be undone (run it after the block)");
+    next();  // for
+    int nm = ident();
+    if (!atKw(K_in)) fail("@syntax expected 'in'");
+    next();
+    int base = slot(), lo = slot(), hi = slot(), fs = slot(), ws = slot();
+    if (!expr()) helper(H_NUMCHK);
+    st(0, lo);
+    if (!accept(T_DOTDOT)) fail("@syntax parallel for runs over a range: parallel for i in a..b { }");
+    if (!expr()) helper(H_NUMCHK);
+    st(0, hi);
+    if (!at('{')) fail("@syntax expected '{' (the body of the parallel for)");
+    lambda(kw, false, -1, nm), st(0, fs);
+    int lb = F->depth;
+    for (auto& [code, name] : parWrites) imm(0, box((double)code)), st(0, slot()), konst(name), st(0, slot());
+    collect(lb, (int)parWrites.size() * 2, H_LIST), st(0, ws);
+    gmem(0, findGlobal(intern("parallel@"))->slot), st(0, base), callWindow(base, 4, 0, false);
+    F->depth = base;
   }
 
   // spawn f(args): spawn@(f, [args]) starts an isolate running f(args) and gives its task (isolate.cpp). f is a
@@ -1062,6 +1090,7 @@ struct Compiler : Gen {
           return {};
         }
       } else if (at('[') && !cur.nl) {
+        LV base = v;
         next(), load(v);
         int t = slot();
         st(0, t);
@@ -1075,7 +1104,11 @@ struct Compiler : Gen {
           st(0, slot()), expect(']');
           internalCall("slice@", t, 3);
           v = {};
-        } else expect(']'), v = {LV_INDEX, t};
+        } else {
+          expect(']'), v = {LV_INDEX, t};
+          if (F->parVar >= 0 && (base.k == LV_CAP || base.k == LV_GLOBAL))  // from outside a parallel for's body
+            v.b = base.k == LV_CAP ? base.a + 1 : -(base.a + 1), v.own = true, parBase = varName(base);
+        }
       } else if (at('(') && !cur.nl) next(), load(v), call(0, false), v = {};
       else return v;
     }
@@ -1192,6 +1225,7 @@ struct Compiler : Gen {
   bool stmt() {  // returns true for a bare expression statement (the REPL echoes those)
     if (accept(';')) return false;
     if (at('{')) return block(), false;
+    if (at(T_ID) && cur.sym == S_parallel && peek().t == T_ID && peek().sym == K_for) return next(), parallelFor(), false;
     if (at(T_ID)) switch (cur.sym) {
         case K_var: {
           next();
@@ -1232,6 +1266,7 @@ struct Compiler : Gen {
         case K_return:
           next();
           if (F->top) fail("@misplaced 'return' outside a function");
+          if (F->parVar >= 0) failAt(prev.p, prev.line, "@parallel a parallel for's body can't return: every iteration runs (write each result to a buffer at [i])");
         {
           bool n = at('}') || at(T_EOF) || cur.nl ? (imm(0, NIL), false) : expr();
           for (int i = 0; i < F->atomics; i++) callNative("atomic@end", true);  // passes x0 through
@@ -1242,6 +1277,7 @@ struct Compiler : Gen {
         }
         case K_break: case K_continue:
           next();
+          if (!F->loop && F->parVar >= 0) failAt(prev.p, prev.line, "@parallel a parallel for's body can't %s: every iteration runs", name(prev.sym));
           if (!F->loop) failAt(prev.p, prev.line, "@misplaced '%s' outside a loop", name(prev.sym));
           for (int i = F->atomics; i > F->loop->atomics; i--) callNative("atomic@end", true);
           for (int i = F->handles; i > F->loop->handles; i--) callNative("handle@end", true);
@@ -1462,7 +1498,15 @@ struct Compiler : Gen {
       loop(lp, [&] { ldl(0, b), addImm(0, 1), stl(0, b); });
     });
   }
+  std::string parBase;  // the name of the last outside variable indexed in a parallel for's body
   void assign(LV v, int op) {  // op < 0: plain '=', else compound
+    if (F->parVar >= 0 && (v.k == LV_CAP || v.k == LV_GLOBAL))
+      fail("@parallel a parallel for's body can't assign '%s', from outside it: each iteration runs on its own (write each result to a buffer at [i])",
+           varName(v).c_str());
+    if (F->parVar >= 0 && v.k == LV_INDEX && v.own) {
+      auto w = std::make_pair(v.b, parBase);
+      if (std::find(F->parWrites.begin(), F->parWrites.end(), w) == F->parWrites.end()) F->parWrites.push_back(w);
+    }
     auto ty = varType(F, v);
     if (v.k == LV_LOCAL && isFReg(v.a) && op >= 0 && op <= O_DIV) {
       unprove(v.a);
@@ -1540,7 +1584,10 @@ struct Compiler : Gen {
     if (cls >= 0) homes.push_back(f.selfHome = home()), f.locals.push_back({K_self, f.selfHome});
     if (f.lambda) homes.push_back(f.cloHome = home());  // the closure itself, for captured variables
     int first = (int)homes.size();  // the first declared parameter
-    if (f.arrow) {  // { n -> body }
+    if (f.parVar >= 0) {  // a parallel for's body: its variable is the parameter, and the block follows
+      int h = home();
+      f.locals.push_back({f.parVar, h}), homes.push_back(h), ptys.push_back({f.parVar, Ty{}});
+    } else if (f.arrow) {  // { n -> body }
       expect('{');
       int s = ident(), h = home();
       f.locals.push_back({s, h}), homes.push_back(h), ptys.push_back({s, Ty{}});

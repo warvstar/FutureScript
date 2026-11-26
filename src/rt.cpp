@@ -58,8 +58,12 @@ const std::string& symName(int s) { return nameBlocks[s / NB].load(std::memory_o
 
 static int nextGlobal;
 int globalCount() { return nextGlobal; }
+static void newGlobalSlot(int slot);
 Global& global(int sym) {
-  if (Global& g = growAt(globals, sym); g.slot < 0 && (g.slot = nextGlobal++) >= MAXG) compileFail("too many globals", false);
+  if (Global& g = growAt(globals, sym); g.slot < 0) {
+    if (nextGlobal >= MAXG) compileFail("too many globals", false);
+    g.slot = nextGlobal, newGlobalSlot(g.slot);
+  }
   return globals[sym];
 }
 Global* findGlobal(int sym) { return (size_t)sym < globals.size() && globals[sym].slot >= 0 ? &globals[sym] : nullptr; }
@@ -99,6 +103,15 @@ int newIC(bool set) {
   TSAN_UNSEEN_END();
   return nics++;
 }
+// Each isolate's copy of a new global starts nil (a new isolate's: vmNew, which sets only the slots in use, as most
+// of its 64K are never used). Written from the compiling thread, as newIC's.
+static void newGlobalSlot(int slot) {
+  Locked g(icMu);
+  TSAN_UNSEEN_BEGIN();
+  for (VM* v : vms) v->globals[slot] = NIL;
+  TSAN_UNSEEN_END();
+  nextGlobal = slot + 1;
+}
 void clearSetICs() { Locked g(icMu); for (int i : setICs) vm->ics[i].key = EMPTY; }
 u32 icEpoch = 1;
 void clearICs() {  // a reload: every isolate is stopped
@@ -115,7 +128,7 @@ VM* vmNew() {
 #endif
   Locked g(icMu);
   if (!vms.empty()) memcpy(v->helpers, vms[0]->helpers, sizeof v->helpers);
-  for (V& x : v->globals) x = NIL;
+  for (int i = 0; i < nextGlobal; i++) v->globals[i] = NIL;  // (the rest: newGlobalSlot)
   for (int i = 0; i < nics; i++) v->ics[i].key = EMPTY;
   v->allowed = EFF_BITS, v->hstack = NIL;  // unchecked, no handlers (as effectsInit)
   v->fuel = int64_t(1) << 62;              // no budget (fuel.cpp)
@@ -533,20 +546,20 @@ static V rt_geti(V a, V i) {
 }
 static V rt_seti(V a, V i, V v) {
   if (is(a, K::Map)) {
-    if (obj(a)->typed) typeWrite(obj(a), i, v, RA());
+    if (obj(a)->typed & 1) typeWrite(obj(a), i, v, RA());
     return touch(obj(a)), mapSet(as<Map>(a), i, v), v;
   }
   if (isObj(a) && isBuf(obj(a)->kind)) return touch(obj(a)), bufSet(a, i, v);
   if (!is(a, K::List)) ERR("@index cannot assign into %s", typeName(a));
   auto& l = as<List>(a)->v;
   size_t at = INDEX(i, l.size());
-  if (obj(a)->typed) typeWrite(obj(a), NIL, v, RA());
+  if (obj(a)->typed & 1) typeWrite(obj(a), NIL, v, RA());
   return touch(obj(a)), l[at] = v;
 }
 static V rt_iter(V c, uint64_t i) {
   if (is(c, K::List)) return i < as<List>(c)->v.size() ? as<List>(c)->v[i] : END;
   if (is(c, K::Map)) return i < as<Map>(c)->e.size() ? as<Map>(c)->e[i].first : END;
-  if (isObj(c) && isBuf(obj(c)->kind)) return i < bufLen(as<Buf>(c)) ? box(bufAt(as<Buf>(c), i)) : END;
+  if (isObj(c) && isBuf(obj(c)->kind)) return i < bufLen(bufLive(c)) ? box(bufAt(as<Buf>(c), i)) : END;
   if (is(c, K::Chan)) return chanNext(c, RA());  // each value received, until it is closed and drained
   if (is(c, K::Fiber)) {  // each yielded value; the fiber's return value ends the loop
     V r = as<Fiber>(c)->state == FIB_DONE ? END : fiberResume(c, NIL);
@@ -912,7 +925,7 @@ static V n_sleep(V v) { return sleepFor(NUMARG(v, "sleep")), NIL; }
 static V n_floor(V v) { return box(std::floor(NUMARG(v, "floor"))); }
 static V n_sqrt(V v) { return box(std::sqrt(NUMARG(v, "sqrt"))); }
 static V l_push(V l, V v) {
-  if (obj(l)->typed) typeWrite(obj(l), NIL, v, RA());
+  if (obj(l)->typed & 1) typeWrite(obj(l), NIL, v, RA());
   touch(obj(l)), as<List>(l)->v.push_back(v);
   return l;
 }

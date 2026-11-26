@@ -25,6 +25,7 @@
 //   operation (and print) a generator seeded with n picks which runnable isolate goes on. The same seed replays the
 //   same interleaving; between those points isolates share nothing, so nothing else can differ.
 #include "fut.h"
+#include <cmath>
 #include <unordered_map>
 #if !ONE_THREAD
 #include <pthread.h>
@@ -83,8 +84,10 @@ struct ChanState : Shared {
   uint64_t sent = 0, taken = 0;
   std::vector<Iso*> recvq, sendq;  // waiting to receive, to send
 };
+struct ParJob;
 struct TaskState : Shared {
   int id = 0;
+  ParJob* job = nullptr;  // a parallel for's isolate: runs its iterations (parWork), not a call
   bool done = false, failed = false, joined = false;
   Msg start;              // the function, its arguments and the spawner's globals
   Msg result;             // its result, or the error it failed with
@@ -176,6 +179,8 @@ ISO_LOCAL(outSink);
 ISO_LOCAL(errSink);
 ISO_LOCAL(errValue);
 ISO_LOCAL(txnPollLater);
+ISO_LOCAL(parAt);
+ISO_LOCAL(parBody);
 
 char* stateNew() {
   char* b = (char*)aligned_alloc(isoLocalAlign, (isoLocalSize + isoLocalAlign) & ~(isoLocalAlign - 1));
@@ -505,6 +510,7 @@ struct Writer {
   u32 n = 0;
   int depth = 0;
   bool moving = true;        // false: buffers met go as dead handles (a spawned isolate's copy of the globals)
+  bool lending = false;      // buffers met are lent, not moved (a parallel for's: see bufLend)
   std::vector<Obj*> moved;   // the sender's buffer handles, dead once the message is made (sent())
   void sent() { for (Obj* o : moved) bufSent(o); }
   template <class T> void raw(T x) { m.b.append((const char*)&x, sizeof x); }
@@ -554,6 +560,8 @@ struct Writer {
         break;
       }
       case K::Buf: case K::BufI32: case K::BufU8:
+        if (lending && ((Buf*)o)->gone) { m.b += 'D'; break; }  // (sent: dead in the copies too)
+        if (lending) { m.bufs.push_back(bufShare(o)), m.b += 'L', raw((u32)m.bufs.size() - 1); break; }
         if (!moving) { m.b += 'D'; break; }
         m.bufs.push_back(bufTake(o)), moved.push_back(o);
         m.b += 'B', raw((u32)m.bufs.size() - 1);
@@ -569,10 +577,14 @@ struct Reader {
   const Msg& m;
   size_t at = 0;
   std::vector<V> objs;
+  bool freeze = false;  // a parallel for's copy: every list, map and instance FROZEN (its body may not change them)
   explicit Reader(const Msg& m) : m(m) { building = &objs; }
   ~Reader() { building = nullptr; }
   template <class T> T raw() { T x; memcpy(&x, m.b.data() + at, sizeof x); at += sizeof x; return x; }
-  V keep(Obj* o) { return objs.push_back(box(o)), box(o); }
+  V keep(Obj* o) {
+    if (freeze && (o->kind == K::List || o->kind == K::Map || o->kind == K::Inst)) o->typed |= FROZEN;
+    return objs.push_back(box(o)), box(o);
+  }
   V get() {
     switch (m.b[at++]) {
       case 'v': return raw<V>();
@@ -619,6 +631,7 @@ struct Reader {
       }
       case 'B': { V h = bufGive(m.bufs[raw<u32>()]); return keep(obj(h)); }
       case 'D': return keep(obj(bufElsewhere()));
+      case 'L': { V h = bufLend(m.bufs[raw<u32>()]); return keep(obj(h)); }
       case 'C': case 'T': {
         char t = m.b[at - 1];
         V h = handle(m.refs[raw<u32>()], t == 'C' ? K::Chan : K::Task);
@@ -725,6 +738,7 @@ V n_channel(V n) {
 
 // ---- isolates ----
 struct IsoRun { TaskState* t; Msg* result; };
+void parWork(ParJob*);
 void isoRun(void* p) {  // the spawned call: its globals and arguments rebuilt here, then the call; its result encoded
   TaskState* t = ((IsoRun*)p)->t;
   volatile V a[8] = {};  // on the stack, so the GC sees them
@@ -735,6 +749,7 @@ void isoRun(void* p) {  // the spawned call: its globals and arguments rebuilt h
     codeSync();           // (threads) their slots, in this thread's table
     for (auto& g : globals) if (g.slot >= 0 && g.o) vm->globals[g.slot] = box(g.o);
   }
+  if (t->job) return parWork(t->job), void(*((IsoRun*)p)->result = encode(NIL));
   {
     Reader r(t->start);  // the function, its arguments, then the spawner's globals (rebuilt before any code runs)
     V f = r.get(), args = r.get();
@@ -819,6 +834,8 @@ void isoEntry() {  // the bottom frame of every spawned isolate's stack
   switchTo(m, to);  // and whatever runs next frees this stack
   __builtin_unreachable();
 }
+bool launch(TaskState* t, void* ra);
+V n_cores();
 V n_spawn(V f, V args) {
   void* ra = RA();
   effRequire(EFF_SPAWN, "spawn", ra);
@@ -839,6 +856,13 @@ V n_spawn(V f, V args) {
   TaskState* t = new TaskState;  // one reference for the isolate, one for this handle
   t->start = std::move(w.m), t->at = WASM_OR(hereWhere(), codeWhere(ra)), t->allowed = vm->allowed, t->who = vm->who, t->out = outBase();
   V h = handle(t, K::Task);
+  bool det = launch(t, ra);
+  // Seeded, the run is the same every time, so fut test --changed may reuse its result (if the seed is its default).
+  if (traceOn && (!det || isolateSeed != 1)) traceImpure();
+  isolatePoint();  // seeded: the new isolate may go first
+  return h;
+}
+bool launch(TaskState* t, void* ra) {  // start an isolate running t (it takes a reference on t): is its program seeded?
   char* stack = stackNew();
   if (!stack) release(t), rtError(ra, "@memory spawn: out of memory for the isolate's stack");
   Iso* c = new Iso;
@@ -857,10 +881,7 @@ V n_spawn(V f, V args) {
     isos.push_back(c), r->live++;
     ready(c);
   }
-  // Seeded, the run is the same every time, so fut test --changed may reuse its result (if the seed is its default).
-  if (traceOn && (!det || isolateSeed != 1)) traceImpure();
-  isolatePoint();  // seeded: the new isolate may go first
-  return h;
+  return det;
 }
 V t_join(V tv) {
   void* ra = RA();
@@ -883,6 +904,181 @@ V t_join(V tv) {
   V v = decode(t->result);  // done: no one writes it again
   if (t->failed) traceAdd(t->trace + "  (in isolate " + std::to_string(t->id) + ", spawned at " + t->at + ")\n"), throwValue(v, ra);
   return v;
+}
+// ---- parallel for (docs/isolates.md, phase 6): `parallel for i in a..b { body }` compiles to parallel@(a, b, body,
+// writes). Isolates of the pool run the iterations, each a block at a time, each with a copy of the body's closure
+// and of the globals made from one message: lists, maps and instances FROZEN (the body reads them, and can't change
+// them), buffers lent, not copied (bufLend: the ones the body writes as name[i] = reach only [i]; the rest are
+// read-only). The body performs no effects. So what it computes can't depend on which isolate ran which i, or when:
+// the loop's result is the same as a plain for's. An error is the one at the lowest i that fails (iterations after
+// it are skipped, and a few may have run), so it too is the same every run.
+}  // namespace
+struct ParJob {
+  Msg msg;                        // the body, then the globals: lent (Writer::lending)
+  u32 ng = 0;
+  double lo = 0;
+  int64_t n = 0, block = 1;
+  std::atomic<int64_t> next{0};   // the next block's first iteration
+  std::atomic<int64_t> failAt;    // the lowest iteration known to fail (n: none): later ones are skipped
+  Mutex mu;                       // guards the error
+  Msg err;
+  std::string trace;
+  const char* code = nullptr;     // its error code, if a runtime error (raisedCode)
+  bool exact = true;              // it failed at failAt (else: in the block from it, changing a global)
+};
+namespace {
+#if __wasm__
+bool tryRun(void (*f)(void*), void* c, V* err, std::string* trace) { return catchFut(f, c, err, trace); }
+#else
+bool tryRun(void (*f)(void*), void* c, V* err, std::string* trace) {  // f(c): did it raise? (its error and trace)
+  jmp_buf jb, *outer = errJmp;
+  std::string* sink = errSink;
+  V* val = errValue;
+  volatile bool failed = false;
+  errJmp = &jb, errSink = trace, errValue = err;
+  if (setjmp(jb)) failed = true;
+  else f(c);
+  errJmp = outer, errSink = sink, errValue = val;
+  return failed;
+}
+#endif
+struct ParRun { ParJob* j; V f; void* code; int64_t k, end; };  // (k: in memory, as vmCall may raise)
+void parIterate(void* p) {
+  ParRun* r = (ParRun*)p;
+  for (; r->k < r->end && r->k < r->j->failAt.load(std::memory_order_relaxed); r->k++) {
+    parAt = r->j->lo + (double)r->k;
+    vmCall(r->code, {r->f, box(parAt)});
+  }
+}
+void parFail(ParJob* j, int64_t k, Msg&& m, std::string trace, const char* code, bool exact) {
+  Locked l(j->mu);
+  if (k < j->failAt.load(std::memory_order_relaxed) || (k == j->failAt.load(std::memory_order_relaxed) && exact && !j->exact))
+    j->failAt.store(k, std::memory_order_relaxed), j->err = std::move(m), j->trace = std::move(trace), j->code = code, j->exact = exact;
+}
+Msg errMsg(V err) {  // an error, to send to the loop's isolate (its text, if it can't be sent itself)
+  std::pair<V, Msg> e{err, Msg()};
+  if (tryRun([](void* p) { auto* e = (std::pair<V, Msg>*)p; e->second = encode(e->first); }, &e, nullptr, nullptr))
+    e.second = encode(box(newStr(toStr(err))));
+  return std::move(e.second);
+}
+void parWork(ParJob* j) {  // a parallel for's isolate: blocks of iterations until none is left
+  volatile V keep[2] = {};  // the body, and the globals as they started: on the stack, so the GC sees them
+  ParRun run{j, NIL, nullptr, 0, 0};
+  {
+    Reader r(j->msg);
+    r.freeze = true;
+    run.f = r.get();
+    keep[0] = run.f;
+    r.raw<u32>();
+    for (u32 i = 0; i < j->ng; i++) vm->globals[i] = r.get();
+  }
+  run.code = as<Clo>(run.f)->fn->code;
+  List* start = make<List>();
+  keep[1] = box(start);
+  start->v.assign(vm->globals, vm->globals + j->ng);
+  parBody = true;
+  vm->allowed = ((vm->allowed >> EFF_LEVEL) + 1) << EFF_LEVEL, vm->who = WHO_PARALLEL;
+  EffState eff = effSave();
+  u32 txn = vm->txn;
+  vm->handler = nullptr;
+  for (;;) {
+    int64_t k0 = j->next.fetch_add(j->block, std::memory_order_relaxed);
+    if (k0 >= j->n || k0 >= j->failAt.load(std::memory_order_relaxed)) break;
+    run.k = k0, run.end = std::min(k0 + j->block, j->n);
+    V err = NIL;
+    std::string trace;
+    if (tryRun(parIterate, &run, &err, &trace)) {
+      txnUnwind(txn), vm->handler = nullptr, effLoad(eff);
+      if (isolateStopped()) break;  // its program failed: it ends (nobody waits for its error)
+      volatile V held = err;
+      (void)held;
+      parFail(j, run.k, errMsg(err), std::move(trace), raisedCode(err), true);
+    }
+    for (u32 g = 0; g < j->ng; g++)
+      if (vm->globals[g] != start->v[g]) {
+        std::string name = "?";
+        for (size_t sym = 0; sym < globals.size(); sym++) if (globals[sym].slot == (int)g) name = symName((int)sym);
+        bool one = run.end - k0 == 1;  // (else: one of the block's iterations)
+        std::string text = "a parallel for's body changed the global '" + name + "'" +
+                           (one ? "" : " (in an iteration from i = " + toStr(box(j->lo + (double)k0)) + " to " + toStr(box(j->lo + (double)run.end - 1)) + ")") +
+                           ": each iteration runs on its own, with its own copy (write each result to a buffer at [i])";
+        parFail(j, k0, encode(box(newStr(text))), "", "parallel", one);
+        vm->globals[g] = start->v[g];
+      }
+  }
+  parBody = false;
+}
+V n_parallel(V lo, V hi, V f, V writes) {
+  void* ra = RA();
+  if (parBody) rtError(ra, "@parallel a parallel for inside a parallel for's body: the outer one already uses every core (make the inner one a plain for)");
+  if (vm->txn) rtError(ra, "@atomic parallel for inside atomic { }: its isolates' work can't be undone (run it after the block)");
+  double a = num(lo), b = num(hi);
+  if (a != std::trunc(a) || b != std::trunc(b) || std::fabs(a) > 9e15 || std::fabs(b) > 9e15)
+    rtError(ra, "@argument parallel for runs over whole numbers, a..b: got %s..%s", toStr(lo).c_str(), toStr(hi).c_str());
+  if (b <= a) return NIL;
+  Clo* c = as<Clo>(f);
+  auto& w = as<List>(writes)->v;
+  std::vector<Obj*> written;
+  for (size_t k = 0; k + 1 < w.size(); k += 2) {
+    int at = (int)num(w[k]);
+    V v = at > 0 ? c->env()[at - 1] : vm->globals[-at - 1];
+    std::string name(as<Str>(w[k + 1])->sv());
+    if (!isObj(v) || !isBuf(obj(v)->kind))
+      rtError(ra, "@parallel a parallel for's body writes %s[...], and %s is %s: the body writes only buffers (buffer(n), i32buffer(n), u8buffer(n)), each at [i]",
+              name.c_str(), name.c_str(), typeName(v));
+    bufLength(v);  // (raises if it was sent)
+    written.push_back(obj(v));
+  }
+  ParJob* j = new ParJob;
+  {
+    Writer wr;
+    wr.lending = true;
+    wr.put(f);
+    j->ng = (u32)globalCount();
+    wr.raw(j->ng);
+    for (u32 i = 0; i < j->ng; i++) wr.put(vm->globals[i]);
+    j->msg = std::move(wr.m);
+  }
+  j->lo = a, j->n = (int64_t)(b - a), j->failAt = j->n;
+  int64_t cores = std::max<int64_t>(1, (int64_t)num(n_cores()));
+  int64_t workers = std::min<int64_t>({cores, j->n, 64});
+  j->block = std::max<int64_t>(1, j->n / (workers * 8));
+  for (Obj* o : written) bufWriting(o, true);
+  std::vector<TaskState*> ts;
+  for (int64_t k = 0; k < workers; k++) {
+    TaskState* t = new TaskState;  // one reference for the isolate, one for this loop
+    t->rc.fetch_add(1, std::memory_order_relaxed);
+    t->job = j, t->at = WASM_OR(hereWhere(), codeWhere(ra)), t->allowed = vm->allowed, t->who = vm->who, t->out = outBase();
+    launch(t, ra), ts.push_back(t);
+  }
+  isolatePoint();  // seeded: they may go first
+  std::string err;
+  {
+    Locked l(chanMu);
+    for (TaskState* t : ts)
+      while (!t->done && err.empty()) err = waitFor(&t->joiners, "parallel for", ra);
+  }
+  for (Obj* o : written) bufWriting(o, false);
+  if (!err.empty()) raise(err, ra);  // (its program is failing: its isolates are stopped too; j stays theirs)
+  for (TaskState* t : ts) {
+    if (t->failed) parFail(j, -1, std::move(t->result), t->trace, nullptr, true);  // (outside its iterations)
+    release(t);
+  }
+  if (j->failAt.load() == j->n) return delete j, NIL;
+  V e = decode(j->err);
+  int64_t k = j->failAt.load();
+  std::string trace = j->trace;
+  const char* code = j->code;
+  bool exact = j->exact;
+  delete j;
+  std::string at = k < 0 ? "" : toStr(box(a + (double)k));
+  if (is(e, K::Str) && k >= 0) {
+    std::string text = (exact ? "parallel for, at i = " + at + ": " : "parallel for: ") + std::string(as<Str>(e)->sv());
+    e = box(newStr(text));
+    if (code) noteRaised(e, text, code);
+  }
+  traceAdd(trace + (exact && k >= 0 ? "  (in parallel for's body, at i = " + at + ")\n" : ""));
+  throwValue(e, ra);
 }
 V t_done(V tv) {
   effRequire(EFF_CHAN, "done()", RA());
@@ -956,8 +1152,8 @@ void reloadPoint() {
     chanMu.unlock();
     std::string err;
     txnBegin();
-    int st = partRun(chunk, err);
-    if (!st && hook) st = partRun(hook, err);
+    int st = parBody ? 0 : partRun(chunk, err);  // (a parallel for's isolate has only frozen copies: it runs no part)
+    if (!st && hook && !parBody) st = partRun(hook, err);
     chanMu.lock();
     if (st && rl.err.empty()) rl.err = "isolate " + std::to_string(m->id) + ": " + err;
     m->rlParted = true, rl.pending--;
@@ -1122,7 +1318,7 @@ std::string isolatesFinish(bool failed) {
 }
 void isolatesInit() {
   if (!me) isolateRoot();
-  native<n_spawn>("spawn@"), native<n_channel>("channel"), native<n_cores>("cores");
+  native<n_spawn>("spawn@"), native<n_parallel>("parallel@"), native<n_channel>("channel"), native<n_cores>("cores");
   method<c_send>(K::Chan, S_send), method<c_recv>(K::Chan, intern("recv")), method<c_tryRecv>(K::Chan, intern("tryRecv"));
   method<c_close>(K::Chan, intern("close"));
   method<t_join>(K::Task, intern("join")), method<t_done>(K::Task, S_done);

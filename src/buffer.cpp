@@ -14,6 +14,7 @@
 struct BufData {
   std::atomic<int> rc{1};
   std::atomic<const void*> holder;  // the isolate whose handles may use it; null while a message carries it
+  std::atomic<bool> writing{false};  // a parallel for's body writes it (its isolates' handles reach only [i])
   K kind;
   size_t n;
   void* d;
@@ -43,9 +44,10 @@ V handle(BufData* s) {
   b->kind = s->kind, point(b, s);
   return box(b);
 }
-enum { LIVE, SENT, ELSEWHERE };
+enum { LIVE, SENT, ELSEWHERE, AT };
 Buf* live(V v) {  // a handle that still reaches its buffer
   Buf* b = as<Buf>(v);
+  if (b->gone == AT) ERR("@parallel a parallel for's body writes this buffer, so it may reach it only at [i] (its own iteration's element)");
   if (b->gone == SENT) ERR("@send this buffer was sent to another isolate: sending a buffer moves it (send back what you still need)");
   if (b->gone == ELSEWHERE) ERR("@send this buffer belongs to another isolate: a spawned isolate's globals don't take their buffers (pass one as an argument to move it)");
   return b;
@@ -121,19 +123,43 @@ V b_slice(V b, V a, V e) {  // a new buffer of b's type with a copy of b[a..e], 
 V b_type(V b) { return box(newStr(typeOf(as<Buf>(b)->kind))); }
 }  // namespace
 
-double bufAt(Buf* b, size_t i) {
-  return b->kind == K::Buf ? ((double*)b->d)[i] : b->kind == K::BufI32 ? ((int32_t*)b->d)[i] : ((uint8_t*)b->d)[i];
+namespace {
+double read(K k, void* d, size_t i) { return k == K::Buf ? ((double*)d)[i] : k == K::BufI32 ? ((int32_t*)d)[i] : ((uint8_t*)d)[i]; }
+size_t own(Buf* h, V i) {  // a parallel for's handle on a buffer its body writes: b[i] only at the iteration's i
+  size_t at = whole(i, h->s->n);
+  if ((double)at != parAt || num(i) != parAt)
+    ERR("@parallel a parallel for's body writes this buffer, so it may reach it only at [i] (here i is %s, and the index %s)",
+        toStr(box(parAt)).c_str(), toStr(i).c_str());
+  return at;
 }
-V bufGet(V b, V i) { Buf* h = live(b); return box(bufAt(h, whole(i, h->n))); }
+}  // namespace
+double bufAt(Buf* b, size_t i) { return read(b->kind, b->d, i); }
+V bufGet(V b, V i) {
+  Buf* h = as<Buf>(b);
+  if (h->gone == AT) return box(read(h->kind, h->s->d, own(h, i)));
+  h = live(b);
+  return box(bufAt(h, whole(i, h->n)));
+}
 V bufSet(V b, V i, V v) {
-  Buf* h = live(b);
+  Buf* h = as<Buf>(b);
+  if (h->gone == AT) {
+    size_t at = own(h, i);
+    double x = element(h->kind, v, "b[i] = v");
+    if (vm->txn) ERR("@parallel a parallel for's body can't write its buffer inside atomic { } (write it after the block)");
+    Buf t = *h;
+    t.d = h->s->d;
+    return put(&t, at, x), v;
+  }
+  h = live(b);
   size_t at = whole(i, h->n);
   return put(h, at, element(h->kind, v, "b[i] = v")), v;
 }
-void bufFree(Obj* o) { release(((Buf*)o)->s), point((Buf*)o, nullptr); }
-size_t bufLength(V b) { return live(b)->n; }
+Buf* bufLive(V b) { return live(b); }
+void bufFree(Obj* o) { release(((Buf*)o)->s), point((Buf*)o, nullptr), ((Buf*)o)->s = nullptr; }
+size_t bufLength(V b) { return as<Buf>(b)->gone == AT ? as<Buf>(b)->s->n : live(b)->n; }
 BufData* bufTake(Obj* o) {
   Buf* b = live(box(o));
+  if (o->typed & FROZEN) ERR("@parallel a parallel for's body can't send a buffer from outside it");
   if (vm->txn) ERR("@atomic a buffer can't be sent inside atomic { }: sending moves it, which can't be undone (send it after the block)");
   return b->s->rc.fetch_add(1, std::memory_order_relaxed), b->s;
 }
@@ -156,6 +182,25 @@ V bufElsewhere() {
   return box(b);
 }
 void bufRelease(BufData* s) { release(s); }
+BufData* bufShare(Obj* o) {
+  Buf* b = live(box(o));
+  return b->s->rc.fetch_add(1, std::memory_order_relaxed), b->s;
+}
+BufData* bufWriting(Obj* o, bool on) {
+  BufData* s = on ? live(box(o))->s : ((Buf*)o)->s;
+  if (s) s->writing.store(on, std::memory_order_relaxed);  // (the isolates it is lent to start after: their start orders it)
+  return s;
+}
+V bufLend(BufData* s) {
+  s->rc.fetch_add(1, std::memory_order_relaxed);
+  if (!s->writing.load(std::memory_order_relaxed)) {
+    V h = handle(s);
+    return obj(h)->typed |= FROZEN, h;
+  }
+  Buf* b = make<Buf>();  // length 0 here, so compiled code's b[i] always calls bufGet / bufSet
+  b->kind = s->kind, point(b, nullptr), b->s = s, b->gone = AT;
+  return box(b);
+}
 void bufSave(Obj* o, std::vector<V>& v) {  // its bytes, in as many Vs as they need
   Buf* b = (Buf*)o;
   size_t bytes = b->n * width(b->kind);

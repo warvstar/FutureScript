@@ -120,6 +120,8 @@ void effMark(void (*mark)(V)) {
 static std::string whoName() { return vm->who && vm->who < sites.size() ? sites[vm->who].fn : "this code"; }
 [[noreturn]] static void forbidden(const std::string& what, uint64_t effect, void* ra) {
   const char* e = effName[bitIndex(effect)].c_str();
+  if (vm->who == WHO_PARALLEL)
+    rtError(ra, "@parallel %s performs %s, which a parallel for's body can't: its iterations run at once, in no set order (do it after the loop)", what.c_str(), e);
   if (effect == EFF_IO && (vm->who == WHO_ATOMIC || (txnAtomic() && (vm->allowed & effect))))
     rtError(ra, "@atomic %s performs io, which can't be undone inside atomic { } (do it after the block, or handle it inside the block)", what.c_str());
   if (vm->who && vm->who < sites.size())
@@ -129,6 +131,8 @@ static std::string whoName() { return vm->who && vm->who < sites.size() ? sites[
 static void rt_effect(uint64_t site) {  // entering a declaring function whose effects its caller may not perform
   Site& s = sites[site];
   std::string extra = names(s.mask & ~vm->allowed & EFF_BITS);
+  if (vm->who == WHO_PARALLEL)
+    rtError(RA(), "@parallel %s declares %s, which a parallel for's body can't perform: it can't be called there", s.fn.c_str(), extra.c_str());
   if (vm->who == WHO_ATOMIC)
     rtError(RA(), "@atomic %s declares %s, which can't be undone inside atomic { }: it can't be called inside the block", s.fn.c_str(), extra.c_str());
   rtError(RA(), "@effect %s declares %s, but it is called from inside %s, which does not (%s)", s.fn.c_str(), extra.c_str(),

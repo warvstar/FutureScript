@@ -198,6 +198,13 @@ commit; `recv`/`join`/`spawn` there raise. Unjoined failures fail the program. P
 stops all isolates, then each runs the new top level and `reload()`; all commit or all roll back. Wasm: fut.wasm has one
 thread, always seeded (default 1); fut-mt.wasm (the threads build) has the pool, on workers, and reloads as natively;
 in fut.wasm a reload waits for the isolates to end.
+```
+parallel for i in 0..n { out[i] = f(xs[i]) }   // the iterations on the pool's isolates; ends when all have
+```
+Same result as a plain `for`, every run: whole-number range; the body can't assign outside variables, `return` or
+`break` (compile errors); a buffer it writes (`name[...] = ` in the body itself) it reaches only at `[i]`; what else it
+reads from outside is a frozen copy (changing one raises, globals too); no effects. An error is the lowest failing
+i's: "parallel for, at i = 7: ...". [parallel]
 
 ## Modules, packages
 

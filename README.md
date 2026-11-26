@@ -616,6 +616,21 @@ xs = t.join()
   undone; a write to one there is undone like any other.
 - `==` is identity (two handles on one buffer are equal); `expect a == b` compares what they hold, as for lists.
 
+### Parallel for
+
+```
+var img = u8buffer(w * h)
+parallel for i in 0..w * h { img[i] = pixel(i % w, i / w, scene) }   // every core; then the next line
+```
+
+- **The iterations run on the pool's isolates at once,** a block at a time, and the loop ends when all have. A
+  mandelbrot of 1200×800 takes 105 ms instead of 841 ms on 12 cores.
+- **Its result is a plain `for`'s, on every run, machine and core count.** The body writes its results to buffers,
+  each only at `[i]`: one it writes (as `name[...] =` in the body) it can't read or write at any other index. What it
+  reads from outside (`scene`, other buffers, the globals) is a frozen copy: changing one raises. It can't assign a
+  variable from outside it, `return` or `break` (compile errors), and it performs no effects (no `print`, `random`,
+  channels). An error is the one at the lowest i that fails: `parallel for, at i = 7: ...`.
+
 ## C functions
 
 ```

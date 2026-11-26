@@ -181,6 +181,10 @@ struct Fun {  // per-function emission state
   int npar = 0;
   u32 spec = 0;
   int lambdaName = -1;  // a named lambda resolves its own name to the incoming closure
+  // A parallel for's body (`parallel for i in a..b { }`, compiled as a lambda of i): its variable, and the variables
+  // from outside it that it writes as name[...] = (each a closure slot + 1, or -(global slot + 1); and its name).
+  int parVar = -1;
+  std::vector<std::pair<int, std::string>> parWrites;
   int self = -1;
   std::vector<u32> guard;  // registers holding speculated parameters, checked on entry
   // A function containing `try` keeps every local in its frame (a throw skips the epilogues of the frames it

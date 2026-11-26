@@ -180,7 +180,7 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
 6. **Shared buffers and `parallel for`, for C-like throughput.**
    - Step one, done: typed buffers (`buffer(n)` f64, `i32buffer(n)`, `u8buffer(n)`) live outside every heap, and
      compiled code indexes them inline. Sending a buffer moves its ownership instead of copying it.
-   - Step two: `parallel for i in a..b { }` splits the range over the pool. Its result is the same as a plain `for`'s
+   - Step two, done: `parallel for i in a..b { }` splits the range over the pool. Its result is the same as a plain `for`'s
      on every run, machine and core count: the body can't assign variables from outside it (a compile error); a
      buffer it writes it may reach only at index `i` (checked through the handle, so also in functions it calls),
      and the others only read; values it captures arrive as frozen copies, so changing one raises; and it runs with
@@ -435,4 +435,39 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
 - **Speed.** Filling a million-element buffer and summing it 20 times, in a function: f64 42 ms, i32 51 ms, u8
   62 ms, a list 47 ms; C (clang -O2) 20 ms. (On a loaded machine: rough.)
 - **Not yet.** Type annotations (`b: buffer`), and passing buffers to JavaScript as typed arrays.
+
+## Phase 6, step two as built: parallel for
+
+- **Compiling.** `parallel` is a contextual keyword before `for`. The body compiles as a lambda of `i` (named
+  `parallel@<line>`), and the loop as a call of `parallel@(a, b, body, writes)` (`src/isolate.cpp`). While compiling
+  the body, an assignment to a captured or global variable, a `return`, and a `break` or `continue` that would leave
+  it are compile errors. Each `name[...] = ` whose `name` is a captured variable or a global is recorded, as the
+  closure slot or the global slot and the name: that is `writes`.
+- **Starting.** `parallel@` checks each written variable holds a buffer, encodes one message for every worker (the
+  body's closure, then the globals) with buffers lent (`Writer::lending`: a reference each, the sender's handle
+  stays live), marks the written ones (`BufData::writing`), and starts min(cores, n) isolates, which run `parWork`
+  instead of a call (`TaskState::job`). It waits for all of them, unmarks, and raises the error, if any.
+- **What a worker sees.** It decodes the message with `Reader::freeze`: every list, map and instance gets
+  `FROZEN` (a bit of `Obj::typed`). The inline stores compare the kind and `typed` together, and the field cache's
+  key holds `typed`, so a store to a frozen object goes to its helper, where `touch()` raises (`touchSlow`). Reads
+  stay inline. A lent buffer the body doesn't write is a `FROZEN` handle on the same memory: reads inline, stores
+  raise. One it writes is a handle of length 0 (`gone == AT`), so compiled `b[i]` always misses to `bufGet`/`bufSet`,
+  which allow only the index `parAt` (the iteration, isolate-local); `len()` works, iterating raises.
+- **Effects.** A worker narrows `vm->allowed` to nothing, with `vm->who = WHO_PARALLEL` for the message. A global
+  the body (or a function it calls) assigns is found after each block, by comparing with the globals it started
+  from; that error names the block's range unless the block is one iteration.
+- **Work and errors.** Iterations go out in blocks of n / (workers × 8) from an atomic counter. A block runs under
+  its own catch (`tryRun`: setjmp natively, `catchFut` in wasm); a failure at i records itself if it is the lowest
+  yet (`ParJob::failAt`, under a lock, with the error encoded and its code), and every worker skips iterations past
+  the lowest failure. So the error raised is always the lowest failing i's, whatever ran first, though some
+  iterations after it may have run. A hot reload during the loop: workers run no part (they hold only frozen copies)
+  and commit or roll back an empty transaction with the rest.
+- **Cost.** A new isolate was 55 µs natively, most of it setting all 64K global slots of its VM to nil; `vmNew` now
+  sets only those in use, and a new slot is set in every VM as it is made (`newGlobalSlot`, as `newIC` does), so
+  `spawn`/`join` is 17 µs and a `parallel for` over 12 workers costs about 0.2 ms more than its work. In
+  fut-mt.wasm a worker costs about 140 µs (`calloc` of the whole VM block, 8 MB).
+- **Speed.** A 1200×800 mandelbrot into a u8 buffer, 12 cores: 841 ms plain, 105 ms parallel natively; in
+  fut-mt.wasm under Node, 1201 ms and 414 ms.
+- **Not yet.** A persistent pool of workers (each loop starts its isolates), a cheaper VM block in wasm, and
+  reductions (`parallel for` that sums): for now each iteration writes a buffer element and the sum is a plain loop.
 

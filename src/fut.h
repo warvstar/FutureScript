@@ -125,8 +125,11 @@ enum class K : uint8_t { Str, List, Fn, Class, Inst, Map, Clo, Fiber, Ref, Chan,
 // For an Inst, `nslots` and `cid` (its class id) are in the header and are zero for every other kind, so one
 // 64-bit compare of the header checks kind, class and slot count together (the field inline cache).
 // `zero` stays 0 for that compare (mark bits live in the GC's side bitmap, not here).
-// typed: a list or map that has its element type (types.cpp); the inline list stores test it along with the kind.
+// typed: bit 0, a list or map that has its element type (types.cpp); FROZEN, a parallel for's copy of a value from
+// outside its body, which it may read and not change (touch raises). The inline stores test it along with the kind
+// (and the field cache's key holds it), so a store to either goes to its helper.
 struct Obj { K kind; uint8_t typed; uint16_t nslots; u32 cid; };
+constexpr uint8_t FROZEN = 0x80;
 struct Str : Obj {
   static constexpr K KIND = K::Str;
   u32 len, hash;
@@ -226,8 +229,9 @@ void sharedFree(Obj*);  // the GC found a channel or task handle dead
 struct BufData;
 struct Buf : Obj { static constexpr K KIND = K::Buf; void* d; uintptr_t endOrCount; size_t n; BufData* s; int gone; };
 inline bool isBuf(K k) { return k == K::Buf || k == K::BufI32 || k == K::BufU8; }
-inline size_t bufLen(Buf* b) { return b->n; }
+inline size_t bufLen(Buf* b) { return b->n; }  // (0 for a dead handle; bufLive raises for one)
 size_t bufLength(V b);  // len(): raises if it was sent
+Buf* bufLive(V b);      // b, if it reaches its numbers here; else raises
 double bufAt(Buf*, size_t i);  // (i < len)
 V bufGet(V b, V i);
 V bufSet(V b, V i, V v);
@@ -240,6 +244,14 @@ void bufSent(Obj*);
 V bufGive(BufData*);
 V bufElsewhere();
 void bufRelease(BufData*);
+// A parallel for lends its buffers to its isolates (isolate.cpp's parallel@): each gets a handle on the same memory
+// (bufLend). One the body writes (bufWriting: marked while the loop runs) the body may reach only at [i], parAt: its
+// handle has length 0, so compiled code always calls the helpers, which check. Any other is read-only (FROZEN).
+BufData* bufShare(Obj*);
+BufData* bufWriting(Obj*, bool on);
+V bufLend(BufData*);
+inline TLS double parAt;     // the iteration a parallel for's body runs (an isolate's: ISO_LOCAL)
+inline TLS bool parBody;     // this isolate runs a parallel for's body
 const void* isolateId();  // the running isolate's identity (isolate.cpp)
 void bufSave(Obj*, std::vector<V>&);  // a transaction's copy of its numbers (txn.cpp), and putting them back
 void bufRestore(Obj*, const std::vector<V>&);
@@ -325,7 +337,7 @@ inline TLS uintptr_t* stackTop;
   X(true) X(false) X(nil) X(self) X(super) X(import) X(extern) X(yield) X(try) X(catch) X(throw)
 #define SYM_ENUM(k) K_##k,
 #define SYM_STR(k) #k,
-#define EXTRA_SYMS(X) X(init) X(main) X(push) X(pop) X(len) X(has) X(remove) X(keys) X(values) X(reload) X(resume) X(send) X(done) X(as) X(test) X(expect) X(throws) X(prints) X(pub) X(override) X(atomic) X(effect) X(handle) X(with) X(requires) X(ensures) X(invariant) X(old) X(result) X(allocs) X(grows) X(like) X(todo) X(spawn) X(type) X(enum) X(match)
+#define EXTRA_SYMS(X) X(init) X(main) X(push) X(pop) X(len) X(has) X(remove) X(keys) X(values) X(reload) X(resume) X(send) X(done) X(as) X(test) X(expect) X(throws) X(prints) X(pub) X(override) X(atomic) X(effect) X(handle) X(with) X(requires) X(ensures) X(invariant) X(old) X(result) X(allocs) X(grows) X(like) X(todo) X(spawn) X(type) X(enum) X(match) X(parallel)
 #define SYM_S(k) S_##k,
 enum { KEYWORDS(SYM_ENUM) NKW, S_FIRST = NKW - 1, EXTRA_SYMS(SYM_S) };
 int intern(std::string_view);
@@ -604,7 +616,8 @@ void txnCommit();
 void txnAbort();                // roll back the innermost
 void txnUnwind(u32 depth);      // roll back until depth are open
 void txnTouch(Obj*);            // o is about to change: save it, unless the innermost transaction has already
-inline void touch(Obj* o) { if (vm->txn) txnTouch(o); }
+void touchSlow(Obj*);          // (raises for a FROZEN o)
+inline void touch(Obj* o) { if (vm->txn || (o->typed & FROZEN)) touchSlow(o); }
 bool txnOpenIn(Fiber*);         // does f have a transaction open? (it may not yield)
 bool txnAtomic();               // is an atomic block open? (io can't be undone there)
 void txnMark(void (*mark)(V));  // GC roots: what rollbacks would put back
@@ -650,6 +663,7 @@ constexpr int EFF_LEVEL = 44;
 constexpr uint64_t EFF_IO = 1, EFF_CLOCK = 2, EFF_RANDOM = 4, EFF_YIELD = 8, EFF_SPAWN = 16, EFF_CHAN = 32, EFF_BITS = (1ull << EFF_LEVEL) - 1;
 constexpr int EFF_BUILTIN = 6;  // io, clock, random, yield, spawn, chan: user effects get the bits after them
 constexpr u32 WHO_ATOMIC = ~0u;  // vm->who inside an atomic block (it takes io away)
+constexpr u32 WHO_PARALLEL = ~0u - 1;  // in a parallel for's body (no effects)
 enum { OP_YIELD = 1, OP_EXTERN = 2 };  // operations with fixed ids; builtins and user effects' get theirs at startup / compile time
 int effSite(const std::string& fn, uint64_t mask, const std::string& text);  // a declaring function: what errors name
 uint64_t effBit(int sym);                     // a user effect's bit (0: too many effects)
