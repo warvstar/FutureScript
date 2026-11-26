@@ -342,9 +342,11 @@ fn runTests(dir, only) {
   var n = {passed: 0, failed: 0, errors: 0, pending: 0, broken: 0}
   var bad = []
   var pend = []
+  var fails = []  // keys of the tests that didn't pass ("file: name", or "file: (file)" for the whole file)
+  var pends = []
   for k in 0..res.len() {
     var r = res[k]
-    if r.timedOut { n.broken += 1 bad.push(files[k] + ": the test run timed out") continue }
+    if r.timedOut { n.broken += 1 bad.push(files[k] + ": the test run timed out") fails.push(files[k] + ": (file)") continue }
     var seen = false
     for l in lines(r.out) {
       if l[0] != "\{" { continue }
@@ -353,9 +355,10 @@ fn runTests(dir, only) {
       seen = true
       if j.type == "test" {
         if j.status == "pass" { n.passed += 1 }
-        else if j.status == "pending" { n.pending += 1 pend.push(j.name + ": " + (j.reason || "")) }
+        else if j.status == "pending" { n.pending += 1 pend.push(j.name + ": " + (j.reason || "")) pends.push(files[k] + ": " + j.name) }
         else if j.status == "fail" {
           n.failed += 1
+          fails.push(files[k] + ": " + j.name)
           var x = j.expect || {}
           var d = "FAIL " + j.name + " (" + j.file + ":" + str(j.line) + ") expect " + (x.expr || "")
           if x.left { d = d + "\n    left " + x.left.expr + " = " + x.left.value }
@@ -366,23 +369,42 @@ fn runTests(dir, only) {
           bad.push(d)
         } else {
           n.errors += 1
+          fails.push(files[k] + ": " + j.name)
           bad.push("ERROR " + j.name + " (" + j.file + ":" + str(j.line) + "): " + (j.message || "") + "\n    " + clip(json(j.trace || ""), 600))
         }
       } else if j.type == "compile_error" {
         n.broken += 1
+        fails.push(files[k] + ": (file)")
         bad.push("COMPILE ERROR " + j.file + ":" + str(j.line) + ":" + str(j.col) + ": " + j.message + "\n    " + (j.text || ""))
       } else if j.type == "error" {
         n.broken += 1
+        fails.push(files[k] + ": (file)")
         bad.push("ERROR in top-level code of " + files[k] + ": " + j.message + "\n    " + clip(json(j.trace || ""), 600))
       }
     }
-    if !seen && r.code != 0 { n.broken += 1 bad.push(files[k] + ": exit " + str(r.code) + "\n" + clip(r.err, 1500)) }
+    if !seen && r.code != 0 { n.broken += 1 fails.push(files[k] + ": (file)") bad.push(files[k] + ": exit " + str(r.code) + "\n" + clip(r.err, 1500)) }
   }
   var summary = str(n.passed) + " passed, " + str(n.failed) + " failed, " + str(n.errors) + " errors, " + str(n.pending) + " pending, " + str(n.broken) + " broken files"
   var report = summary
   if bad.len() > 0 { report = report + "\n" + clip(bad.join("\n"), 7000) }
   if pend.len() > 0 { report = report + "\npending:\n  " + clip(pend.join("\n  "), 1500) }
-  return {ok: n.failed == 0 && n.errors == 0 && n.broken == 0, report: report, summary: summary, n: n}
+  return {ok: n.failed == 0 && n.errors == 0 && n.broken == 0, report: report, summary: summary, n: n, fails: fails, pends: pends}
+}
+// The merge rule: nothing that passes on main may break. Tests that fail or are pending on main may fail (a pending
+// test fails once what it waits for exists: that shows a gap, it doesn't block the change that exposed it).
+fn regressions(r) {
+  var known = {}
+  for k in mainTests.fails || [] { known[k] = true }
+  for k in mainTests.pends || [] { known[k] = true }
+  var out = []
+  for k in r.fails || [] { if !known[k] { out.push(k) } }
+  return out
+}
+fn gateReport(r) {
+  var reg = regressions(r)
+  if reg.len() == 0 && !r.ok { return r.report + "\n\nNone of these failures blocks you: each also fails, or is pending, on main." }
+  if reg.len() > 0 && reg.len() < (r.fails || []).len() { return r.report + "\n\nThese block (they pass on main, or are new): " + clip(reg.join("; "), 1500) + ". The other failures also fail, or are pending, on main." }
+  return r.report
 }
 
 // ---- tasks ----
@@ -571,7 +593,7 @@ fn runTool(w, name, inp) {
   if name == "test" {
     if inp.path && (!safePath(inp.path) || readFile(wt + "/" + inp.path) == nil) { return {text: "no such test file: " + inp.path, err: true} }
     var r = runTests(wt, inp.path)
-    return {text: r.report, err: !r.ok}
+    return {text: gateReport(r), err: regressions(r).len() > 0}
   }
   if name == "done" { return submit(w, inp.summary || "") }
   return {text: "unknown tool " + name, err: true}
@@ -590,7 +612,7 @@ fn submit(w, summary) {
   w.empty = sh("git rev-list --count main..HEAD", w.wt).out.trim() == "0"  // main may already do it: the reviewer decides
   if sh("git rebase -q main", w.wt).code != 0 { return {text: conflicted(w), err: true} }
   var r = runTests(w.wt, nil)
-  if !r.ok { return {text: "not submitted: the tests fail.\n" + r.report, err: true} }
+  if regressions(r).len() > 0 { return {text: "not submitted: the tests fail.\n" + gateReport(r), err: true} }
   w.phase = "review"
   w.tests = r.summary
   var how = ""
@@ -673,9 +695,9 @@ fn merge(w) {
     return nil
   }
   var r = runTests(w.wt, nil)
-  if !r.ok {
+  if regressions(r).len() > 0 {
     w.phase = "work"
-    w.messages.push({role: "user", content: "Approved, but after rebasing onto the latest main the tests fail:\n" + r.report})
+    w.messages.push({role: "user", content: "Approved, but after rebasing onto the latest main the tests fail:\n" + gateReport(r)})
     return nil
   }
   if sh("git merge -q --ff-only w" + str(w.i), WORK).code != 0 { log("merge of #" + str(w.task.id) + " failed; retrying next round") return nil }
