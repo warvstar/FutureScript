@@ -1,4 +1,4 @@
-// The public interface of package ui 0.2.0 (ui.fut), written by `fut api`. `fut test` fails while it is out of date.
+// The public interface of package ui 0.3.0 (ui.fut), written by `fut api`. `fut test` fails while it is out of date.
 
 // f() once, after so many seconds (unless stopped first).
 pub fn after(seconds: num, f: fn): fn
@@ -83,9 +83,14 @@ pub fn lineChart(series, opts): any
 // what source read changes. source may be a URL as it is.
 pub fn load(source): Resource
 
-// An element of a view: an HTML or SVG tag, or one of fut's own (row, column, text, field, check, link), with props
+// An element of a view: an HTML or SVG tag, or one of fut's own (row, column, text, field, choice, area, check, dialog, link, tabs and tab, menu, table rows:), with props
 // (bind: a signal the element shows and sets) and children.
 pub fn make(tag: str, props, kids): any
+
+// A menu: a button showing label, which opens items (buttons, links: any children) below it. Choosing one, a click
+// outside or Escape closes it; the arrow keys move between its items. props: the box's (with an id, the button's is
+// id-button).
+pub fn menu(label, items, props): any
 
 // Show view() in target (a selector or a node), replacing what was there. The returned function takes it down: its
 // effects stop.
@@ -136,6 +141,19 @@ pub fn style(sheet: str)
 
 // An SVG element (tag, props, kids), as el() makes HTML ones. "label" makes SVG's <text>.
 pub fn svg(tag: str, props, kids): any
+
+// A table of rows (a list, or a function of one), one column per entry of columns: {key, label}, and optionally num:
+// true (right-aligned figures), value: fn(row) (else row[key]), show: fn(row) (what the cell shows, else its value),
+// sort: false (a column that doesn't sort), class (its cells'). A column's heading sorts by it; again, the other way.
+// opts (or nil): key: fn(row) (rows that keep their key keep their nodes; else row.id, or the row as text), search:
+// text or a function of it (only rows with it in a cell), pick: fn(row) (a row is clicked, or Enter pressed on it),
+// picked: fn(row) (true: the row is marked), sort and desc (the column to start sorted by, and whether the other way),
+// empty (shown when no row is), rowId: fn(row) (a row's id), id (the table's; a heading's button is then id-key).
+pub fn table(rows, columns, opts): any
+
+// Tabs: items is a list of {id, label, view: fn} (view: the panel's contents, made when it's first shown and kept), and
+// selected a signal of the shown one's id (nil: the first). The arrow keys move between them, Home and End to the ends.
+pub fn tabs(items, selected, props): any
 
 pub fn textAt(t, f: fn)
 

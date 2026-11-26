@@ -8,6 +8,8 @@
 //     return ui.el("div", nil, [ui.button("+1", fn(e) { n.update(fn(v) { return v + 1 }) }), fn() { return "clicked {n.get()}" }])
 //   })
 import "std/reactive" as r
+import "std/lists"
+import "std/strings"
 
 extern dom fn create(str): any
 extern dom fn text(str): any
@@ -42,6 +44,8 @@ extern dom fn modal(any, any): void
 extern dom fn measure(any): any
 extern dom fn template(any): num
 extern dom fn instance(num, num): any
+extern dom fn focus(any): void
+extern dom fn dropdown(any, any): void
 
 // What kind of child v is: "none" (nil, false, true), "text" (a string or number), "fn", "list" or "node".
 fn kindOf(v) {
@@ -498,6 +502,7 @@ pub fn sparkline(values, props): any {
     return svg("svg", {viewBox: "0 0 100 30", preserveAspectRatio: "none"}, [svg("polyline", {points: pts}, nil)])
   })
 }
+fn orNil(v) { if v == nil { return "" } return v }
 fn orEmpty(props) {
   if props == nil { return {} }
   return props
@@ -731,6 +736,160 @@ fn drawRow(item, i, height, view, inner) {
   return {item: item, node: slot, dispose: dispose}
 }
 
+// ---- tables, tabs and menus ----
+
+fn cell(c, x) {  // column c's value in row x
+  if c.has("value") { return c.value(x) }
+  return x[c.key]
+}
+fn matches(x, columns, q) {
+  for c in columns { if strings.lower(str(cell(c, x))).has(q) { return true } }
+  return false
+}
+// A table of rows (a list, or a function of one), one column per entry of columns: {key, label}, and optionally num:
+// true (right-aligned figures), value: fn(row) (else row[key]), show: fn(row) (what the cell shows, else its value),
+// sort: false (a column that doesn't sort), class (its cells'). A column's heading sorts by it; again, the other way.
+// opts (or nil): key: fn(row) (rows that keep their key keep their nodes; else row.id, or the row as text), search:
+// text or a function of it (only rows with it in a cell), pick: fn(row) (a row is clicked, or Enter pressed on it),
+// picked: fn(row) (true: the row is marked), sort and desc (the column to start sorted by, and whether the other way),
+// empty (shown when no row is), rowId: fn(row) (a row's id), id (the table's; a heading's button is then id-key).
+pub fn table(rows, columns, opts): any {
+  var o = orEmpty(opts)
+  var cols = columns
+  var by = r.signal(o["sort"])
+  var desc = r.signal(o["desc"] == true)
+  var key = o["key"]
+  if key == nil { key = fn(x) { if kindOf(x) == "map" && x.has("id") { return x.id } return str(x) } }
+  var shown = r.computed(fn() {
+    var list = now(rows)
+    var q = ""
+    if o["search"] != nil { q = strings.lower(str(now(o.search))).trim() }
+    if q != "" { list = lists.filter(list, fn(x) { return matches(x, cols, q) }) }
+    var k = by.get()
+    for c in cols {
+      if c.key == k {
+        list = lists.sortBy(list, fn(x) { return cell(c, x) })
+        if desc.get() { list = lists.reverse(list) }
+      }
+    }
+    return list
+  })
+  var heads = []
+  for c in cols { heads.push(heading(c, by, desc, o["id"])) }
+  var body = el("tbody", nil, each(fn() { return shown.get() }, key, fn(x) { return tableRow(x, cols, o) }))
+  var empty = o["empty"]
+  if empty == nil { empty = "Nothing to show." }
+  var none = el("tr", {"class": "table-empty", hidden: fn() { return shown.get().len() > 0 }},
+                el("td", {colspan: cols.len()}, empty))
+  append(body, none)
+  return el("table", {"class": "table", id: o["id"]}, [el("thead", nil, el("tr", nil, heads)), body])
+}
+fn heading(c, by, desc, id) {
+  var label = c["label"]
+  if label == nil { label = c.key }
+  var props = {scope: "col"}
+  if c["num"] == true { props["class"] = "num" }
+  if c["sort"] == false { return el("th", props, label) }
+  props["aria-sort"] = fn() {
+    if by.get() != c.key { return nil }
+    if desc.get() { return "descending" }
+    return "ascending"
+  }
+  var sortId = nil
+  if id != nil { sortId = "{id}-{c.key}" }
+  return el("th", props, el("button", {"class": "sort", id: sortId, onclick: fn(e) {
+    r.batch(fn() {
+      if by.peek() == c.key { desc.set(!desc.peek()) }
+      else { by.set(c.key) desc.set(false) }
+    })
+  }}, label))
+}
+fn tableRow(x, cols, o) {
+  var cells = []
+  for c in cols {
+    var shows = nil
+    if c.has("show") { shows = c.show(x) } else { shows = str(cell(c, x)) }
+    var cls = c["class"]
+    if c["num"] == true { cls = (str(orNil(cls)) + " num").trim() }
+    cells.push(el("td", {"class": cls}, shows))
+  }
+  var props = {}
+  if o["rowId"] != nil { props["id"] = o.rowId(x) }
+  if o["picked"] != nil { props["aria-selected"] = fn() { return o.picked(x) == true } }
+  if o["pick"] != nil {
+    props["class"] = "pick"
+    props["tabindex"] = 0
+    props["onclick"] = fn(e) { o.pick(x) }
+    props["onkeydown"] = fn(e) { if e.key == "Enter" { o.pick(x) } }
+  }
+  return el("tr", props, cells)
+}
+
+// Tabs: items is a list of {id, label, view: fn} (view: the panel's contents, made when it's first shown and kept), and
+// selected a signal of the shown one's id (nil: the first). The arrow keys move between them, Home and End to the ends.
+pub fn tabs(items, selected, props): any {
+  var sel = selected
+  if sel == nil { sel = r.signal(nil) }
+  var current = fn() {
+    var v = sel.get()
+    for t in items { if t.id == v { return v } }
+    if items.len() > 0 { return items[0].id }
+    return nil
+  }
+  tabsMade += 1
+  var base = "tabs{tabsMade}-"
+  var bar = el("div", {role: "tablist"}, nil)
+  var panels = []
+  var buttons = []
+  var i = 0
+  for t in items {
+    var at = i
+    var b = el("button", {role: "tab", id: "{base}{at}", "aria-controls": "{base}{at}-panel",
+                          "aria-selected": fn() { return str(current() == t.id) },
+                          tabindex: fn() { if current() == t.id { return 0 } return -1 },
+                          onclick: fn(e) { sel.set(t.id) },
+                          onkeydown: fn(e) { moveTab(e.key, at, items, sel, buttons) }}, t.label)
+    buttons.push(b)
+    append(bar, b)
+    var panel = el("div", {role: "tabpanel", id: "{base}{at}-panel", "aria-labelledby": "{base}{at}",
+                           hidden: fn() { return current() != t.id }}, nil)
+    var made = {done: false}
+    r.effect(fn() {
+      if current() == t.id && !made.done {
+        made.done = true
+        r.untrack(fn() { add(panel, t.view()) })
+      }
+    })
+    panels.push(panel)
+    i += 1
+  }
+  return el("div", withClass(orEmpty(props), "tabs"), [bar] + panels)
+}
+var tabsMade = 0
+fn moveTab(k, at, items, sel, buttons) {
+  var to = -1
+  if k == "ArrowRight" { to = (at + 1) % items.len() }
+  else if k == "ArrowLeft" { to = (at + items.len() - 1) % items.len() }
+  else if k == "Home" { to = 0 }
+  else if k == "End" { to = items.len() - 1 }
+  if to < 0 { return }
+  sel.set(items[to].id)
+  focus(buttons[to])
+}
+
+// A menu: a button showing label, which opens items (buttons, links: any children) below it. Choosing one, a click
+// outside or Escape closes it; the arrow keys move between its items. props: the box's (with an id, the button's is
+// id-button).
+pub fn menu(label, items, props): any {
+  var p = orEmpty(props)
+  var bid = nil
+  if p["id"] != nil { bid = "{now(p.id)}-button" }
+  var button = el("button", {"class": "menu-button", id: bid, "aria-haspopup": "menu", "aria-expanded": "false"}, label)
+  var list = el("div", {"class": "menu-list", role: "menu"}, items)
+  dropdown(button, list)
+  return el("div", withClass(p, "menu"), [button, list])
+}
+
 // ---- for views (src/views.cpp rewrites `view` and `state` into these) ----
 
 // The list f fills: a view's block of children.
@@ -762,7 +921,14 @@ fn withClass(props, base: str) {
   return props
 }
 
-// An element of a view: an HTML or SVG tag, or one of fut's own (row, column, text, field, check, link), with props
+fn flat(k) {  // a view's children as one list
+  if kindOf(k) != "list" { return [k] }
+  var out = []
+  for c in k { if kindOf(c) == "list" { out += flat(c) } else { out.push(c) } }
+  return out
+}
+
+// An element of a view: an HTML or SVG tag, or one of fut's own (row, column, text, field, choice, area, check, dialog, link, tabs and tab, menu, table rows:), with props
 // (bind: a signal the element shows and sets) and children.
 pub fn make(tag: str, props, kids): any {
   var bound = nil
@@ -803,6 +969,32 @@ pub fn make(tag: str, props, kids): any {
       listen(d, "click", fn(e) { if e.direct { bound.set(false) } })
     }
     return d
+  }
+  if tag == "table" && props.has("rows") {  // table rows: list columns: [...] key: fn search: text on pick { e: the row }
+    var o = {}
+    for k in props.keys() { if k != "rows" && k != "columns" { o[k] = props[k] } }
+    for k in ["key", "rowId", "picked"] { if o.has(k) { o[k] = o[k]() } }  // (a view gives each as a function of it)
+    if o.has("onpick") { o["pick"] = o.remove("onpick") }
+    for k in ["sort", "desc", "empty", "id"] { if o.has(k) { o[k] = now(o[k]) } }
+    var t = table(props.rows, now(props.columns), o)
+    if o.has("class") { setProp(t, "class", "table " + now(o["class"])) }
+    return t
+  }
+  if tag == "tabs" {  // tabs bind: s { tab "Label" id: "x" { ... } ... }: s, the shown tab's id (else its label)
+    var items = []
+    for t in flat(kids) { if t != nil { items.push(t) } }
+    return tabs(items, bound, props)
+  }
+  if tag == "tab" {  // (for tabs): its label (the first child), its id, and its contents
+    var list = flat(kids)
+    var id = now(props["id"])
+    if id == nil { id = now(list[0]) }
+    var rest = list.slice(1, list.len())
+    return {id: id, label: list[0], view: fn() { return rest }}
+  }
+  if tag == "menu" {  // menu "Label" { button "Item" on click { ... } ... }
+    var list = flat(kids)
+    return menu(list[0], list.slice(1, list.len()), props)
   }
   if tag == "link" {  // link to: "/path" "Text": an <a> to #/path, class "active" while the page is there
     var to = props.remove("to")
@@ -910,4 +1102,26 @@ dialog::backdrop \{ background: rgb(10 14 20 / .45); }
 .rows \{ position: relative; overflow: auto; height: 480px; }
 .rows-inner \{ position: relative; }
 .row-slot \{ position: absolute; left: 0; right: 0; }
+.table \{ width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.table th \{ text-align: left; font-weight: 500; font-size: 12.5px; color: var(--muted); padding: 6px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.table td \{ padding: 8px 10px; border-bottom: 1px solid var(--line); }
+.table .num \{ text-align: right; }
+.table th .sort \{ font: inherit; color: inherit; background: none; border: 0; padding: 0; border-radius: 3px; }
+.table th[aria-sort] .sort \{ color: var(--fg); }
+.table th[aria-sort=ascending] .sort::after \{ content: ' ↑'; }
+.table th[aria-sort=descending] .sort::after \{ content: ' ↓'; }
+.table tr.pick \{ cursor: pointer; }
+.table tr.pick:hover td, .table tr[aria-selected=true] td \{ background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.table tr.pick:focus-visible \{ outline: 2px solid var(--accent); outline-offset: -2px; }
+.table-empty td \{ color: var(--muted); padding: 18px 10px; }
+[role=tablist] \{ display: flex; gap: 2px; border-bottom: 1px solid var(--line); margin-bottom: 14px; }
+[role=tab] \{ border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; color: var(--muted); padding: 8px 12px; margin-bottom: -1px; }
+[role=tab]:hover \{ color: var(--fg); }
+[role=tab][aria-selected=true] \{ color: var(--fg); border-bottom-color: var(--accent); }
+.menu \{ display: inline-block; }
+.menu-list \{ margin: 0; inset: auto; position: fixed; min-width: 160px; padding: 4px; display: flex; flex-direction: column;
+  border: 1px solid var(--line); border-radius: var(--radius); background: var(--bg); color: var(--fg); box-shadow: 0 10px 30px rgb(0 0 0 / .18); }
+.menu-list:not(:popover-open)[popover], .menu-list[hidden] \{ display: none; }
+.menu-list > * \{ text-align: left; border: 0; background: none; padding: 6px 10px; border-radius: calc(var(--radius) - 3px); color: inherit; text-decoration: none; }
+.menu-list > :hover, .menu-list > :focus-visible \{ background: var(--line); outline: none; }
 "

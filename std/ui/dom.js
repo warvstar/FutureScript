@@ -114,6 +114,46 @@ export function modal(n, on) {  // a <dialog> shown modally, or closed (once it 
   if (on && !n.open) n.showModal();
   else if (!on && n.open) n.close();
 }
+export const focus = (n) => void n.focus?.();
+// A menu's button b and its list: the list is a popover b toggles (light dismiss: a click outside or Escape closes it),
+// placed under b; choosing an item closes it; the arrow keys move between its items. Without popovers (or a page), the
+// list is hidden until b is clicked.
+export function dropdown(b, list) {
+  const items = () => [...(list.querySelectorAll?.("button, a[href], [role=menuitem]") ?? [])];
+  const pop = typeof list.showPopover === "function";
+  const open = () => (pop ? list.matches(":popover-open") : !list.hasAttribute("hidden"));
+  const show = (on) => {
+    if (pop) return void (on ? list.showPopover() : list.hidePopover());
+    on ? list.removeAttribute("hidden") : list.setAttribute("hidden", "");
+    b.setAttribute("aria-expanded", String(on));
+  };
+  if (pop) {
+    list.setAttribute("popover", "auto");
+    b.popoverTargetElement = list;  // b toggles it, and a click on b isn't one outside
+    list.addEventListener("beforetoggle", (e) => {
+      if (e.newState !== "open") return;
+      const r = b.getBoundingClientRect();
+      list.style.top = `${r.bottom + 4}px`;
+      list.style.left = `${Math.min(r.left, innerWidth - list.offsetWidth - 8)}px`;
+    });
+    list.addEventListener("toggle", (e) => {
+      b.setAttribute("aria-expanded", String(e.newState === "open"));
+      if (e.newState === "open") for (const it of items()) it.setAttribute("role", "menuitem");
+      if (e.newState === "open") items()[0]?.focus();
+    });
+  } else {
+    list.setAttribute("hidden", "");
+    b.addEventListener("click", () => show(!open()));
+  }
+  list.addEventListener("click", (e) => { if (e.target !== list) show(false); });
+  list.addEventListener("keydown", (e) => {
+    const all = items(), at = all.indexOf(doc.activeElement);
+    const to = { ArrowDown: at + 1, ArrowUp: at - 1, Home: 0, End: all.length - 1 }[e.key];
+    if (to === undefined || !all.length) return;
+    e.preventDefault?.();
+    all[(to + all.length) % all.length].focus();
+  });
+}
 export const measure = (n) => ({ top: n.scrollTop ?? 0, height: n.clientHeight ?? 0 });
 export const createSvg = fresh((tag) => doc.createElementNS ? doc.createElementNS("http://www.w3.org/2000/svg", tag) : doc.createElement(tag));
 
@@ -149,6 +189,7 @@ function fakeDocument() {
     setAttribute(k, v) { this.attrs.set(k, String(v)); }
     removeAttribute(k) { this.attrs.delete(k); }
     getAttribute(k) { return this.attrs.get(k) ?? null; }
+    hasAttribute(k) { return this.attrs.has(k); }
     shallow() { const e = new Element(this.tagName); e.attrs = new Map(this.attrs); return e; }
     addEventListener(t, f) { (this.listeners[t] ??= []).push(f); }
     dispatchEvent(e) { e.target ??= this; for (let n = this; n; n = n.parentNode) for (const f of n.listeners?.[e.type] ?? []) f(e); }
