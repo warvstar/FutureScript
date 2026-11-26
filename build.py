@@ -52,7 +52,36 @@ def build(debug=False, wasm=False, tsan=False, threads=False):
     if stale or not out.exists():
         link = (WASM_MT_LINK if threads else WASM_LINK) if wasm else ["-lobjc", "-lcurl"]
         subprocess.run([cxx, *(o for o in opt if o not in ("-mllvm", "-wasm-enable-sjlj")), *(str(o) for _, o in objs), *link, "-o", str(out)], check=True)
+    if kind == "wasm":
+        small(objs, cc, shared)
     return out
+
+
+# fut-small.wasm (web/site.mjs's): the compiler's files for size (-Oz), the runtime's as fut.wasm has them. A third
+# smaller (1.4 MB -> 0.9 MB, 365 -> 280 KB compressed), as fast at run time; a compile takes about a third longer.
+RUNTIME = {"rt", "gc", "jsval", "wasm", "buffer", "isolate", "txn", "fmath", "fuel", "interp", "effects"}
+def small(objs, cc, shared):
+    objdir, out = ROOT / "build" / "obj-wasm-small", ROOT / "build" / "fut-small.wasm"
+    objdir.mkdir(parents=True, exist_ok=True)
+    opt = ["-Oz", *WASM_FLAGS]
+    stamp, flags = objdir / "flags", " ".join([str(LLVM), *FLAGS, *opt])
+    fresh = stamp.exists() and stamp.read_text() == flags
+    cold = [(c, objdir / (c.stem + ".o")) for c, _ in objs if c.stem not in RUNTIME]
+    stale = [(c, o) for c, o in cold if not fresh or not o.exists() or o.stat().st_mtime < max(shared, c.stat().st_mtime)]
+
+    def ccz(job):
+        print("wasm -Oz clang++", job[0].name, flush=True)
+        return subprocess.run([str(LLVM), *FLAGS, *opt, "-c", str(job[0]), "-o", str(job[1])]).returncode
+    with ThreadPoolExecutor(len(stale) or 1) as ex:
+        if any(list(ex.map(ccz, stale))):
+            sys.exit(1)
+    stamp.write_text(flags)
+    hot = [o for c, o in objs if c.stem in RUNTIME]  # first: an inline function both kinds define is linked from these
+    newest = max(o.stat().st_mtime for o in hot + [o for _, o in cold])
+    if out.exists() and out.stat().st_mtime >= newest:
+        return
+    subprocess.run([str(LLVM), "-O2", *(o for o in WASM_FLAGS if o not in ("-mllvm", "-wasm-enable-sjlj")),
+                    *(str(o) for o in hot + [o for _, o in cold]), *WASM_LINK, "-o", str(out)], check=True)
 
 
 def runner(exe):
@@ -281,7 +310,7 @@ def hot_isolates(exe):
     reload() too), and the next one gives each isolate its own new var and reload() run. Main waits in recv() all
     along, and reloads from there. (Native, and fut-mt.wasm: in fut.wasm, isolates run on one thread, and a reload
     waits until they have ended.)"""
-    if exe.name == "fut.wasm":
+    if exe.name in ("fut.wasm", "fut-small.wasm"):
         return True, "not in fut.wasm"
     head = "var who = \"main\"\nvar reloads = 0\nfn reload() { reloads += 1 }\n"
     rest = ("fn worker(i, c) { who = \"w{i}\"  var last = 0\n"

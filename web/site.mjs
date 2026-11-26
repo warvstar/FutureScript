@@ -3,7 +3,7 @@
 //
 //   node web/site.mjs [--root dir] [--title text] [--copy path]... [--no-prerender] app.fut outdir
 //
-// outdir gets index.html, fut.js and fut.wasm (the compiler and runtime: the page compiles the program as it loads,
+// outdir gets index.html, fut.js and fut.wasm (build/fut-small.wasm, the compiler and runtime: the page compiles the program as it loads,
 // as the dev page does), files.json (every source the program reads: its own files and std's, one request), and the
 // JavaScript modules it uses (std/ui's dom.js) at their paths. --root: the directory whose files the program may read
 // (the main file's, by default); --copy: a file or directory below root the page fetches itself (data, images), copied
@@ -35,6 +35,9 @@ root ??= dirname(file);
 const inside = (p, dir) => !relative(dir, p).startsWith("..") && !relative(dir, p).startsWith(sep);
 if (!inside(file, root)) die(`${rest[0]} is not below --root ${root}`);
 const std = join(repo, "std");
+// fut-small.wasm (python3 build.py wasm): the compiler built for size, the runtime as fut.wasm's
+const wasmFile = join(repo, "build", "fut-small.wasm");
+try { statSync(wasmFile); } catch { die("no build/fut-small.wasm: python3 build.py wasm makes it"); }
 
 // Where the page sees a file (/app/..., /std/...), and where it is here.
 const ROOT = "/app", STD = "/std";
@@ -45,7 +48,7 @@ const main = pagePath(file);
 // Compile it here, as the page will, keeping what it reads and the JavaScript modules it loads.
 const files = {}, modules = new Set(), err = [];
 const fut = await createFut({
-  wasm: readFileSync(join(repo, "build", "fut.wasm")),
+  wasm: readFileSync(wasmFile),
   std: STD,
   verbose: false,
   read(p) {
@@ -80,7 +83,7 @@ if (prerender && modules.has(STD + "/ui/dom.js")) {
 rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });
 copyFileSync(join(repo, "web", "fut.js"), join(out, "fut.js"));
-copyFileSync(join(repo, "build", "fut.wasm"), join(out, "fut.wasm"));
+copyFileSync(wasmFile, join(out, "fut.wasm"));
 writeFileSync(join(out, "files.json"), JSON.stringify(files));
 for (const m of modules) {
   const at = local(m);
