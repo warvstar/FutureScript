@@ -34,10 +34,11 @@ static int run(void* code) {  // 0 ok, 1 runtime error, 2 restart requested
   void* handler = vm.handler;  // REPL lines typed into a running program must not land in its try blocks
   u32 txn = vm.txn;            // an uncaught error rolls back the transactions opened since
   int st = 0;
+  u32 eff = effEnter();        // unchecked, with no handlers, whatever the code it interrupts may do
   errJmp = &jb, vm.handler = nullptr;
   if (int r = setjmp(jb)) st = r, txnUnwind(txn);
   else vmCall(code);
-  errJmp = outer, vm.handler = handler;
+  errJmp = outer, vm.handler = handler, effLeave(eff);
   return st;
 }
 static Global* fnNamed(int sym) {

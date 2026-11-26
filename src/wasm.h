@@ -10,7 +10,7 @@ enum : uint8_t {
   I64_STORE = 0x37, F64_STORE = 0x39, I32_CONST = 0x41, I64_CONST = 0x42, F64_CONST = 0x44, I32_EQZ = 0x45,
   I32_EQ = 0x46, I32_NE = 0x47, I32_LT_U = 0x49, I32_GT_U = 0x4b, I32_GE_U = 0x4f, I64_EQ = 0x51, I64_GE_S = 0x59, I64_LT_U = 0x54, I64_NE = 0x52, F64_EQ = 0x61, F64_NE = 0x62, F64_LT = 0x63,
   F64_GT = 0x64, F64_LE = 0x65, F64_GE = 0x66, I32_ADD = 0x6a, I32_SUB = 0x6b, I32_AND = 0x71, I32_OR = 0x72, I32_XOR = 0x73, I32_SHL = 0x74,
-  I64_ADD = 0x7c, I64_AND = 0x83, I64_OR = 0x84, I64_SHL = 0x86, I64_SHR_U = 0x88, F64_ADD = 0xa0, I32_WRAP = 0xa7, I64_EXTEND_U = 0xad, I64_REINTERPRET = 0xbd,
+  I64_ADD = 0x7c, I64_AND = 0x83, I64_OR = 0x84, I64_XOR = 0x85, I64_SHL = 0x86, I64_SHR_U = 0x88, F64_ADD = 0xa0, I32_WRAP = 0xa7, I64_EXTEND_U = 0xad, I64_REINTERPRET = 0xbd,
   F64_REINTERPRET = 0xbf, VOID = 0x40, I32 = 0x7f, I64 = 0x7e, F64 = 0x7c,
 };
 // Every function has the same locals: the frame, 18 i64 "registers", four i32 temporaries; then one i64 or f64
@@ -24,7 +24,7 @@ inline const char* const FUT_SIG = "iillll:l";
 // Helper signatures: parameters, ':' and the result (l: i64, i: i32 pointer; none: void).
 inline const char* const HSIG[NH] = {
     ":", ":", "lll:l", "lli:l", "llli:l", "ll:l", "lll:l", "illli:i", "il:l", "ll:l", "l:l", ":", "il:l", "lli:l",
-    "li:", "l:l", "ii:l", "l:l", "iii:", "l:", "lil:l", "ll:l", "lll:l"};
+    "li:", "l:l", "ii:l", "l:l", "iii:", "l:", "lil:l", "ll:l", "lll:l", "l:"};
 inline void uleb(std::vector<uint8_t>& o, uint64_t v) {
   do o.push_back(uint8_t((v & 0x7f) | (v > 0x7f ? 0x80 : 0))), v >>= 7;
   while (v);

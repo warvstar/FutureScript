@@ -17,6 +17,7 @@
 static_assert(offsetof(VM, helpers) == HOFF(0) && offsetof(VM, globals) == GOFF(0) && GOFF(MAXG) < (1 << 24));
 static_assert(offsetof(VM, ics) == IOFF(0) && IOFF(MAXIC) < (1 << 24) && IOFF(0) % 16 == 0);
 static_assert(offsetof(VM, runs) == ROFF(0) && ROFF(NCLS + 1) <= 504);  // ldp reaches every run from x28
+static_assert(offsetof(VM, allowed) == EOFF && offsetof(VM, hstack) == EOFF + 8 && offsetof(VM, who) == EOFF + 16);
 static_assert(INST_SLOTS == 16 && sizeof(Inst) == 24 && CLO_ENV == 24 && CLS_IHDR == 8 && CLS_IRUN == 16);  // as JIT code assumes
 
 // ---------------- line tables, stack traces, errors ----------------
@@ -38,7 +39,8 @@ template <class F> static void eachReturnAddress(F f, uintptr_t* fp = (uintptr_t
   }
 }
 // Jump into a try's handler in its JIT frame: restore sp, fp, the pinned registers, x0 = the error value.
-struct Handler { Handler* prev; void *sp, *fp, *limit, *pc; uint64_t txn; };  // txn: transactions open at its entry
+// txn: transactions open at its entry; allowed, hstack, who: the effect state at its entry (effects.cpp)
+struct Handler { Handler* prev; void *sp, *fp, *limit, *pc; uint64_t txn, allowed; V hstack; uint64_t who; };
 #if __has_feature(address_sanitizer)
 extern "C" void __asan_handle_no_return();  // the frames we jump past must not stay poisoned
 #else
@@ -51,7 +53,7 @@ __attribute__((naked)) static void enterHandler(Handler*, V, VM*) {
 static std::string fiberTrace;  // frames of a fiber that ended with an error, printed if nothing catches it
 [[noreturn]] void throwValue(V v, void* ra) {
   if (auto* h = (Handler*)vm.handler)  // the transactions opened inside the try roll back before its handler runs
-    vm.handler = h->prev, txnUnwind((u32)h->txn), fiberTrace.clear(), __asan_handle_no_return(), enterHandler(h, v, &vm);
+    vm.handler = h->prev, txnUnwind((u32)h->txn), effLoad({h->allowed, h->hstack, (u32)h->who}), fiberTrace.clear(), __asan_handle_no_return(), enterHandler(h, v, &vm);
   // Uncaught: the site that failed, then every JIT frame found by walking the frame-pointer chain.
   std::vector<std::string> fr;
   if (auto d = frameDesc((uintptr_t)ra); !d.empty()) fr.push_back(d);

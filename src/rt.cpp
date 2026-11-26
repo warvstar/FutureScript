@@ -286,6 +286,7 @@ static void* rt_prep(V* w, uint64_t n, uint64_t sym, V sup, IC* ic) {
     if (ic && is(r, K::Inst) && f->arity == (int)n + 1) *ic = {header(obj(r)), (uint64_t)f->code};
   } else if (is(r, K::Fn)) {
     f = as<Fn>(r);
+    if (f->op) return effPrep(f, w, n);  // an effect's operation: a handler, the builtin, or an error
     if (f->arity != (int)n) ERR("%s expects %d arguments, got %d", symName(f->name).c_str(), f->arity, (int)n);
     memmove(w, w + 1, n * 8);
     return f->code;
@@ -341,6 +342,7 @@ V newFiber(V fn) {
   if (f->arity - is(fn, K::Clo) > 1) ERR("a fiber's function takes at most one parameter (the first value sent)");
   Fiber* b = make<Fiber>();
   b->fn = fn, b->val = NIL, fiberStack(b);
+  b->allowed = vm.allowed, b->who = vm.who, b->hstack = NIL;  // it may do what its creator may, and has its own handlers
   return box(b);
 }
 V fiberResume(V fv, V v) {  // run fv until it yields (giving the yielded value) or returns (its result)
@@ -349,7 +351,13 @@ V fiberResume(V fv, V v) {  // run fv until it yields (giving the yielded value)
   if (f->state == FIB_RUNNING) ERR("resume of a running fiber");
   bool start = f->state == FIB_NEW;
   f->val = v, f->resumer = fiberCur, f->state = FIB_RUNNING;
+  EffState mine = effSave();  // each fiber has its own effect state (allowed effects, handlers)
+  volatile V keep = mine.hstack;
+  (void)keep;
+  effLoad({f->allowed, f->hstack, f->who});
   fiberRun(f, start);
+  f->allowed = vm.allowed, f->hstack = vm.hstack, f->who = vm.who;
+  effLoad(mine);
   if (f->state == FIB_DONE) {
     fiberFree(f);
     if (int r = f->fail) {
@@ -362,6 +370,9 @@ V fiberResume(V fv, V v) {  // run fv until it yields (giving the yielded value)
   return std::exchange(f->val, NIL);
 }
 V rt_yield(V v) {
+  bool handled;
+  V r = effYield(v, &handled);  // a handler answers in place; otherwise this code must be allowed to yield
+  if (handled) return r;
   Fiber* f = fiberCur;
   if (!f) ERR("yield outside a fiber");
   if (txnOpenIn(f)) ERR("yield inside atomic { }: other code would run while it is half done (yield after it ends)");
@@ -476,4 +487,5 @@ void rtInit() {
   method<+[](V m) { return mapList(m, true); }>(K::Map, S_keys);
   method<+[](V m) { return mapList(m, false); }>(K::Map, S_values);
   testInit();
+  effectsInit();  // after the natives it marks as operations
 }

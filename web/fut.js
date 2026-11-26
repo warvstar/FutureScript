@@ -130,8 +130,8 @@ export async function createFut(opts) {
   const poke = () => { if (ex) dv().setUint32(pollAt, dv().getUint32(pollAt, true) | 1, true); wake?.(), (wake = null); };
   let pollAt = 0;
   async function call(slot) {  // run code; on an error the shadow stack pointer is put back, and transactions opened since roll back
-    const sp = spG.value, txn = ex.fut_txn_depth();
-    try { return await callP(slot); } catch (e) { spG.value = sp, ex.fut_txn_unwind(txn); throw e; }
+    const sp = spG.value, txn = ex.fut_txn_depth(), eff = ex.fut_eff_enter();  // unchecked, no handlers (effects.cpp)
+    try { return await callP(slot); } catch (e) { spG.value = sp, ex.fut_txn_unwind(txn); throw e; } finally { ex.fut_eff_leave(eff); }
   }
   async function evalRepl(more) {  // compile and run replBuf, unless it is unfinished and `more` may follow
     const s = withStr(replBuf, (p) => withStr("<repl>", (n) => ex.fut_compile(n, 0, 1, p)));

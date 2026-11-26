@@ -149,7 +149,7 @@ void trace(Obj* o) {
     case K::Clo: mark(((Clo*)o)->fn); for (u32 k = 0; k < ((Clo*)o)->n; k++) markV(((Clo*)o)->env()[k]); break;
     case K::Fiber: {  // a switched-out fiber's stack (its saved registers included) is scanned like the main stack
       Fiber* f = (Fiber*)o;
-      markV(f->fn), markV(f->val), mark(f->resumer);
+      markV(f->fn), markV(f->val), markV(f->hstack), mark(f->resumer);
       if (f != fiberCur && f->stack) scan((uintptr_t*)f->sp, f->top);
       break;
     }
@@ -188,6 +188,7 @@ void collect() {
   for (V v : vm.globals) markV(v);
   for (V v : consts) markV(v);
   txnMark(markV);
+  effMark(markV);
   for (auto& g : globals) mark(g.o);
   while (!work.empty()) {
     Obj* o = work.back();

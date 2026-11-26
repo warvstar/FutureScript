@@ -99,6 +99,7 @@ struct Gen : CState {
     u32 bytes = ((F->maxd * 8 + 15) & ~15) + 16 * (pairs + fpairs);
     for (int r : F->rets) patch(r);
     if (F->retTy) typeCheck(F->retTy, F->retSite, F->retTy == TY_NUM);  // the result, outside every try: see Fun::retTy
+    if (F->effHome >= 0) ld(9, F->effHome), E(str(9, 28, EOFF)), ld(9, F->effHome + 1), E(strw(9, 28, EOFF + 16));  // the caller's effects
     for (int k = 0; k < pairs; k++) E(ldp_off(19 + 2 * k, 20 + 2 * k, 29, -16 * (k + 1)));
     for (int k = 0; k < fpairs; k++) E(ldpd(8 + 2 * k, 9 + 2 * k, 29, -16 * (pairs + k + 1)));
     E(addi(SP, 29, 0)), E(ldp_post(29, 30)), E(RET);
@@ -191,15 +192,16 @@ struct Gen : CState {
   }
   void jump(Loop& lp, bool brk) { (brk ? lp.brk : lp.cont).push_back(E(B)); }
   void leaveTries(size_t k) { if (F->tries.size() > k) ld(9, F->tries[k]), E(str(9, 28, VM_HANDLER)); }  // unlink tries k..
-  // try { } catch e { }: the record (prev, sp, fp, x26, handler pc, vm.txn) lives in six frame slots and is
-  // linked into vm.handler; a throw (or runtime error) unlinks it, rolls back the transactions opened since, and
-  // jumps to the handler with x0 = the value.
+  // try { } catch e { }: the record (prev, sp, fp, x26, handler pc, vm.txn, then the effect state: vm.allowed,
+  // vm.hstack, vm.who) lives in nine frame slots and is linked into vm.handler; a throw (or runtime error) unlinks
+  // it, rolls back the transactions opened since, puts the effect state back, and jumps to the handler with x0 = the value.
   TryAt tryBegin() {
     if (!F->noRegs) fail("internal: try in a function not prepared for it");
     TryAt t{F->depth};
-    for (int i = 0; i < 6; i++) slot();
+    for (int i = 0; i < 9; i++) slot();
     addsp(9, t.r), E(ldr(10, 28, VM_HANDLER)), E(str(10, 9, 0)), E(addi(10, SP, 0)), E(str(10, 9, 8));
     E(str(29, 9, 16)), E(str(26, 9, 24)), E(ldrw(10, 28, 4)), E(str(10, 9, 40));
+    E(ldr(10, 28, EOFF)), E(str(10, 9, 48)), E(ldr(10, 28, EOFF + 8)), E(str(10, 9, 56)), E(ldrw(10, 28, EOFF + 16)), E(str(10, 9, 64));
     t.pc = E(ADR | 10);
     E(str(10, 9, 32)), E(str(9, 28, VM_HANDLER));
     return t;
@@ -254,6 +256,18 @@ struct Gen : CState {
     int skip = numFast ? (E(mvn(9, 0)), E(tstq(9)), E(bcond(NE))) : -1;
     imm(1, t), imm(2, (V)site), helper(H_TYPECHK);
     if (skip >= 0) patch(skip);
+  }
+  // A function that declares effects: its caller must be allowed them (else rt_effect raises), and until it returns
+  // only they are allowed. vm.allowed = (level + 1) << EFF_LEVEL | mask; vm.who = site. The old values go to two slots.
+  void effectsIn(uint64_t mask, int site) {
+    int s = F->effHome = slot();
+    slot();
+    E(ldr(9, 28, EOFF)), imm(10, mask), E(bicsz(10, 9));  // any declared effect not allowed?
+    int ok = E(bcond(EQ));
+    imm(0, (V)site), helper(H_EFFECT), patch(ok);
+    st(9, s), E(ldrw(11, 28, EOFF + 16)), st(11, s + 1);
+    E(lsri(11, 9, EFF_LEVEL)), E(addi(11, 11, 1)), E(orrlsl(10, 10, 11, EFF_LEVEL)), E(str(10, 28, EOFF));
+    imm(11, (V)site), E(strw(11, 28, EOFF + 16));
   }
   void cloEnv() { ldl(9, F->cloHome), E(andaddr(9, 9)); }  // x9 = this closure object
   void capLoad(int i) { cloEnv(), E(ldr(0, 9, CLO_ENV + 8 * i)); }

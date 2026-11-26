@@ -399,6 +399,10 @@ EXPORT(fut_poll) u32* futPoll() { return &vm.poll; }
 // Transactions, for the host: a hot reload's top level and reload() hook run inside one (see hostPoll in fut.js),
 // and an error that reaches the host rolls back those opened since the call began.
 EXPORT(fut_txn_depth) u32 futTxnDepth() { return vm.txn; }
+// Code the host runs (top level, main, a REPL line, a reload) is unchecked and starts with no handlers, whatever the
+// code it interrupts may do; leaving puts that code's effect state back (see effEnter).
+EXPORT(fut_eff_enter) u32 futEffEnter() { return effEnter(); }
+EXPORT(fut_eff_leave) void futEffLeave(u32 depth) { effLeave(depth); }
 EXPORT(fut_txn_begin) void futTxnBegin() { txnBegin(); }
 EXPORT(fut_txn_commit) void futTxnCommit() { txnCommit(); }
 EXPORT(fut_txn_unwind) void futTxnUnwind(u32 depth) { txnUnwind(depth); }

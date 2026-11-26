@@ -56,9 +56,9 @@ fn reload() { }                      // optional: runs after every hot reload (m
 
 - **Values:** numbers (f64; whole numbers are exact up to 2^53 and print without a decimal point), strings, `true`/`false`/`nil`, lists, maps, functions and closures, classes and instances. `nil` and `false` are the only falsy values.
 - **Operators:** `+ - * / %`, `== != < <= > >=`, `&& ||` (short-circuit, return the operand), `!`, `= += -= *= /=`. Bitwise `& | ^ ~ << >>` work on whole numbers as 64-bit integers (`1.5 & 1` is an error), with Python's precedence: `2 + 3 & 6` is `(2 + 3) & 6`. `+` with a string on either side concatenates.
-- **Builtins:** `print len str int clock sleep floor sqrt fiber run` (`int` truncates toward zero), plus graphics (below).
+- **Builtins:** `print len str int clock sleep random floor sqrt fiber run` (`int` truncates toward zero; `random()` is in [0, 1)), plus graphics (below).
 - **Numbers:** `12`, `1.5`, `2e3`, `0xff8800`.
-- **Keywords:** `var fn class if else while for in return break continue true false nil self super import extern yield try catch throw`. `as`, `pub`, `override` and `atomic` are special only where they start an import alias, declaration or block, so they stay usable as names.
+- **Keywords:** `var fn class if else while for in return break continue true false nil self super import extern yield try catch throw`. `as`, `pub`, `override`, `atomic`, `effect`, `handle` and `with` are special only where they start an import alias, declaration or block, so they stay usable as names.
 - **Methods:** `list.push/pop/len`, `map.has/remove/keys/values/len`, `str.len/has` (`has`: contains a substring), `fiber.resume/send/done`.
 - **Closures:** a closure captures the enclosing variables by value. The closure can still change its own copy, so counters work, but it does not see later changes in the enclosing function.
 - **Interpolation:** expressions inside `{...}` in a string can't contain `"`. Write `\{` for a literal brace.
@@ -109,6 +109,66 @@ a.balance = nil        // -> field 'balance' of Account must be num, got nil
 - **Interfaces:** types are part of a `.api` file, so changing `n: num` to `n: str` on a `pub` function is an interface change that `fut test` reports.
 - `num`, `str` and the other type names are ordinary names everywhere else. Locals and top-level vars can't have types yet.
 
+## Effects
+
+A function can declare what it may do outside itself, after its result type. Like types, the declaration is optional and is checked at run time, where it is written.
+
+```
+fn save(p: Player): bool ! io { ... }     // may print, write files, run programs, call C
+fn tick() ! clock, random { ... }
+fn score(hits: list): num ! { ... }       // `!` alone: performs nothing
+fn helper(x) { ... }                      // no `!`: unchecked, as before
+```
+
+```
+fn report() ! clock { save(p) }   // -> save() declares io, but it is called from inside report(), which does not (it declares ! clock)
+fn total() ! { print(n) }         // -> print() performs io, which total() does not declare (it declares no effects)
+```
+
+- **Effects:** `io` (print, `run()`, `extern` calls, the window and its input), `clock` (`clock`, `sleep`), `random` (`random()`, a number in [0, 1)), `yield` (a fiber's `yield`), and effects a program declares (below). Builtins perform theirs. Throwing is not an effect.
+- **How it is checked:** while a function that declares effects runs, only those are allowed. Entering it checks that the code calling it is allowed all of them, so a declared function can't be reached from one that declares less. Performing an operation checks it at the place it happens. Functions that declare nothing run under whatever their caller allows, so `helper()` above may print when called from `main` but not when called from `total`. What is allowed comes back when the function returns or a throw leaves it, and each fiber keeps its own.
+- **Why:** when many people or agents change code at once, a signature should say what a function may touch. `fn score(hits: list): num !` promises that changing `score` won't start writing files, and the promise is kept by the program, not by review. As with types, checking at run time keeps every change local: a reload, or a caller compiled against an older version, gets a clean error naming the function and the effect, instead of a static check that would have to revisit every caller.
+
+### Handlers
+
+`handle` runs a block and answers the operations it names, in place:
+
+```
+var out = []
+handle {
+  save(p)                            // its print goes to out
+  print(clock())                     // and so does this: 1000
+} with print(s) { out.push(s) } with clock() { return 1000 }
+```
+
+While the block runs, an operation it names calls the nearest handler for it on the current stack, as an ordinary function call. The handler's return value is the operation's result, and the code that performed it carries on. A handler never resumes anything later, or twice. One that throws ends the operation like any throw. Tests use handlers to replace the outside world (output, time, randomness, an effect of the program's own) for just the code they run, with no global mocks to set up and take down.
+
+- **Which operations:** `print`, `clock`, `sleep`, `random`, `run`, `yield`, the graphics builtins, and the operations of declared effects. A handler's parameters are the operation's. A handler is a closure, so it captures the variables around it by value: collect into a list or map.
+- **Where a handler runs:** with the effects and handlers that were in force where it was installed. A handler for `print` can itself `print`, which reaches the real output or a handler further out.
+- **Handlers and declarations.** A handled operation doesn't count against a declaration in the same function: `fn quiet() ! { handle { print("x") } with print(s) { ... } }` is allowed, since nothing leaves `quiet`. Code inside a function that declares the effect is reached by a handler installed outside it, which is how a test can fake `save`'s output. Code inside a function that does not declare the effect is not: a handler can't make `total()` above print. A `handle` that answers every operation of an effect also allows that effect inside its block, so `fn run() ! { handle { work() } with Log.log(m) { } }` may call `fn work() ! Log`. Partly answering an effect doesn't allow it, and `io` can't be answered whole, since C calls can't be handled.
+- **Fibers:** each fiber has its own handlers, and starts with the effects allowed where it was created.
+- `return`, `break` and `continue` leave a `handle` block cleanly, and a throw removes the handlers it unwinds past.
+
+### Declared effects
+
+```
+pub effect Log {
+  fn log(msg: str)
+  fn level(): num
+}
+fn work() ! Log { if Log.level() > 1 { Log.log("detail") } }
+handle { work() } with Log.log(m) { lines.push(m) } with Log.level() { return 2 }
+```
+
+An `effect` declares operations without bodies, at the top level (`pub` makes it usable from other files: `audit.Audit.record(x)`). Code performs one by calling it through the effect's name, `Log.log("x")`, and the nearest handler answers. With no handler, performing it is an error. The effect's name, written at every place it is performed, makes the code easy to search, reads as the call it is, and tells the compiler the arity, which it checks. A keyword such as `perform log("x")` would add a reserved word and hide which effect is meant. Operations may have types, checked when one is performed and when its handler returns.
+
+- **Atomic blocks:** performing `io` inside `atomic { }` is an error, because printed output or a written file can't be rolled back. A function that declares `io` can't be called there. A handler installed inside the block may answer an `io` operation, since what it does (such as pushing to a list) is rolled back with the block. Other effects are allowed.
+- **Overrides** declare a subset of the effects of the method they replace, often the same set. Doing less breaks no caller. If the replaced method declares effects, the override must declare some too, since an unchecked override could do anything.
+- **Interfaces:** effects are part of a `.api` file (`pub fn save(p): bool ! io`), so adding `io` to a `pub` function is an interface change that `fut test` reports. `pub effect` declarations are listed with their operations.
+- **Hot reload:** changing a function's declared effects takes effect at its next call, from any caller, like a changed result type. Its callers are not recompiled, since the check is in the function itself. Frames already running keep their old declaration until they return.
+- **Cost:** none for functions that declare nothing: they contain no extra code. A declaring function checks and narrows the allowed set on entry with about a dozen instructions and no call, and puts it back in its epilogue with four. 5M calls of `fn f(x) ! { return x + 1 }` take 11 ms against 8 ms undeclared (wasm: 20 vs 18). The set is a bitmask in the VM block (44 effects, the rest of the word counts nested narrowings). A builtin that performs an effect is checked when it is called, inside the runtime call that already resolves it. Entering a `try` saves three more words. A handled operation is a list walk and a call through the runtime.
+- `effect`, `handle` and `with` are special only where they start a declaration or a block, so they stay usable as names. `io`, `clock`, `random` and `yield` are effect names only after `!`.
+
 ## Errors
 
 ```
@@ -136,7 +196,7 @@ fn transfer(from, to, n) {
 If an error leaves an `atomic` block, everything the block changed that other code can see is put back before the error continues. That covers instance fields, lists, maps, globals and closures' captured variables. The error can be a `throw` or a runtime error, from any depth of calls. Whatever catches it then sees the state as it was before the block. If the block finishes, or leaves by `return`, `break` or `continue`, its changes stay. Blocks nest: an inner block that fails rolls back only its own changes, and an outer block that fails also rolls back what its inner blocks did.
 
 - **Nothing to declare.** Any code can run inside a block, including calls into code that knows nothing about it. The runtime saves each object just before the block first writes to it.
-- **Not rolled back:** the outside world (printed output, files, C calls), and local variables of the running functions, which no other code can see.
+- **Not rolled back:** local variables of the running functions, which no other code can see. The outside world (printed output, files, C calls) can't be rolled back either, so performing `io` inside a block is an error unless a handler installed inside the block answers it (see [Effects](#effects)).
 - **Fibers:** a fiber may not `yield` inside its own atomic block, because other code would then see the block half done. A `yield` written directly in the block is a compile error; one reached through a call is a runtime error. A fiber resumed from inside a block may yield, and what it changed belongs to that block.
 - **Cost:** a block copies the globals when it starts, and each object the first time it writes to it. Field stores inside a block skip their inline caches. Hot reloads and typed lines wait until open blocks finish.
 
@@ -240,7 +300,7 @@ f.send(10)  f.send(5)                // -> 10, 15: send(v) resumes and becomes y
 f.resume()  f.done()                 // resume() sends nil
 ```
 
-An error inside a fiber ends it and is raised again in its resumer. Switching costs about as much as a function call: callee-saved registers are saved on one stack, and the stack pointer moves to the other. Hot reload sees suspended fibers' frames, so code they will return into is kept.
+An error inside a fiber ends it and is raised again in its resumer. Each fiber has its own effect handlers and allowed effects (see [Effects](#effects)). Switching costs about as much as a function call: callee-saved registers are saved on one stack, and the stack pointer moves to the other. Hot reload sees suspended fibers' frames, so code they will return into is kept.
 
 ## C functions
 
@@ -325,6 +385,7 @@ Other differences from arm64: file changes and typed lines are delivered only wh
 | `main.cpp` | Driver: watcher, safepoint reload (as a transaction), `main` restart, REPL, `--asm`, `fut test`, `fut api` |
 | `txn.cpp` | Transactions (`atomic`, reloads): an object is copied before its first write, globals at the start; rollback, nesting |
 | `types.cpp` | Optional types: what each check names, the check compiled code calls, and the one field stores make |
+| `effects.cpp` | Effects: declared sets and their checks (entry, perform site), operations and their ids, handler records, `handle`, `random()` |
 | `api.cpp` | Public interfaces: a file's `pub` declarations as `.api` text, the check `fut test` runs, `fut api` |
 | `test.cpp` | `expect`'s check (deep equality, failure details) and the test runner's reporting, text and JSON; shared by both platforms |
 

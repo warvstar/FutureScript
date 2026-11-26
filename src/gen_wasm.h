@@ -135,6 +135,10 @@ struct Gen : CState {
     if (!size && F->calls) size = 16;      // keeps the stack check for recursion
     op(ENDOP);                             // the body block
     if (F->retTy) typeCheck(F->retTy, F->retSite, F->retTy == TY_NUM);  // the result, outside every try: see Fun::retTy
+    if (F->effHome >= 0) {  // the caller's effects
+      i32c(0), get(F->effHome), mem(I64_STORE, 3, slotOf(&vm.allowed));
+      i32c(0), get(F->effHome + 1), op(I32_WRAP), mem(I32_STORE, 2, slotOf(&vm.who));
+    }
     get(R0), op(ENDOP);
     Code& k = F->k;
     std::vector<uint8_t> body = std::move(k.c);
@@ -231,16 +235,22 @@ struct Gen : CState {
   void jump(Loop& lp, bool brk) { br(BR, brk ? lp.depth : lp.depth + 2); }
   void leaveTries(size_t) {}  // wasm try blocks are structured: leaving one needs nothing
   // block $done { block $catch (result i64) { try_table (catch $fut -> $catch) { body } br $done } e = it; reset sp; ... }
-  // A frame slot keeps vm.txn at entry: the handler rolls back the transactions opened since (rt_txunwind).
+  // A frame slot keeps vm.txn at entry: the handler rolls back the transactions opened since (rt_txunwind). Three
+  // more keep the effect state (vm.allowed, vm.hstack, vm.who), which the handler puts back.
+  void effSlot(int s, u32 at, bool w32) { base(s), i32c(0), mem(w32 ? I32_LOAD : I64_LOAD, w32 ? 2 : 3, at), w32 ? op(I64_EXTEND_U) : void(), mem(I64_STORE, 3, off(s)); }
+  void effBack(int s, u32 at, bool w32) { i32c(0), base(s), mem(I64_LOAD, 3, off(s)), w32 ? op(I32_WRAP) : void(), mem(w32 ? I32_STORE : I64_STORE, w32 ? 2 : 3, at); }
   TryAt tryBegin() {
     TryAt t{F->depth};
     slot(), base(t.r), txnDepth(), op(I64_EXTEND_U), mem(I64_STORE, 3, off(t.r));
+    slot(), slot(), slot();
+    effSlot(t.r + 1, slotOf(&vm.allowed), false), effSlot(t.r + 2, slotOf(&vm.hstack), false), effSlot(t.r + 3, slotOf(&vm.who), true);
     open(BLOCK), open(BLOCK, I64), open(TRY_TABLE), u(1), b(0), u(0), u(0);  // one catch: tag 0, label 0
     return t;
   }
   void txnDepth() { i32c(0), mem(I32_LOAD, 2, slotOf(&vm.txn)); }
   void tryCatch(TryAt& t) {
     close(), br(BR, F->blocks - 1), close(), set(R0);
+    effBack(t.r + 1, slotOf(&vm.allowed), false), effBack(t.r + 2, slotOf(&vm.hstack), false), effBack(t.r + 3, slotOf(&vm.who), true);
     txnDepth(), base(t.r), mem(I64_LOAD, 3, off(t.r)), op(I32_WRAP), op(I32_GT_U), open(IF, VOID, UNLIKELY);
     ld(1, t.r), helper(H_TXUNWIND), close();
   }
@@ -278,6 +288,17 @@ struct Gen : CState {
     if (numFast) isNumber(0), op(I32_EQZ), open(IF, VOID, UNLIKELY);
     karg(1, (int64_t)t), karg(2, site), helper(H_TYPECHK);
     if (numFast) close();
+  }
+  // A function that declares effects (see gen_a64.h): the caller's vm.allowed and vm.who go to two i64 locals.
+  void effectsIn(uint64_t mask, int site) {
+    u32 a = F->effHome = L0 + (u32)F->k.wlocals.size(), w = a + 1;
+    F->k.wlocals.push_back(I64), F->k.wlocals.push_back(I64);
+    i32c(0), mem(I64_LOAD, 3, slotOf(&vm.allowed)), set(a);
+    i64c((int64_t)mask), get(a), i64c(-1), op(I64_XOR), op(I64_AND), i64c(0), op(I64_NE);  // any declared effect not allowed?
+    open(IF, VOID, UNLIKELY), karg(0, site), helper(H_EFFECT), close();
+    i32c(0), mem(I32_LOAD, 2, slotOf(&vm.who)), op(I64_EXTEND_U), set(w);
+    i32c(0), get(a), i64c(EFF_LEVEL), op(I64_SHR_U), i64c(1), op(I64_ADD), i64c(EFF_LEVEL), op(I64_SHL), i64c((int64_t)mask), op(I64_OR);
+    mem(I64_STORE, 3, slotOf(&vm.allowed)), i32c(0), i32c(site), mem(I32_STORE, 2, slotOf(&vm.who));
   }
   void capAddr() { base(F->cloHome), mem(I64_LOAD, 3, off(F->cloHome)), op(I32_WRAP); }  // this closure object
   void capLoad(int i) { capAddr(), mem(I64_LOAD, 3, CLO_ENV + 8 * i), set(R0); }

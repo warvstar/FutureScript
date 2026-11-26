@@ -78,7 +78,7 @@ struct Jumps {  // a few forward branches to patch to one place (no heap allocat
   const int* end() const { return v + n; }
 };
 // A loop being compiled. brk/cont/exit: branches to patch (arm64); depth: its blocks' nesting (wasm).
-struct Loop { std::vector<int> brk, cont; Jumps exit; size_t tries = 0; int top = 0, contAt = 0, depth = 0, atomics = 0; };
+struct Loop { std::vector<int> brk, cont; Jumps exit; size_t tries = 0; int top = 0, contAt = 0, depth = 0, atomics = 0, handles = 0; };
 constexpr int HOT = 1000;  // calls before a function is compiled again (tier 2)
 struct TryAt { int r = 0, pc = 0, done = 0; };  // a try being compiled: its record's first slot, branches to patch
 struct Fun {  // per-function emission state
@@ -111,6 +111,10 @@ struct Fun {  // per-function emission state
   bool noRegs = false;
   std::vector<int> tries;  // slots of the active try records, outermost first
   int atomics = 0;         // atomic blocks open here: return, break and continue commit them
+  int handles = 0;         // handle bodies open here: return, break and continue remove their handlers
+  // Declared effects (`fn f() ! io`): where the caller's vm.allowed and vm.who are kept (arm64: two frame slots;
+  // wasm: two locals) while the function runs; the epilogue every return goes through puts them back. -1: none.
+  int effHome = -1;
   // Its declared result type (`fn f(): num`; 0: none), checked in the epilogue every return goes through, so after
   // the function's own try blocks: a function never catches its own result's failed check.
   uint64_t retTy = 0;

@@ -63,6 +63,16 @@ std::string interfaceOf(const std::string& path, const std::string& text) {
     if (Lexer q = L; q.next().t == '?') L = q, end = q.p;
     return end;
   };
+  auto effects = [&](const char* end) {  // `! io, geom.Log` next (or a bare `!`): through it
+    Lexer s = L;
+    if (s.next().t != '!') return end;
+    L = s, end = s.p;
+    for (Lexer d = L;; d = L) {
+      int t = d.next().t;
+      if (t != T_ID && t != ',' && t != '.') return end;
+      L = d, end = d.p;
+    }
+  };
   auto skipBody = [&](Tok& t) {  // t is '{': through the matching '}'
     for (int d = 0; t.t != T_EOF; t = next()) if ((d += (t.t == '{') - (t.t == '}')) == 0) return;
   };
@@ -73,7 +83,7 @@ std::string interfaceOf(const std::string& path, const std::string& text) {
     if (depth || !isKw(t, S_pub)) continue;
     Lexer save = L;
     Tok k = next();
-    if (k.t != T_ID || k.nl || !(k.sym == K_fn || k.sym == K_class || k.sym == K_var || k.sym == K_extern)) { L = save; continue; }
+    if (k.t != T_ID || k.nl || !(k.sym == K_fn || k.sym == K_class || k.sym == K_var || k.sym == K_extern || k.sym == S_effect)) { L = save; continue; }
     Item it;
     std::string doc = docs(src, t.p, "");
     if (k.sym == K_var) {
@@ -82,7 +92,7 @@ std::string interfaceOf(const std::string& path, const std::string& text) {
     } else if (k.sym == K_fn) {
       Tok n = next(), p = next();
       const char* end = params(p);
-      it = {symName(n.sym), "pub " + squash(k.p, typed(end))};
+      it = {symName(n.sym), "pub " + squash(k.p, effects(typed(end)))};
     } else if (k.sym == K_extern) {
       Tok n = next();
       while (n.t != T_EOF && !isKw(n, K_fn)) n = next();
@@ -91,6 +101,20 @@ std::string interfaceOf(const std::string& path, const std::string& text) {
       Lexer s = L;
       if (s.next().t == ':') s.next(), end = s.p, L = s;  // its result type
       it = {symName(nm.sym), "pub " + squash(k.p, end)};
+    } else if (k.sym == S_effect) {  // an effect: its operations, sorted, with their comments
+      Tok n = next(), b = next();
+      while (b.t != '{' && b.t != T_EOF) b = next();
+      it.name = symName(n.sym), it.text = "pub effect " + symName(n.sym) + " {\n";
+      std::vector<std::pair<std::string, std::string>> opl;
+      for (Tok m = next(); m.t != '}' && m.t != T_EOF; m = next()) {
+        if (!isKw(m, K_fn)) continue;
+        std::string d = docs(src, m.p, "  ");
+        Tok nm = next(), p = next();
+        opl.push_back({symName(nm.sym), d + "  " + squash(m.p, typed(params(p))) + "\n"});
+      }
+      std::stable_sort(opl.begin(), opl.end(), [](auto& a, auto& b) { return before(a.first, b.first); });
+      for (auto& [_, s] : opl) it.text += s;
+      it.text += "}";
     } else {  // a class: its header, then its fields and methods (each sorted), with their comments
       Tok n = next(), b = next();
       while (b.t != '{' && b.t != T_EOF) b = next();
@@ -113,7 +137,7 @@ std::string interfaceOf(const std::string& path, const std::string& text) {
         if (isKw(m, S_override)) m = next();
         if (!isKw(m, K_fn)) continue;
         Tok nm = next(), p = next();
-        const char* end = typed(params(p));
+        const char* end = effects(typed(params(p)));
         methods.push_back({symName(nm.sym), d + "  " + squash(first.p, end) + "\n"});
         Tok body = next();
         skipBody(body);
@@ -147,9 +171,10 @@ static std::vector<std::string> entries(const std::string& text) {
     if (l.empty() || l.starts_with("//")) continue;
     if (l.starts_with("pub ")) l = l.substr(4);
     if (l == "}") cls.clear();
-    else if (l.starts_with("class ") && l.ends_with("{")) {
+    else if ((l.starts_with("class ") || l.starts_with("effect ")) && l.ends_with("{")) {
       l = squash(l.data(), l.data() + l.size() - 1), e.push_back(l);
-      cls = l.substr(6, l.find(' ', 6) - 6);
+      size_t at = l.find(' ') + 1;
+      cls = l.substr(at, l.find(' ', at) - at);
     } else e.push_back(cls.empty() ? l : cls + ": " + l);
   }
   return std::sort(e.begin(), e.end()), e;

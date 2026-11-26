@@ -13,6 +13,9 @@ namespace {
 struct Saved { Obj* o; std::vector<V> v; std::vector<u32> idx; u32 used = 0; };  // a map's entries: key, value, ...
 struct Level {
   Fiber* owner;                  // the fiber that opened it (null: the main stack)
+  bool atomic = false;           // an atomic block (not a reload): it takes io away; allowed/who as it found them
+  uint64_t allowed = 0;
+  u32 who = 0;
   std::vector<V> globals;        // as they were when it opened
   std::vector<Saved> saved;      // each object as it was before its first write
   std::unordered_set<Obj*> seen;
@@ -89,6 +92,10 @@ void txnTouch(Obj* o) {
   Level& l = levels.back();
   if (l.seen.insert(o).second) l.saved.push_back(save(o));
 }
+bool txnAtomic() {
+  for (auto& l : levels) if (l.atomic) return true;
+  return false;
+}
 bool txnOpenIn(Fiber* f) {
   for (auto& l : levels) if (l.owner == f) return true;
   return false;
@@ -106,8 +113,19 @@ void txnMark(void (*markV)(V)) {
 // atomic { }: the compiler calls atomic@begin before the block, and atomic@end (passing x0 through) wherever
 // control leaves it normally: its end, return, break, continue. An error leaving it is rolled back by whatever
 // catches it (see throwValue, and the try handlers the compilers emit).
-static V atomicBegin() { return txnBegin(), NIL; }
-static V atomicEnd(V v) { return txnCommit(), v; }
+// An atomic block can't undo io, so it takes io away until it ends (a narrowing, like a declared function's): only a
+// handler installed inside the block can answer an io operation there.
+static V atomicBegin() {
+  txnBegin();
+  Level& l = levels.back();
+  l.atomic = true, l.allowed = vm.allowed, l.who = vm.who;
+  vm.allowed = ((vm.allowed >> EFF_LEVEL) + 1) << EFF_LEVEL | (vm.allowed & EFF_BITS & ~EFF_IO), vm.who = WHO_ATOMIC;
+  return NIL;
+}
+static V atomicEnd(V v) {
+  if (!levels.empty() && levels.back().atomic) vm.allowed = levels.back().allowed, vm.who = levels.back().who;
+  return txnCommit(), v;
+}
 static V rt_capset(V v, Clo* c, uint64_t i) { return txnTouch(c), c->env()[i] = v; }  // a captured variable, inside one
 static V rt_txunwind(V v, uint64_t depth) { return txnUnwind((u32)depth), v; }      // a try caught an error
 void txnInit() {

@@ -30,7 +30,12 @@ struct FieldUse { int cls, sym; At at; };  // `self.name` in a method: checked a
 // A fn/method in the source. retNum: it declares `: num`, so a direct call's result is known to be a number.
 struct Span { const char *start = nullptr, *end = nullptr; int line = 0, endLine = 0, arity = 0; bool retNum = false; };
 // Each fn/method's parameter and result types (0: none), as last compiled: an override must declare the same.
-struct Sig { std::vector<uint64_t> types; std::string text; };
+// eff: it declares effects (effMask, as written: effText), so an override must declare a subset.
+struct Sig { std::vector<uint64_t> types; std::string text; bool eff = false; uint64_t effMask = 0; std::string effText; };
+// Each effect's operations (qualified effect symbol -> (operation symbol, arity)), as last compiled: what performs
+// and handlers compile against when the effect is not in the files being compiled (the REPL).
+using EffOps = std::unordered_map<int, std::vector<std::pair<int, int>>>;
+static EffOps effectOps;
 static std::unordered_map<std::string, Sig> sigs;
 struct Rec { uint64_t text, env; int line, arity; u32* body; std::vector<u32*> lambdas; bool repl; };  // what is installed now
 static std::unordered_map<std::string, Rec> recs;
@@ -77,6 +82,9 @@ struct Compiler : Gen {
   std::unordered_map<std::string, std::vector<int>> pubs;  // file -> its top-level names marked `pub`
   std::vector<char> pubSym;                                 // by (prefixed) symbol: declared `pub`
   std::unordered_map<int, std::string> privateIn;           // a private name (as written) -> a file declaring it
+  EffOps effOps;                                            // effects this compile declares (the prescan finds them)
+  struct EffectDef { int sym; std::vector<EffOpDef> ops; };
+  std::vector<EffectDef> effDefs;                           // installed by commit
 
   static void add(std::string& s, const std::string& n) { s += (s.empty() ? "" : ", ") + n; }
   const char* name(int s) { return symName(s).c_str(); }
@@ -158,6 +166,80 @@ struct Compiler : Gen {
     if (ty.code && !(known && ty.code == TY_NUM)) typeCheck(ty.code, typeSite(what, ty.text), ty.code == TY_NUM);
   }
 
+  // ---- effects: io clock random yield, or an `effect` (geom.Log for a module's) ----
+  uint64_t effectName(std::string& text) {
+    Tok t = cur;
+    if (atKw(K_yield)) return next(), text += "yield", EFF_YIELD;
+    int s = ident();
+    const std::string& n = symName(s);
+    if (n == "io" || n == "clock" || n == "random") return text += n, n == "io" ? EFF_IO : n == "clock" ? EFF_CLOCK : EFF_RANDOM;
+    Tok q = topName(prev);
+    Global* g = findGlobal(q.sym);
+    if (!g || g->kind != 'e') failAt(t.p, t.line, "unknown effect '%s' (io, clock, random, yield, or one declared with 'effect')", std::string(t.p, prevEnd).c_str());
+    uint64_t b = effBit(q.sym);
+    if (!b) failAt(t.p, t.line, "too many effects (a program can declare at most %d)", EFF_LEVEL - 4);
+    return text += std::string(t.p, prevEnd), b;
+  }
+  const std::vector<std::pair<int, int>>* opsOf(int effSym) {
+    if (auto it = effOps.find(effSym); it != effOps.end()) return &it->second;
+    if (auto it = effectOps.find(effSym); it != effectOps.end()) return &it->second;
+    return nullptr;
+  }
+  // E.op after the effect's name (just read, as t): the operation's id and arity
+  std::pair<int, int> effectOp(const Tok& t) {
+    if (!accept('.')) failAt(t.p, t.line, "'%s' is an effect: perform its operations as %s.name(...)", name(t.sym), name(t.sym));
+    Tok ot = cur;
+    int o = ident();
+    if (auto* l = opsOf(t.sym))
+      for (auto [s, a] : *l) if (s == o) return {effOpId(symName(t.sym) + "." + symName(o)), a};
+    failAt(ot.p, ot.line, "effect '%s' has no operation '%s'", name(t.sym), name(o));
+  }
+  void perform(const Tok& t) {  // E.op(args): a call that rt_prep sends to the nearest handler (see effPrep)
+    Tok ot = cur;
+    auto [op, arity] = effectOp(t);
+    if (!at('(') || cur.nl) failAt(ot.p, ot.line, "expected '(': perform an operation by calling it");
+    next();
+    int base = slot();
+    imm(0, box(effOpFn(op))), st(0, base);
+    int n = exprList(')');
+    if (n != arity) failAt(ot.p, ot.line, "'%s' expects %d arguments, got %d", effOpName(op).c_str(), arity, n);
+    callWindow(base, n, 0, false);
+  }
+  // handle { body } with op(params) { ... } ...: each handler is compiled first, as a closure, so it is ready when
+  // the body starts; then handle@begin([op, handler, ...]), the body, and handle@end where it ends normally.
+  void handleStmt() {
+    Mark body = mark();
+    skipBlock();
+    if (!atKw(S_with)) fail("expected 'with': handle { ... } with op(params) { ... }");
+    int base = F->depth, n = 0;
+    while (atKw(S_with) && peek().t == T_ID) {
+      next();
+      Tok t = cur;
+      int op = 0, arity = -1;
+      if (atKw(K_yield)) next(), op = OP_YIELD, arity = 1;
+      else {
+        ident();
+        Tok q = topName(prev);
+        Global* g = findGlobal(q.sym);
+        if (g && g->kind == 'e') std::tie(op, arity) = effectOp(q);
+        else if (g && g->kind == 'n' && (op = effBuiltinOp(q.sym))) arity = effOpArity(op);
+        else failAt(t.p, t.line, "'%s' is not an effect's operation (print, clock, sleep, random, run, yield, the graphics builtins, or Effect.name)", std::string(t.p, prevEnd).c_str());
+      }
+      imm(0, box((double)op)), st(0, slot());
+      if (!at('(')) fail("expected '(' and the operation's parameters");
+      Fn* h = lambda(t);
+      if (h->arity - 1 != arity) failAt(t.p, t.line, "a handler for %s takes %d parameters, not %d", effOpName(op).c_str(), arity, h->arity - 1);
+      st(0, slot()), n += 2;
+    }
+    collect(base, n, H_LIST);
+    callNative("handle@begin", true);
+    Mark after = mark();
+    rewind(body);
+    F->handles++, block(), F->handles--;
+    if (F->live) callNative("handle@end", true);
+    rewind(after);
+  }
+
   void proveOperands(int op, bool lnum, bool rnum, int lh, int rh) {
     if (op == O_ADD || op == O_EQ || op == O_NE) return;
     if (op <= O_MOD || op >= O_BAND || rnum) prove(lh);
@@ -167,7 +249,7 @@ struct Compiler : Gen {
     auto had = F->facts;
     F->facts.reset();
     if (F->tier2) for (auto& l : F->locals) if (tracked(l.home) && had[l.home + 128] && !assignedIn(l.sym)) prove(l.home);
-    lp.tries = F->tries.size(), lp.atomics = F->atomics, loopBegin(lp);
+    lp.tries = F->tries.size(), lp.atomics = F->atomics, lp.handles = F->handles, loopBegin(lp);
   }
 
   void combine(int s, int op) { mv(1, 0), ld(0, s), F->depth--, binop(op); }  // left in slot s, right in x0
@@ -298,7 +380,7 @@ struct Compiler : Gen {
     }
     collect(base, n, H_MAP);
   }
-  void lambda(const Tok& t) {  // fn(params) { body }: captures enclosing locals by value into the closure
+  Fn* lambda(const Tok& t) {  // fn(params) { body }: captures enclosing locals by value into the closure
     if (tiering) compileFail("tier 2 does not handle lambdas", false);
     Fun f;
     f.parent = F, f.lambda = true;
@@ -309,6 +391,7 @@ struct Compiler : Gen {
     int base = F->depth, n = (int)f.caps.size();
     for (auto& [s, src] : f.caps) { LV v = src; load(v), st(0, slot()); }
     closure(fn, base, n);
+    return fn;
   }
 
   // ---- expressions: result in x0 ----
@@ -353,6 +436,7 @@ struct Compiler : Gen {
     if (!g) undefined(t);
     if (g->kind == 'f' && at('(') && !cur.nl) return next(), directCall(t, *g), t.sym == F->self || returnsNum(t.sym) ? NUM : LV{};
     if (g->kind == 'c' && at('(') && !cur.nl) return next(), construct(*g), LV{};
+    if (g->kind == 'e') return perform(t), LV{};
     return {LV_GLOBAL, g->slot, 0, g->kind != 'v'};
   }
   LV postfix() {
@@ -479,6 +563,7 @@ struct Compiler : Gen {
         {
           bool n = at('}') || at(T_EOF) || cur.nl ? (imm(0, NIL), false) : expr();
           for (int i = 0; i < F->atomics; i++) callNative("atomic@end", true);  // passes x0 through
+          for (int i = 0; i < F->handles; i++) callNative("handle@end", true);
           leaveTries(0);                          // leaving every try
           F->retNum &= n || F->retTy == TY_NUM;  // the epilogue checks the result type
           return ret(), false;
@@ -487,12 +572,14 @@ struct Compiler : Gen {
           next();
           if (!F->loop) failAt(prev.p, prev.line, "'%s' outside a loop", name(prev.sym));
           for (int i = F->atomics; i > F->loop->atomics; i--) callNative("atomic@end", true);
+          for (int i = F->handles; i > F->loop->handles; i--) callNative("handle@end", true);
           leaveTries(F->loop->tries), jump(*F->loop, prev.sym == K_break), F->live = false;
           return false;
         case K_class: case K_import: fail("'%s' is only allowed at top level", name(cur.sym));
         case K_fn: if (!peekIs('(')) fail("named functions are only allowed at top level; use 'var f = fn(...) {...}'"); break;
         case S_expect: if (isExpect()) return expectStmt(), false; break;
         case S_atomic: if (peekIs('{') && !peek().nl) return next(), atomicStmt(), false; break;
+        case S_handle: if (peekIs('{') && !peek().nl) return next(), handleStmt(), false; break;
       }
     LV v = unary();
     int t = cur.t;
@@ -701,6 +788,9 @@ struct Compiler : Gen {
     if (cls < 0 && !f.lambda && !f.test) f.stub = stub;
     std::vector<int> homes;
     std::vector<std::pair<int, Ty>> ptys;  // each declared parameter's symbol and type
+    bool edecl = false;                    // declared effects, their bits and their text (`! io, clock`)
+    uint64_t emask = 0;
+    std::string etext;
     if (cls >= 0) homes.push_back(f.selfHome = home()), f.locals.push_back({K_self, f.selfHome});
     if (f.lambda) homes.push_back(f.cloHome = home());  // the closure itself, for captured variables
     int first = (int)homes.size();  // the first declared parameter
@@ -721,11 +811,18 @@ struct Compiler : Gen {
         if (init) failAt(c.p, c.line, "init can't declare a result type: it returns the new instance");
         f.retTy = r.code, f.retSite = typeSite("the result of " + display(nm), r.text);
       }
+      if (at('!')) {  // declared effects: ! io, clock (an empty set: performs nothing)
+        next(), edecl = true, etext = "!";
+        if (!at('{'))
+          do etext += etext.size() > 1 ? ", " : " ", emask |= effectName(etext);
+          while (accept(','));
+      }
       if (!f.lambda && !tiering) {  // for the override check: "(num, _): str" (_: untyped)
         Sig& g = sigs[nm];
         g.types.clear(), g.text = "(";
         for (auto& [s, ty] : ptys) g.types.push_back(ty.code), g.text += (g.text.size() > 1 ? ", " : "") + (ty.code ? ty.text : "_");
         g.types.push_back(r.code), g.text += ")" + (r.code ? ": " + r.text : "");
+        g.eff = edecl, g.effMask = emask, g.effText = etext;
       }
     }
     int arity = (int)homes.size();
@@ -740,6 +837,7 @@ struct Compiler : Gen {
       ldl(0, h), checkType(ty, "argument '" + symName(s) + "' of " + display(nm));
       if (ty.code == TY_NUM) prove(h);
     }
+    if (edecl) effectsIn(emask, effSite(display(nm), emask, etext));
     Tier* tier = nullptr;
     if (!f.lambda && !f.test && !tiering) hotCounter(tier = &tiers[nm], first, homes);
     block();
@@ -855,6 +953,47 @@ struct Compiler : Gen {
     if (sig.size() > 7) failAt(t.p, t.line, "extern functions take at most 7 parameters");
     externs.push_back({qualify(s), fn, sig, accept(':') ? type(true) : 'v'});
   }
+  // effect Name { fn op(params) [: type] ... }: operations with no body. Code performs one as Name.op(args); the
+  // nearest handler for it answers (handle { } with Name.op(params) { }).
+  void effectDecl() {
+    Tok nt = cur;
+    int raw = ident(), s = qualify(raw);
+    for (const char* b : {"io", "clock", "random", "yield"})
+      if (symName(raw) == b) failAt(nt.p, nt.line, "'%s' is a builtin effect", b);
+    if (!effBit(s)) failAt(nt.p, nt.line, "too many effects (a program can declare at most %d)", EFF_LEVEL - 4);
+    expect('{');
+    EffectDef d{s, {}};
+    std::vector<int> seen;
+    while (!accept('}')) {
+      if (atKw(S_pub)) fail("an effect's operations are public when the effect is: put 'pub' before 'effect'");
+      if (!atKw(K_fn)) fail("expected 'fn' (an operation: fn name(params)) in an effect");
+      next();
+      Tok ot = cur;
+      int o = ident();
+      if (std::find(seen.begin(), seen.end(), o) != seen.end()) failAt(ot.p, ot.line, "duplicate operation '%s'", name(o));
+      seen.push_back(o);
+      std::string q = symName(s) + "." + symName(o);
+      EffOpDef od{effOpId(q), 0, {}, 0, {}, -1};
+      expect('(');
+      if (!accept(')')) {
+        do {
+          int p = ident();
+          Ty ty = accept(':') ? type() : Ty{};
+          od.ptypes.push_back(ty.code), od.psites.push_back(ty.code ? typeSite("argument '" + symName(p) + "' of " + q + "()", ty.text) : -1);
+          od.arity++;
+        } while (accept(','));
+        expect(')');
+      }
+      if (od.arity > 7) failAt(ot.p, ot.line, "an operation takes at most 7 parameters");
+      if (accept(':')) {
+        Ty r = type();
+        od.rtype = r.code, od.rsite = typeSite("the result of " + q + "()", r.text);
+      }
+      if (at('{')) fail("an effect's operations have no body: a handler gives one (handle { } with %s(...) { })", q.c_str());
+      d.ops.push_back(std::move(od));
+    }
+    effDefs.push_back(std::move(d));
+  }
   void skipBlock() {  // a balanced { ... }, unparsed
     expect('{');
     for (int d = 1; d; next()) {
@@ -926,7 +1065,7 @@ struct Compiler : Gen {
     struct Open { std::string q; const char* start; int line, depth; };
     std::vector<Open> open;
     Lexer L{src};
-    int depth = 0, cls = -1;
+    int depth = 0, cls = -1, eff = -1;  // eff: inside `effect Name { }` (its operations have no bodies)
     bool ext = false;  // after `extern` (a C function: no body)
     // The parameters after a declaration's name: how many (a name after `(` or `,`; one after `:` is a type), and
     // whether its result is declared `: num` (and nothing else: `: num?` may be nil).
@@ -947,16 +1086,24 @@ struct Compiler : Gen {
       if (t.t == T_ID && t.sym == S_pub && !depth) {
         Lexer s = L;
         Tok n = lex(s);
-        pubNext = n.t == T_ID && !n.nl && (n.sym == K_fn || n.sym == K_class || n.sym == K_var || n.sym == K_extern);
+        pubNext = n.t == T_ID && !n.nl && (n.sym == K_fn || n.sym == K_class || n.sym == K_var || n.sym == K_extern || n.sym == S_effect);
       } else if (t.t == T_ID && t.sym == K_extern && !depth) ext = true;
       else if (ext && afterKw && p.sym == K_fn) declare(q(t), 'x', params()), ext = false; else if (t.t == '{') depth++;
       else if (t.t == '}') {
-        if (--depth == 0) cls = -1;
+        if (--depth == 0) cls = -1, eff = -1;
         if (!open.empty() && depth == open.back().depth) {
           Span& sp = spans[open.back().q];
           sp.start = open.back().start, sp.end = L.p, sp.line = open.back().line, sp.endLine = L.line;
           open.pop_back();
         }
+      } else if (afterKw && p.sym == K_fn && depth == 1 && eff >= 0) {  // an effect's operation
+        int n = params();
+        effOps[eff].push_back({t.sym, n});
+        envHash = (envHash ^ (uint64_t(eff) << 40 | uint64_t(t.sym) << 8 | uint64_t(n))) * 1099511628211ull;
+      } else if (depth == 0 && afterKw && p.sym == S_effect && !t.nl && [&] { Lexer s = L; return lex(s).t == '{'; }()) {
+        Tok d = q(t);
+        declare(d, 'e', 0);
+        effOps[eff = d.sym].clear();
       } else if (afterKw && p.sym == K_fn && (depth == 0 || (depth == 1 && cls >= 0))) {
         Tok d = depth ? t : q(t);
         std::string qn = depth ? symName(cls) + "." + symName(t.sym) : symName(d.sym);
@@ -1002,7 +1149,7 @@ struct Compiler : Gen {
   bool atPub() {  // `pub` before a top-level declaration (the prescan noted it); elsewhere `pub` is an ordinary name
     if (!atKw(S_pub)) return false;
     Tok n = peek();
-    return n.t == T_ID && !n.nl && (n.sym == K_fn || n.sym == K_class || n.sym == K_var || n.sym == K_extern);
+    return n.t == T_ID && !n.nl && (n.sym == K_fn || n.sym == K_class || n.sym == K_var || n.sym == K_extern || n.sym == S_effect);
   }
   void topLevel() {
     while (!at(T_EOF)) {
@@ -1010,6 +1157,7 @@ struct Compiler : Gen {
       if (atKw(K_fn)) { next(), fnDecl(); continue; }
       if (atKw(K_class)) { next(), classDecl(); continue; }
       if (atKw(K_extern)) { next(), externDecl(); continue; }
+      if (atKw(S_effect) && peek().t == T_ID && !peek().nl && peek().sym >= NKW) { next(), effectDecl(); continue; }
       if (atKw(S_test) && peekIs(T_STR)) { next(), testDecl(); continue; }
       if (atKw(K_import)) {
         next();
@@ -1096,6 +1244,10 @@ struct Compiler : Gen {
         auto a = sigs.find(symName(owner) + "." + m), b = sigs.find(q);
         if (a != sigs.end() && b != sigs.end() && a->second.types != b->second.types)
           failHere(w.at, "'%s' must declare the same types as %s, which it overrides: %s, not %s", m, symName(owner) + "." + m, a->second.text, b->second.text);
+        // ...and may perform only what the method it replaces declares (a subset: doing less breaks no caller).
+        if (a != sigs.end() && b != sigs.end() && a->second.eff && (!b->second.eff || (b->second.effMask & ~a->second.effMask)))
+          failHere(w.at, "'%s' must declare effects within those of %s, which it overrides (%s), not %s", m, symName(owner) + "." + m,
+                   a->second.effText, b->second.eff ? b->second.effText : "none (unchecked)");
       }
     // Fields: in a class that declares its fields (or inherits declared ones), self.name must be one of them.
     for (auto& u : fieldUses) {
@@ -1184,8 +1336,10 @@ struct Compiler : Gen {
     }
     for (auto& e : externs) {
       Fn* f = globalObj<Fn>(e.sym);
-      f->code = ffiThunk(e.fn, e.sig, e.ret, e.sym), f->arity = (int)e.sig.size();
+      f->code = ffiThunk(e.fn, e.sig, e.ret, e.sym), f->arity = (int)e.sig.size(), f->op = OP_EXTERN;  // performs io
     }
+    for (auto& d : effDefs) effDefine(d.sym, symName(d.sym), d.ops);
+    for (auto& [s, l] : effOps) effectOps[s] = l;
     for (auto& cd : classes) globalObj<Class>(cd.sym);  // all exist before any superclass link is made
     for (auto& cd : classes) {
       Class* c = globalObj<Class>(cd.sym);

@@ -1,0 +1,10 @@
+// The public interface of audit.fut, written by `fut api`. `fut test` fails while it is out of date.
+
+// One line of an audit trail. Whoever runs the code decides where it goes.
+pub effect Audit {
+  fn count(): num
+  fn record(line: str)
+}
+
+// Records a deposit; the caller handles Audit.
+pub fn deposit(n: num): num ! Audit

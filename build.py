@@ -186,7 +186,23 @@ def hot_result_type(exe):
     return ok, f"stdout: {out!r}\n  stderr: {err!r}"
 
 
+def hot_effects(exe):
+    """Changing a function's declared effects takes effect at the next call, like a changed result type: a call that
+    its old declaration forbade succeeds once the new one allows it."""
+    prog = ("fn stamp(){sig} {{ return \"t\" + str(clock() > 0) }}\n"
+            "fn main() {{ var last = \"\"\n"
+            "  while true {{ var v = \"\"\n"
+            "    try {{ v = stamp() }} catch e {{ v = \"denied\" }}\n"
+            "    if v != last {{ print(v) last = v }}\n"
+            "    if v == \"ttrue\" {{ return }}\n"
+            "    sleep(0.01) }} }}\n")
+    out, err = live(exe, {"e.fut": prog.format(sig=" ! io")}, [("e.fut", prog.format(sig=" ! io, clock"))])
+    ok = out.split() == ["denied", "ttrue"]
+    return ok, f"stdout: {out!r}\n  stderr: {err!r}"
+
+
 HOT_TESTS = [("methods, errors, main restart", hot_methods_and_main),
+             ("a changed effect declaration takes effect", hot_effects),
              ("a changed result type recompiles callers", hot_result_type),
              ("a failed reload rolls back", hot_reload_rollback),
              ("imports, no-op, hook, stale arity", hot_imports_stale_hook),
@@ -264,6 +280,11 @@ def runner_api(exe):
     (d / "main.fut").write_text('import "lib.fut"\ntest "sq" { expect sq(3) == 9 }\n')
     t = run("test", main)
     ok = ok and t.returncode == 1 and "  - fn sq(x)\n  + fn sq(x: num): num\n" in t.stdout
+    run("api", main)  # so are effects: adding io to a pub function changes its interface
+    (d / "lib.fut").write_text(lib.replace("pub fn sq(x)", "pub fn sq(x: num): num ! io"))
+    fx = run("test", main)
+    ok = ok and fx.returncode == 1 and "  - fn sq(x: num): num\n  + fn sq(x: num): num ! io\n" in fx.stdout
+    t = fx
     return ok, f"missing: {a.stdout!r}\n  api: {w.stdout!r} -> {api!r}\n  after: {b.stdout!r}\n  private edit: {c.stdout!r}\n  changed: {e.stdout!r}\n  json: {j.stdout!r}\n  check: {k.stdout!r}\n  typed: {t.stdout!r}"
 
 

@@ -46,7 +46,7 @@ struct Str : Obj {
   std::string_view sv() { return {s(), len}; }
 };
 struct List : Obj { static constexpr K KIND = K::List; std::vector<V> v; };
-struct Fn : Obj { static constexpr K KIND = K::Fn; void* code; int arity, name; };
+struct Fn : Obj { static constexpr K KIND = K::Fn; void* code; int arity, name, op = 0; };  // op: an effect operation (effects.cpp)
 inline u32 classCount;
 struct Class : Obj {
   static constexpr K KIND = K::Class;
@@ -101,6 +101,9 @@ struct Fiber : Obj {
   jmp_buf* err;  // its error handler, while switched out
   void* handler; // its innermost try, while switched out
   Fiber* resumer;
+  uint64_t allowed;  // its effect state while switched out (effects.cpp): what it may perform, who narrowed it,
+  V hstack;          // and its innermost handler
+  u32 who;
   int state, fail, idx;  // fail: an error ended it (its resumer re-raises it); idx: in the live-fiber list
 };
 enum { FIB_NEW, FIB_SUSPENDED, FIB_RUNNING, FIB_DONE };
@@ -145,7 +148,7 @@ extern uintptr_t* stackTop;
   X(true) X(false) X(nil) X(self) X(super) X(import) X(extern) X(yield) X(try) X(catch) X(throw)
 #define SYM_ENUM(k) K_##k,
 #define SYM_STR(k) #k,
-#define EXTRA_SYMS(X) X(init) X(main) X(push) X(pop) X(len) X(has) X(remove) X(keys) X(values) X(reload) X(resume) X(send) X(done) X(as) X(test) X(expect) X(throws) X(prints) X(pub) X(override) X(atomic)
+#define EXTRA_SYMS(X) X(init) X(main) X(push) X(pop) X(len) X(has) X(remove) X(keys) X(values) X(reload) X(resume) X(send) X(done) X(as) X(test) X(expect) X(throws) X(prints) X(pub) X(override) X(atomic) X(effect) X(handle) X(with)
 #define SYM_S(k) S_##k,
 enum { KEYWORDS(SYM_ENUM) NKW, S_FIRST = NKW - 1, EXTRA_SYMS(SYM_S) };
 int intern(std::string_view);
@@ -153,7 +156,7 @@ const std::string& symName(int);
 
 // ---- the VM block pinned in x28; JIT code reaches helpers and globals with one ldr ----
 enum Helper { H_POLL, H_STACK, H_BINOP, H_GETF, H_SETF, H_GETI, H_SETI, H_PREP, H_LIST, H_ITER, H_NUMCHK, H_UNDEF,
-              H_MAP, H_CLOSURE, H_STALE, H_ECHO, H_FFI, H_YIELD, H_HOT, H_THROW, H_CAPSET, H_TXUNWIND, H_TYPECHK, NH };
+              H_MAP, H_CLOSURE, H_STALE, H_ECHO, H_FFI, H_YIELD, H_HOT, H_THROW, H_CAPSET, H_TXUNWIND, H_TYPECHK, H_EFFECT, NH };
 enum Op { O_ADD, O_SUB, O_MUL, O_DIV, O_MOD, O_EQ, O_NE, O_LT, O_LE, O_GT, O_GE, O_BAND, O_BOR, O_BXOR, O_SHL, O_SHR };
 constexpr int MAXG = 1 << 16;
 // Per-site inline cache. key: the receiver's header word (methods compare only its class id); val: slot or code.
@@ -164,15 +167,18 @@ constexpr int MAXIC = 1 << 19;
 struct Run { uintptr_t cur, end; };
 // handler: the innermost active `try` (a record in its JIT frame: prev, sp, fp, x26, handler pc, txn at entry).
 // txn: how many transactions are open (see txn.cpp); JIT code reads it (arm64: at +4).
+// allowed, who, hstack: the effects code may perform now, the declaration that narrowed them, the innermost
+// handler (effects.cpp). Functions that declare effects read and write the first two; try records save all three.
 #ifdef __wasm__  // limit, then poll: one i64 load at &limit tests both on a function's entry (gen_wasm.h)
-struct VM { void* limit; u32 poll; void* handler; u32 txn; void* helpers[NH]; Run runs[NCLS + 1]; V globals[MAXG]; IC ics[MAXIC]; };
+struct VM { void* limit; u32 poll; void* handler; u32 txn; void* helpers[NH]; Run runs[NCLS + 1]; uint64_t allowed; V hstack; u32 who, pad; V globals[MAXG]; IC ics[MAXIC]; };
 #else
-struct VM { u32 poll, txn; void* limit; void* handler; void* helpers[NH]; Run runs[NCLS + 1]; V globals[MAXG]; IC ics[MAXIC]; };
+struct VM { u32 poll, txn; void* limit; void* handler; void* helpers[NH]; Run runs[NCLS + 1]; uint64_t allowed; V hstack; u32 who, pad; V globals[MAXG]; IC ics[MAXIC]; };
 #endif
 extern VM vm;
 constexpr int HOFF(int h) { return 24 + 8 * h; }
 constexpr int ROFF(int c) { return 24 + 8 * NH + 16 * c; }
-constexpr int GOFF(int g) { return ROFF(NCLS + 1) + 8 * g; }
+constexpr int EOFF = ROFF(NCLS + 1);  // vm.allowed; vm.hstack at +8, vm.who at +16
+constexpr int GOFF(int g) { return EOFF + 24 + 8 * g; }
 constexpr u32 VM_HANDLER = 16;
 constexpr u32 IOFF(int i) { return (GOFF(MAXG) + 15) / 16 * 16 + 16 * i; }
 int newIC(bool set = false);  // set: a field store's, which must miss while a transaction is open
@@ -294,6 +300,7 @@ void txnUnwind(u32 depth);      // roll back until depth are open
 void txnTouch(Obj*);            // o is about to change: save it, unless the innermost transaction has already
 inline void touch(Obj* o) { if (vm.txn) txnTouch(o); }
 bool txnOpenIn(Fiber*);         // does f have a transaction open? (it may not yield)
+bool txnAtomic();               // is an atomic block open? (io can't be undone there)
 void txnMark(void (*mark)(V));  // GC roots: what rollbacks would put back
 extern bool txnPollLater;       // a reload or typed line waits for the transactions to end
 int globalCount();              // global slots in use
@@ -306,6 +313,33 @@ bool typeAccepts(uint64_t type, V v);
 int typeSite(const std::string& what, const std::string& type);  // what a check names when it fails: its number
 [[noreturn]] void typeFail(int site, V v, void* ra);
 void typesInit();
+
+// ---- effects (effects.cpp): declared effect sets (`fn f() ! io, clock`), checked at run time, and handlers ----
+// vm.allowed holds the effects code may perform now in its low 44 bits (all set: unchecked) and, above them, a
+// level that each narrowing (a declared function, an atomic block) raises by one. vm.who names the narrowing.
+constexpr int EFF_LEVEL = 44;
+constexpr uint64_t EFF_IO = 1, EFF_CLOCK = 2, EFF_RANDOM = 4, EFF_YIELD = 8, EFF_BITS = (1ull << EFF_LEVEL) - 1;
+constexpr u32 WHO_ATOMIC = ~0u;  // vm.who inside an atomic block (it takes io away)
+enum { OP_YIELD = 1, OP_EXTERN = 2 };  // operations with fixed ids; builtins and user effects' get theirs at startup / compile time
+int effSite(const std::string& fn, uint64_t mask, const std::string& text);  // a declaring function: what errors name
+uint64_t effBit(int sym);                     // a user effect's bit (0: too many effects)
+int effOpId(const std::string& qualified);    // "Log.log" -> its operation id, kept for good
+Fn* effOpFn(int op);                          // the Fn a perform calls (rt_prep resolves it, see effPrep)
+struct EffOpDef { int op, arity; std::vector<uint64_t> ptypes; uint64_t rtype; std::vector<int> psites; int rsite; };
+void effDefine(int sym, const std::string& name, const std::vector<EffOpDef>& ops);  // at commit: an `effect` and its operations
+int effOpArity(int op);                       // -1: not an operation
+uint64_t effOpEffect(int op);
+const std::string& effOpName(int op);
+int effBuiltinOp(int sym);                    // print, clock, ...: the builtin's operation id, else 0
+void* effPrep(Fn* f, V* w, uint64_t n);       // rt_prep, calling an operation: a handler, the builtin, or an error
+V effYield(V v, bool* handled);               // `yield`: a handler's answer (handled), else checks it may yield
+struct EffState { uint64_t allowed; V hstack; u32 who; };
+EffState effSave();
+void effLoad(const EffState&);
+u32 effEnter();             // a driver runs code (top level, main, REPL line, reload): unchecked, no handlers
+void effLeave(u32 depth);   // and back
+void effMark(void (*mark)(V));
+void effectsInit();
 
 // ---- public interfaces (api.cpp): each file's `pub` declarations, kept in a .api file next to it ----
 struct ApiIssue {
@@ -365,6 +399,10 @@ constexpr u32 cmpwi(u32 n, u32 imm) { return 0x7100001f | imm << 10 | n << 5; }
 constexpr u32 cmpsp(u32 m) { return 0xeb2063ff | m << 16; }
 constexpr u32 andnot1(u32 d, u32 n) { return 0x927ff800 | n << 5 | d; }  // and d, n, #~1
 constexpr u32 andaddr(u32 d, u32 n) { return 0x9240bc00 | n << 5 | d; } // and d, n, #0xffffffffffff
+constexpr u32 strw(u32 t, u32 n, u32 off) { return 0xb9000000 | (off / 4) << 10 | n << 5 | t; }
+constexpr u32 bicsz(u32 n, u32 m) { return 0xea20001f | m << 16 | n << 5; }                      // bics xzr, n, m (n & ~m)
+constexpr u32 lsri(u32 d, u32 n, u32 sh) { return 0xd340fc00 | sh << 16 | n << 5 | d; }          // lsr d, n, #sh
+constexpr u32 orrlsl(u32 d, u32 n, u32 m, u32 sh) { return 0xaa000000 | m << 16 | sh << 10 | n << 5 | d; }  // orr d, n, m, lsl #sh
 constexpr u32 mvn(u32 d, u32 m) { return 0xaa2003e0 | m << 16 | d; }
 constexpr u32 tstq(u32 n) { return 0xf24e301f | n << 5; }    // tst n, #QNAN
 constexpr u32 tstptr(u32 n) { return 0xf24e341f | n << 5; }  // tst n, #PTR
