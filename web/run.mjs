@@ -36,6 +36,7 @@ const fut = await createFut({
   wasm: readFileSync(new URL("../build/fut.wasm", import.meta.url)),
   std: process.env.FUT_STD || fileURLToPath(new URL("../std", import.meta.url)),
   verbose,
+  interp: !!process.env.FUT_INTERP,  // FUT_INTERP=1: interpret the compiled code (as a static Cloudflare Worker would)
   read(p) { try { return readFileSync(p); } catch { return null; } },
   save(p, text) { try { return text == null ? rmSync(p) : writeFileSync(p, text), true; } catch { return false; } },
   write: writeAll,

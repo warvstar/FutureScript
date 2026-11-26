@@ -38,6 +38,15 @@ static void* getsp() { void* p; asm volatile("global.get __stack_pointer\n\tloca
 static void setsp(void* p) { asm volatile("local.get %0\n\tglobal.set __stack_pointer" : : "r"(p)); }
 extern char __stack_low, __stack_high;
 
+// The interpreter (interp.cpp), for a host that can't compile code: it runs each batch's bodies instead.
+extern bool interpMode;
+void interpInit();
+void interpSetTryCall(u32 slot);
+void interpAdd(const std::vector<u32>& slots, std::vector<std::vector<uint8_t>>& bodies, std::vector<int32_t>& ops);
+void interpRetire(u32 slot);
+extern void* interpTop;
+std::string interpTrace_(const char* (*where)(int slot, int off));
+
 // ---------------- code: modules, table slots, line tables ----------------
 JitBatch::JitBatch() {}
 JitBatch::~JitBatch() {}
@@ -133,6 +142,7 @@ void jitCollect() {  // install the batch as one module, then make the queued ta
   using namespace wa;
   for (u32 s : retired) {
     ops.push_back((int32_t)s), ops.push_back(-1), freeSlots.push_back(s);
+    if (interpMode) interpRetire(s);
     if (auto it = lineTabs.find(s); it != lineTabs.end()) mods[it->second.mod].refs--, lineTabs.erase(it);
   }
   retired.clear();
@@ -144,6 +154,7 @@ void jitCollect() {  // install the batch as one module, then make the queued ta
   std::vector<uint8_t*> fresh;       // the batch's cells (they go live after the queued changes)
   for (size_t i = 0; i < batch.size(); i++) fresh.push_back(newCell());
   std::vector<uint8_t> m{0, 'a', 's', 'm', 1, 0, 0, 0}, s;
+  std::vector<std::vector<uint8_t>> interpBodies;  // interpMode: each body (locals, then code)
   if (!batch.empty()) {
     wa::uleb(s, 2 + NH), funcType(s, FUT_SIG);
     for (int h = 0; h < NH; h++) funcType(s, HSIG[h]);
@@ -199,15 +210,17 @@ void jitCollect() {  // install the batch as one module, then make the queued ta
       wa::uleb(code, locals.size() + f.k.c.size());
       code.insert(code.end(), locals.begin(), locals.end());
       LineTab& t = lineTabs[f.slot] = {std::move(f.k.name), std::move(f.k.file), {}, mod};
-      for (auto [at, line] : f.k.lines) t.lines.push_back({int(code.size() + at), line});  // + where `code` lands, below
+      for (auto [at, line] : f.k.lines) t.lines.push_back({int((interpMode ? locals.size() : code.size()) + at), line});  // + where `code` lands, below
+                                                                                                    // (interpMode: offsets in the body)
       code.insert(code.end(), f.k.c.begin(), f.k.c.end());
+      if (interpMode) interpBodies.push_back(locals), interpBodies.back().insert(interpBodies.back().end(), f.k.c.begin(), f.k.c.end());
     }
     if (hinted) {
       name(hints, "metadata.code.branch_hint"), wa::uleb(hints, hinted), hints.insert(hints.end(), hs.begin(), hs.end());
       section(m, 0, hints);
     }
     size_t base = m.size() + 1 + 5;  // section id + a 5-byte size (padded below) = where `code` starts
-    for (auto& f : batch) for (auto& l : lineTabs[f.slot].lines) l.first += (int)base;
+    if (!interpMode) for (auto& f : batch) for (auto& l : lineTabs[f.slot].lines) l.first += (int)base;
     m.push_back(10);
     for (int i = 0; i < 5; i++) m.push_back(uint8_t((code.size() >> (7 * i) & 0x7f) | (i < 4 ? 0x80 : 0)));
     m.insert(m.end(), code.begin(), code.end());
@@ -219,7 +232,12 @@ void jitCollect() {  // install the batch as one module, then make the queued ta
     mods.push_back({m.size(), (int)batch.size()});
     batch.clear();
   }
-  if (m.size() > 8 || !ops.empty()) host_install(m.size() > 8 ? m.data() : nullptr, (u32)m.size(), ops.data(), (u32)ops.size() / 2);
+  if (interpBodies.size()) {  // no module: the bodies' slots get trampolines into the interpreter, before the queued changes
+    std::vector<int32_t> all;
+    interpAdd(bodies, interpBodies, all);
+    all.insert(all.end(), ops.begin(), ops.end());
+    host_install(nullptr, 0, all.data(), (u32)all.size() / 2);
+  } else if (m.size() > 8 || !ops.empty()) host_install(m.size() > 8 ? m.data() : nullptr, (u32)m.size(), ops.data(), (u32)ops.size() / 2);
   for (size_t i = 0; i < fresh.size(); i++) cells[bodies[i]] = fresh[i];
   for (size_t i = 0; i < ops.size(); i += 2) {
     u32 dst = ops[i];
@@ -312,7 +330,9 @@ bool guardCompile(void (*f)(void*), void* ctx, std::string* err) {  // a compile
 // ---------------- fibers: the host switches wasm stacks; we switch the shadow stack, limit and GC roots ----------------
 constexpr size_t FIBER_STACK = 256 << 10;
 static char* mainLimit;
+static std::map<Fiber*, void*> interpTops;  // interpMode: each switched-out context's innermost interpreted frame
 void fiberFree(Fiber* f) {
+  if (interpMode) interpTops.erase(f);
   if (f->stack) free(f->stack), f->stack = nullptr, host_fiber_gone(f);
 }
 void fiberStack(Fiber* b) {
@@ -320,9 +340,13 @@ void fiberStack(Fiber* b) {
   if (!b->stack) ERR("@memory out of memory for fiber stacks");
   b->limit = b->stack + (16 << 10), b->top = (uintptr_t*)(b->stack + FIBER_STACK), b->sp = b->top;
 }
-static void use(Fiber* f) { fiberCur = f, stackTop = f ? f->top : fiberMainTop, vm->limit = f ? f->limit : mainLimit; }
+static void use(Fiber* f) {
+  fiberCur = f, stackTop = f ? f->top : fiberMainTop, vm->limit = f ? f->limit : mainLimit;
+  if (interpMode) { auto it = interpTops.find(f); interpTop = it == interpTops.end() ? nullptr : it->second; }
+}
 static void enter(Fiber* f) { use(f), setsp(f ? f->sp : fiberMainSp); }  // f (null: main) runs again, on its shadow stack
 static void leave() {  // save the running context's shadow stack
+  if (interpMode) interpTops[fiberCur] = interpTop;
   if (Fiber* f = fiberCur) f->sp = getsp();
   else fiberMainSp = getsp(), fiberMainTop = stackTop, mainLimit = (char*)vm->limit;
 }
@@ -406,7 +430,15 @@ static std::string text;  // what the last string-returning export returned
 static Compiled last;
 EXPORT(fut_std) void futStd(const char* dir) { stdRoot = canonicalPath(dir); }  // the host says where std/ is
 // flags: 1 verbose, 2 no tier 2 (nothing compiles after a program loads: a Cloudflare Worker can't compile code)
-EXPORT(fut_init) void futInit(int flags) { verbose = flags & 1, noTier = flags & 2, rtInit(), jitCollect(), refRelease = host_ref_gone; }  // installs the natives' adapters
+// 4 interpret the compiled code (interp.cpp) instead of installing it: a host that can't compile at all)
+EXPORT(fut_init) void futInit(int flags) {  // installs the natives' adapters
+  verbose = flags & 1, noTier = flags & 6, interpMode = flags & 4;
+  if (interpMode) interpInit();
+  rtInit(), jitCollect(), refRelease = host_ref_gone;
+}
+extern bool interpTrace;
+EXPORT(fut_interp_debug) void futInterpDebug(int on) { interpTrace = on; }
+EXPORT(fut_set_trycall) void futSetTryCall(u32 slot) { interpSetTryCall(slot); }  // the host's try_call (see interp.cpp)
 EXPORT(fut_alloc) char* futAlloc(u32 n) { return (char*)malloc(n); }
 EXPORT(fut_free) void futFree(char* p) { free(p); }
 // Compile a file (text null) or REPL input; returns the chunk's slot, 0 after an error (printed), -1 if input ended early,
@@ -453,6 +485,10 @@ EXPORT(fut_where) const char* futWhere(int slot, int off) {  // "name (file:line
   for (auto [at, l] : it->second.lines) if (at <= off) line = l;
   return (text = it->second.name + " (" + it->second.file + ":" + std::to_string(line) + ")").c_str();
 }
+// interpMode: the interpreted frames' trace (as fut_where gives them) when a fut exception is thrown; reset: the
+// host caught one, so no interpreted frame is active
+EXPORT(fut_interp_trace) const char* futInterpTraceText() { return (text = interpTrace_(futWhere)).c_str(); }
+EXPORT(fut_interp_reset) void futInterpReset() { interpTop = nullptr; }
 EXPORT(fut_live) u32 futLive() { return (u32)jitLive(); }
 // fut test: the host calls the top level, then each test's code, catching errors (see test.cpp for the rest)
 EXPORT(fut_tests_begin) void futTestsBegin(int json, const char* filter) { testsBegin({json != 0, filter}); }

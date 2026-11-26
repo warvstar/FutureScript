@@ -7,6 +7,8 @@
 //   module(bytes): the WebAssembly.Module for a module the compiler emitted (default: compile it; a Cloudflare Worker,
 //     which can't compile code, finds the one compiled ahead of time -- web/worker.mjs)
 //   noTier: bool -- no tier 2, so nothing compiles once the program has loaded
+//   interp: bool -- compile nothing at all: fut.wasm interprets the code it compiles (src/interp.cpp), for one static
+//     Worker that runs any program; tryModule: tryCallBytes() as a WebAssembly.Module (compiled from them if absent)
 //   fetch(url, init): the platform's fetch, for fut's fetch() and fetchAll() (default: globalThis.fetch)
 //           read(path): file bytes or null      write(fd, bytes): stdout (1) / stderr (2)
 //   verbose: bool                     getenv(name): string or undefined   window(w, h): bool, present(rgba, w, h): Promise
@@ -15,6 +17,26 @@
 //   importModule(path, stamp): Promise of a JS module's namespace (stamp: change it to load the file again)
 //   stamp(path): anything that changes when the file does (a modification time), for reloading modules
 //   std: the directory of the standard library's packages (import "std/strings")
+// The interpreter's try_call(cb, ctx): runs the C++ callback cb(ctx) (a try_table's body) and returns its result, or
+// catches a fut exception, stores its payload (i64) at ctx, puts the stack pointer back and returns -1. Static, so a
+// Worker can upload it compiled.
+export function tryCallBytes() {
+  const str = (t) => [t.length, ...new TextEncoder().encode(t)], sec = (id, b) => [id, b.length, ...b];
+  const imp = (name, desc) => [...str("env"), ...str(name), ...desc];
+  const code = [2, 1, 0x7f, 1, 0x7e,                       // locals: the saved sp (i32), the payload (i64)
+    0x23, 0, 0x21, 2,                                        // saved = sp
+    0x02, 0x7e, 0x1f, 0x40, 1, 0, 0, 0,                      // block (result i64) try_table (catch tag 0 -> 0)
+    0x20, 1, 0x20, 0, 0x11, 0, 0, 0x0f,                      //   return cb(ctx)
+    0x0b, 0x00, 0x0b,                                        // end; unreachable; end
+    0x21, 3, 0x20, 1, 0x20, 3, 0x37, 3, 0,                   // *ctx = payload
+    0x20, 2, 0x24, 0, 0x41, 0x7f, 0x0b];                     // sp = saved; -1
+  return new Uint8Array([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
+    ...sec(1, [3, 0x60, 1, 0x7f, 1, 0x7f, 0x60, 2, 0x7f, 0x7f, 1, 0x7f, 0x60, 1, 0x7e, 0]),
+    ...sec(2, [4, ...imp("table", [1, 0x70, 0, 0]), ...imp("memory", [2, 0, 0]), ...imp("sp", [3, 0x7f, 1]), ...imp("tag", [4, 0, 2])]),
+    ...sec(3, [1, 1]),
+    ...sec(7, [1, ...str("try_call"), 0, 0]),
+    ...sec(10, [1, code.length, ...code])]);
+}
 export class Restart extends Error {}  // unwinds to the driver, which reruns main()
 export class Exit extends Error { constructor(code) { super("exit " + code), (this.code = code); } }
 export class FutError extends Error { constructor(text) { super(text.split("\n")[0]), (this.text = text); } }  // from apply()
@@ -173,7 +195,7 @@ export async function createFut(opts) {
       try {
         const sp = spG.value, txn = ex.fut_txn_depth(), eff = ex.fut_eff_enter();
         try { c.res(fromFut(cstr(await withStrAsync(c.json, (p) => applyP(c.id, p))))); }
-        catch (e) { spG.value = sp, ex.fut_txn_unwind(txn); throw e; }
+        catch (e) { spG.value = sp, ex.fut_txn_unwind(txn), opts.interp && ex.fut_interp_reset(); throw e; }
         finally { ex.fut_eff_leave(eff); }
       } catch (e) {
         if (e instanceof Restart || e instanceof Exit) throw e;
@@ -233,8 +255,8 @@ export async function createFut(opts) {
 
   // ---- stack traces: V8 names our frames name@slot and gives the module offset; fut_where maps it to a line ----
   function trace(e) {
-    const fr = [];
-    for (const l of String(e.stack ?? "").split("\n")) {
+    const fr = e?.futTrace != null ? e.futTrace.split(/(?<=\n)/).filter(Boolean) : [];
+    if (e?.futTrace == null) for (const l of String(e.stack ?? "").split("\n")) {
       const m = /@(\d+) \(.*:0x([0-9a-f]+)\)\s*$/.exec(l);
       const d = m && cstr(ex.fut_where(+m[1], parseInt(m[2], 16)));
       if (d) fr.push("  at " + d + "\n");
@@ -262,7 +284,7 @@ export async function createFut(opts) {
   let pollAt = 0;
   async function call(slot) {  // run code; on an error the shadow stack pointer is put back, and transactions opened since roll back
     const sp = spG.value, txn = ex.fut_txn_depth(), eff = ex.fut_eff_enter();  // unchecked, no handlers (effects.cpp)
-    try { return await callP(slot); } catch (e) { spG.value = sp, ex.fut_txn_unwind(txn); throw e; } finally { ex.fut_eff_leave(eff); }
+    try { return await callP(slot); } catch (e) { spG.value = sp, ex.fut_txn_unwind(txn), opts.interp && ex.fut_interp_reset(); throw e; } finally { ex.fut_eff_leave(eff); }
   }
   async function evalRepl(more) {  // compile and run replBuf, unless it is unfinished and `more` may follow
     const s = await compileWith(() => withStr(replBuf, (p) => withStr("<repl>", (n) => ex.fut_compile(n, 0, 1, p))));
@@ -354,7 +376,11 @@ export async function createFut(opts) {
       for (let i = 0; i < o.length; i += 2) table.set(o[i], o[i + 1] < 0 ? null : table.get(o[i + 1]));
     },
     grow: (n, fill) => table.grow(n, table.get(fill)),
-    throw(v) { throw new WebAssembly.Exception(tag, [v], { traceStack: true }); },
+    throw(v) {
+      const e = new WebAssembly.Exception(tag, [v], { traceStack: true });
+      if (opts.interp) e.futTrace = cstr(ex.fut_interp_trace());  // interpreted frames aren't V8's: fut_where them now
+      throw e;
+    },
     restart() { throw new Restart(); },
     read(p) {
       const b = opts.read(cstr(p));
@@ -396,7 +422,11 @@ export async function createFut(opts) {
   Object.assign(env, { memory: mem, table, sp: spG, tag });
   const callP = WebAssembly.promising(ex.fut_call), applyP = WebAssembly.promising(ex.fut_apply);
   fiberStart = WebAssembly.promising(ex.fut_fiber_start);
-  ex._initialize(), ex.fut_init((opts.verbose ? 1 : 0) | (opts.noTier ? 2 : 0)), (pollAt = ex.fut_poll());
+  if (opts.interp) {
+    const tm = opts.tryModule ?? new WebAssembly.Module(tryCallBytes());
+    ex.fut_set_trycall(table.grow(1, new WebAssembly.Instance(tm, { env }).exports.try_call));
+  }
+  ex._initialize(), ex.fut_init((opts.verbose ? 1 : 0) | (opts.noTier ? 2 : 0) | (opts.interp ? 4 : 0)), (pollAt = ex.fut_poll());
   if (opts.std) withStr(opts.std, (p) => ex.fut_std(p));  // where the standard library's packages are
 
   const pinned = new Map();  // name -> id, for apply()
@@ -431,7 +461,7 @@ export async function createFut(opts) {
         const sp = spG.value, txn = ex.fut_txn_depth(), eff = ex.fut_eff_enter();
         try { return fromFut(cstr(await withStrAsync(toFut(args), (p) => applyP(id, p)))); }
         catch (e) {
-          spG.value = sp, ex.fut_txn_unwind(txn);
+          spG.value = sp, ex.fut_txn_unwind(txn), opts.interp && ex.fut_interp_reset();
           throw e instanceof Restart || e instanceof Exit ? e : new FutError(errorText(e));
         } finally { ex.fut_eff_leave(eff); }
       };
