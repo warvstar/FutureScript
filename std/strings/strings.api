@@ -9,6 +9,10 @@ pub fn count(s: str, part: str): num !
 pub fn endsWith(s: str, part: str): bool !
   ensures !result || s.len() >= part.len()
 
+// Is s a whole number: an optional "-" then one or more digits 0-9, and nothing else (no spaces, "+" or ".")?
+pub fn isInt(s: str): bool !
+  ensures !result || (s.len() > 0 && s[s.len() - 1] != "-")
+
 // The lines of s, without their "\n" (or "\r\n"). A final newline doesn't start another line.
 pub fn lines(s: str): list !
 
@@ -25,6 +29,10 @@ pub fn padEnd(s: str, n: num, fill: str): str !
 pub fn padStart(s: str, n: num, fill: str): str !
   requires fill.len() == 1
   ensures result.len() >= s.len()
+
+// The whole number s is ("-12" -> -12), or nil when it isn't one (isInt(s) is false).
+pub fn parseInt(s: str): num? !
+  ensures (result == nil) == !isInt(s)
 
 // s, n times over.
 pub fn repeat(s: str, n: num): str !

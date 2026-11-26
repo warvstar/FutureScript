@@ -243,7 +243,7 @@ reload keeps its value. Not in a parallel for's body. [atomic]
 
 `import "std/<name>"` (no dep line; `as` to rename). Signatures, docs and contracts: `std/<name>/<name>.api`.
 
-- `std/strings`: replace startsWith endsWith count repeat padStart padEnd upper lower lines words reverse
+- `std/strings`: replace startsWith endsWith count repeat padStart padEnd upper lower lines words reverse isInt parseInt (an optional `-` and digits only; parseInt: nil otherwise)
 - `std/lists`: sort sortable sortBy map filter reduce find any all count indexOf contains reverse unique flatten range sum min max
 - `std/math`: pow exp log log2 log10 cbrt hypot sin cos tan asin acos atan atan2 ceil trunc abs min max clamp sign round isNaN pi e
 - `std/reactive`: signal(v) (.get .set .update .peek) effect computed batch untrack onCleanup root — effects rerun when a signal read on their last run changes

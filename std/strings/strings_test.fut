@@ -24,3 +24,9 @@ test "lines, words" {
   expect lines("bar\nfur\r\nok\r") == ["bar", "fur", "ok"]   // only a carriage return goes, not a final r
   expect words("error free\r\n") == ["error", "free"]
 }
+test "isInt, parseInt" {
+  for s in ["0", "7", "42", "-3", "007", "-0", "1234567890"] { expect isInt(s) }
+  for s in ["", "-", "+1", " 1", "1 ", "1.5", "1e3", "--1", "1-", "0x10", "é", "12a", "a12", "1\n"] { expect !isInt(s) }
+  expect parseInt("42") == 42 && parseInt("-17") == -17 && parseInt("007") == 7
+  expect parseInt("") == nil && parseInt("4.2") == nil && parseInt(" 4") == nil && parseInt("+4") == nil
+}

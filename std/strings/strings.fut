@@ -105,6 +105,28 @@ pub fn reverse(s: str): str !
   return parts.join("")
 }
 
+// Is s a whole number: an optional "-" then one or more digits 0-9, and nothing else (no spaces, "+" or ".")?
+pub fn isInt(s: str): bool !
+  ensures !result || (s.len() > 0 && s[s.len() - 1] != "-")
+{
+  var start = 0
+  if s.len() > 0 && s[0] == "-" { start = 1 }
+  if s.len() == start { return false }
+  for i in start..s.len() {
+    var b = s.byte(i)
+    if b < 48 || b > 57 { return false }   // "0".."9"
+  }
+  return true
+}
+
+// The whole number s is ("-12" -> -12), or nil when it isn't one (isInt(s) is false).
+pub fn parseInt(s: str): num? !
+  ensures (result == nil) == !isInt(s)
+{
+  if !isInt(s) { return nil }
+  return parseNum(s)
+}
+
 fn max0(n) { if n > 0 { return int(n) } return 0 }
 fn mapChars(s, table) {
   var parts = []
