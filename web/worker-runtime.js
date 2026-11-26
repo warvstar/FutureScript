@@ -21,13 +21,14 @@ export function moduleKey(b) {  // length and FNV-1a: install() is synchronous, 
 const enc = new TextEncoder(), dec = new TextDecoder();
 
 // The options both sides give createFut: whatever could change the heap before or during a compile must match.
-export function futOptions({ wasm, read, module, write, fetch, run }) {
-  return { wasm, read, module, write, fetch, run, verbose: false, noTier: true };
+export function futOptions({ wasm, read, module, write, fetch, run, interp, tryModule }) {
+  return { wasm, read, module, write, fetch, run, interp, tryModule, verbose: false, noTier: true };
 }
 
 // run(): a child program, in a fresh instance. A Worker has no processes, and can't compile, so the build runs the
 // tests that call run() and compiles each child they start ahead of time, by id: its args, and its file or source.
-// ctx: { wasm, read(path), module(id, path): createFut's module() hook for that child, or null if it has none }.
+// ctx: { wasm, read(path), module(id, path): createFut's module() hook for that child, or null if it has none;
+// interp, tryModule: for the interpreting Worker, which compiles nothing and so needs no module() at all }.
 const sourceKey = (s) => moduleKey(enc.encode(s));
 export const childId = (args, file, source) => JSON.stringify([args, source != null ? "source " + sourceKey(source) : file]);
 export async function runChild(ctx, args, file, source) {
@@ -39,13 +40,13 @@ export async function runChild(ctx, args, file, source) {
     if (args.length && args[0] != "test") throw new Error(`run() with args ${JSON.stringify(args)}: a Worker runs a program, or its tests (args: ["test", ...])`);
     const module = ctx.module(id, path);
     if (!module) throw new Error(`run(${source != null ? "a source" : file}): not compiled ahead of time. The build runs the tests to find the programs they run(); one that changes from run to run can't be known`);
-    const fut = await createFut(futOptions({ wasm: ctx.wasm, read, module, write, run: (a, f, s) => runChild(ctx, a, f, s) }));
+    const fut = await createFut(futOptions({ wasm: ctx.wasm, read, module, write, run: (a, f, s) => runChild(ctx, a, f, s), interp: ctx.interp, tryModule: ctx.tryModule }));
     const fi = args.indexOf("--filter");
     code = args[0] == "test" ? await fut.test(path, args.includes("--json"), fi > 0 ? args[fi + 1] : "") : await fut.run(path, false);
   } catch (e) { err.push(`fut: ${e?.message ?? e}\n`); }
   return { code, out: out.join(""), err: err.join(""), timedOut: false };
 }
-const bundleCtx = (bundle, read) => ({
+const bundleCtx = (bundle, read) => ({  // a bundle compiled ahead of time
   wasm: bundle.wasm, read,
   module: (id, path) => (bundle.children?.[id] ? aheadOfTime(bundle.modules, bundle.children[id].keys, path) : null),
 });
@@ -119,16 +120,7 @@ export function createWorker(bundle) {
     let body = "", status = 0;
     for (const t of picked) {
       const r = await runTestFile(bundle, t, filter);
-      for (const line of r.lines) {
-        let j;
-        try { j = JSON.parse(line); } catch { j = { type: "output", text: line }; }
-        if (j.type == "summary") {
-          for (const k of ["passed", "failed", "errors", "pending"]) total[k] += j[k] ?? 0;
-          j.file = t.main;
-        } else if (j.type == "compile_error" || j.type == "error") total.errors++;  // the file's tests didn't run
-        body += JSON.stringify(j) + "\n";
-      }
-      status = Math.max(status, r.status);
+      body += summarize(r.lines, t.main, total), (status = Math.max(status, r.status));
     }
     total.ms = Date.now() - t0, total.status = status;
     return new Response(body + JSON.stringify(total) + "\n", { headers: { "content-type": "application/x-ndjson" } });
@@ -146,19 +138,64 @@ export function createWorker(bundle) {
 }
 
 // One test file in a fresh instance: its `fut test --json` lines and exit status (2: did not compile).
-export async function runTestFile(bundle, t, filter) {
-  const out = [], read = (p) => (p in bundle.files ? enc.encode(bundle.files[p]) : null);
-  const errs = [], write = (fd, b) => (fd == 1 ? out.push(dec.decode(b)) : errs.push(dec.decode(b)));
+export function runTestFile(bundle, t, filter) {
+  const read = (p) => (p in bundle.files ? enc.encode(bundle.files[p]) : null);
+  return testIn(bundleCtx(bundle, read), aheadOfTime(bundle.modules, t.keys, t.main), t.main, filter);
+}
+async function testIn(ctx, module, main, filter) {
+  const out = [], errs = [], write = (fd, b) => (fd == 1 ? out.push(dec.decode(b)) : errs.push(dec.decode(b)));
+  const t = { main };
   let status;
   try {
-    const ctx = bundleCtx(bundle, read), run = (a, f, s) => runChild(ctx, a, f, s);
-    const fut = await createFut(futOptions({ wasm: bundle.wasm, read, module: aheadOfTime(bundle.modules, t.keys, t.main), write, run }));
+    const run = (a, f, s) => runChild(ctx, a, f, s);
+    const fut = await createFut(futOptions({ wasm: ctx.wasm, read: ctx.read, module, write, run, interp: ctx.interp, tryModule: ctx.tryModule }));
     status = await fut.test(t.main, true, filter || "");
   } catch (e) {
     out.push(JSON.stringify({ type: "error", file: t.main, message: "internal error: " + (e?.message ?? e), trace: "" }) + "\n"), (status = 1);
   }
   if (errs.length) out.push(JSON.stringify({ type: "stderr", file: t.main, text: errs.join("") }) + "\n");
   return { status, lines: out.join("").split("\n").filter(Boolean) };
+}
+
+// The interpreting Worker: one static bundle (fut.wasm and the try_call module, both uploaded) that compiles and runs
+// whatever the request sends, interpreting the code it compiles (src/interp.cpp). POST /run with JSON
+//   { files: { "path": text, ... }, tests: ["path", ...], filter }   -> each test file's `fut test --json` lines, then
+//                                                                      a summary (as /__fut/test)
+//   { files, main: "path", }                                         -> { code, out, err }: the program run
+// Paths are relative (fut sees them below /app).
+export function createInterpWorker({ wasm, tryModule }) {
+  return {
+    async fetch(request) {
+      if (request.method != "POST" || new URL(request.url).pathname != "/run")
+        return new Response("POST /run {files: {path: text}, tests: [path...] | main: path, filter}\n", { status: 404 });
+      const b = await request.json().catch(() => null);
+      if (!b?.files || !(b.tests || b.main)) return new Response("expected {files, tests | main}\n", { status: 400 });
+      const files = Object.fromEntries(Object.entries(b.files).map(([p, t]) => [ROOT + "/" + p.replace(/^\/+/, ""), t]));
+      const ctx = { wasm, tryModule, interp: true, read: (p) => (p in files ? enc.encode(files[p]) : null), module: () => (bytes) => { throw new Error("the interpreter compiled a module"); } };
+      if (b.main) return Response.json(await runChild(ctx, [], ROOT + "/" + b.main, null));
+      const t0 = Date.now(), total = { type: "summary", files: b.tests.length, passed: 0, failed: 0, errors: 0, pending: 0, ms: 0 };
+      let body = "", status = 0;
+      for (const f of b.tests) {
+        const main = ROOT + "/" + f, r = await testIn(ctx, undefined, main, b.filter);
+        body += summarize(r.lines, main, total), (status = Math.max(status, r.status));
+      }
+      total.ms = Date.now() - t0, total.status = status;
+      return new Response(body + JSON.stringify(total) + "\n", { headers: { "content-type": "application/x-ndjson" } });
+    },
+  };
+}
+function summarize(lines, main, total) {  // a file's lines, its summary given "file"; totals counted
+  let body = "";
+  for (const line of lines) {
+    let j;
+    try { j = JSON.parse(line); } catch { j = { type: "output", text: line }; }
+    if (j.type == "summary") {
+      for (const k of ["passed", "failed", "errors", "pending"]) total[k] += j[k] ?? 0;
+      j.file = main;
+    } else if (j.type == "compile_error" || j.type == "error") total.errors++;  // the file's tests didn't run
+    body += JSON.stringify(j) + "\n";
+  }
+  return body;
 }
 
 // serve()'s result -> a Response: a string is text; a map with status, headers or body is the response itself (a body
