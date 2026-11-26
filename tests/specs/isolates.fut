@@ -143,3 +143,17 @@ test "a program that deadlocks, or loses a failure, says so" {
   expect r.err.has("isolate 2, spawned at main (")
   expect r.err.has("failed and nothing joined it: lost")
 }
+test "seeded (fut test, --seed n): the same seed, the same interleaving; other seeds try others" {
+  var a = run({file: "progs/isolates_order.fut", args: ["--seed", "7"]})
+  expect len(a.out) == 13
+  expect run({file: "progs/isolates_order.fut", args: ["--seed", "7"]}).out == a.out
+  var seen = {}
+  for s in 1..4 { seen[run({file: "progs/isolates_order.fut", args: ["--seed", str(s)]}).out] = true }
+  expect len(seen.keys()) > 1
+  var r = run({file: "progs/isolates_seedfail.fut", args: ["test"]})
+  expect r.out.has("its isolates ran under seed 1: --seed 1 replays the same interleaving")
+}
+test "pooled (the default): thousands of isolates, and busy ones take turns on the threads" {
+  expect run({file: "progs/isolates_many.fut"}).out == "8997000\n"
+  expect run({file: "progs/isolates_preempt.fut", args: ["--threads", "2"], timeout: 60}).out == "all done\n"
+}

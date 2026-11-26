@@ -156,7 +156,11 @@ bool nextRun(Heap& h, int c) {  // point runs[c] at the next free run in a page 
 
 // ---- collecting one heap (g): the others go on running ----
 // The marking functions take the heap being collected, rather than read a thread-local for every object.
+ISO_LOCAL(cur);
+ISO_LOCAL(imaging);
+ISO_LOCAL(target);
 TLS Heap* G;  // the same heap, for markV: the callback that the runtime's root walkers (isolateMark, txnMark...) take
+ISO_LOCAL(G);
 Obj* find(Heap& g, uintptr_t p) {  // the allocated object of g starting exactly at p, if any
   uintptr_t b = (uintptr_t)base;
   if (p < b || p >= b + REGION || (p & (GRAN - 1))) return nullptr;
@@ -275,7 +279,7 @@ void collect(Heap& h) {
 bool due(Heap& h) {  // over the limit: collect now (natively), or at the next safepoint (wasm). The image never.
   if (h.image || h.inUse + 1 <= h.limit) return false;
   if (!WASM) return collect(h), true;
-  return h.wanted = true, vm->poll |= 2, false;
+  return h.wanted = true, __atomic_fetch_or(&vm->poll, 2u, __ATOMIC_RELAXED), false;  // (the ticker sets bits too)
 }
 }  // namespace
 
@@ -320,6 +324,7 @@ void gcOwn(Obj* o) { H().owners.push_back(o); }
 // Objects the running isolate allocated so far. Each takes one cell of its size class, so the runs being bumped
 // through (by JIT code too) say how many came from them: counting costs allocation nothing.
 TLS uint64_t gcUncounted;
+ISO_LOCAL(gcUncounted);
 uint64_t gcAllocations() {
   uint64_t n = cur->allocated - gcUncounted;
   for (int c = 0; c < NCLS; c++) n += (cur->runs[c].cur - cur->runStart[c]) / sizeClasses[c];

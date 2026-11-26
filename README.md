@@ -457,7 +457,7 @@ An error inside a fiber ends it and is raised again in its resumer. Each fiber h
 
 ## Isolates and channels
 
-An isolate runs a function in parallel with the rest of the program, on a thread of its own, with a heap of its own. Isolates share no objects, so there are no data races to write: they communicate by sending values over channels, and each value sent is copied.
+An isolate runs a function in parallel with the rest of the program, on a stack and a heap of its own. Isolates share no objects, so there are no data races to write: they communicate by sending values over channels, and each value sent is copied.
 
 ```
 fn crunch(jobs, results) ! chan {
@@ -484,8 +484,10 @@ fn main() {
 - **Atomic blocks.** A `send` inside `atomic { }` happens when the block commits, and never if it rolls back, so no isolate sees a message from a block that didn't happen. `recv`, `join` and `spawn` inside one are errors: waiting would hold the block open, and a started isolate can't be taken back.
 - **Deadlocks are errors.** If every isolate of a program is waiting on the others, none can ever go on. Each raises an error that names every isolate, what it waits in and where, instead of hanging.
 - **Nothing is lost.** When `main()` returns, the program waits for the isolates it started. An isolate that failed with nothing joining it fails the program, with its error. If `main()` fails, the others are stopped. `fut test` does the same at the end of each test.
-- **Speed.** An isolate costs a thread and a VM block (its globals and inline caches); code compiled by one is used by all. `bench/mandelbrot_par.fut` on 8 isolates runs 7.9 times as fast as on one. Spawning copies every global, so keep large data out of globals that workers don't need, or send it.
-- Natively only for now: in wasm, `spawn` raises (channels work within the one isolate). Under `-w`, a reload waits until the isolates `main()` started have ended. Both are later phases of `docs/isolates.md`, as are a scheduler for thousands of isolates and deterministic replay in tests.
+- **Scheduling.** A program's isolates run on a pool of up to `cores()` threads (`--threads n` sets another size); `main()` keeps its own. An isolate that waits lets others run on its thread, and one that computes for 10 ms while another on its thread is ready gives way at its next loop iteration or call. Thousands of isolates are fine. A call that blocks its thread (`sleep`, `exec`, `fetch`) holds up the isolates that share it.
+- **Tests replay.** `fut test` runs each program's isolates on one thread, switching between them at channel operations (and `print`) as a generator seeded with 1 decides. Every run interleaves them the same way, so a test that spawns passes or fails the same every time, and `--changed` can reuse its result. `--seed n` tries another interleaving; a failing test names its seed. `fut --seed n prog.fut` runs a program the same way.
+- **Speed.** An isolate costs a stack (8 MB reserved, touched as used) and a VM block (its globals and inline caches); code compiled by one is used by all. `bench/mandelbrot_par.fut` on 8 isolates runs about 7 times as fast as on one. Spawning copies every global, so keep large data out of globals that workers don't need, or send it.
+- Natively only for now: in wasm, `spawn` raises (channels work within the one isolate). Under `-w`, a reload waits until the isolates `main()` started have ended. Both are later phases of `docs/isolates.md`.
 
 ## C functions
 

@@ -24,6 +24,7 @@ struct Level {
   std::vector<After> after;      // what waits for the outermost commit: sends to channels (isolate.cpp)
 };
 TLS std::vector<Level> levels;  // per isolate
+ISO_LOCAL(levels);
 }  // namespace
 
 static Saved save(Obj* o) {

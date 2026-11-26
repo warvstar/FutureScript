@@ -50,6 +50,7 @@ clock()                  seconds (monotonic)
 sleep(s)                 seconds
 random()                 in [0, 1)
 fiber(fn(x) { ... })     f.resume()  f.send(v)  f.done()
+channel(n)  cores()      see Isolates
 run(path)  run({source, args, timeout})   fut in a child process -> {code, out, err, timedOut}
 todo()                   placeholder body: throws "f() is not implemented yet"
 time()                   seconds since 1970
@@ -109,7 +110,7 @@ expect throws { bad() }
 
 A list or map that passes `list<T>`/`map<K, V>` keeps that type for good: any later store into it, through any reference, throws unless it fits, and later checks of it cost nothing. A union or a failed check doesn't do this; `slice()` makes an unchecked copy. A shape is checked only when the value crosses the boundary, so a map can change after it passes; use a class to keep fields checked.
 
-Effects: `io` (print, run, extern, graphics, files, env, exec, fetch) `clock` (clock, sleep, time) `random` `yield`, declared ones; json is pure. A handler's return is the op's result, no resumption.
+Effects: `io` (print, run, extern, graphics, files, env, exec, fetch) `clock` (clock, sleep, time) `random` `yield` `spawn` `chan` (every channel/task op), declared ones; json is pure. A handler's return is the op's result, no resumption.
 
 ## Errors, atomic, contracts
 
@@ -148,6 +149,18 @@ test "t" {
 var fb = fiber(fn(x) { while true { x += yield x } })   // yield from any call depth
 expect fb.send(1) == 1 && fb.send(2) == 3 && !fb.done()  // send(v): v is yield's value; resume() sends nil
 ```
+
+## Isolates
+
+```
+var t = spawn f(a, b)          // f (name, field or lambda) in a new isolate: own heap, copy of the globals
+t.join() -> f's result         // re-raises f's error; t.done() -> bool
+var c = channel(8)             // capacity required; channel(0): send waits for a receiver
+c.send(v)  c.recv()  c.tryRecv() -> v | nil  c.close()  for v in c { }   // values are copied (sharing, cycles kept)
+```
+No shared objects. All waiting on each other: a deadlock error naming each wait. `send` in `atomic` waits for the
+commit; `recv`/`join`/`spawn` there raise. Unjoined failures fail the program. Pool of `cores()` threads (`--threads n`); `fut test`
+(and `--seed n`) runs them on one thread, interleaved by the seed (default 1): same seed, same run. Native only.
 
 ## Modules, packages
 

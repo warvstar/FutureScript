@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -33,10 +34,11 @@ using RMutex = Mutex;
 #else
 #define TLS thread_local
 #include <pthread.h>
+inline thread_local int locksHeld;  // by this thread (not isolate): an isolate holding one must not be switched out
 struct Mutex {
   pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
-  void lock() { pthread_mutex_lock(&m); }
-  void unlock() { pthread_mutex_unlock(&m); }
+  void lock() { pthread_mutex_lock(&m), locksHeld++; }
+  void unlock() { locksHeld--, pthread_mutex_unlock(&m); }
 };
 struct RMutex : Mutex { RMutex() { m = PTHREAD_RECURSIVE_MUTEX_INITIALIZER; } };  // the holder may lock it again
 #endif
@@ -45,6 +47,38 @@ struct Locked {
   explicit Locked(Mutex& m) : m(m) { m.lock(); }
   ~Locked() { m.unlock(); }
 };
+// ISO_LOCAL(var): a TLS variable that is an isolate's state, not its thread's. Isolates take turns on threads
+// (isolate.cpp): switching one out swaps every such variable with its saved copy, and a new isolate starts with
+// each as it was before main(). TLS that is only the thread's (JIT write mode, locksHeld) isn't registered.
+#if __wasm__
+#define ISO_LOCAL(var)
+#else
+struct IsoLocal {
+  size_t off;
+  void (*init)(void* dst, const void* from);  // construct a copy
+  void (*fini)(void*);
+  void (*swap)(void*);  // swap the running thread's variable with this copy
+  void* def;            // the value before main()
+};
+std::vector<IsoLocal>& isoLocals();
+size_t isoLocalPlace(size_t size, size_t align);
+template <class T> struct IsoLocalOps {
+  static void init(void* d, const void* f) {
+    if constexpr (std::is_trivially_copyable_v<T>) memcpy(d, f, sizeof(T));
+    else new (d) T(*(const T*)f);
+  }
+  static void fini(void* p) { if constexpr (!std::is_trivially_destructible_v<T>) ((T*)p)->~T(); }
+};
+template <class T> int isoLocalAdd(void (*swap)(void*), const T& var) {
+  void* def = aligned_alloc(alignof(T) < 16 ? 16 : alignof(T), (sizeof(T) + 15) & ~size_t(15));
+  IsoLocalOps<T>::init(def, &var);
+  isoLocals().push_back({isoLocalPlace(sizeof(T), alignof(T)), IsoLocalOps<T>::init, IsoLocalOps<T>::fini, swap, def});
+  return 0;
+}
+#define ISO_LOCAL(var)                                                                                             \
+  [[maybe_unused]] static const int isoLocal_##var = isoLocalAdd<std::remove_reference_t<decltype(var)>>(        \
+      +[](void* p) { std::swap(var, *(std::remove_reference_t<decltype(var)>*)p); }, var)
+#endif
 inline std::atomic<int> isolates{1};  // running: with more than one, code no frame of this isolate uses may be another's
 struct Run;
 // Compiling and the code region it writes (JIT memory, line tables, stubs, the compiler's tables): one isolate at a
@@ -270,6 +304,8 @@ struct VM { u32 poll, txn; void* limit; void* handler; Run runs[NCLS + 1]; void*
 inline TLS VM* vm;
 VM* vmNew();
 void threadInit();  // a new isolate's thread: its stack bounds (stackTop, vm->limit)
+void ctxSwap(void** save, void* to);           // save this context's registers and sp in *save, resume `to`
+void* ctxFrame(uintptr_t* top, void (*entry)());  // a context on a fresh stack that starts by calling entry
 void vmFree(VM*);
 void eachVM(void (*f)(VM*, void*), void* ctx);  // every isolate's (under the runtime lock)
 constexpr int ROFF(int c) { return 24 + 16 * c; }  // first, so ldp reaches every run from x28
@@ -386,6 +422,14 @@ std::string isolatesFinish(bool failed);  // the root's program ended: wait for 
                                           // if it failed); what went wrong among them (a deadlock, an unjoined failure)
 void isolatesMark(void (*mark)(V));
 bool isolateStopped();       // this isolate was asked to stop (rt_poll raises)
+void isolateYield();         // rt_poll: its turn on a pool thread is up (vm->poll bit 8), so others may run
+void isolatePoint();         // a seeded program may switch isolates here (each channel operation, print)
+// Scheduling: 0, the default, runs a program's isolates on a pool of threads, in parallel. A seed runs them all on
+// the root's thread, switching at channel operations by a generator seeded with it, so a run replays exactly
+// (fut test, which defaults to seed 1, and --seed n).
+inline uint64_t isolateSeed;
+inline int isolateThreads;  // the pool's size (--threads n; 0: cores())
+std::string isolateSeedNote();  // a failed test's: the seed that replays it, if its isolates were scheduled by one
 V chanNext(V ch, void* ra);  // for v in ch: the next value received, or END once it is closed and drained
 void txnAfter(void (*run)(void*), void (*drop)(void*), void* p);  // when the outermost transaction commits (else drop)
 

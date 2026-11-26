@@ -59,6 +59,7 @@ __attribute__((naked)) static void enterHandler(Handler*, V, VM*) {
       "mov x28, x2\n movz x27, #0x7ffc, lsl #48\n mov x0, x1\n br x9");
 }
 static TLS std::string fiberTrace;  // frames of a fiber that ended with an error, printed if nothing catches it
+ISO_LOCAL(fiberTrace);
 void traceAdd(const std::string& frames) { fiberTrace += frames; }
 [[noreturn]] void throwValue(V v, void* ra) {
   if (auto* h = (Handler*)vm->handler)  // the transactions opened inside the try roll back before its handler runs
@@ -130,6 +131,10 @@ static TLS char* mainLimit;  // the isolate's main stack, while a fiber runs
 static TLS jmp_buf* mainErr;
 static TLS void* mainHandler;
 static TLS std::vector<Fiber*> fibers;  // every fiber not yet collected (their suspended frames count for jitCollect)
+ISO_LOCAL(mainLimit);
+ISO_LOCAL(mainErr);
+ISO_LOCAL(mainHandler);
+ISO_LOCAL(fibers);
 static void switchTo(Fiber* to) {   // from the running context to `to` (null: the main stack)
   Fiber* from = fiberCur;
   if (from) from->err = errJmp, from->handler = vm->handler;
@@ -161,6 +166,14 @@ void fiberStack(Fiber* b) {
   uintptr_t* sp = b->top - 20;  // a fiberSwap frame: x29 = 0 ends frame walks, x30 = fiberStart
   sp[11] = (uintptr_t)fiberStart;
   b->sp = sp, b->idx = (int)fibers.size(), fibers.push_back(b);
+}
+// Isolates switch contexts the same way (isolate.cpp): an isolate's stack is a fiberSwap frame while it is out.
+void ctxSwap(void** save, void* to) { fiberSwap(save, to); }
+void* ctxFrame(uintptr_t* top, void (*entry)()) {
+  uintptr_t* sp = top - 20;  // as fiberStack: x29 = 0 ends frame walks, x30 = entry
+  memset(sp, 0, 20 * sizeof *sp);
+  sp[11] = (uintptr_t)entry;
+  return sp;
 }
 void fiberRun(Fiber* f, bool) { switchTo(f); }
 void fiberYield(Fiber* f) { switchTo(f->resumer); }

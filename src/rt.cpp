@@ -232,6 +232,8 @@ static V rt_binop(V a, V b, uint64_t op) {
 // Per isolate, since they are in its heap: isolateMark keeps them.
 static TLS std::vector<V> keyStrs;
 static TLS V charStrs[256];
+ISO_LOCAL(keyStrs);
+ISO_LOCAL(charStrs);
 static V cached(V& slot, std::string_view s) { return slot ? slot : (slot = box(newStr(s))); }
 static V mapKey(uint64_t s) { return cached(growAt(keyStrs, s), symName(s)); }
 // What a shape type checks: o's field or key named s, if it has one (a map's key; an instance's field, or its method).
@@ -514,7 +516,9 @@ u32* ffiThunk(void* fn, const std::string& sig, char ret, int sym) {
   return t = ffiCode(e);
 }
 static void rt_poll() {
-  if (isolateStopped()) vm->poll = 0, ERR("@isolate stopped: the isolate that started this one ended with an error");
+  // (atomic: another thread sets bits, the ticker for one)
+  if (isolateStopped()) __atomic_store_n(&vm->poll, 0, __ATOMIC_RELAXED), ERR("@isolate stopped: the isolate that started this one ended with an error");
+  if (__atomic_load_n(&vm->poll, __ATOMIC_RELAXED) & 8) isolateYield();  // a pool isolate's turn is up
   if (pollHook) pollHook();
 }
 
@@ -530,6 +534,7 @@ void emitOut(std::string_view s) {
   flockfile(stdout), fwrite(s.data(), 1, s.size(), stdout), putc_unlocked('\n', stdout), funlockfile(stdout);
 }
 static V n_print(V v) {
+  isolatePoint();  // seeded isolates: whose line comes first is one of the choices
   std::string t;
   return emitOut(text(v, t)), NIL;
 }

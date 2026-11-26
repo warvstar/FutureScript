@@ -1,6 +1,6 @@
 # Isolates and channels
 
-Status: phases 1 (the runtime split per isolate) and 2 (spawn, join, channels, one thread per isolate) are done. The README has the language as built; `src/isolate.cpp` has the runtime. Phase 3 (the scheduler) is next. This is how fut gets parallelism: many isolates run at once, each owning its own heap,
+Status: phases 1 (the runtime split per isolate), 2 (spawn, join, channels) and 3 (the scheduler: isolate stacks, a thread pool with preemption, seeded runs) are done. The README has the language as built; `src/isolate.cpp` has the runtime. Phase 4 (hot reload across isolates) is next. This is how fut gets parallelism: many isolates run at once, each owning its own heap,
 and they share data only by sending it over channels. There is no shared mutable memory, so there are no locks,
 no memory orderings and no data races to write. Read this before you add any global state to the runtime.
 
@@ -167,8 +167,10 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
    - Work: one thread per isolate.
    - Test: `tests/specs/isolates.fut` (also in N isolates at once, and under TSan), and a parallel mandelbrot in
      `bench/`, against C on 8 threads.
-3. **The scheduler.**
+3. **The scheduler.** Done.
    - Work: isolate stacks, the thread pool, preemption at polls, and deterministic `fut test` with `--seed`.
+   - Test: thousands of isolates; more busy isolates than threads, which finish only if they are preempted; the same
+     seed giving the same interleaving and other seeds others; a failed test naming its seed.
 4. **Hot reload across isolates.**
    - Work: stop the world, then the two-phase commit.
    - Test: the hot-reload suite with workers running.
@@ -214,3 +216,34 @@ Each phase lands on its own, with every suite passing natively, in wasm and unde
   tests fork, because a child process has only the thread that forked.
 - **Speed.** `bench/mandelbrot_par.fut` on 8 isolates: 57 ms, against 453 ms on one isolate and 16 ms for C on 8
   threads. The gap to C is the single-threaded one (the optimizing tier's job); the scaling is near-linear.
+
+## Phase 3 as built
+
+- **Isolate-local state.** The runtime's per-isolate variables stay thread-locals, each registered with
+  `ISO_LOCAL` (fut.h). Switching isolates on a thread swaps every registered variable with the isolate's saved copy,
+  about 35 swaps, and switches stacks with the fibers' `fiberSwap`. A new isolate starts with each variable as it
+  was before `main()`. Thread-locals that belong to the thread itself (JIT write mode, `locksHeld`) aren't registered.
+- **Stacks.** A spawned isolate gets an 8 MB stack (reserved, with a guard page; the main thread's size). Stacks of
+  ended isolates are kept for reuse, up to 64. ASan and TSan are told about each switch (their fiber APIs), so they
+  follow an isolate's frames from stack to stack.
+- **The pool.** Up to `cores()` threads (`--threads n`), started as isolates are spawned. Each spawned isolate goes to the thread
+  with the fewest and **stays on it**. Moving an isolate between threads would be wrong: a C++ frame on its stack
+  (say `take()`, waiting in `recv`) may have computed a thread-local's address before the switch, since the compiler
+  treats that address as fixed within a function, and would go on using the old thread's. Moving isolates is
+  possible later if the frames that can be on a switched-out stack read no thread-local after the switch. Until
+  then, a thread whose isolates all wait sits idle while another has a queue.
+- **Preemption.** A ticker thread wakes every 10 ms. A pool thread's isolate that has run a whole slice while
+  another of that thread's waits gets bit 8 of `vm->poll`. `rt_poll` then puts it at the back of its thread's queue,
+  unless it holds a lock (`locksHeld`: compiling, say).
+- **The root keeps its thread.** `main()` may own the window (macOS wants the main thread), so a pool program's root
+  never moves; its waits block its thread on a condition variable, as in phase 2.
+- **Seeded.** Under `fut test` (seed 1 unless `--seed n`) or `fut --seed n`, a program's isolates all run on its
+  root's thread. At every channel or task operation, `spawn` and `print`, a xorshift generator picks which runnable
+  isolate goes on (the one at the point included). An isolate that waits hands the thread straight to the next
+  pick. Between those points, isolates share nothing, so the picks determine everything the program can observe.
+  The deadlock check is unchanged: when every isolate waits, there is nothing left to pick.
+- **Switching holds no lock.** A pthread mutex belongs to a thread, and TSan tracks it per fiber, so a switch never
+  carries `chanMu` across. An isolate marks itself parked or runnable under the lock, releases it, then switches.
+  Whoever resumes it next waits for `onStack` to clear, which the side it switched to sets once it is off the stack.
+- **Speed.** `bench/mandelbrot_par.fut` on 8 isolates is as fast as with a thread each (about 55 ms, against 372 ms
+  on one). 3000 isolates spawned and joined take 0.17 s.

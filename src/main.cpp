@@ -310,8 +310,8 @@ int main(int argc, char** argv) {
   bool mapMode = argc > 1 && std::string(argv[1]) == "map", mapPub = false, mapJson = false;
   std::string mapOnly;
   TestRun topts;
-  const char* usage = "usage: fut [-w | -v | --asm | --isolates n] [file.fut]   (no file: REPL)\n"
-                      "       fut test [--changed] [--json] [--filter text] [--timeout s] [--isolates n] file.fut\n"
+  const char* usage = "usage: fut [-w | -v | --asm | --isolates n | --seed n | --threads n] [file.fut]   (no file: REPL)\n"
+                      "       fut test [--changed] [--json] [--filter text] [--timeout s] [--isolates n] [--seed n] file.fut\n"
                       "       fut api [--check] file.fut\n       fut map [--pub] [--json] file.fut [package | file]\n       fut explain [code]\n"
                       "       fut worker build ...   (Cloudflare Workers: node web/worker.mjs)\n";
   for (int i = 1 + (testMode || apiMode || mapMode); i < argc; i++) {
@@ -326,6 +326,8 @@ int main(int argc, char** argv) {
       else if (a[0] == '-') return fputs(usage, stderr), 2;
       else path = a;
     } else if (a == "--isolates" && i + 1 < argc && atoi(argv[i + 1]) > 0 && !WASM) topts.isolates = atoi(argv[++i]);
+    else if (a == "--seed" && i + 1 < argc && strtoull(argv[i + 1], nullptr, 10) > 0) isolateSeed = strtoull(argv[++i], nullptr, 10);
+    else if (a == "--threads" && i + 1 < argc && atoi(argv[i + 1]) > 0) isolateThreads = atoi(argv[++i]);
     else if (testMode && a == "--json") topts.json = true;
     else if (testMode && a == "--filter" && i + 1 < argc) topts.filter = argv[++i];
     else if (testMode && a == "--changed") topts.changed = true;
@@ -336,6 +338,7 @@ int main(int argc, char** argv) {
     else if (a[0] == '-') return fputs(usage, stderr), 2;
     else path = a;
   }
+  if (testMode && !isolateSeed) isolateSeed = 1;  // a test's isolates interleave the same way every run
   rtInit();
   if ((testMode || apiMode || mapMode) && path.empty()) return fputs(usage, stderr), 2;
   if (mapMode) return mapCommand(mapPub, mapJson, mapOnly);

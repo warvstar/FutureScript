@@ -60,6 +60,7 @@ static bool same(V a, V b, std::string& at, std::string& what) {
   return a == b;
 }
 static TLS Failure failure;
+ISO_LOCAL(failure);
 
 static std::string oneLine(std::string s) {  // an expression's source on one line: a line break and its indent become one space
   std::string o;
@@ -238,6 +239,7 @@ int propSite(PropSite p) {
 }
 namespace {
 TLS uint64_t prng = 1;  // per isolate: each runs its property tests from the same seed
+ISO_LOCAL(prng);
 uint64_t rnd() { return prng ^= prng >> 12, prng ^= prng << 25, prng ^= prng >> 27, prng * 0x2545F4914F6CDD1Dull; }
 int below(int n) { return n <= 0 ? 0 : (int)(rnd() % (uint64_t)n); }
 double unit() { return double(rnd() >> 11) * 0x1p-53; }
@@ -451,6 +453,7 @@ static V propDone(V site, V ok, V n) {  // too few inputs met the requires to ca
 // expect prints { ... }: print() output inside the block is collected (nested captures stack) and becomes the value.
 struct Capture { std::string* prev; std::string buf; };
 static TLS std::vector<Capture*> captures;
+ISO_LOCAL(captures);
 std::string* outBase() { return captures.empty() ? outSink : captures.front()->prev; }
 static void endCaptures() {  // a test that returned or crashed out of a capture
   for (; !captures.empty(); captures.pop_back()) outSink = captures.back()->prev, delete captures.back();
@@ -582,6 +585,7 @@ std::string testReport(const TestCase& t, bool err, const std::string& e, char& 
       std::string msg = e.substr(0, nl), c = splitCode(msg);
       j += ",\"message\":" + json(msg) + (c.empty() ? "" : ",\"code\":" + json(c)) + ",\"trace\":" + json(nl == std::string::npos ? "" : e.substr(nl + 1));
     }
+    if ((failure.set || err) && !isolateSeedNote().empty()) j += ",\"seed\":" + std::to_string(isolateSeed);
     return j + ",\"output\":" + json(out) + "}\n" + traceReport(t);
   }
   std::string s = std::string(failure.set ? "FAIL    " : err ? "ERROR   " : "ok      ") + t.name;
@@ -592,6 +596,7 @@ std::string testReport(const TestCase& t, bool err, const std::string& e, char& 
   } else if (err) s += " (" + where(t) + ")\n" + indent("runtime error: " + e.substr(0, e.find_last_not_of('\n') + 1), "  ");
   else s += "\n";
   if ((failure.set || err) && !out.empty()) s += "  output:\n" + indent(out.substr(0, out.size() - (out.back() == '\n')), "    ");
+  if (failure.set || err) s += indent(isolateSeedNote(), "  ");
   return s + traceReport(t);
 }
 void testRecord(char code, const std::string& text) {

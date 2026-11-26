@@ -44,6 +44,8 @@ int printOp;  // print(): deterministic where tests run (their output is capture
 TLS std::vector<EffState> saved;    // effEnter (per isolate)
 struct Pending { V clo = 0, rec = 0; int op = 0; uint64_t n = 0; };
 TLS Pending pending;  // effPrep -> invokeHandler
+ISO_LOCAL(saved);
+ISO_LOCAL(pending);
 }  // namespace
 
 static int bitIndex(uint64_t bit) { return __builtin_ctzll(bit); }
@@ -247,6 +249,7 @@ static V rt_inventer(V self, uint64_t* rec) {
 }
 
 static TLS uint64_t rng;
+ISO_LOCAL(rng);
 static V n_random() {  // xorshift64*, seeded from the clock: [0, 1)
   if (!rng) rng = (uint64_t)(now() * 1e9) | 1;
   rng ^= rng >> 12, rng ^= rng << 25, rng ^= rng >> 27;
