@@ -7,6 +7,7 @@ python3 build.py               # -> build/fut   (clang++ -std=c++23 -O2, files i
 python3 build.py test          # language tests, tests/specs/*.fut via `fut test`, live hot-reload scenarios
 python3 build.py test --debug  # same, under ASan/UBSan
 python3 build.py fuzz 1000     # mutate the tests; any crash or sanitizer report fails
+python3 bench/run.py           # fut (native and wasm) against the same kernels in C (clang -O2) -> bench/results.md
 build/fut file.fut             # run
 build/fut test file.fut        # run its `test` blocks (--json: one JSON object per line; --filter text; --timeout s)
 build/fut -w file.fut          # run and hot-reload on save (file and its imports); type lines to run them inside it
