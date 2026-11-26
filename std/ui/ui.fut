@@ -142,7 +142,7 @@ pub fn wire(n, props) { for k in props { prop(n, k, props[k]) } }  // a template
 pub fn hole(marker, c) { addAt(nil, marker, c) }  // a template's place for a child
 pub fn textAt(t, f: fn) { region(nil, nil, f, t) }  // a template's text, kept current
 
-// Prop k of node n: "on<event>" takes a handler, given {type, value, checked, key}; a function shows its current
+// Prop k of node n: "on<event>" takes a handler, given {type, value, checked, key, x, y, clientX, clientY, button, ctrl, shift, alt, meta}; a function shows its current
 // result; "class" (a keyword: write {"class": ...}), "id" and other attributes take text (nil or false removes one); "value" and "checked" set the
 // field's state.
 fn prop(n, k, v) {

@@ -59,8 +59,12 @@ export function listen(n, type, f) {
   n.addEventListener(type, (e) => {
     const t = e.target ?? {};
     if (type === "submit") e.preventDefault?.();  // a form's submit is the page's to handle: no navigation
+    const at = e.clientX == null ? null : n.getBoundingClientRect?.() ?? { left: 0, top: 0 };  // pointer events: where
     const r = f({ type, value: t.value ?? null, checked: !!t.checked, key: e.key ?? null, direct: t === n,
-                  top: n.scrollTop ?? 0, height: n.clientHeight ?? 0 });
+                  top: n.scrollTop ?? 0, height: n.clientHeight ?? 0,
+                  x: at && e.clientX - at.left, y: at && e.clientY - at.top,  // from the handler's element's corner
+                  clientX: e.clientX ?? null, clientY: e.clientY ?? null, button: e.button ?? null,  // in the window
+                  ctrl: !!e.ctrlKey, shift: !!e.shiftKey, alt: !!e.altKey, meta: !!e.metaKey });
     if (r && typeof r.catch === "function") r.catch(() => {});  // a fut error is reported by fut itself
   });
 }
@@ -78,7 +82,11 @@ export function fire(n, type, data) {  // as a user would: set what they typed o
   if (data && "checked" in data) n.checked = data.checked;
   if (data && "top" in data) n.scrollTop = data.top;
   if (data && "height" in data && !globalThis.document) n.clientHeight = data.height;
-  n.dispatchEvent(globalThis.document ? new KeyboardEvent(type, { bubbles: true, key: data?.key ?? "" }) : { type, target: n, key: data?.key, files: data?.files });
+  const mods = { ctrlKey: !!data?.ctrl, shiftKey: !!data?.shift, altKey: !!data?.alt, metaKey: !!data?.meta };
+  const at = data && "x" in data ? { clientX: data.x, clientY: data.y ?? 0, button: data.button ?? 0 } : {};  // x, y: in the window
+  n.dispatchEvent(!globalThis.document ? { type, target: n, key: data?.key, files: data?.files, ...mods, ...at }
+    : /^(pointer|mouse|click|dblclick|contextmenu)/.test(type) ? new MouseEvent(type, { bubbles: true, ...mods, ...at })
+    : new KeyboardEvent(type, { bubbles: true, key: data?.key ?? "", ...mods }));
 }
 
 // ---- data, timers, the address, storage, SVG ----

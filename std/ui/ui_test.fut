@@ -116,3 +116,15 @@ test "an item's own signals update just that item" {
   b.set(20)
   expect htmlOf(host).has("<b>1</b>") && htmlOf(host).has("<b>20</b>")
 }
+
+test "pointer events carry where and which button; every event carries the modifier keys" {
+  var got = []
+  var pad = el("div", {id: "pad", onpointerdown: fn(e) { got.push([e.x, e.y, e.clientX, e.clientY, e.button, e.shift]) },
+                       onkeydown: fn(e) { got.push([e.key, e.ctrl, e.alt, e.meta, e.x]) }}, nil)
+  page(fn() { return pad })
+  trigger(pad, "pointerdown", {x: 30, y: 40, button: 2, shift: true})
+  trigger(pad, "keydown", {key: "l", ctrl: true})
+  expect got[1] == ["l", true, false, false, nil]
+  expect got[0][2] == 30 && got[0][3] == 40 && got[0][4] == 2 && got[0][5]
+  expect typeOf(got[0][0]) == "number" && typeOf(got[0][1]) == "number"   // from the element's corner, wherever it is
+}
