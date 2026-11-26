@@ -394,6 +394,9 @@ static V rt_format(V v, V packed, V prefix) {
   return box(newStr(s));
 }
 
+static bool isF32s(V v);
+static V elementwise(V a, V b, int op);
+static V vecField(V o, uint64_t s);
 static V rt_binop(V a, V b, uint64_t op) {
   static const char* ops[] = {"+", "-", "*", "/", "%", "==", "!=", "<", "<=", ">", ">=", "&", "|", "^", "<<", ">>"};
   if (op >= O_BAND) {  // integer operators: on whole numbers (exact up to 2^53), computed in 64 bits
@@ -421,6 +424,7 @@ static V rt_binop(V a, V b, uint64_t op) {
     int c = as<Str>(a)->sv().compare(as<Str>(b)->sv());
     return boxb(op == O_LT ? c < 0 : op == O_LE ? c <= 0 : op == O_GT ? c > 0 : c >= 0);
   }
+  if (op <= O_MOD && (isF32s(a) || isF32s(b))) return elementwise(a, b, (int)op);
   ERR("@operand bad operands for '%s': %s and %s", ops[op], typeName(a), typeName(b));
 }
 // Fields: slow paths of the inline caches emitted by the compiler; they also fill the cache.
@@ -462,6 +466,7 @@ static V rt_getf(V o, uint64_t s, IC* ic) {
     if (const V* d = in->cls->declared((int)s)) return *d;  // never assigned (or declared since it was made): the default
     if (in->cls->closed()) ERR("@no-field %s has no field '%s'", symName(in->cls->name).c_str(), symName(s).c_str());
   }
+  if (is(o, K::Buf)) return vecField(o, s);
   ERR("@no-field %s has no field '%s'", typeName(o), symName(s).c_str());
 }
 // What JIT constructors read from a class: a new instance has room for every field the class has had so far.
@@ -918,6 +923,88 @@ static V b_slice(V v, V a, V z) {  // a copy, like a list's
   if (i < j) memcpy(b->p, s->p + i * e, (j - i) * e);
   return box(b);
 }
+// Vectors, as gpu fns use them: vec2f(x, y), vec3f, vec4f are f32s of 2, 3 or 4 numbers. v.x (also y z w, or r g b a)
+// reads one; v.xy, v.zyx, ... make a vector of those. Arithmetic on f32s is elementwise, with an f32s of the same
+// length or a number.
+static bool isF32s(V v) { return is(v, K::Buf) && as<Buf>(v)->et == 'f'; }
+static V elementwise(V a, V b, int op) {
+  static const char* ops[] = {"+", "-", "*", "/", "%"};
+  Buf *x = isF32s(a) ? as<Buf>(a) : nullptr, *y = isF32s(b) ? as<Buf>(b) : nullptr;
+  if ((!x && !isNum(a)) || (!y && !isNum(b))) ERR("@operand bad operands for '%s': %s and %s", ops[op], typeName(a), typeName(b));
+  if (x && y && x->n != y->n) ERR("@operand '%s' on f32s of different lengths: %zu and %zu", ops[op], x->n, y->n);
+  volatile V keep[] = {a, b};
+  (void)keep;
+  size_t n = x ? x->n : y->n;
+  Buf* r = newBuf('f', n);
+  float* o = (float*)r->p;
+  for (size_t i = 0; i < n; i++) {
+    double p = x ? ((float*)x->p)[i] : num(a), q = y ? ((float*)y->p)[i] : num(b);
+    o[i] = (float)(op == O_ADD ? p + q : op == O_SUB ? p - q : op == O_MUL ? p * q : op == O_DIV ? p / q : p - q * std::floor(p / q));
+  }
+  return box(r);
+}
+static V vecOf(const double* xs, size_t n) {
+  Buf* b = newBuf('f', n);
+  for (size_t i = 0; i < n; i++) ((float*)b->p)[i] = (float)xs[i];
+  return box(b);
+}
+static double vnum(V v, const char* f) {
+  if (!isNum(v)) ERR("@argument %s() expects numbers, got %s", f, typeName(v));
+  return num(v);
+}
+static V n_vec2(V x, V y) { double d[] = {vnum(x, "vec2f"), vnum(y, "vec2f")}; return vecOf(d, 2); }
+static V n_vec3(V x, V y, V z) { double d[] = {vnum(x, "vec3f"), vnum(y, "vec3f"), vnum(z, "vec3f")}; return vecOf(d, 3); }
+static V n_vec4(V x, V y, V z, V w) { double d[] = {vnum(x, "vec4f"), vnum(y, "vec4f"), vnum(z, "vec4f"), vnum(w, "vec4f")}; return vecOf(d, 4); }
+// v.x, v.rgb: the components a swizzle names (-1: not a swizzle)
+static int swizzle(int s, int* at) {
+  const std::string& n = symName(s);
+  if (n.empty() || n.size() > 4) return -1;
+  const char* sets[] = {"xyzw", "rgba"};
+  for (const char* set : sets) {
+    size_t k = 0;
+    for (; k < n.size(); k++) {
+      const char* c = strchr(set, n[k]);
+      if (!c || !n[k]) break;
+      at[k] = int(c - set);
+    }
+    if (k == n.size()) return (int)k;
+  }
+  return -1;
+}
+static V vecField(V o, uint64_t s) {
+  int at[4], k = swizzle((int)s, at);
+  Buf* b = as<Buf>(o);
+  if (k < 0 || b->et != 'f') ERR("@no-field %s has no field '%s'", typeName(o), symName(s).c_str());
+  for (int i = 0; i < k; i++)
+    if ((size_t)at[i] >= b->n) ERR("@no-field .%s of an f32s of %zu: it has no %c", symName(s).c_str(), b->n, symName(s)[i]);
+  if (k == 1) return bufGet(b, (size_t)at[0]);
+  double d[4];
+  for (int i = 0; i < k; i++) d[i] = ((float*)b->p)[at[i]];
+  return vecOf(d, (size_t)k);
+}
+static Buf* vecArg(V v, const char* f, size_t n = 0) {
+  if (!isF32s(v)) ERR("@argument %s() expects an f32s, got %s", f, typeName(v));
+  if (n && as<Buf>(v)->n != n) ERR("@argument %s() expects an f32s of %zu, got one of %zu", f, n, as<Buf>(v)->n);
+  return as<Buf>(v);
+}
+static double vdot(Buf* a, Buf* b, const char* f) {
+  if (a->n != b->n) ERR("@argument %s() on f32s of different lengths: %zu and %zu", f, a->n, b->n);
+  double d = 0;
+  for (size_t i = 0; i < a->n; i++) d += (double)((float*)a->p)[i] * ((float*)b->p)[i];
+  return d;
+}
+static V v_length(V v) { Buf* b = vecArg(v, "length"); return box(std::sqrt(vdot(b, b, "length"))); }
+static V v_dot(V v, V w) { return box(vdot(vecArg(v, "dot"), vecArg(w, "dot"), "dot")); }
+static V v_normalize(V v) {
+  Buf* b = vecArg(v, "normalize");
+  double l = std::sqrt(vdot(b, b, "normalize"));
+  return elementwise(v, box(l), O_DIV);
+}
+static V v_cross(V v, V w) {
+  float *a = (float*)vecArg(v, "cross", 3)->p, *b = (float*)vecArg(w, "cross", 3)->p;
+  double d[] = {(double)a[1] * b[2] - (double)a[2] * b[1], (double)a[2] * b[0] - (double)a[0] * b[2], (double)a[0] * b[1] - (double)a[1] * b[0]};
+  return vecOf(d, 3);
+}
 static V n_slice(V v, V a, V b) {
   if (is(v, K::Str)) return s_slice(v, a, b);
   if (is(v, K::List)) return l_slice(v, a, b);
@@ -1063,8 +1150,12 @@ void rtInit() {
   method<n_len>(K::Str, S_len), method<n_len>(K::Map, S_len), method<n_len>(K::Buf, S_len);
   method<b_slice>(K::Buf, intern("slice"));
   method<+[](V b) { return box((double)(as<Buf>(b)->n * bufElem(as<Buf>(b)->et))); }>(K::Buf, intern("bytes"));
+  native<n_vec2>("vec2f"), native<n_vec3>("vec3f"), native<n_vec4>("vec4f");
+  method<v_length>(K::Buf, intern("length")), method<v_dot>(K::Buf, intern("dot"));
+  method<v_normalize>(K::Buf, intern("normalize")), method<v_cross>(K::Buf, intern("cross"));
   native<n_buf<'f'>>("f32s"), native<n_buf<'u'>>("u32s"), native<n_buf<'i'>>("i32s"), native<n_buf<'b'>>("u8s");
   gfxInit();
+  gpuInit();
   method<m_has>(K::Map, S_has), method<m_remove>(K::Map, S_remove);
   method<+[](V s, V sub) {  // str.has(part): does it contain part?
     if (!is(sub, K::Str)) ERR("@argument has() on a string expects a string, got %s", typeName(sub));

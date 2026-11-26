@@ -473,6 +473,7 @@ void fmathInit();  // fmath.cpp: sin, cos, exp, log, pow, ... that give the same
 void method(K k, int sym, void* f, int arity);
 template <auto f> void native(const char* name) { native(name, callable<f>(), nargs(f)); }
 template <auto f> void method(K k, int sym) { method(k, sym, callable<f>(), nargs(f)); }
+void gpuInit();  // wgsl(f): a gpu fn's translation (wgsl.cpp)
 void gfxInit(), gfxPump();  // window, drawing, input (gfx.cpp)
 std::string toStr(V, bool quote = false);
 V variantField(Inst* in, int sym);  // an enum variant's field (nil if unset)

@@ -123,6 +123,8 @@ static std::vector<Decl> declsOf(const std::string& text) {
   auto& L = S.L;
   auto isKw = Scan::isKw;
   int depth = 0;
+  static const int gpuSym = intern("gpu");
+  auto isGpu = [](const Tok& t) { return t.t == T_ID && t.sym == gpuSym; };
   for (Tok t = S.next(); t.t != T_EOF; t = S.next()) {
     if (t.t == '{') depth++;
     if (t.t == '}') depth--;
@@ -132,10 +134,16 @@ static std::vector<Decl> declsOf(const std::string& text) {
     if (isKw(t, S_pub)) {
       Lexer save = L;
       Tok n = S.next();
-      if (!pubDecl(n)) { L = save; continue; }
+      bool gpu = [&] { Lexer s = L; return isGpu(n) && isKw(s.next(), K_fn); }();
+      if (!pubDecl(n) && !gpu) { L = save; continue; }
       pub = true, k = n;
     }
     const char* from = pub ? t.p : k.p;
+    if (isGpu(k)) {  // gpu fn: a fn, which says so
+      Lexer save = L;
+      if (Tok f = S.next(); isKw(f, K_fn) && !f.nl) k = f;
+      else L = save;
+    }
     std::string doc = docs(src, t.p, "");
     if (isKw(k, K_fn)) {
       Tok n = S.next(), p = S.next();

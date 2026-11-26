@@ -370,6 +370,7 @@ struct Compiler : Gen {
       static const char* const kinds[] = {"any", "num", "str", "bool", "list", "map"};
       for (int i = 0; i < 6; i++) if (symName(prev.sym) == kinds[i]) ty.code = TY_ANY + i;
       for (char et : {'f', 'u', 'i', 'b'}) if (symName(prev.sym) == bufName(et)) ty.code = TY_BUF | uint64_t(et) << 8;
+      for (int n = 2; n <= 4; n++) if (symName(prev.sym) == "vec" + std::to_string(n) + "f") ty.code = TY_BUF | uint64_t('f') << 8 | uint64_t(n) << 16;
       if ((ty.code == TY_LIST || ty.code == TY_MAP) && at('<') && !cur.nl) {  // list<T>, map<V>, map<K, V>
         bool list = ty.code == TY_LIST;
         next();
@@ -551,9 +552,9 @@ struct Compiler : Gen {
   }
 
   void proveOperands(int op, bool lnum, bool rnum, int lh, int rh) {
-    if (op == O_ADD || op == O_EQ || op == O_NE) return;
-    if (op <= O_MOD || op >= O_BAND || rnum) prove(lh);
-    if (op <= O_MOD || op >= O_BAND || lnum) prove(rh);
+    if (op <= O_MOD || op == O_EQ || op == O_NE) return;  // arithmetic also takes an f32s (vectors): no proof
+    if (op >= O_BAND || rnum) prove(lh);
+    if (op >= O_BAND || lnum) prove(rh);
   }
   void loopTop(Loop& lp) {  // facts must hold on every back-edge: tier 2 keeps those of locals the loop never assigns
     auto had = F->facts;
@@ -2242,7 +2243,8 @@ struct Compiler : Gen {
       if (t.t == T_ID && t.sym == S_pub && !depth) {
         Lexer s = L;
         Tok n = lex(s);
-        pubNext = pubDecl(n);
+        Lexer s2 = s;
+        pubNext = pubDecl(n) || gpuFn(n, lex(s2));
       } else if (t.t == T_ID && t.sym == K_extern && !depth) ext = true;
       else if (ext && afterKw && p.sym == K_fn) declare(q(t), 'x', params()), ext = false; else if (t.t == '{') depth++;
       else if (t.t == '}') {
@@ -2347,7 +2349,38 @@ struct Compiler : Gen {
   bool atPub() {  // `pub` before a top-level declaration (the prescan noted it); elsewhere `pub` is an ordinary name
     if (!atKw(S_pub)) return false;
     Tok n = peek();
-    return pubDecl(n);
+    Lexer s = lx;
+    s.next();
+    return pubDecl(n) || gpuFn(n, s.next());
+  }
+  // gpu fn: also translated to WGSL (wgsl.cpp), after the whole program is compiled
+  static bool gpuFn(const Tok& a, const Tok& b) {
+    static const int gpu = intern("gpu");
+    return a.t == T_ID && a.sym == gpu && b.t == T_ID && b.sym == K_fn && !b.nl;
+  }
+  struct GpuDecl { std::string file; const char* src; size_t i; int q; };
+  std::unordered_map<std::string, std::vector<GpuFnSrc>> gpuSrcs;
+  std::vector<GpuDecl> gpuDecls;
+  void gpuDecl() {  // at `fn`
+    const char* p = cur.p;
+    int line = cur.line;
+    next();
+    Tok n = cur;
+    fnDecl();
+    auto& fs = gpuSrcs[file];
+    fs.push_back({n.sym, p, line});
+    gpuDecls.push_back({file, srcStart, fs.size() - 1, qualify(n.sym)});
+  }
+  void checkGpu() {
+    for (auto& d : gpuDecls) {
+      auto alias = [&](int s) -> const std::string* {
+        auto f = aliases.find(d.file);
+        auto it = f == aliases.end() ? decltype(f->second.end()){} : f->second.find(s);
+        return f != aliases.end() && it != f->second.end() ? &it->second : nullptr;
+      };
+      auto fail = [&](const char* p, int line, const std::string& m) { failHere(At{p, line, d.file, d.src}, "@gpu %s", m); };
+      gpuInfoSet(d.q, wgslOf(gpuSrcs[d.file], d.i, alias, fail));
+    }
   }
   void topLevel() {
     while (!at(T_EOF)) {
@@ -2355,6 +2388,7 @@ struct Compiler : Gen {
       bool trace = traceOn && testing;
       if (atPub()) next();
       if (atKw(K_fn)) { next(), fnDecl(); if (trace) traceFn(item); continue; }
+      if (at(T_ID) && [&] { Lexer s = lx; return gpuFn(cur, s.next()); }()) { next(), gpuDecl(); if (trace) traceFn(item); continue; }
       if (atKw(K_class)) { next(), classDecl(); if (trace) traceClassDecl(item); continue; }
       if (atKw(K_extern)) { next(), externDecl(); continue; }
       if (atKw(S_effect) && peek().t == T_ID && !peek().nl && peek().sym >= NKW) { next(), effectDecl(); continue; }
@@ -2439,6 +2473,7 @@ struct Compiler : Gen {
     if (testing) todosPending(), specProperties();
     if (testing && traceOn) traceFiles();
     checkClasses();
+    checkGpu();
     for (auto& [sym, v] : varTypes) globalType(sym);  // each typed var's type, for commit
     Code chunk = finish();
     return commit(chunk);

@@ -89,6 +89,15 @@ struct Lexer {
   }
 };
 
+// gpu fn (wgsl.cpp): a top-level function also translated to WGSL. Each file's gpu fns, from their `fn`; a gpu fn
+// calls others of its file by name. alias(s): the package a module alias names ("math"), if s is one.
+struct GpuFnSrc { int sym; const char* p; int line; };
+struct GpuInfo { std::string wgsl, entry, result; std::vector<std::string> names, types; };
+// fail(p, line, message) reports what the GPU can't do, and does not return (a compile error)
+using GpuFail = std::function<void(const char*, int, const std::string&)>;
+GpuInfo wgslOf(const std::vector<GpuFnSrc>& fns, size_t i, const std::function<const std::string*(int)>& alias, const GpuFail& fail);
+void gpuInfoSet(int sym, GpuInfo);
+
 // A type's tokens (see type()), from L: atoms joined by |, each maybe followed by ?. Leaves L after it.
 template <class Next> void skipType(Lexer& L, Next next) {
   for (;;) {

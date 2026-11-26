@@ -17,12 +17,17 @@ pub class Frame {
   var g
   // draw count vertices from buf (nil: the vertex shader makes them from its vertex_index)
   fn draw(p: Pipeline, buf, count: num): Frame
+  // fill the frame with f, a gpu fn (uv: vec2f, ...): vec4f run for each pixel: uv is (0, 0) at the top left and
+  // (1, 1) at the bottom right, the result (r, g, b, a) from 0 to 1. f's other parameters get args. A frame's
+  // paints all see the args of its last paint of f.
+  fn paint(f, args: list): Frame
 }
 
 pub class Gpu {
   var h = 0
   var headless = false
   var height = 0
+  var kernels
   var shaders
   var width = 0
   // {shader: wgsl, entry: "main", bind: [buffers, in binding order], size: its @workgroup_size (64)}
@@ -30,6 +35,12 @@ pub class Gpu {
   // begin a frame cleared to 0xRRGGBB; present() shows it (or pixels(), headless)
   fn frame(rgb: num): Frame
   fn init(o: map)
+  // the pipeline for a gpu fn, made once: "map" (see map) or "paint" (see Frame.paint)
+  fn kernel(f, how: str)
+  // f, a gpu fn (x: T, ...): T, applied to each element of data on the GPU, in place. T is num, vec2f or vec4f (an
+  // element is that many numbers of data); f's other parameters get args, the same for every element. data is a
+  // storage Buffer, which stays on the GPU, or an f32s, which goes there and back.
+  fn map(f, data, args: list)
   // headless: the frame as u8s, 4 per pixel (r, g, b, a), rows top first
   fn pixels(): u8s
   // {shader: wgsl, vertex: "vs", fragment: "fs", layout: its vertices' Layout (nil: no vertex buffer),

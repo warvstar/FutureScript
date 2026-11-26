@@ -25,6 +25,7 @@ const ErrCode codes[] = {
     {"import", "An import can't be resolved, crosses a package boundary, or forms a cycle.", "Import files by path inside a package and packages by name (with a dep line in fut.pkg)."},
     {"manifest", "A fut.pkg line is malformed.", "Fix the line: name, version, root, dep, js, wasm or c."},
     {"extern", "An extern declaration can't bind: an unknown module, function, library or parameter type.", "List the module in fut.pkg for this build, and use the types the message names."},
+    {"gpu", "A gpu fn uses something the GPU doesn't have (strings, lists, maps, globals, recursion, an untyped parameter, ...).", "Use num, bool and vec2f/3f/4f values, locals and parameters, and call only gpu fns, sqrt, floor, int and std/math."},
     {"limit", "A fixed limit is exceeded (parameters, fields, effects).", "Pass a map or list instead of more parameters; split the class or effect."},
     // compile time or run time
     {"type", "A value doesn't have the declared type of a parameter, result, field or var.", "Pass or store a value of that type, or change the declaration (T? allows nil)."},

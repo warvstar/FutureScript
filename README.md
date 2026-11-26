@@ -672,6 +672,8 @@ extern fn memset(ptr, int, long): ptr
 memset(u8s(8), 0, 8)                 // a ptr parameter gets the buffer's bytes
 ```
 
+**Vectors** are `f32s` of 2, 3 or 4: `vec2f(x, y)`, `vec3f(x, y, z)`, `vec4f(x, y, z, w)`, and `vec2f` (etc.) as a type is an `f32s` of that length. `v.x` (`y z w`, or `r g b a`) reads one number; `v.xy`, `v.zyx` make a new vector. `+ - * / %` on `f32s` work elementwise, with an `f32s` of the same length or a number (`v * 2`, `1 - v`), giving a new one. `v.length()`, `v.dot(w)`, `v.normalize()`, `v.cross(w)`.
+
 Their length is fixed. A store is checked: a non-number, or a number a whole-number buffer can't hold, is an error rather than a value wrapped or clipped. `==` is identity and `expect`'s compares the numbers, as for lists. They print as `f32s[1, 0.1]` (an f32 with the fewest digits that give it back). They are copied when sent to another isolate, become arrays of numbers in `json` and for JavaScript, and an `atomic` block that fails puts their contents back. `b[i]` on an `f32s` is compiled inline, like a list's: about 3.7 ns for a load, add and store natively against 9 ns through the runtime (wasm: 10 ns against 37). The other kinds go through the runtime.
 
 ## GPU
@@ -702,7 +704,32 @@ while present() {
 - **Handles** are freed with `.free()` (buffers and pipelines), not by the GC.
 - **In the browser** (`node web/serve.mjs`, then `?file=examples/gpu_triangle.fut`) it uses the browser's WebGPU instead: `std/gpu/gpu.js`, the same flat API as the C library, declared `main` so that in the threads build it runs on the page's thread. A `ptr` argument is an address in fut's memory, which fut.js (or, for the page, browser.js) puts in a module's exported `fut` object; in the threads build that memory is shared, so the page reads and writes what the worker sees. WebGPU's Promises (the device, reading back, a shader's messages, error scopes) suspend the calling fut code, so every call is synchronous for fut. `gpu.open(nil)` puts a WebGPU canvas in the window's place, with the same size and input, and `present()` shows its frame instead of the pixel buffer. The canvas uses the browser's preferred format, not sRGB, as natively, so colors match. `?file=std/gpu/gpu_test.fut&test` runs the tests on the page. Under Node there is no WebGPU, so `gpu.open()` fails with an error that says so.
 
-`fut -w examples/gpu_triangle.fut` is a spinning triangle; `fut examples/gpu_particles.fut` moves 100,000 particles with a compute shader and draws them from the same buffer.
+### Shaders in fut: `gpu fn`
+
+A function declared `gpu fn` also runs on the GPU. On the CPU it is an ordinary function (call it, test it, step through it); fut also translates it to WGSL when it compiles, and `std/gpu` runs that.
+
+```
+import "std/gpu"
+import "std/math" as math
+
+gpu fn sky(uv: vec2f, sun: vec2f, t: num): vec4f {     // uv: (0, 0) top left to (1, 1) bottom right
+  var glow = 1 - math.min((uv - sun).length() * 3, 1)
+  return vec4f(glow, glow * 0.6, 0.3 + 0.2 * math.sin(t), 1)
+}
+gpu fn fall(v: vec2f, dt: num): vec2f { return vec2f(v.x, v.y - 9.8 * dt) }
+
+while present() { g.frame(0).paint(sky, [vec2f(0.5, 0.3), clock()]) }   // each pixel
+g.map(fall, velocities, [1 / 60])                                       // each element of an f32s or storage Buffer
+expect sky(vec2f(0.5, 0.3), vec2f(0.5, 0.3), 0) == vec4f(1, 0.6, 0.3, 1)   // the same function, on the CPU
+```
+
+- **What it takes:** numbers (`num`, an f32 on the GPU), `bool`, and `vec2f` / `vec3f` / `vec4f`, for every parameter (each needs its type) and the result. In the body: `var`, assignment (`+=` too), `if` / `else if` / `else`, `while`, `for i in a..b`, `return`, `break`, `continue`; arithmetic, comparisons, `&& || !`, `?:`, `**`; `v.x` and swizzles; calls of other gpu fns of the same file, of `sqrt`, `floor`, `int`, `vec2f`/`vec3f`/`vec4f`, of std/math's `sin cos tan asin acos atan atan2 exp log log2 pow abs min max clamp sign ceil trunc` and `math.pi`, and the vector methods `length dot normalize cross`.
+- **What it can't:** anything else is a compile error that says what to write instead (`[gpu]`): strings, lists, maps, lambdas, globals (`pass K in as a parameter`), other functions, recursion (the GPU has no stack), bitwise operators, and changing a vector in place (`v = vec2f(v.x, 1)`, not `v.x = 1`).
+- **Same meaning on both:** `%` keeps the divisor's sign and `?:` picks a side, as in fut; numbers are f32 on the GPU, so results agree to f32 rounding.
+- **`g.map(f, data, args)`:** `f(x: T, ...): T` with `T` a `num`, `vec2f` or `vec4f`, applied to each element of `data` in place: a storage `Buffer` (it stays on the GPU) or an `f32s` (sent and read back). **`frame.paint(f, args)`:** `f(uv: vec2f, ...): vec4f` colors each pixel. `args` fill the parameters after the first, the same for every element or pixel (a uniform buffer, laid out by `gpu.layout`). Each gpu fn's pipeline is made once.
+- **`wgsl(f)`:** what the translation made: `{wgsl, entry, names, types, result}`, for a pipeline of your own.
+
+`fut -w examples/gpu_triangle.fut` is a spinning triangle; `fut examples/gpu_particles.fut` moves 100,000 particles with a compute shader and draws them from the same buffer; `fut examples/gpu_shader.fut` paints an evening sea with a gpu fn, its sun following the mouse.
 
 ## Hot reload (`-w`)
 

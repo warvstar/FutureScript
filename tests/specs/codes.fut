@@ -21,6 +21,7 @@ test "compile errors" {
   var ps = "p0"
   for i in 1..65 { ps += ", p{i}" }
   expect err("fn f(" + ps + ") \{ }").has(" [limit]\n")
+  expect err("gpu fn f(x: num): num \{ return [x] }").has(" [gpu]\n")
 }
 
 test "runtime errors" {
