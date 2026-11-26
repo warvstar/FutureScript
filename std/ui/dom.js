@@ -31,7 +31,9 @@ export function setProp(n, k, v) {
 export function listen(n, type, f) {
   n.addEventListener(type, (e) => {
     const t = e.target ?? {};
-    const r = f({ type, value: t.value ?? null, checked: !!t.checked, key: e.key ?? null });
+    if (type === "submit") e.preventDefault?.();  // a form's submit is the page's to handle: no navigation
+    const r = f({ type, value: t.value ?? null, checked: !!t.checked, key: e.key ?? null, direct: t === n,
+                  top: n.scrollTop ?? 0, height: n.clientHeight ?? 0 });
     if (r && typeof r.catch === "function") r.catch(() => {});  // a fut error is reported by fut itself
   });
 }
@@ -46,6 +48,8 @@ export const html = (n) => n.outerHTML ?? n.textContent;
 export function fire(n, type, data) {  // as a user would: set what they typed or ticked, then the event
   if (data && "value" in data) n.value = data.value;
   if (data && "checked" in data) n.checked = data.checked;
+  if (data && "top" in data) n.scrollTop = data.top;
+  if (data && "height" in data && !globalThis.document) n.clientHeight = data.height;
   n.dispatchEvent(globalThis.document ? new KeyboardEvent(type, { bubbles: true, key: data?.key ?? "" }) : { type, target: n, key: data?.key });
 }
 
@@ -77,6 +81,13 @@ export function onHash(f) { globalThis.location ? addEventListener("hashchange",
 const mem = new Map();
 export function stored(k) { try { return globalThis.document && globalThis.localStorage ? localStorage.getItem(k) : mem.get(k) ?? null; } catch { return null; } }
 export function store(k, v) { try { globalThis.document && globalThis.localStorage ? localStorage.setItem(k, v) : mem.set(k, v); } catch {} }
+export function modal(n, on) {  // a <dialog> shown modally, or closed (once it is on the page)
+  if (!n.showModal) return void (on ? n.setAttribute("open", "") : n.removeAttribute("open"));
+  if (on && !n.isConnected) return void queueMicrotask(() => modal(n, on));
+  if (on && !n.open) n.showModal();
+  else if (!on && n.open) n.close();
+}
+export const measure = (n) => ({ top: n.scrollTop ?? 0, height: n.clientHeight ?? 0 });
 export const createSvg = (tag) => doc.createElementNS ? doc.createElementNS("http://www.w3.org/2000/svg", tag) : doc.createElement(tag);
 
 // ---- a document for Node: elements, text, comments and fragments; attributes; listeners; outerHTML ----

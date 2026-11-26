@@ -35,6 +35,33 @@ pub fn field(s: r.Signal, props): any
 
 pub fn find(selector: str): any
 
+// Fields with their first values, and rules: a rule takes a field's value and returns what's wrong with it, or nil.
+//   var f = ui.form({email: ""}, {email: fn(v) { return v.has("@") ? nil : "Enter an email address." }})
+//   form on submit { f.submit(fn(values) { save(values) }) } { field "Email" bind: f.at("email") button "Save" }
+pub class Form {
+  fn at(name: str): FormField
+  fn check(name: str)
+  fn error(name: str)
+  fn init(values, rules)
+  fn reset()
+  // done(values) if every rule passes (true); else false, and every field shows what's wrong with it.
+  fn submit(done: fn): bool
+  fn valid(): bool
+  fn value(name: str)
+  fn values()
+}
+
+pub fn form(values, rules): Form
+
+// One of a Form's fields: get() and set() its value (so bind: takes it), and error(), what's wrong with it once it has
+// been left or a submit was tried (else nil).
+pub class FormField {
+  fn error()
+  fn get()
+  fn init(form, name, v)
+  fn set(v)
+}
+
 // Go to path p (the address becomes #p).
 pub fn go(p: str)
 
@@ -61,6 +88,9 @@ pub fn make(tag: str, props, kids): any
 // effects stop.
 pub fn mount(target, view: fn): fn
 
+// A short message at the bottom of the page (show() puts them there), gone after a few seconds or when dismissed.
+pub fn notify(text: str)
+
 // The page's path (the address after #, "/" if none), followed as a signal is.
 pub fn path(): str
 
@@ -84,6 +114,11 @@ pub class Resource {
 
 // What load() gets for url from now on (text, or {status, body}), instead of the network: for tests and demos.
 pub fn respond(url: str, res)
+
+// items (a list, or a function of one), each shown by view(item) in a row height pixels tall, in a box that scrolls
+// (class "rows": give it a height; props: the box's, or nil). Only the rows in sight, and a few either side, are on the page, so a list of
+// 100,000 costs what a screenful does. A row is drawn again when the item at its place changes.
+pub fn rows(items, height: num, view: fn, props): any
 
 // Show view() on the page (web/index.html's #ui, else the body), with fut's theme under the page's own styles. The
 // page shown before (as a reload shows it again) is taken down first: its effects and timers stop.

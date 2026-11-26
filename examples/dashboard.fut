@@ -4,6 +4,7 @@
 import "std/ui"
 import "std/lists"
 import "std/strings"
+import "std/reactive" as r
 
 var DATA = "/examples/data/fleet.json"
 var fleet = ui.load(DATA)
@@ -12,6 +13,8 @@ state tick = 0          // how many live updates have come in: the charts' windo
 state hoursBack = 12    // hours shown
 state live = true
 state dark = ui.persist("switchyard.dark", false)
+state reporting = false  // the report dialog is open
+state reported = []      // incidents reported here, newest first
 
 class Incident {
   state acked
@@ -37,7 +40,7 @@ var built = nil
 fn incidents() {
   if data() == nil { return [] }
   if built == nil { built = lists.map(data().incidents, fn(m) { return Incident(m) }) }
-  return built
+  return reported + built
 }
 fn open() { return lists.filter(incidents(), fn(i) { return !i.acked }) }
 fn openFor(id) { return lists.filter(incidents(), fn(i) { return i.service == id }) }
@@ -130,6 +133,62 @@ fn ranked(q, only, by, desc) {
   return l
 }
 
+// ---- reporting an incident ----
+
+var report = ui.form({title: "", service: "", severity: "medium", details: ""}, {
+  title: fn(v) {
+    if v.trim().len() < 8 { return "Say what's wrong in a few words (8 characters or more)." }
+    return nil
+  },
+  service: fn(v) {
+    if v == "" { return "Pick the service it affects." }
+    return nil
+  }
+})
+var nextIncident = 419
+fn fileReport(v) {
+  var i = Incident({id: "INC-{nextIncident}", title: v.title.trim(), service: v.service, severity: v.severity,
+                    opened: data().hours[(23 + tick) % 24], acked: false})
+  nextIncident += 1
+  reported = [i] + reported
+  reporting = false
+  report.reset()
+  ui.notify("Reported {i.id}.")
+}
+
+// ---- the request log: made up the same way every time, 20,000 of them ----
+
+var logCache = nil
+fn requestLog() {
+  if logCache != nil { return logCache }
+  var paths = ["/api/cart", "/api/search?q=boots", "/api/login", "/img/p/4411.webp", "/api/orders/77812", "/api/recs/home"]
+  var out = []
+  var i = 0
+  while i < 20000 {
+    var s = services()[(i * 7 + floor(i / 13)) % services().len()]
+    var roll = (i * 37 + 11) % 1000 / 10
+    var code = 200
+    if s.status == "down" { code = 503 }
+    else if roll < s.errors { code = 500 }
+    else if roll > 97.5 { code = 404 }
+    var secs = 86399 - floor(i * 4.3)
+    out.push({n: i, at: "{pad(floor(secs / 3600))}:{pad(floor(secs / 60) % 60)}:{pad(secs % 60)}", service: s.name, code: code,
+              ms: floor(s.p95 * (0.3 + (i * 53 % 100) / 120)), path: paths[(i * 5) % paths.len()]})
+    i += 1
+  }
+  logCache = out
+  return out
+}
+fn pad(n) { return n < 10 ? "0{n}" : "{n}" }
+fn commas(n) {  // 20000 -> "20,000"
+  if n < 1000 { return "{n}" }
+  var rest = strings.padStart("{n % 1000}", 3, "0")
+  return "{commas(floor(n / 1000))},{rest}"
+}
+fn filteredLog(only, who) {
+  return lists.filter(requestLog(), fn(e) { return (only == "all" || e.code >= 500) && (who == "" || e.service == who) })
+}
+
 // ---- the pages ----
 
 view App {
@@ -143,6 +202,7 @@ view App {
       else if ui.at("/services/:id") != nil { ServicePage(ui.at("/services/:id").id) }
       else if ui.at("/services") != nil { Services() }
       else if ui.at("/incidents") != nil { Incidents() }
+      else if ui.at("/requests") != nil { Requests() }
       else { Overview() }
     }
   }
@@ -160,6 +220,7 @@ view Rail {
       "Incidents"
       if open().len() > 0 { span .count "{open().len()}" }
     }
+    link .nav to: "/requests" id: "nav-requests" "Requests"
     div .rail-foot {
       check "Dark" bind: dark
     }
@@ -329,8 +390,73 @@ view Incidents {
           if f == "all" { "All" } else { "{f}" }
         }
       }
+      button .primary .push id: "report" "Report an incident" on click { reporting = true }
     }
     for i in lists.filter(incidents(), fn(x) { return level == "all" || x.severity == level }) key i.id { IncidentRow(i) }
+  }
+  Report()
+}
+
+view Report {
+  dialog bind: reporting {
+    form .report id: "report-form" on submit { report.submit(fileReport) } {
+      h2 "Report an incident"
+      field "What's wrong" id: "r-title" placeholder: "Checkout times out for EU cards" bind: report.at("title")
+      row .pair {
+        choice "Service" id: "r-service" bind: report.at("service") {
+          option "Pick one" value: ""
+          for s in services() key s.id { option "{s.name}" value: s.id }
+        }
+        choice "Severity" id: "r-severity" bind: report.at("severity") {
+          option "High" value: "high"
+          option "Medium" value: "medium"
+          option "Low" value: "low"
+        }
+      }
+      area "Details (optional)" id: "r-details" rows: 3 bind: report.at("details")
+      row .actions {
+        button .ghost type: "button" "Cancel" on click { reporting = false }
+        button .primary id: "r-submit" "Report incident"
+      }
+    }
+  }
+}
+
+view Requests {
+  state only = "all"
+  state who = ""
+  state shown = r.computed(fn() { return filteredLog(only, who) })
+  section .panel {
+    row .table-tools {
+      for f in ["all", "errors"] key f {
+        button .chip .on: only == f id: "log-{f}" on click { only = f } {
+          if f == "all" { "All" } else { "Errors" }
+        }
+      }
+      select id: "log-service" bind: who {
+        option "Every service" value: ""
+        for s in services() key s.id { option "{s.name}" value: s.name }
+      }
+      span .quiet .push "{commas(shown.len())} requests today"
+    }
+    div .log-head {
+      span "Time"
+      span "Service"
+      span "Status"
+      span .num "ms"
+      span "Path"
+    }
+    ui.rows(fn() { return shown }, 34, fn(e) { return LogRow(e) }, {id: "log-rows"})
+  }
+}
+
+view LogRow(e) {
+  div .log-row .bad: e.code >= 500 .miss: e.code == 404 {
+    span .at "{e.at}"
+    span "{e.service}"
+    span .code "{e.code}"
+    span .num "{e.ms}"
+    span .path "{e.path}"
   }
 }
 
@@ -343,7 +469,7 @@ view IncidentRow(i) {
       link to: "/services/{i.service}" "{i.service}"
     }
     if i.acked { span .quiet "Acknowledged" }
-    else { button .ghost id: "ack-{i.id}" "Acknowledge" on click { i.acked = true } }
+    else { button .ghost id: "ack-{i.id}" "Acknowledge" on click { i.acked = true ui.notify("Acknowledged {i.id}.") } }
   }
 }
 
@@ -436,6 +562,22 @@ button.ghost \{ background: transparent; }
 .sev.high \{ background: color-mix(in srgb, var(--down) 16%, transparent); color: var(--down); }
 .sev.medium \{ background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
 .problem \{ max-width: 52ch; }
+.push \{ margin-left: auto; }
+.report \{ display: flex; flex-direction: column; gap: 14px; }
+.report h2 \{ margin: 0; font-size: 20px; font-weight: 700; letter-spacing: -0.01em; }
+.report .pair \{ flex-wrap: nowrap; align-items: start; }
+.report .pair > * \{ flex: 1; }
+.report .actions \{ justify-content: flex-end; margin-top: 4px; }
+.field select, .field textarea, .field input \{ width: 100%; box-sizing: border-box; }
+.log-head, .log-row \{ display: grid; grid-template-columns: 90px 140px 70px 70px 1fr; gap: 12px; align-items: center; padding: 0 10px; }
+.log-head \{ color: var(--muted); font-size: 12.5px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+.log-row \{ height: 34px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+.log-row .num, .log-head .num \{ text-align: right; }
+.log-row .at \{ color: var(--muted); }
+.log-row .path \{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+.log-row.bad .code \{ color: var(--down); font-weight: 600; }
+.log-row.miss .code \{ color: var(--warn); }
+#log-rows \{ height: min(62vh, 640px); }
 @media (max-width: 860px) \{
   .app \{ grid-template-columns: 1fr; }
   .rail \{ flex-direction: row; flex-wrap: wrap; align-items: center; border-right: 0; border-bottom: 1px solid var(--line); padding: 10px 16px; }

@@ -1,6 +1,7 @@
 // examples/dashboard.fut, driven as a user would (wasm only: std/ui is the DOM's).
 import "../../examples/dashboard.fut"
 import "std/ui"
+import "std/strings"
 
 fn page() { return ui.htmlOf(ui.find("body")) }
 fn click(sel) { ui.trigger(ui.find(sel), "click", nil) }
@@ -44,8 +45,29 @@ test "Switchyard: a failed load, then the board, the table, a service, an incide
   ui.go("/services/nope")
   expect page().has("There is no service called nope.")
   ui.go("/incidents")
+  click("#report")
+  expect page().has("<dialog open")
+  ui.trigger(ui.find("#report-form"), "submit", nil)
+  expect page().has("Say what's wrong in a few words") && page().has("Pick the service it affects.")
+  expect page().has("aria-invalid")
+  ui.trigger(ui.find("#r-title"), "input", {value: "Logins fail for some users"})
+  ui.trigger(ui.find("#r-service"), "change", {value: "auth"})
+  expect !page().has("Say what's wrong") && !page().has("Pick the service")
+  ui.trigger(ui.find("#report-form"), "submit", nil)
+  expect page().has("INC-419") && page().has("Logins fail for some users") && page().has("Reported INC-419.")
+  expect !page().has("<dialog open")
+  click("#report")
+  expect !page().has("Say what's wrong")  // a fresh form: nothing shown as wrong yet
   click("#level-low")
-  expect !page().has("INC-1")
+  expect !page().has("id=\"inc-INC-1\"")  // (its toast may still be up)
   click("#level-all")
-  expect page().has("INC-1")
+  expect page().has("id=\"inc-INC-1\"")
+  ui.go("/requests")
+  expect page().has("20,000 requests today")
+  expect strings.count(page(), "class=\"row-slot\"") < 60
+  expect !page().has("top: 170000px")
+  ui.trigger(ui.find("#log-rows"), "scroll", {top: 170000, height: 600})
+  expect page().has("top: 170000px") && strings.count(page(), "class=\"row-slot\"") < 60
+  click("#log-errors")
+  expect !page().has("20,000 requests today") && page().has("requests today")
 }

@@ -38,6 +38,8 @@ extern dom fn onHash(fn): void
 extern dom fn stored(str): any
 extern dom fn store(str, str): void
 extern dom fn createSvg(str): any
+extern dom fn modal(any, any): void
+extern dom fn measure(any): any
 
 // What kind of child v is: "none" (nil, false, true), "text" (a string or number), "fn", "list" or "node".
 fn kindOf(v) {
@@ -165,7 +167,14 @@ fn bindText(tag, s, props) {
     said = e.value
     s.set(e.value)
   })
+  listen(n, "blur", fn(e) { checked(s) })
   return n
+}
+fn checked(s) { if isa(s, FormField) { s.touched.set(true) } }  // a form's field, once left, shows what's wrong with it
+fn problems(box, s) {  // under a form's field: what's wrong with it, once it shows
+  if !isa(s, FormField) { return nil }
+  r.effect(fn() { setProp(box, "aria-invalid", s.error() != nil) })
+  return el("span", {"class": "field-error"}, fn() { return s.error() })
 }
 
 // A checkbox showing s (a signal of true or false), which ticking sets, with its label (props: the box's).
@@ -462,6 +471,149 @@ fn plot(series, labels, opts) {
   return [el("div", {"class": "legend"}, legend), chart]
 }
 
+// ---- forms ----
+
+// One of a Form's fields: get() and set() its value (so bind: takes it), and error(), what's wrong with it once it has
+// been left or a submit was tried (else nil).
+pub class FormField {
+  fn init(form, name, v) {
+    self.form = form
+    self.name = name
+    self.start = v
+    self.value = r.signal(v)
+    self.touched = r.signal(false)
+  }
+  fn get() { return self.value.get() }
+  fn set(v) { self.value.set(v) }
+  fn error() {
+    if !self.touched.get() && !self.form.tried.get() { return nil }
+    return self.form.check(self.name)
+  }
+}
+
+// Fields with their first values, and rules: a rule takes a field's value and returns what's wrong with it, or nil.
+//   var f = ui.form({email: ""}, {email: fn(v) { return v.has("@") ? nil : "Enter an email address." }})
+//   form on submit { f.submit(fn(values) { save(values) }) } { field "Email" bind: f.at("email") button "Save" }
+pub class Form {
+  fn init(values, rules) {
+    self.fields = {}
+    self.rules = rules
+    self.tried = r.signal(false)
+    for k in values { self.fields[k] = FormField(self, k, values[k]) }
+  }
+  fn at(name: str): FormField {
+    if !self.fields.has(name) { throw "this form has no field {name}" }
+    return self.fields[name]
+  }
+  fn value(name: str) { return self.at(name).get() }
+  fn values() {
+    var m = {}
+    for k in self.fields { m[k] = self.fields[k].get() }
+    return m
+  }
+  fn check(name: str) {  // what's wrong with the field's value now, or nil
+    if self.rules == nil || !self.rules.has(name) { return nil }
+    var rule = self.rules[name]
+    return rule(self.value(name))
+  }
+  fn error(name: str) { return self.at(name).error() }
+  fn valid(): bool {
+    for k in self.fields { if self.check(k) != nil { return false } }
+    return true
+  }
+  // done(values) if every rule passes (true); else false, and every field shows what's wrong with it.
+  fn submit(done: fn): bool {
+    self.tried.set(true)
+    if !self.valid() { return false }
+    done(self.values())
+    return true
+  }
+  fn reset() {  // the first values again, nothing shown as wrong
+    var me = self
+    r.batch(fn() {
+      me.tried.set(false)
+      for k in me.fields {
+        var f = me.fields[k]
+        f.value.set(f.start)
+        f.touched.set(false)
+      }
+    })
+  }
+}
+pub fn form(values, rules): Form { return Form(values, rules) }
+
+// ---- toasts ----
+
+var toastList = r.signal([])
+var toastNext = 0
+// A short message at the bottom of the page (show() puts them there), gone after a few seconds or when dismissed.
+pub fn notify(text: str) {
+  toastNext += 1
+  var id = toastNext
+  toastList.set(toastList.peek() + [{id: id, text: text}])
+  timer(5000, false, fn() { dismiss(id) })
+}
+fn dismiss(id) {
+  var keep = []
+  for t in toastList.peek() { if t.id != id { keep.push(t) } }
+  toastList.set(keep)
+}
+fn toasts() {
+  return el("div", {"class": "toasts", "aria-live": "polite"}, each(fn() { return toastList.get() }, fn(t) { return t.id }, fn(t) {
+    return el("div", {"class": "toast"}, [el("span", nil, t.text),
+      el("button", {"class": "toast-x", "aria-label": "Dismiss", onclick: fn(e) { dismiss(t.id) }}, "Dismiss")])
+  }))
+}
+
+// ---- long lists ----
+
+// items (a list, or a function of one), each shown by view(item) in a row height pixels tall, in a box that scrolls
+// (class "rows": give it a height; props: the box's, or nil). Only the rows in sight, and a few either side, are on the page, so a list of
+// 100,000 costs what a screenful does. A row is drawn again when the item at its place changes.
+pub fn rows(items, height: num, view: fn, props): any {
+  var top = r.signal(0)
+  var seen = r.signal(0)
+  var box = el("div", withClass(orEmpty(props), "rows"), nil)
+  var inner = el("div", {"class": "rows-inner", style: fn() { return "height: {now(items).len() * height}px" }}, nil)
+  append(box, inner)
+  listen(box, "scroll", fn(e) { r.batch(fn() { top.set(e.top) seen.set(e.height) }) })
+  var drawn = {}  // index -> {item, node, dispose}
+  r.onCleanup(fn() { for k in drawn.keys() { drawn[k].dispose() } })
+  r.effect(fn() {
+    var list = now(items)
+    var h = seen.get()
+    if h <= 0 { h = 800 }
+    var first = floor(top.get() / height) - 5
+    if first < 0 { first = 0 }
+    var end = floor((top.get() + h) / height) + 5
+    if end > list.len() { end = list.len() }
+    r.untrack(fn() { drawRows(list, first, end, height, view, inner, drawn) })
+  })
+  after(0, fn() { seen.set(measure(box).height) })
+  return box
+}
+fn drawRows(list, first, end, height, view, inner, drawn) {
+  for k in drawn.keys() {
+    var d = drawn[k]
+    if k < first || k >= end || list[k] != d.item {
+      d.dispose()
+      remove(d.node)
+      drawn.remove(k)
+    }
+  }
+  var i = first
+  while i < end {
+    if !drawn.has(i) { drawn[i] = drawRow(list[i], i, height, view, inner) }
+    i += 1
+  }
+}
+fn drawRow(item, i, height, view, inner) {
+  var slot = el("div", {"class": "row-slot", style: "top: {i * height}px; height: {height}px"}, nil)
+  var dispose = r.root(fn() { add(slot, view(item)) })
+  append(inner, slot)
+  return {item: item, node: slot, dispose: dispose}
+}
+
 // ---- for views (src/views.cpp rewrites `view` and `state` into these) ----
 
 // The list f fills: a view's block of children.
@@ -499,11 +651,23 @@ pub fn make(tag: str, props, kids): any {
   var bound = nil
   if props.has("bind") { bound = props.remove("bind") }
   if tag == "row" || tag == "column" || tag == "text" { return el("div", withClass(props, tag), kids) }
-  if tag == "field" {
-    var input = field(bound, nil)
-    if props.has("id") { setProp(input, "id", props.remove("id")) }
-    if props.has("placeholder") { setProp(input, "placeholder", props.remove("placeholder")) }
-    return el("label", withClass(props, "field"), [el("span", nil, kids), input])
+  if tag == "field" || tag == "choice" || tag == "area" {  // labelled: a text box, a select (its options: kids), a text area
+    var box = nil
+    var label = kids
+    if tag == "choice" {  // choice "Label" bind: s { option ... }: the first child is the label
+      var list = kids
+      if kindOf(list) != "list" { list = [list] }
+      label = list[0]
+      box = el("select", nil, list.slice(1, list.len()))
+      r.effect(fn() { setProp(box, "value", bound.get()) })
+      listen(box, "change", fn(e) { bound.set(e.value) checked(bound) })
+    } else {
+      var t = "input"
+      if tag == "area" { t = "textarea" }
+      box = bindText(t, bound, nil)
+    }
+    for k in ["id", "placeholder", "type", "rows", "disabled"] { if props.has(k) { prop(box, k, props.remove(k)) } }
+    return el("label", withClass(props, "field"), [el("span", nil, label), box, problems(box, bound)])
   }
   if tag == "check" {
     var box = el("input", nil, nil)
@@ -514,6 +678,15 @@ pub fn make(tag: str, props, kids): any {
     return el("label", withClass(props, "check"), [box, el("span", nil, kids)])
   }
   if bound != nil && (tag == "input" || tag == "textarea") { return bindText(tag, bound, props) }
+  if tag == "dialog" {  // bind: s, a signal of true or false: shown (modally) while true; Escape or the backdrop closes it
+    var d = el("dialog", props, el("div", {"class": "dialog-body"}, kids))  // (a click on the dialog itself: the backdrop)
+    if bound != nil {
+      r.effect(fn() { modal(d, bound.get()) })
+      listen(d, "close", fn(e) { bound.set(false) })
+      listen(d, "click", fn(e) { if e.direct { bound.set(false) } })
+    }
+    return d
+  }
   if tag == "link" {  // link to: "/path" "Text": an <a> to #/path, class "active" while the page is there
     var to = props.remove("to")
     var given = props["class"]
@@ -556,7 +729,7 @@ pub fn show(view: fn): fn {
   var target = query("#ui")
   if target == nil { target = "body" }
   shownView = view
-  shown = mount(target, view)
+  shown = mount(target, fn() { return [view(), toasts()] })
   return shown
 }
 
@@ -602,4 +775,22 @@ input[type=checkbox] \{ accent-color: var(--accent); width: 16px; height: 16px; 
 .spark svg \{ width: 100%; height: 100%; display: block; overflow: visible; }
 .spark polyline \{ fill: none; stroke: currentColor; stroke-width: 1.6; vector-effect: non-scaling-stroke; }
 a.active \{ color: var(--accent); }
+:root \{ --bad: #c8372d; }
+@media (prefers-color-scheme: dark) \{ :root \{ --bad: #ff6b5b; } }
+.field-error \{ color: var(--bad); font-size: 12.5px; min-height: 0; }
+.field-error:empty \{ display: none; }
+[aria-invalid=true] \{ border-color: var(--bad) !important; }
+.field select, .field textarea \{ font-size: 15px; color: var(--fg); }
+.dialog-body \{ padding: 22px 24px; }
+dialog \{ border: 1px solid var(--line); border-radius: calc(var(--radius) + 4px); padding: 0; background: var(--bg);
+  color: var(--fg); max-width: min(520px, calc(100vw - 32px)); width: 100%; box-shadow: 0 20px 60px rgb(0 0 0 / .25); }
+dialog::backdrop \{ background: rgb(10 14 20 / .45); }
+.toasts \{ position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column;
+  gap: 8px; z-index: 10; width: max-content; max-width: calc(100vw - 32px); }
+.toast \{ display: flex; align-items: center; gap: 14px; padding: 10px 10px 10px 16px; border-radius: var(--radius);
+  background: var(--fg); color: var(--bg); box-shadow: 0 8px 24px rgb(0 0 0 / .2); }
+.toast-x \{ background: transparent; color: inherit; border-color: transparent; opacity: .75; padding: 4px 8px; }
+.rows \{ position: relative; overflow: auto; height: 480px; }
+.rows-inner \{ position: relative; }
+.row-slot \{ position: absolute; left: 0; right: 0; }
 "
