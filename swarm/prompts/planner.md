@@ -10,3 +10,4 @@ Good tasks:
 - Include fix-up tasks when main's tests fail or a rejection shows a gap.
 - Each is self-contained: the worker sees only its task, not rejections, notes or other tasks. Copy what it needs (the review's numbered points, the bug and where it is) into the detail instead of pointing at "#54's notes".
 - Tasks given back as blocked say what they wait for. Propose that prerequisite (or the bug fix the note names) rather than another task blocked the same way.
+- Done conditions are about the code and its tests ("tests/x_test.fut covers ... and passes"). The harness runs the tests; don't ask workers to report command output.
