@@ -277,7 +277,7 @@ const std::string& symName(int);
 
 // ---- the VM block pinned in x28; JIT code reaches helpers and globals with one ldr ----
 enum Helper { H_POLL, H_STACK, H_BINOP, H_GETF, H_SETF, H_GETI, H_SETI, H_PREP, H_LIST, H_ITER, H_NUMCHK, H_UNDEF,
-              H_MAP, H_CLOSURE, H_STALE, H_ECHO, H_FFI, H_YIELD, H_HOT, H_THROW, H_CAPSET, H_TXUNWIND, H_TYPECHK, H_EFFECT, H_INVENTER, H_PRINTARGS, H_FORMAT, NH };
+              H_MAP, H_CLOSURE, H_STALE, H_ECHO, H_FFI, H_YIELD, H_HOT, H_THROW, H_CAPSET, H_TXUNWIND, H_TYPECHK, H_EFFECT, H_INVENTER, H_PRINTARGS, H_FORMAT, H_FUEL, H_BUDGET, NH };
 struct FormatSpec {
   static constexpr uint16_t noPrecision = UINT16_MAX, maxPrecision = 1000;
   enum { Sign = 1, Zero = 2, Group = 4 };
@@ -300,10 +300,12 @@ struct Run { uintptr_t cur, end; };
 // handler (effects.cpp). Functions that declare effects read and write the first two; try records save all three,
 // and inv: the innermost running method of a class with invariants, as a record in its frame (rt_inventer).
 // invObj: an instance an outside store just changed, whose invariants the store site then checks (rt_setf).
+// fuel: the steps left (fuel.cpp): every loop back-edge and function entry takes one, and below zero raises. budgets:
+// how many budget() calls are open; it shares a word with who, so try records save both and a catch puts back both.
 #ifdef __wasm__  // limit, then poll: one i64 load at &limit tests both on a function's entry (gen_wasm.h)
-struct VM { void* limit; u32 poll; void* handler; u32 txn; Run runs[NCLS + 1]; void* helpers[NH]; uint64_t allowed; V hstack; u32 who, pad; uint64_t inv; V invObj; V globals[MAXG]; IC ics[MAXIC]; };
+struct VM { void* limit; u32 poll; void* handler; u32 txn; Run runs[NCLS + 1]; void* helpers[NH]; uint64_t allowed; V hstack; u32 who, budgets; uint64_t inv; V invObj; int64_t fuel; V globals[MAXG]; IC ics[MAXIC]; };
 #else
-struct VM { u32 poll, txn; void* limit; void* handler; Run runs[NCLS + 1]; void* helpers[NH]; uint64_t allowed; V hstack; u32 who, pad; uint64_t inv; V invObj; V globals[MAXG]; IC ics[MAXIC]; };
+struct VM { u32 poll, txn; void* limit; void* handler; Run runs[NCLS + 1]; void* helpers[NH]; uint64_t allowed; V hstack; u32 who, budgets; uint64_t inv; V invObj; int64_t fuel; V globals[MAXG]; IC ics[MAXIC]; };
 #endif
 // The running isolate's VM block (JIT code has it in x28). Each isolate has its own: its globals, inline caches,
 // allocation runs and handler chain. vmNew makes one for a new isolate (helpers set, caches empty, globals nil).
@@ -327,7 +329,8 @@ void eachVM(void (*f)(VM*, void*), void* ctx);  // every isolate's (under the ru
 constexpr int ROFF(int c) { return 24 + 16 * c; }  // first, so ldp reaches every run from x28
 constexpr int HOFF(int h) { return ROFF(NCLS + 1) + 8 * h; }
 constexpr int EOFF = HOFF(NH);  // vm->allowed; vm->hstack at +8, vm->who at +16, vm->inv at +24, vm->invObj at +32
-constexpr int GOFF(int g) { return EOFF + 40 + 8 * g; }
+constexpr int FOFF = EOFF + 40;  // vm->fuel
+constexpr int GOFF(int g) { return EOFF + 48 + 8 * g; }
 constexpr u32 VM_HANDLER = 16;
 constexpr u32 IOFF(int i) { return (GOFF(MAXG) + 15) / 16 * 16 + 16 * i; }
 int newIC(bool set = false);  // set: a field store's, which must miss while a transaction is open
@@ -416,6 +419,13 @@ template <auto f> void* callable() {
 #endif
 }
 void native(const char* name, void* f, int arity);
+void fuelInit();   // fuel.cpp: steps, budget(n, f)
+extern bool stepsOn;  // compile step counting into code: once a program names budget or stepCount (or the host asks)
+u32 budgetDepth();
+void budgetUnwind(u32 depth);
+u32 budgetFiberEnter();
+void budgetFiberLeave(u32 outer);
+void budgetYieldCheck();
 void fmathInit();  // fmath.cpp: sin, cos, exp, log, pow, ... that give the same bits on every platform
 void method(K k, int sym, void* f, int arity);
 template <auto f> void native(const char* name) { native(name, callable<f>(), nargs(f)); }
@@ -680,6 +690,7 @@ constexpr u32 mov(u32 d, u32 m) { return 0xaa0003e0 | m << 16 | d; }
 constexpr u32 addi(u32 d, u32 n, u32 imm) { return 0x91000000 | imm << 10 | n << 5 | d; }
 constexpr u32 addhi(u32 d, u32 n, u32 imm) { return 0x91400000 | imm << 10 | n << 5 | d; }  // add d, n, #imm, lsl #12
 constexpr u32 subi(u32 d, u32 n, u32 imm) { return 0xd1000000 | imm << 10 | n << 5 | d; }
+constexpr u32 subsi(u32 d, u32 n, u32 imm) { return 0xf1000000 | imm << 10 | n << 5 | d; }  // subs, setting flags
 constexpr u32 subhi(u32 d, u32 n, u32 imm) { return 0xd1400000 | imm << 10 | n << 5 | d; }
 constexpr u32 movz(u32 d, u32 imm, u32 hw) { return 0xd2800000 | hw << 21 | imm << 5 | d; }
 constexpr u32 movk(u32 d, u32 imm, u32 hw) { return 0xf2800000 | hw << 21 | imm << 5 | d; }

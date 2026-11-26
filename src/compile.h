@@ -169,6 +169,7 @@ struct Fun {  // per-function emission state
   // Declared effects (`fn f() ! io`): where the caller's vm->allowed and vm->who are kept (arm64: two frame slots;
   // wasm: two locals) while the function runs; the epilogue every return goes through puts them back. -1: none.
   int effHome = -1;
+  int fuelL = -1;  // wasm: an i64 local the step count passes through (gen_wasm.h fuel())
   // Its declared result type (`fn f(): num`; 0: none), checked in the epilogue every return goes through, so after
   // the function's own try blocks: a function never catches its own result's failed check.
   uint64_t retTy = 0;

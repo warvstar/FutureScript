@@ -100,13 +100,15 @@ int effBuiltinOp(int sym) { auto it = builtinOps.find(sym); return it == builtin
 
 EffState effSave() { return {vm->allowed, vm->hstack, vm->who, vm->inv}; }
 void effLoad(const EffState& s) { vm->allowed = s.allowed, vm->hstack = s.hstack, vm->who = s.who, vm->inv = s.inv; }
+TLS std::vector<u32> savedBudgets;  // budgetDepth() at each effEnter: an uncaught error leaves budgets open
 u32 effEnter() {
-  saved.push_back(effSave());
+  saved.push_back(effSave()), savedBudgets.push_back(budgetDepth());
   vm->allowed = EFF_BITS, vm->hstack = NIL, vm->who = 0, vm->inv = 0;
   return (u32)saved.size() - 1;
 }
 void effLeave(u32 depth) {
   if (depth >= saved.size()) return;
+  budgetUnwind(savedBudgets[depth]), savedBudgets.resize(depth);
   effLoad(saved[depth]), saved.resize(depth);
 }
 void effMark(void (*mark)(V)) {

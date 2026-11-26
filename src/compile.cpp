@@ -141,7 +141,7 @@ struct Compiler : Gen {
   uint64_t envFor(const std::string& f) {
     const std::string& P = pkgPrefix(f);
     auto it = envFinal.find(P);
-    return it != envFinal.end() ? it->second : 1469598103934665603ull;
+    return (it != envFinal.end() ? it->second : 1469598103934665603ull) ^ (stepsOn ? 0x5354455053ull : 0);  // on: all recompile
   }
   std::vector<Pend> pend;
   std::vector<ClassDef> classes;
@@ -2216,6 +2216,10 @@ struct Compiler : Gen {
     for (Tok t = lex(L), p; t.t != T_EOF; p = t, t = lex(L)) {
       bool afterKw = p.t == T_ID && t.t == T_ID;
       topTry |= tryWord(t) && open.empty();  // a try in top-level code
+      if (t.t == T_ID && !stepsOn) {  // a program that names budget or stepCount counts steps from now on (fuel.cpp)
+        static const int b = intern("budget"), c = intern("stepCount");
+        stepsOn = t.sym == b || t.sym == c;
+      }
       if (t.t == T_ID && t.sym == S_pub && !depth) {
         Lexer s = L;
         Tok n = lex(s);

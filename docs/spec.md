@@ -52,6 +52,7 @@ clock()                  seconds (monotonic)
 sleep(s)                 seconds
 random()                 in [0, 1)
 seed(n)                  random() then repeats a fixed sequence (whole n; per isolate)
+budget(n, f)             f() with at most n steps (loop iterations + calls), else [budget]; stepCount()
 fiber(fn(x) { ... })     f.resume()  f.send(v)  f.done()
 channel(n)  cores()      see Isolates
 run(path)  run({source, args, timeout})   fut in a child process -> {code, out, err, timedOut}
@@ -138,7 +139,7 @@ A list or map that passes `list<T>`/`map<K, V>` keeps that type for good: any la
 
 Effects: `io` (print, run, extern, graphics, files, env, exec, fetch) `clock` (clock, sleep, time) `random` `yield` `spawn` `chan` (every channel/task op), declared ones; json is pure. A handler's return is the op's result, no resumption.
 
-Determinism: numbers (`+ - * / %`, sqrt, floor, std/math) give the same bits on every platform. Code whose declared effects leave out `io`, `clock`, `spawn` and `chan` is deterministic, given `seed(n)` if it has `random`; supply the clock with `handle { } with clock() { }`.
+Determinism: numbers (`+ - * / %`, sqrt, floor, std/math) give the same bits on every platform. Code whose declared effects leave out `io`, `clock`, `spawn` and `chan` is deterministic, given `seed(n)` if it has `random`; supply the clock with `handle { } with clock() { }`. Steps count the same everywhere: `budget(n, f)` stops runaway code at the same step on every platform; a try inside f can't get past it; an inner budget gets at most what the outer has left.
 
 ## Errors, atomic, contracts
 

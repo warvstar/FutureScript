@@ -456,9 +456,10 @@ static std::string text;  // what the last string-returning export returned
 static Compiled last;
 EXPORT(fut_std) void futStd(const char* dir) { stdRoot = canonicalPath(dir); }  // the host says where std/ is
 // flags: 1 verbose, 2 no tier 2 (nothing compiles after a program loads: a Cloudflare Worker can't compile code)
-// 4 interpret the compiled code (interp.cpp) instead of installing it: a host that can't compile at all)
+// 4 interpret the compiled code (interp.cpp) instead of installing it: a host that can't compile at all), 8 count steps
 EXPORT(fut_init) void futInit(int flags) {  // installs the natives' adapters
   verbose = flags & 1, noTier = flags & 6, interpMode = flags & 4;
+  stepsOn = flags & 8;  // count steps in all code, budget() or not (fuel.cpp)
   if (interpMode) interpInit();
   rtInit(), jitCollect(), refRelease = host_ref_gone;
 }

@@ -118,6 +118,7 @@ VM* vmNew() {
   for (V& x : v->globals) x = NIL;
   for (int i = 0; i < nics; i++) v->ics[i].key = EMPTY;
   v->allowed = EFF_BITS, v->hstack = NIL;  // unchecked, no handlers (as effectsInit)
+  v->fuel = int64_t(1) << 62;              // no budget (fuel.cpp)
   vms.push_back(v);
   return v;
 }
@@ -673,7 +674,9 @@ V fiberResume(V fv, V v) {  // run fv until it yields (giving the yielded value)
   volatile V keep = mine.hstack;
   (void)keep;
   effLoad({f->allowed, f->hstack, f->who, f->inv});
+  u32 budgets = budgetFiberEnter();
   fiberRun(f, start);
+  budgetFiberLeave(budgets);
   f->allowed = vm->allowed, f->hstack = vm->hstack, f->who = vm->who, f->inv = vm->inv;
   effLoad(mine);
   if (f->state == FIB_DONE) {
@@ -693,6 +696,7 @@ V rt_yield(V v) {
   if (handled) return r;
   Fiber* f = fiberCur;
   if (!f) ERR("@fiber yield outside a fiber");
+  budgetYieldCheck();
   if (txnOpenIn(f)) ERR("@atomic yield inside atomic { }: other code would run while it is half done (yield after it ends)");
   f->val = v, f->state = FIB_SUSPENDED;
   fiberYield(f);
@@ -988,6 +992,7 @@ void rtInit() {
     return NIL;
   }>("match@fail");
   fmathInit();
+  fuelInit();
   method<+[](V m) { return mapList(m, true); }>(K::Map, S_keys);
   method<+[](V m) { return mapList(m, false); }>(K::Map, S_values);
   testInit();

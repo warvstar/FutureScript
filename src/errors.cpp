@@ -39,6 +39,7 @@ const ErrCode codes[] = {
     {"index", "An index is out of range or not a whole number, or the value can't be indexed.", "Check 0 <= i < len first; pop() needs a non-empty list."},
     {"not-iterable", "for-in over a value that can't be iterated.", "Iterate a list, map, str, range (a..b) or fiber."},
     {"not-callable", "A call of something that isn't a function.", "Check the value; a map key must hold a function to be called."},
+    {"budget", "Code running under budget(n, f) took more than n steps (loop iterations and calls).", "Give it a bigger budget, or make it do less: the count is the same on every platform."},
     {"stack-overflow", "Calls nested too deep, usually unbounded recursion.", "Add the base case, or turn the recursion into a loop."},
     {"stale-call", "Old code still running called a function whose parameters a hot reload changed.", "Nothing to fix in the source: let the old frame finish or restart."},
     {"fiber", "A fiber was used wrongly: resumed when finished or running, yield outside one.", "Check f.done() before resuming; yield only inside a fiber's function."},

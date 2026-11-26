@@ -134,6 +134,12 @@ struct Gen : CState {
   void poll() {  // safepoint: hot reload, REPL lines, garbage collection
     vmb(), mem(I32_LOAD, 2, vo(&vm->poll)), open(IF, VOID, UNLIKELY), syncSp(), i32c(slotOf(vm->helpers[H_POLL])), callTable(1 + H_POLL), close();
   }
+  void fuel() {  // a step (fuel.cpp): every back-edge and function entry takes one from vm->fuel; below zero, rt_fuel raises
+    u32 at = vo(&vm->fuel);
+    if (F->fuelL < 0) F->fuelL = L0 + (int)F->k.wlocals.size(), F->k.wlocals.push_back(I64);
+    vmb(), vmb(), mem(I64_LOAD, 3, at), i64c(1), op(I64_SUB), op(LOCAL_TEE), u(F->fuelL), mem(I64_STORE, 3, at);
+    get(F->fuelL), i64c(0), op(I64_LT_S), open(IF, VOID, UNLIKELY), syncSp(), i32c(slotOf(vm->helpers[H_FUEL])), callTable(1 + H_FUEL), close();
+  }
   void ret() { if (F->init) ldl(0, F->selfHome); br(BR, 0), F->live = false; }  // to the epilogue
 
   // Frame: FP = sp - size (on the shadow stack shared with C++; sp is the caller's FP), a stack check and a
@@ -173,6 +179,7 @@ struct Gen : CState {
       for (u32 p = SP; p < A0 + NA; p++) get(p);
       i32c((int32_t)slotOf(deopt)), op(RETURN_CALL_INDIRECT), u(0), u(0), close();  // a tail call: no extra frame
     }
+    if (stepsOn && F->vmLocal < 0) F->vmLocal = (int)(L0 + F->k.wlocals.size()), F->k.wlocals.push_back(I32);  // fuel() below
     if (size || F->vmLocal >= 0) {
       if (F->vmLocal < 0) F->vmLocal = (int)(L0 + F->k.wlocals.size()), F->k.wlocals.push_back(I32);
       op(GLOBAL_GET), u(1), set((u32)F->vmLocal);
@@ -185,6 +192,7 @@ struct Gen : CState {
       get(FP), op(I64_EXTEND_U), vmb(), mem(I64_LOAD, 3, vo(&vm->limit)), op(I64_LT_U);
       open(IF, VOID, UNLIKELY), syncSp(), i32c(slotOf(vm->helpers[H_STACK])), callTable(1 + H_STACK), close();
     }
+    if (stepsOn) fuel();
     // The stack check is also the safepoint (a function that calls has a frame). A leaf needs none of its own:
     // its caller has one, and so do its loops.
     b(BLOCK), b(VOID);
@@ -254,7 +262,7 @@ struct Gen : CState {
   void exitIfEnd(Loop& lp) { get(R0), i64c(END), op(I64_EQ), br(BR_IF, lp.depth, UNLIKELY); }
   void bodyBegin(Loop&) { open(BLOCK); }
   void contHere(Loop&) { close(); }
-  void loopBack(Loop& lp) { poll(), br(BR, lp.depth + 1); }
+  void loopBack(Loop& lp) { if (stepsOn) fuel(); poll(), br(BR, lp.depth + 1); }
   void loopEnd(Loop&) { close(), close(); }
   void jump(Loop& lp, bool brk) { br(BR, brk ? lp.depth : lp.depth + 2); }
   void leaveTries(size_t) {}  // wasm try blocks are structured: leaving one needs nothing
@@ -267,7 +275,7 @@ struct Gen : CState {
     TryAt t{F->depth};
     slot(), base(t.r), txnDepth(), op(I64_EXTEND_U), mem(I64_STORE, 3, off(t.r));
     slot(), slot(), slot(), slot();
-    effSlot(t.r + 1, vo(&vm->allowed), false), effSlot(t.r + 2, vo(&vm->hstack), false), effSlot(t.r + 3, vo(&vm->who), true);
+    effSlot(t.r + 1, vo(&vm->allowed), false), effSlot(t.r + 2, vo(&vm->hstack), false), effSlot(t.r + 3, vo(&vm->who), false);  // and vm->budgets
     effSlot(t.r + 4, vo(&vm->inv), false);
     open(BLOCK), open(BLOCK, I64), open(TRY_TABLE), u(1), b(0), u(0), u(0);  // one catch: tag 0, label 0
     return t;
@@ -275,7 +283,10 @@ struct Gen : CState {
   void txnDepth() { vmb(), mem(I32_LOAD, 2, vo(&vm->txn)); }
   void tryCatch(TryAt& t) {
     close(), br(BR, F->blocks - 1), close(), set(R0);
-    effBack(t.r + 1, vo(&vm->allowed), false), effBack(t.r + 2, vo(&vm->hstack), false), effBack(t.r + 3, vo(&vm->who), true);
+    // budget() calls opened inside the try give back their unused steps before vm->budgets is put back (fuel.cpp)
+    vmb(), mem(I32_LOAD, 2, vo(&vm->budgets)), base(t.r + 3), mem(I32_LOAD, 2, off(t.r + 3) + 4), op(I32_NE), open(IF, VOID, UNLIKELY);
+    syncSp(), base(t.r + 3), mem(I32_LOAD, 2, off(t.r + 3) + 4), i32c(slotOf(vm->helpers[H_BUDGET])), callTable(1 + H_BUDGET), close();
+    effBack(t.r + 1, vo(&vm->allowed), false), effBack(t.r + 2, vo(&vm->hstack), false), effBack(t.r + 3, vo(&vm->who), false);
     effBack(t.r + 4, vo(&vm->inv), false);
     txnDepth(), base(t.r), mem(I64_LOAD, 3, off(t.r)), op(I32_WRAP), op(I32_GT_U), open(IF, VOID, UNLIKELY);
     ld(1, t.r), helper(H_TXUNWIND), close();

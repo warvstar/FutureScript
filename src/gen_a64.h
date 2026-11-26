@@ -116,6 +116,9 @@ struct Gen : CState {
   u32 fload(int h, u32 d) { return isF(h) ? dOf(h) : (ldl(9, h), E(fmovdx(d, 9)), d); }  // the d-register holding h
   void falsy() { E(andnot1(9, 0)), E(cmp(9, 27)); }  // flags EQ <=> x0 is nil/false
   void poll() { E(ldrw(16, 28, 0)), E(cbzw(16) | 3 << 5), helper(H_POLL); }  // hot-reload safepoint
+  // A step (fuel.cpp): every back-edge and function entry takes one from vm->fuel; below zero, rt_fuel raises.
+  static constexpr u32 FUEL[] = {ldr(16, 28, FOFF), subsi(16, 16, 1), str(16, 28, FOFF), bcond(PL) | 3 << 5, ldr(16, 28, HOFF(H_FUEL)), blr(16)};
+  void fuel() { for (u32 i : FUEL) E(i); }
   void ret() { if (F->init) ldl(0, F->selfHome); F->rets.push_back(E(B)), F->live = false; }
 
   // The prologue is prepended once the frame size and the callee-saved registers used are known:
@@ -141,6 +144,7 @@ struct Gen : CState {
     for (int k = 0; k < pairs; k++) pro.push_back(stp_off(19 + 2 * k, 20 + 2 * k, 29, -16 * (k + 1)));
     for (int k = 0; k < fpairs; k++) pro.push_back(stpd(8 + 2 * k, 9 + 2 * k, 29, -16 * (pairs + k + 1)));
     if (F->calls) pro.insert(pro.end(), {cmpsp(26), bcond(HS) | 3 << 5, ldr(16, 28, HOFF(H_STACK)), blr(16)});
+    if (stepsOn) pro.insert(pro.end(), std::begin(FUEL), std::end(FUEL));
     for (size_t i = F->guard.size(); i-- > 0;) pro.insert(pro.begin(), {mvn(9, F->guard[i]), tstq(9), bcond(EQ)});  // not a number: deopt
     Code& k = F->k;
     int n = (int)pro.size();
@@ -236,7 +240,7 @@ struct Gen : CState {
   void exitIfEnd(Loop& lp) { E(addi(9, 27, 3)), E(cmp(0, 9)), lp.exit.push_back(E(bcond(EQ))); }  // x0 == END
   void bodyBegin(Loop&) {}
   void contHere(Loop& lp) { lp.contAt = here(); }
-  void loopBack(Loop& lp) { poll(), patch(E(B), lp.top); }
+  void loopBack(Loop& lp) { if (stepsOn) fuel(); poll(), patch(E(B), lp.top); }
   void loopEnd(Loop& lp) {
     for (int e : lp.exit) patch(e);
     for (int b : lp.brk) patch(b);
@@ -245,7 +249,7 @@ struct Gen : CState {
   void jump(Loop& lp, bool brk) { (brk ? lp.brk : lp.cont).push_back(E(B)); }
   void leaveTries(size_t k) { if (F->tries.size() > k) ld(9, F->tries[k]), E(str(9, 28, VM_HANDLER)); }  // unlink tries k..
   // try { } catch e { }: the record (prev, sp, fp, x26, handler pc, vm->txn, then the effect state: vm->allowed,
-  // vm->hstack, vm->who, vm->inv) lives in ten frame slots and is linked into vm->handler; a throw (or runtime error) unlinks
+  // vm->hstack, vm->who with vm->budgets, vm->inv) lives in ten frame slots and is linked into vm->handler; a throw (or runtime error) unlinks
   // it, rolls back the transactions opened since, puts the effect state back, and jumps to the handler with x0 = the value.
   TryAt tryBegin() {
     if (!F->noRegs) fail("internal: try in a function not prepared for it");
@@ -253,7 +257,7 @@ struct Gen : CState {
     for (int i = 0; i < 10; i++) slot();
     addsp(9, t.r), E(ldr(10, 28, VM_HANDLER)), E(str(10, 9, 0)), E(addi(10, SP, 0)), E(str(10, 9, 8));
     E(str(29, 9, 16)), E(str(26, 9, 24)), E(ldrw(10, 28, 4)), E(str(10, 9, 40));
-    E(ldr(10, 28, EOFF)), E(str(10, 9, 48)), E(ldr(10, 28, EOFF + 8)), E(str(10, 9, 56)), E(ldrw(10, 28, EOFF + 16)), E(str(10, 9, 64)), E(ldr(10, 28, EOFF + 24)), E(str(10, 9, 72));
+    E(ldr(10, 28, EOFF)), E(str(10, 9, 48)), E(ldr(10, 28, EOFF + 8)), E(str(10, 9, 56)), E(ldr(10, 28, EOFF + 16)), E(str(10, 9, 64)), E(ldr(10, 28, EOFF + 24)), E(str(10, 9, 72));
     t.pc = E(ADR | 10);
     E(str(10, 9, 32)), E(str(9, 28, VM_HANDLER));
     return t;

@@ -35,6 +35,7 @@ test "runtime errors" {
   expect err("for i in 3 \{ }").has(" [not-iterable]\n")
   expect err("var x = 1\nx()").has(" [not-callable]\n")
   expect err("fn f() \{ return f() + 1 }\nf()").has(" [stack-overflow]\n")
+  expect err("budget(10, fn() \{ while true \{ } })").has(" [budget]\n")
   expect err("var f = fiber(fn() \{ })\nf.resume()\nf.resume()").has(" [fiber]\n")
   expect err("len(1)").has(" [argument]\n")
   expect err("present()").has(" [host]\n")
