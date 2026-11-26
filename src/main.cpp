@@ -286,9 +286,25 @@ static int dumpAsm() {  // assemble the emitted words with clang and disassemble
   return system(cmd.c_str()) ? 1 : 0;
 }
 
+// fut worker ...: Cloudflare Worker bundles, made by web/worker.mjs (Node) next to this binary's build/ directory
+static int workerCommand(int argc, char** argv) {
+  char exe[4096], real[4096];
+  uint32_t n = sizeof exe;
+  if (_NSGetExecutablePath(exe, &n) || !realpath(exe, real)) return fputs("fut worker: cannot find the fut binary\n", stderr), 2;
+  std::string script = real;
+  for (int up = 0; up < 2; up++) script = script.substr(0, script.rfind('/'));  // build/fut -> the repository
+  script += "/web/worker.mjs";
+  std::vector<char*> av{(char*)"node", script.data()};
+  for (int i = 2; i < argc; i++) av.push_back(argv[i]);
+  av.push_back(nullptr);
+  execvp("node", av.data());
+  return fprintf(stderr, "fut worker: cannot run node (%s): it runs %s\n", strerror(errno), script.c_str()), 2;
+}
+
 int main(int argc, char** argv) {
   findStd();
   if (argc > 1 && std::string(argv[1]) == "explain") return explain(argc > 2 ? argv[2] : nullptr);  // an error code's rule and fix
+  if (argc > 1 && std::string(argv[1]) == "worker") return workerCommand(argc, argv);
   bool watch = false, asmMode = false, testMode = argc > 1 && std::string(argv[1]) == "test";
   bool apiMode = argc > 1 && std::string(argv[1]) == "api", apiCheck = false;
   bool mapMode = argc > 1 && std::string(argv[1]) == "map", mapPub = false, mapJson = false;
@@ -296,7 +312,8 @@ int main(int argc, char** argv) {
   TestRun topts;
   const char* usage = "usage: fut [-w | -v | --asm | --isolates n] [file.fut]   (no file: REPL)\n"
                       "       fut test [--changed] [--json] [--filter text] [--timeout s] [--isolates n] file.fut\n"
-                      "       fut api [--check] file.fut\n       fut map [--pub] [--json] file.fut [package | file]\n       fut explain [code]\n";
+                      "       fut api [--check] file.fut\n       fut map [--pub] [--json] file.fut [package | file]\n       fut explain [code]\n"
+                      "       fut worker build ...   (Cloudflare Workers: node web/worker.mjs)\n";
   for (int i = 1 + (testMode || apiMode || mapMode); i < argc; i++) {
     std::string a = argv[i];
     if (mapMode) {

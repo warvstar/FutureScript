@@ -14,6 +14,7 @@ fut map f.fut [--pub] [pkg]    where everything is: packages, files, declaration
 fut explain [code]             an error code's rule and fix (no code: all codes)
 fut api f.fut                  rewrite the .api files after an interface change
 fut -w f.fut                   run, hot-reload on save; stdin lines run inside the program
+fut worker build ...           Cloudflare Workers bundles (README)
 node web/run.mjs ...           the same CLI on WebAssembly
 ```
 
@@ -61,7 +62,7 @@ readFile(path) -> str | nil    writeFile(path, text)   (makes parent dirs)
 exec([argv...])  exec({cmd: [argv...], cwd, input, timeout}) -> {code, out, err, timedOut}
 fetch(url)  fetch({url, method, headers, body, timeout}) -> {status, body, headers}; failure: {status: 0, error}, no throw
 execAll([cmd, ...])  fetchAll([req, ...])   run at once, results in order
-                         time/json/parseJson also in wasm; the other host builtins are native only
+                         time/json/parseJson/fetch/fetchAll also in wasm; the other host builtins are native only
 l.push(v) -> l   l.pop() -> v   l.len()   l.slice(a, b)   l.join(sep) -> str
 m.has(k)   m.remove(k) -> v   m.keys()   m.values()   m.len()
 s.len()    s.has(sub)   s[i] -> 1-char str   s.find(sub) -> i | -1   s.slice(a, b)   s.split(sep)   s.trim()
