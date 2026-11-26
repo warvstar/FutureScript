@@ -265,7 +265,7 @@ int run(Frame& fr, u32 pc, int base) {
       case LOCAL_GET: PUSH(loc[uleb(c, pc)]); break;
       case LOCAL_SET: loc[uleb(c, pc)] = POP(); break;
       case LOCAL_TEE: loc[uleb(c, pc)] = TOP; break;
-      case GLOBAL_GET: uleb(c, pc), PUSH((I)(uintptr_t)getsp()); break;  // global 0: the stack pointer
+      case GLOBAL_GET: PUSH(uleb(c, pc) ? (I)(uintptr_t)vm : (I)(uintptr_t)getsp()); break;  // 0: the stack pointer, 1: the VM block
       case GLOBAL_SET: uleb(c, pc), s--; break;  // ignored (see the top)
       case I32_CONST: PUSH((I)(int32_t)sleb(c, pc)); break;
       case I64_CONST: PUSH(sleb(c, pc)); break;

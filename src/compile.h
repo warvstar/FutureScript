@@ -103,6 +103,7 @@ struct Fun {  // per-function emission state
   int depth = 0, maxd = 0, label = 0, nreg = 0, maxreg = 0, nfreg = 0, maxfreg = 0, scope = 0, cls = -1, selfHome = 0, cloHome = 0;
   int blocks = 0;      // wasm: structured blocks open at this point
   u32* stub = nullptr; // wasm: a top-level function's stub (direct calls reach its body; see Gen::finish)
+  int vmLocal = -1;    // wasm: the i32 local holding the VM block's address (read from global 1 on entry), once used
   std::vector<int> wloc, wlocf;  // wasm: the i64 / f64 wasm local caching each frame slot used as a home (-1: none)
   std::vector<bool> wnum;         // wasm: homes of locals that start as numbers: cached in f64 locals
   size_t scopeAt = 0;  // first local of the innermost block

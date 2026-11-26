@@ -28,6 +28,7 @@ HOST(ref_gone) void host_ref_gone(u32 id);                     // no fut code ho
 HOST(resume) void host_resume(Fiber* f, int start);            // suspending: run f until it yields, returns or fails
 HOST(yield) void host_yield(Fiber* f);                         // suspending: back to f's resumer
 HOST(fiber_gone) void host_fiber_gone(Fiber* f);
+HOST(vm) void host_vm(VM* v);                                  // the running isolate's VM block: JIT code's global 1
 HOST(sleep) void host_sleep(double seconds);                   // suspending
 HOST(poll) void host_poll();                                   // suspending: run typed lines, reload changed files
 HOST(run) int host_run(const char* args, const char* source, double timeout);  // suspending: run(): the result's length (in take), -1: none
@@ -160,10 +161,11 @@ void jitCollect() {  // install the batch as one module, then make the queued ta
     for (int h = 0; h < NH; h++) funcType(s, HSIG[h]);
     funcType(s, "i:l");
     section(m, 1, s), s.clear();
-    wa::uleb(s, 4);
+    wa::uleb(s, 5);
     name(s, "env"), name(s, "memory"), s.insert(s.end(), {2, 0, 0});
     name(s, "env"), name(s, "table"), s.insert(s.end(), {1, 0x70, 0, 0});
     name(s, "env"), name(s, "sp"), s.insert(s.end(), {3, I32, 1});
+    name(s, "env"), name(s, "vm"), s.insert(s.end(), {3, I32, 1});  // global 1: the running isolate's VM block
     name(s, "env"), name(s, "tag"), s.insert(s.end(), {4, 0}), wa::uleb(s, 1 + H_THROW);
     section(m, 2, s), s.clear();
     wa::uleb(s, batch.size());
@@ -415,8 +417,9 @@ static void rt_hot(void* t, V* args, int n) {  // a tier-1 body reached its call
   for (int i = 0; i < n; i++) m |= u32(isNum(args[i])) << i;
   tierUp(t, m);
 }
+void vmSwitched() { host_vm(vm); }
 void platformInit() {
-  stackTop = (uintptr_t*)&__stack_high, vm->limit = &__stack_low + (64 << 10);
+  stackTop = (uintptr_t*)&__stack_high, vm->limit = &__stack_low + (64 << 10), vmSwitched();
   vm->helpers[H_FFI] = (void*)rt_ffi, vm->helpers[H_HOT] = (void*)rt_hot;
   undefSlot = wa::slotOf(callable<undefFn>());
   jitCollect();

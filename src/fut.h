@@ -312,6 +312,11 @@ struct VM { u32 poll, txn; void* limit; void* handler; Run runs[NCLS + 1]; void*
 inline TLS VM* vm;
 VM* vmNew();
 void threadInit();  // a new isolate's thread: its stack bounds (stackTop, vm->limit)
+#if __wasm__
+void vmSwitched();  // vm changed: JIT code reaches it through a wasm global the host holds
+#else
+inline void vmSwitched() {}  // (JIT code has it in x28, loaded on entry)
+#endif
 void ctxSwap(void** save, void* to);           // save this context's registers and sp in *save, resume `to`
 void* ctxFrame(uintptr_t* top, void (*entry)());  // a context on a fresh stack that starts by calling entry
 void vmFree(VM*);

@@ -363,7 +363,7 @@ export async function createFut(opts) {
 
   // ---- instantiate ----
   const S = (f) => new WebAssembly.Suspending(f);
-  const env = {};
+  const env = {}, vmG = new WebAssembly.Global({ value: "i32", mutable: true }, 0);  // the running isolate's VM block
   const host = {
     pow: libc.pow,
     install(mod, len, ops, nops) {
@@ -393,6 +393,7 @@ export async function createFut(opts) {
     ffi: S(ffi),
     ref_gone(id) { refIds.delete(refs.get(id)), refs.delete(id); },
     resume: S(resume), yield: S(yieldTo), fiber_gone: (f) => fibers.delete(f),
+    vm: (p) => void (vmG.value = p),
     sleep: S((s) => new Promise((r) => setTimeout(r, Math.max(0, s * 1000)))),
     poll: S(() => (ffiDepth ? void (pollLater = true) : hostPoll())),  // not inside a callback: after the extern call
     run: S(async (argsP, srcP, timeout) => {  // run(): fut in a child process, if the host can (opts.run)
@@ -420,7 +421,7 @@ export async function createFut(opts) {
   const wasmMod = opts.wasm instanceof WebAssembly.Module ? opts.wasm : await WebAssembly.compile(opts.wasm);
   const inst = await WebAssembly.instantiate(wasmMod, { host, wasi_snapshot_preview1: wasi });
   ex = inst.exports, (mem = ex.memory), (table = ex.__indirect_function_table), (spG = ex.__stack_pointer);
-  Object.assign(env, { memory: mem, table, sp: spG, tag });
+  Object.assign(env, { memory: mem, table, sp: spG, tag, vm: vmG });
   const callP = WebAssembly.promising(ex.fut_call), applyP = WebAssembly.promising(ex.fut_apply);
   fiberStart = WebAssembly.promising(ex.fut_fiber_start);
   if (opts.interp) {
