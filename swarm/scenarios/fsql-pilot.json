@@ -1,0 +1,2 @@
+{"description": "the first fsql run: 8 Haiku workers, no time limit, up to the whole budget",
+ "target": "fsql", "workers": 8, "model": "claude-haiku-5-5", "cap": 19.96}

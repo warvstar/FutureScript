@@ -168,9 +168,19 @@ export function createInterpWorker({ wasm, tryModule }) {
   return {
     async fetch(request, env) {
       const path = new URL(request.url).pathname;
-      if (request.method == "GET" && env?.PAGES) return page(env.PAGES, path);  // public: pages others put there
+      if (request.method == "GET" && env?.PAGES && !path.startsWith("/kv/")) return page(env.PAGES, path);  // public: pages others put there
       if (env?.FUT_TOKEN && !sameText(request.headers.get("authorization") ?? "", "Bearer " + env.FUT_TOKEN))
         return new Response("unauthorized\n", { status: 401 });
+      if (path.startsWith("/kv/") && env?.PAGES) {  // GET or PUT /kv/<key>: a JSON document (a swarm's control and scenarios)
+        const key = "kv:" + path.slice(4).replace(/[^\w.:-]/g, "");
+        if (request.method == "PUT") {
+          const text = await request.text();
+          try { JSON.parse(text); } catch { return new Response("not JSON\n", { status: 400 }); }
+          return await env.PAGES.put(key, text), new Response("ok\n");
+        }
+        const v = await env.PAGES.get(key);
+        return new Response(v ?? "null", { headers: { "content-type": "application/json", "cache-control": "no-store" } });
+      }
       if (request.method == "PUT" && path.startsWith("/pages/") && env?.PAGES) {  // PUT /pages/<name>: an HTML page
         const name = path.slice(7).replace(/[^\w.-]/g, "") || "index";
         await env.PAGES.put(name, await request.text(), { metadata: { at: Date.now() } });
@@ -195,7 +205,8 @@ export function createInterpWorker({ wasm, tryModule }) {
   };
 }
 // Pages: with a KV namespace bound as PAGES, GET /<name> serves the HTML stored under name ("/": index), which an
-// authorized PUT /pages/<name> stores. A swarm publishes its dashboard this way (swarm.fut, SWARM_CF_URL).
+// authorized PUT /pages/<name> stores. A swarm publishes its dashboard this way (swarm.fut, SWARM_DASH_URL). GET and
+// PUT /kv/<key> (authorized) read and write JSON documents: the dashboard writes a swarm's control there, the swarm reads it.
 async function page(kv, path) {
   const name = path.slice(1).replace(/[^\w.-]/g, "") || "index", html = await kv.get(name);
   if (html == null) return new Response("no page " + name + "\n", { status: 404 });

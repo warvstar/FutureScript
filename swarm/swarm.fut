@@ -3,23 +3,32 @@
 // and each run's progress by time and spend goes to swarm/results/<run>.json.
 // Planner -> approver choose the next tasks; workers implement them in their own git worktrees with tools;
 // the harness runs the tests; a reviewer approves each change before it merges into main.
-// Runs until $SWARM_DIR/STOP exists or the budget is spent. Start it with swarm/run.sh.
+// Runs until $SWARM_DIR/STOP exists or the budget is spent. Start it with swarm/run.sh <scenario>.
+// A scenario (swarm/scenarios/<name>.json, or edited on the dashboard) sets the target, the team and the limits;
+// SWARM_* variables override it. With SWARM_DASH_URL, the dashboard on that Worker can change a running swarm (workers,
+// models, cap, time, pause, stop) and start the next run; all runs together stay under SWARM_GLOBAL_CAP.
 
 var ROOT = env("SWARM_ROOT")
 var DIR = env("SWARM_DIR")
 var FUT = env("FUT")
 var KEY = env("SWARM_API_KEY")
 var URL = env("SWARM_API_URL") || "https://api.anthropic.com/v1/messages"
-var TARGET = env("SWARM_TARGET") || "fsql"
-var MODEL = env("SWARM_MODEL") || "claude-haiku-5-5"   // every role's default; SWARM_MODEL_<ROLE> overrides one
-var MODELS = {worker: env("SWARM_MODEL_WORKER") || MODEL, planner: env("SWARM_MODEL_PLANNER") || MODEL,
-              approver: env("SWARM_MODEL_APPROVER") || MODEL, reviewer: env("SWARM_MODEL_REVIEWER") || MODEL}
-var MINUTES = parseNum(env("SWARM_MINUTES") || "0")    // run time limit, summed over restarts; 0: none
+var SCENARIO = env("SWARM_SCENARIO")                   // configure() reads it; until then, the defaults below
+var TARGET = "fsql"
+var MODEL = "claude-haiku-5-5"                          // every role's default; models: {role: model} overrides one
+var ROLES = ["worker", "planner", "approver", "reviewer"]
+var MODELS = {worker: MODEL, planner: MODEL, approver: MODEL, reviewer: MODEL}
+var MINUTES = 0                                         // run time limit, summed over restarts; 0: none
 var CF = env("SWARM_CF_URL")                            // set: test files run on this interpreting Worker, one per request
-var DASH = env("SWARM_DASH_URL")                        // set: the dashboard is published to this Worker's pages too
+var DASH = env("SWARM_DASH_URL")                        // set: the dashboard is published to this Worker, and controls the swarm
 var lastPush = 0
-var CAP = parseNum(env("SWARM_CAP") || "20")          // dollars, hard: no request starts that could cross it
-var NWORKERS = parseNum(env("SWARM_WORKERS") || "8")
+var CAP = 20                                            // this run's dollars, hard: no request starts that could cross it
+var GLOBAL_CAP = parseNum(env("SWARM_GLOBAL_CAP") || "20")   // every run in swarm/results together, hard
+var NWORKERS = 8
+var scenarios = {}      // name -> {target, workers, model, models, cap, minutes, cfTests}
+var control = nil       // the dashboard's last control document: {rev, run, live: {workers, cap, minutes, models}, pause, stop, next}
+var lastPoll = -1000
+var paused = false
 var MAXSTEPS = 90
 var MAXCTX = 240000                                     // chars of a worker's conversation (stays under 100K tokens)
 var WORK = DIR + "/work"
@@ -41,6 +50,131 @@ var TDIR = ""           // swarm/targets/<target>
 var lastScore = -1000   // elapsed seconds at the last acceptance run
 var stopReason = nil
 var accept = nil        // {passed, total} on main, when the target has acceptance tests
+
+// ---- configuration: scenario, then SWARM_* variables, then the dashboard's live changes ----
+fn safeName(s) {  // names that become paths
+  if s == nil || s == "" { return false }
+  for k in 0..s.len() { if !"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-".has(s[k]) { return false } }
+  return s[0] != "."
+}
+fn kvGet(key) {
+  var r = fetch({url: DASH + "/kv/" + key, headers: {authorization: "Bearer " + cfToken()}, timeout: 15})
+  if r.status != 200 { return nil }
+  var v = nil
+  try { v = parseJson(r.body) } catch e { return nil }
+  return v
+}
+fn kvPut(key, v) {
+  return fetch({url: DASH + "/kv/" + key, method: "PUT", body: json(v), timeout: 15,
+                headers: {authorization: "Bearer " + cfToken(), "content-type": "application/json"}}).status == 200
+}
+fn loadScenarios() {  // the files, and with a dashboard its copies (which win: the dashboard edits them)
+  var all = {}
+  for f in lines(sh("ls *.json 2>/dev/null", ROOT + "/swarm/scenarios").out) {
+    try { all[f.slice(0, f.len() - 5)] = parseJson(readFile(ROOT + "/swarm/scenarios/" + f)) } catch e { print("bad scenario " + f) }
+  }
+  if DASH {
+    var kv = kvGet("scenarios") || {}
+    var add = false
+    for k in all.keys() { if kv[k] == nil { kv[k] = all[k] add = true } }
+    if add { kvPut("scenarios", kv) }
+    all = kv
+  }
+  scenarios = all
+}
+fn configure() {  // false: can't run
+  loadScenarios()
+  var sc = {}
+  if SCENARIO {
+    sc = scenarios[SCENARIO]
+    if sc == nil { print("no scenario " + SCENARIO + " (swarm/scenarios/, or the dashboard's)") return false }
+  }
+  TARGET = env("SWARM_TARGET") || sc.target || "fsql"
+  if !safeName(TARGET) || readFile(ROOT + "/swarm/targets/" + TARGET + ".md") == nil { print("no target " + TARGET + " (swarm/targets/)") return false }
+  MODEL = env("SWARM_MODEL") || sc.model || "claude-haiku-5-5"
+  var m = sc.models || {}
+  var ENV = {worker: "SWARM_MODEL_WORKER", planner: "SWARM_MODEL_PLANNER", approver: "SWARM_MODEL_APPROVER", reviewer: "SWARM_MODEL_REVIEWER"}
+  for role in ROLES {
+    MODELS[role] = env(ENV[role]) || m[role] || MODEL
+    if PRICES[MODELS[role]] == nil { print("no price for model " + MODELS[role] + "; add it to PRICES") return false }
+  }
+  MINUTES = parseNum(env("SWARM_MINUTES") || str(sc.minutes || 0))
+  CAP = parseNum(env("SWARM_CAP") || str(sc.cap || 20))
+  NWORKERS = parseNum(env("SWARM_WORKERS") || str(sc.workers || 8))
+  if CF == nil && sc.cfTests { CF = DASH }
+  return true
+}
+fn otherSpent() {  // what the other saved runs spent
+  var n = 0
+  for r in savedRuns() { if r.run != ledger.run.id { n += r.spent || 0 } }
+  return n
+}
+fn budgetLeft() { return min2(CAP, GLOBAL_CAP - otherSpent()) - ledger.spent }  // dollars this run may still spend
+fn min2(a, b) { if a < b { return a } return b }
+fn pollControl() {  // the dashboard's changes to this run, read every 10 s
+  if DASH == nil || time() - lastPoll < 10 { return nil }
+  lastPoll = time()
+  var sc = kvGet("scenarios")
+  if sc { scenarios = sc }
+  var c = kvGet("control")
+  if c == nil || (control && c.rev == control.rev) { return nil }
+  control = c
+  if c.run != ledger.run.id { return nil }
+  var l = c.live || {}
+  var did = []
+  if l.workers && l.workers != NWORKERS && l.workers >= 1 && l.workers <= 32 {
+    NWORKERS = int(l.workers)
+    addWorkers()
+    did.push(str(NWORKERS) + " workers")
+  }
+  if l.cap != nil && l.cap != CAP { CAP = l.cap did.push("cap $" + str(CAP)) }
+  if l.minutes != nil && l.minutes != MINUTES { MINUTES = l.minutes did.push("time limit " + str(MINUTES) + " min") }
+  var lm = l.models || {}
+  for role in ROLES {
+    var mm = lm[role]
+    if mm && mm != MODELS[role] {
+      if PRICES[mm] == nil { did.push("unknown model " + mm + " ignored") } else { MODELS[role] = mm did.push(role + " " + mm) }
+    }
+  }
+  if (c.pause || false) != paused {
+    paused = c.pause || false
+    if paused { did.push("paused") } else { did.push("resumed") }
+  }
+  if c.stop {  // done: a later restart of this run must not stop again
+    stopReason = "stopped from the dashboard"
+    c.stop = false
+    c.rev = (c.rev || 0) + 1
+    if kvPut("control", c) { control = c }
+  }
+  if did.len() > 0 { log("dashboard: " + did.join(", ")) }
+}
+fn idle() {  // the run is over: publish the dashboard and wait for it to start the next run (build/swarm-next)
+  log("idle: start the next run from the dashboard")
+  dashboard(stopReason, true)
+  while readFile(DIR + "/STOP") == nil {
+    var c = kvGet("control")
+    if c && c.next {
+      if !safeName(c.next) || scenarios[c.next] == nil { log("no scenario " + str(c.next)) }
+      else if GLOBAL_CAP - otherSpent() - ledger.spent < 0.25 { log("the global budget is spent: not starting " + c.next) }
+      else {
+        writeFile(ROOT + "/build/swarm-next", c.next)
+        log("next run: " + c.next)
+        c.next = nil
+        c.rev = (c.rev || 0) + 1
+        kvPut("control", c)
+        dashboard("starting the next run", true)
+        return nil
+      }
+      c.next = nil
+      c.rev = (c.rev || 0) + 1
+      kvPut("control", c)
+    }
+    var sc = kvGet("scenarios")
+    if sc { scenarios = sc }
+    dashboard(stopReason, false)
+    sleep(10)
+  }
+}
 
 // ---- small helpers ----
 fn log(s) {
@@ -95,8 +229,8 @@ fn worstCase(r) {  // the most a request can cost: ~2.5 chars a token, all of it
 }
 
 // ---- the API ----
-fn request(role, tools, messages) {  // {body, model}
-  var model = MODELS[role]
+fn request(role, tools, messages) { return requestAs(role, MODELS[role], tools, messages) }
+fn requestAs(role, model, tools, messages) {  // {body, model}
   var body = {model: model, max_tokens: PRICES[model].maxTok, system: system(role), messages: messages, cache_control: {type: "ephemeral"}}
   if tools != nil { body.tools = tools }
   return {body: json(body), model: model}
@@ -237,7 +371,7 @@ fn titles(list) {
   return out.join("\n")
 }
 fn saveState() {
-  dashboard(nil)
+  dashboard(nil, false)
   writeFile(DIR + "/ledger.json", json(ledger))
   writeFile(DIR + "/tasks.json", json({tasks: tasks, nextId: nextId, rejections: rejections}))
   var w = []
@@ -290,6 +424,7 @@ fn startTask(w, t) {
   if !resume { t.attempts = (t.attempts || 0) + 1 }
   t.worker = w.i
   w.task = t
+  w.model = MODELS.worker   // a conversation keeps its model: thinking blocks belong to the model that wrote them
   w.steps = 0
   w.refreshes = 0
   w.reviews = 0
@@ -552,7 +687,7 @@ fn results() {  // swarm/results/<run>.json: what the run reached, and when
   for d in [1, 2, 5, 10, 20] { if ledger.spent >= d { checks["$" + str(d)] = at("spent", d) } }
   var srcLines = parseNum(sh("cat src/*.fut 2>/dev/null | wc -l", WORK).out.trim()) || 0
   var testLines = parseNum(sh("cat tests/*.fut 2>/dev/null | wc -l", WORK).out.trim()) || 0
-  var out = {run: ledger.run.id, target: TARGET, fut: ledger.run.fut, models: MODELS, workers: NWORKERS, cap: CAP, minutes: MINUTES,
+  var out = {run: ledger.run.id, scenario: SCENARIO, target: TARGET, fut: ledger.run.fut, models: MODELS, workers: NWORKERS, cap: CAP, minutes: MINUTES,
     elapsed: int(ledger.elapsed), spent: int(ledger.spent * 10000) / 10000, byModel: ledger.byModel, calls: ledger.calls,
     merged: ledger.merged, rejected: ledger.rejected, failedTasks: byStatus("failed").len(), tests: mainTests.n.passed,
     accept: accept, srcLines: srcLines, testLines: testLines, checkpoints: checks, timeline: ledger.timeline}
@@ -560,8 +695,8 @@ fn results() {  // swarm/results/<run>.json: what the run reached, and when
   runs = nil
 }
 fn RESULTS() { return env("SWARM_RESULTS") || ROOT + "/swarm/results" }
-var runs = nil          // the saved runs, for the dashboard (nil: read them again)
-fn dashboard(stopped) {  // $SWARM_DIR/dashboard.html: swarm/dashboard.html with this run's data in it
+var runs = nil          // the saved runs (nil: read them again)
+fn savedRuns() {
   if runs == nil {
     runs = []
     for f in lines(sh("ls *.json 2>/dev/null", RESULTS()).out) {
@@ -570,6 +705,9 @@ fn dashboard(stopped) {  // $SWARM_DIR/dashboard.html: swarm/dashboard.html with
       runs.push(r)
     }
   }
+  return runs
+}
+fn dashboard(stopped, force) {  // $SWARM_DIR/dashboard.html: swarm/dashboard.html with this run's data in it
   var ws = []
   for w in workers {
     var t = nil
@@ -583,10 +721,12 @@ fn dashboard(stopped) {  // $SWARM_DIR/dashboard.html: swarm/dashboard.html with
   var d = {now: time(), run: ledger.run, target: TARGET, models: MODELS, nworkers: NWORKERS, cap: CAP, minutes: MINUTES,
     elapsed: ledger.elapsed, spent: ledger.spent, byModel: ledger.byModel, calls: ledger.calls, merged: ledger.merged,
     rejected: ledger.rejected, tests: mainTests.n, accept: accept, counts: counts, tasks: ts, workerList: ws, events: events,
-    timeline: ledger.timeline, runs: runs, stopped: stopped}
+    timeline: ledger.timeline, runs: savedRuns(), stopped: stopped, paused: paused, scenario: SCENARIO, scenarios: scenarios,
+    control: control, globalCap: GLOBAL_CAP, globalSpent: otherSpent() + ledger.spent, knownModels: PRICES.keys(),
+    targets: lines(sh("ls *.md 2>/dev/null | sed 's/[.]md$//'", ROOT + "/swarm/targets").out), dash: DASH != nil}
   var page = readFile(ROOT + "/swarm/dashboard.html").split("/*DATA*/").join(json(d).split("</").join("<\\/"))
   writeFile(DIR + "/dashboard.html", page)
-  if DASH && (stopped || time() - lastPush >= 15) {  // the Worker serves it at / and at /<run>
+  if DASH && (force || time() - lastPush >= 15) {  // the Worker serves it at / and at /<run>
     lastPush = time()
     var h = {authorization: "Bearer " + cfToken(), "content-type": "text/html"}
     var got = fetchAll([{url: DASH + "/pages/index", method: "PUT", body: page, headers: h, timeout: 20},
@@ -596,6 +736,14 @@ fn dashboard(stopped) {  // $SWARM_DIR/dashboard.html: swarm/dashboard.html with
 }
 
 // ---- the loop ----
+fn addWorkers() {  // up to NWORKERS, each with its worktree; fewer: the extra ones finish their task and stop
+  for i in workers.len()..NWORKERS {
+    if readFile(DIR + "/wt/w" + str(i) + "/README.md") == nil {
+      sh("git worktree add -q -B w" + str(i) + " " + DIR + "/wt/w" + str(i) + " main", WORK)
+    }
+    workers.push(newWorker(i))
+  }
+}
 fn setup() {
   TDIR = ROOT + "/swarm/targets/" + TARGET
   if readFile(WORK + "/README.md") == nil {
@@ -604,12 +752,7 @@ fn setup() {
     writeFile(WORK + "/.gitignore", "*.api\n.fut-cache/\n")
     sh("git init -q -b main && git config user.name swarm && git config user.email swarm@localhost && git add -A && git commit -qm 'project start'", WORK)
   }
-  for i in 0..NWORKERS {
-    if readFile(DIR + "/wt/w" + str(i) + "/README.md") == nil {
-      sh("git worktree add -q -B w" + str(i) + " " + DIR + "/wt/w" + str(i) + " main", WORK)
-    }
-    workers.push(newWorker(i))
-  }
+  addWorkers()
   var spec = readFile(ROOT + "/docs/spec.md")
   COMMON = readFile(ROOT + "/swarm/prompts/common.md").split("\{\{SPEC}}").join(spec).split("\{\{TARGET}}").join(readFile(TDIR + ".md"))
   for r in ["worker", "planner", "approver", "reviewer"] { ROLE[r] = readFile(ROOT + "/swarm/prompts/" + r + ".md") }
@@ -617,14 +760,13 @@ fn setup() {
 
 fn main() {
   if KEY == nil || DIR == nil || ROOT == nil || FUT == nil { print("set SWARM_API_KEY, SWARM_DIR, SWARM_ROOT and FUT (swarm/run.sh does)") return nil }
+  if !configure() { return nil }
   setup()
   loadState()
-  for role in ["worker", "planner", "approver", "reviewer"] {
-    if PRICES[MODELS[role]] == nil { print("no price for model " + MODELS[role] + "; add it to PRICES") return nil }
-  }
   if ledger.run == nil {
-    ledger.run = {id: TARGET + "-" + sh("date -u +%Y%m%d-%H%M", ROOT).out.trim(), fut: sh("git rev-parse --short HEAD", ROOT).out.trim()}
+    ledger.run = {id: (SCENARIO || TARGET) + "-" + sh("date -u +%Y%m%d-%H%M", ROOT).out.trim(), fut: sh("git rev-parse --short HEAD", ROOT).out.trim()}
   }
+  ledger.run.scenario = SCENARIO
   mainTests = runTests(WORK)
   log("swarm starts: " + TARGET + " (run " + ledger.run.id + "), " + str(NWORKERS) + " workers, models " + json(MODELS) + ", cap $" + str(CAP) +
     ", spent so far $" + str(ledger.spent))
@@ -638,28 +780,31 @@ fn main() {
     last = now
     if readFile(DIR + "/STOP") != nil { log("STOP file: stopping") stopReason = "STOP file" break }
     if MINUTES > 0 && ledger.elapsed >= MINUTES * 60 { log("time limit: " + str(MINUTES) + " minutes; stopping") stopReason = "time limit" break }
+    pollControl()
+    if stopReason { log(stopReason) break }
+    if paused { saveState() sleep(5) last = time() continue }
     var merged = ledger.merged
     ledger.rounds += 1
     // idle workers take queued tasks
     for w in workers {  // a task resumes on the worker whose worktree has it
-      if w.phase != "idle" { continue }
+      if w.phase != "idle" || w.i >= NWORKERS { continue }
       for t in byStatus("queued") { if t.worker == w.i { startTask(w, t) break } }
     }
     for w in workers {
-      if w.phase != "idle" { continue }
+      if w.phase != "idle" || w.i >= NWORKERS { continue }
       var q = []
-      for t in byStatus("queued") { if t.worker == nil { q.push(t) } }
+      for t in byStatus("queued") { if t.worker == nil || t.worker >= NWORKERS { q.push(t) } }
       if q.len() > 0 { startTask(w, q[0]) }
     }
     // this round's requests
     var reqs = []
     var who = []
     for w in workers {
-      if w.phase == "work" { reqs.push(request("worker", WORKER_TOOLS, w.messages)) who.push({kind: "worker", w: w}) }
+      if w.phase == "work" { reqs.push(requestAs("worker", w.model || MODELS.worker, WORKER_TOOLS, w.messages)) who.push({kind: "worker", w: w}) }
       else if w.phase == "review" { reqs.push(reviewRequest(w)) who.push({kind: "review", w: w}) }
     }
     var idle = 0
-    for w in workers { if w.phase == "idle" { idle += 1 } }
+    for w in workers { if w.phase == "idle" && w.i < NWORKERS { idle += 1 } }
     if proposals.len() > 0 { reqs.push(decideRequest()) who.push({kind: "decide"}) }
     else if planWait > 0 { planWait -= 1 }
     else if byStatus("queued").len() < idle + 2 {
@@ -669,7 +814,7 @@ fn main() {
       who.push({kind: "plan"})
     }
     // the budget: drop what could cross the cap
-    var room = CAP - ledger.spent - 0.02
+    var room = budgetLeft() - 0.02
     var keep = []
     var keepWho = []
     for k in 0..reqs.len() {
@@ -677,7 +822,7 @@ fn main() {
       if c <= room { room -= c keep.push(reqs[k]) keepWho.push(who[k]) }
     }
     if keep.len() == 0 {
-      if reqs.len() > 0 { log("budget reached: $" + str(ledger.spent) + " of $" + str(CAP) + "; stopping") stopReason = "budget" break }
+      if reqs.len() > 0 { log("budget reached: $" + str(ledger.spent) + " (cap $" + str(CAP) + ", all runs $" + str(GLOBAL_CAP) + "); stopping") stopReason = "budget" break }
       saveState()
       sleep(3)
       continue
@@ -717,5 +862,6 @@ fn main() {
   mark()
   results()
   saveState()
-  dashboard(stopReason)
+  dashboard(stopReason, true)
+  if DASH && stopReason != "STOP file" { idle() }
 }

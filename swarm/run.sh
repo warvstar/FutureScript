@@ -1,20 +1,25 @@
 #!/bin/sh
-# Start the swarm in the background:  swarm/run.sh <file holding the API key>
-# Stop it:  touch build/swarm/STOP   (it stops after the current round; spend so far is in build/swarm/status.md)
-# Environment (optional): SWARM_TARGET (fsql; a spec in swarm/targets/), SWARM_DIR (build/swarm; a new directory starts a
-#   new run from scratch), SWARM_CAP (dollars, default 20), SWARM_MINUTES (time limit, 0 = none), SWARM_WORKERS (8),
-#   SWARM_MODEL (every role, default claude-haiku-5-5), SWARM_MODEL_{WORKER,PLANNER,APPROVER,REVIEWER} (one role),
-#   SWARM_API_URL, SWARM_RESULTS (swarm/results).
-# A benchmark run:  SWARM_DIR=build/swarm-fsql-2 SWARM_MINUTES=60 SWARM_CAP=5 swarm/run.sh <key file>
-#   The hidden tests in swarm/targets/<target>/accept/ score main as it grows; swarm/results/<run>.json has the result.
+# Start a swarm run in the background:  swarm/run.sh <scenario> [key file]   (key file default: build/swarm/.key)
+#   Scenarios: swarm/scenarios/<name>.json, or as edited on the dashboard. It sets target, workers, model / models
+#   (per role: worker, planner, approver, reviewer), cap (dollars), minutes (0: none) and cfTests (tests on the Worker).
+# Stop it:  touch <run dir>/STOP   (it stops after the current round; spend so far is in <run dir>/status.md)
+# Environment (optional, overrides the scenario): SWARM_DIR (default build/swarm-runs/<scenario>-<time>; an existing
+#   directory resumes its run), SWARM_TARGET, SWARM_WORKERS, SWARM_MODEL, SWARM_MODEL_{WORKER,PLANNER,APPROVER,REVIEWER},
+#   SWARM_CAP, SWARM_MINUTES, SWARM_GLOBAL_CAP (all runs together, default 20), SWARM_CF_URL (tests on that Worker),
+#   SWARM_DASH_URL (publish the dashboard to that Worker; its controls then reach the swarm), SWARM_API_URL, SWARM_RESULTS.
+# With SWARM_DASH_URL, a run that ends waits for the dashboard to start the next one; swarm/supervise.sh starts it.
 set -e
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-export SWARM_ROOT="$ROOT" SWARM_DIR="${SWARM_DIR:-$ROOT/build/swarm}" FUT="$ROOT/build/fut"
+[ -n "$1" ] || { sed -n '2,10p' "$0"; exit 2; }
+export SWARM_SCENARIO="$1"
+KEYFILE="${2:-$ROOT/build/swarm/.key}"
+[ -f "$ROOT/swarm/scenarios/$1.json" ] || [ -n "$SWARM_DASH_URL" ] || { echo "no scenario swarm/scenarios/$1.json"; exit 2; }
+export SWARM_ROOT="$ROOT" FUT="$ROOT/build/fut" SWARM_KEY_FILE="$KEYFILE"
+export SWARM_DIR="${SWARM_DIR:-$ROOT/build/swarm-runs/$1-$(date +%Y%m%d-%H%M%S)}"
+export SWARM_CF_TOKEN_FILE="${SWARM_CF_TOKEN_FILE:-$ROOT/build/swarm/.cftoken}"
 python3 "$ROOT/build.py" >/dev/null
 mkdir -p "$SWARM_DIR"
 rm -f "$SWARM_DIR/STOP"
-SWARM_API_KEY="$(cat "$1")"
-export SWARM_API_KEY
-nohup "$FUT" "$ROOT/swarm/swarm.fut" >> "$SWARM_DIR/log.txt" 2>&1 &
+nohup sh "$ROOT/swarm/supervise.sh" >> "$SWARM_DIR/log.txt" 2>&1 &
 echo $! > "$SWARM_DIR/pid"
-echo "swarm running (pid $!): tail -f $SWARM_DIR/log.txt; status in $SWARM_DIR/status.md; stop with: touch $SWARM_DIR/STOP"
+echo "swarm running (pid $!): $SWARM_DIR/dashboard.html${SWARM_DASH_URL:+, $SWARM_DASH_URL}; stop with: touch $SWARM_DIR/STOP"

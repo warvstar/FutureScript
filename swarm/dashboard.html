@@ -3,7 +3,6 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="15">
 <title>Swarm Dashboard</title>
 <!-- swarm.fut writes this page to $SWARM_DIR/dashboard.html every round, with the run's data in place of DATA below. -->
 <style>
@@ -82,6 +81,21 @@ tr:last-child td { border-bottom: 0; }
 .log { max-height: 340px; overflow: auto; white-space: pre-wrap; word-break: break-word; margin: 0; color: var(--text-secondary); }
 .log div { padding: 2px 0; border-bottom: 1px solid var(--grid); }
 .empty { color: var(--text-muted); font-size: 13px; padding: 16px 0; text-align: center; }
+.ctl { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 10px; }
+.ctl h3 { margin: 0 0 10px; font-size: 13px; font-weight: 600; }
+.form { display: grid; grid-template-columns: auto 1fr; gap: 8px 10px; align-items: center; font-size: 13px; }
+.form label { color: var(--text-secondary); white-space: nowrap; }
+input, select, textarea { font: inherit; font-size: 13px; color: var(--text-primary); background: var(--surface-0); border: 1px solid var(--border);
+  border-radius: 6px; padding: 5px 8px; min-width: 0; width: 100%; }
+textarea { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; min-height: 150px; resize: vertical; }
+.btns { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; align-items: center; }
+.btn { font: inherit; font-size: 13px; border: 1px solid var(--border); background: var(--surface-1); color: var(--text-primary);
+  border-radius: 7px; padding: 6px 12px; cursor: pointer; }
+.btn.primary { background: var(--series-1); border-color: var(--series-1); color: #fff; }
+.btn:disabled { opacity: .5; cursor: default; }
+.msg { font-size: 12px; color: var(--text-secondary); }
+.check { display: flex; gap: 6px; align-items: center; font-size: 13px; color: var(--text-secondary); }
+.check input { width: auto; }
 </style>
 </head>
 <body>
@@ -97,10 +111,23 @@ const dur = (s) => { s = Math.round(s || 0); const h = Math.floor(s / 3600), m =
 const pct = (a, b) => (b ? Math.round(100 * a / b) : 0);
 const store = { get(k, d) { try { return localStorage.getItem(k) ?? d; } catch { return d; } }, set(k, v) { try { localStorage.setItem(k, v); } catch {} } };
 let xKey = store.get("swarm.x", "t"), taskFilter = store.get("swarm.tasks", "active");
+let dirty = false, editing = store.get("swarm.scenario", ""), message = "";
+const served = location.protocol.startsWith("http");  // from the Worker: the controls can write to its KV
+async function refresh() {  // new data every 15 s, unless a form is being edited
+  if (dirty || document.activeElement?.matches("input, select, textarea")) return;
+  if (!served) return location.reload();
+  try {
+    const html = await (await fetch(location.href, { cache: "no-store" })).text();
+    const m = html.match(/<script id="data" type="application\/json">([\s\S]*?)<\/script>/);
+    if (m) Object.assign(D, JSON.parse(m[1])), render();
+  } catch {}
+}
+setInterval(refresh, 15000);
 
 function statusOf() {
   const age = (Date.now() / 1000) - D.now;
-  if (D.stopped) return { color: "var(--text-muted)", text: "stopped: " + D.stopped };
+  if (D.stopped) return { color: "var(--text-muted)", text: "stopped: " + D.stopped + (D.dash ? " · idle" : "") };
+  if (D.paused) return { color: "var(--warning)", text: "paused" };
   if (age > 120) return { color: "var(--warning)", text: `not updated for ${dur(age)}` };
   return { color: "var(--good)", text: "running" };
 }
@@ -241,14 +268,104 @@ function runsBlock() {
     <th class="num">Src lines</th><th>fut</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
+// ---- controls: they write the swarm's control document (and the scenarios) to the Worker's KV; the swarm reads it ----
+const token = () => store.get("swarm.token", "");
+async function kv(key, value) {
+  const headers = { authorization: "Bearer " + token() };
+  if (value === undefined) {
+    const r = await fetch("/kv/" + key, { headers, cache: "no-store" });
+    if (!r.ok) throw new Error(r.status == 401 ? "the write token is wrong" : "read failed: " + r.status);
+    return r.json();
+  }
+  const r = await fetch("/kv/" + key, { method: "PUT", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify(value) });
+  if (!r.ok) throw new Error(r.status == 401 ? "the write token is wrong" : "write failed: " + r.status);
+}
+async function control(change) {  // read, change, write back with the next revision
+  const c = (await kv("control")) || {};
+  if (c.run != D.run.id) delete c.live, delete c.pause, delete c.stop;  // what was set for an earlier run
+  change(c);
+  c.rev = (c.rev || 0) + 1;
+  await kv("control", c);
+}
+async function act(what, f) {
+  message = what + "…", render();
+  try { await f(); message = what + ": saved. The swarm applies it within a minute.", dirty = false; }
+  catch (e) { message = what + " failed: " + e.message; }
+  render();
+}
+const num = (id) => { const v = $("#" + id).value.trim(); return v == "" ? undefined : +v; };
+function controlsBlock() {
+  if (!served || !D.dash) return `<div class="card"><div class="msg">Controls work on the dashboard the Worker serves (SWARM_DASH_URL).</div></div>`;
+  const live = !D.stopped, opts = (sel) => D.knownModels.map((m) => `<option ${m == sel ? "selected" : ""}>${esc(m)}</option>`).join("");
+  const names = Object.keys(D.scenarios || {}).sort();
+  if (!names.includes(editing)) editing = D.scenario && names.includes(D.scenario) ? D.scenario : names[0] || "";
+  const sc = D.scenarios?.[editing];
+  return `<div class="ctl">
+    <div class="card"><h3>This run${live ? "" : " (over)"}</h3>
+      <div class="form">
+        <label for="f-workers">Workers</label><input id="f-workers" type="number" min="1" max="32" value="${D.nworkers}" ${live ? "" : "disabled"}>
+        <label for="f-cap">Cap ($)</label><input id="f-cap" type="number" step="0.5" min="0" value="${D.cap}" ${live ? "" : "disabled"}>
+        <label for="f-min">Time limit (min)</label><input id="f-min" type="number" min="0" value="${D.minutes}" ${live ? "" : "disabled"}>
+        ${["worker", "planner", "approver", "reviewer"].map((r) => `<label for="f-m-${r}">${r}</label><select id="f-m-${r}" ${live ? "" : "disabled"}>${opts(D.models[r])}</select>`).join("")}
+      </div>
+      <div class="btns"><button class="btn primary" id="b-apply" ${live ? "" : "disabled"}>Apply</button>
+        <button class="btn" id="b-pause" ${live ? "" : "disabled"}>${D.paused ? "Resume" : "Pause"}</button>
+        <button class="btn" id="b-stop" ${live ? "" : "disabled"}>Stop run</button></div>
+      <div class="msg" style="margin-top:8px">All runs together: ${money(D.globalSpent)} of ${money(D.globalCap)} (a hard cap).</div></div>
+    <div class="card"><h3>Scenarios</h3>
+      <div class="form"><label for="f-sc">Scenario</label><select id="f-sc">${names.map((n) => `<option ${n == editing ? "selected" : ""}>${esc(n)}</option>`).join("")}<option value="">new…</option></select>
+        <label for="f-name">Name</label><input id="f-name" value="${esc(editing)}" placeholder="letters, digits, . _ -"></div>
+      <textarea id="f-json" style="margin-top:8px" spellcheck="false">${esc(JSON.stringify(sc ?? { description: "", target: D.targets[0], workers: 8, model: D.knownModels[0], cap: 5, minutes: 60 }, null, 2))}</textarea>
+      <div class="msg">target: ${D.targets.map(esc).join(", ")} · models: ${D.knownModels.map(esc).join(", ")} · optional: models {role: model}, cfTests</div>
+      <div class="btns"><button class="btn" id="b-save">Save scenario</button>
+        <button class="btn primary" id="b-next">Run it next</button>
+        <label class="check"><input type="checkbox" id="f-stopfirst" ${live ? "checked" : "disabled"}> stop this run first</label></div></div>
+    <div class="card"><h3>Write access</h3>
+      <div class="form"><label for="f-token">Token</label><input id="f-token" type="password" value="${esc(token())}" placeholder="the Worker's FUT_TOKEN" autocomplete="off"></div>
+      <div class="msg" style="margin-top:8px">Kept in this browser only. Anyone can view this page; changes need the token.</div>
+      ${message ? `<div class="msg" style="margin-top:10px"><b>${esc(message)}</b></div>` : ""}</div>
+  </div>`;
+}
+function scenarioFromForm() {
+  const name = $("#f-name").value.trim();
+  if (!/^[A-Za-z0-9_-][A-Za-z0-9._-]*$/.test(name)) throw new Error("name: letters, digits, . _ -");
+  const sc = JSON.parse($("#f-json").value);
+  if (!D.targets.includes(sc.target)) throw new Error("no target " + sc.target);
+  for (const m of [sc.model, ...Object.values(sc.models || {})]) if (m && !D.knownModels.includes(m)) throw new Error("no price for model " + m);
+  return [name, sc];
+}
+function wireControls() {
+  for (const el of document.querySelectorAll(".ctl input, .ctl select, .ctl textarea")) el.addEventListener("input", () => (dirty = true));
+  $("#f-token")?.addEventListener("change", (e) => (store.set("swarm.token", e.target.value.trim()), (dirty = false)));
+  $("#f-sc")?.addEventListener("change", (e) => { editing = e.target.value, store.set("swarm.scenario", editing), dirty = false, render(); });
+  $("#b-apply")?.addEventListener("click", () => act("Apply", () => control((c) => {
+    const models = {};
+    for (const r of ["worker", "planner", "approver", "reviewer"]) models[r] = $("#f-m-" + r).value;
+    c.run = D.run.id, c.live = { workers: num("f-workers"), cap: num("f-cap"), minutes: num("f-min"), models }, c.stop = false;
+  })));
+  $("#b-pause")?.addEventListener("click", () => act(D.paused ? "Resume" : "Pause", () => control((c) => { c.run = D.run.id, c.pause = !D.paused; })));
+  $("#b-stop")?.addEventListener("click", () => confirm("Stop this run? It ends after the current round.") && act("Stop", () => control((c) => { c.run = D.run.id, c.stop = true; })));
+  $("#b-save")?.addEventListener("click", () => act("Save scenario", async () => {
+    const [name, sc] = scenarioFromForm(), all = (await kv("scenarios")) || {};
+    all[name] = sc, await kv("scenarios", all), D.scenarios = all, editing = name, store.set("swarm.scenario", name);
+  }));
+  $("#b-next")?.addEventListener("click", () => act("Run next", async () => {
+    const [name, sc] = scenarioFromForm(), all = (await kv("scenarios")) || {};
+    if (JSON.stringify(all[name]) != JSON.stringify(sc)) all[name] = sc, await kv("scenarios", all), D.scenarios = all;
+    const stopFirst = $("#f-stopfirst")?.checked;
+    await control((c) => { c.next = name; if (stopFirst && !D.stopped) c.run = D.run.id, c.stop = true; });
+  }));
+}
+
 function render() {
   const st = statusOf();
   $("#app").innerHTML = `
     <header><div><h1>${esc(D.target)} swarm</h1>
-      <div class="sub"><span class="mono">${esc(D.run?.id)}</span><span>${D.nworkers} workers</span><span>fut ${esc(D.run?.fut)}</span>
+      <div class="sub"><span class="mono">${esc(D.run?.id)}</span>${D.scenario ? `<span>scenario ${esc(D.scenario)}</span>` : ""}<span>${D.nworkers} workers</span><span>fut ${esc(D.run?.fut)}</span>
       <span>updated ${new Date(D.now * 1000).toLocaleTimeString()}</span></div></div>
       <span class="pill"><span class="dot" style="background:${st.color}"></span>${esc(st.text)}</span></header>
     ${tiles()}
+    <h2>Control</h2>${controlsBlock()}
     <h2>Progress</h2>
     <div class="controls"><span class="muted" style="font-size:12px">x axis</span><div class="seg" role="group" aria-label="x axis">
       <button data-x="t" aria-pressed="${xKey == "t"}">Time</button><button data-x="spent" aria-pressed="${xKey == "spent"}">Spend</button></div></div>
@@ -259,6 +376,7 @@ function render() {
     <h2>Recent events</h2><div class="card"><div class="log mono">${(D.events || []).slice().reverse().map((e) => `<div>${esc(e)}</div>`).join("")}</div></div>`;
   for (const svg of document.querySelectorAll("svg[id]")) svg.addEventListener("pointermove", hover), svg.addEventListener("pointerleave", unhover);
   for (const b of document.querySelectorAll("[data-x]")) b.onclick = () => { xKey = b.dataset.x, store.set("swarm.x", xKey), render(); };
+  wireControls();
   for (const b of document.querySelectorAll("[data-task]")) b.onclick = () => { taskFilter = b.dataset.task, store.set("swarm.tasks", taskFilter), render(); };
 }
 render();

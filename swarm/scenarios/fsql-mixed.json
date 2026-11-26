@@ -1,0 +1,3 @@
+{"description": "fsql from scratch: 8 Haiku workers; Opus plans, Sonnet approves and reviews; one hour, $5",
+ "target": "fsql", "workers": 8, "model": "claude-haiku-5-5",
+ "models": {"planner": "claude-opus-5-5", "approver": "claude-sonnet-5-5", "reviewer": "claude-sonnet-5-5"}, "cap": 5, "minutes": 60}
