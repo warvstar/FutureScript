@@ -147,7 +147,7 @@ static V allocsEnd(V start) { return box((double)gcAllocations() - num(start)); 
 // expect grows [allocs] { n -> ... } like "n^2": grows@(site, body, growth, by allocations). The growth is an upper
 // bound: n^k, optionally times log n ("1", "log n", "n", "n log n", "n^2", ...). The body runs for sizes n that double,
 // and the check fits how its cost grows on a log-log scale: it fails if, divided by the growth, the cost still grows
-// (slope over tolerance). Time is the best of 3 runs of a batch lasting 2 ms or more, from the n at which one call
+// (slope over tolerance). Time (the thread's CPU time) is the best of 3 runs of a batch lasting 2 ms or more, from the n at which one call
 // takes 50 us, measured afresh up to twice before it fails; allocations are counted for n = 64..2048 (exact, so their tolerance is tight).
 // With FUT_UNTIMED set (build.py tsan, where the sanitizer and N isolates per core bend every timing), time isn't
 // measured: those checks pass, and the summary says they weren't measured. Allocation checks still run. The same
@@ -192,6 +192,16 @@ static bool untimed() { return clockStopped; }  // no environment there (the hos
 #else
 static bool untimed() { static bool u = getenv("FUT_UNTIMED"); return u || clockStopped; }
 #endif
+// The time a check measures is the thread's CPU time, not the wall clock's: on a busy machine (a test suite running
+// beside it, a build), a thread waiting for a core would add time at random to some sizes and bend the fit either
+// way, so n^2 could pass as n. In wasm it's WASI's thread CPU clock: Node's (process.threadCpuUsage), and a host
+// without one (a browser) gives its wall clock for it (web/fut.js).
+#if __wasm__
+extern "C" __attribute__((import_module("wasi_snapshot_preview1"), import_name("clock_time_get"))) uint16_t wasiClockTimeGet(uint32_t id, uint64_t precision, uint64_t* ns);
+static double cpuNow() { uint64_t ns = 0; return wasiClockTimeGet(3, 1, &ns) ? now() : ns * 1e-9; }
+#else
+static double cpuNow() { timespec t; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+#endif
 static V growsAt(V site, V clo, V growth, V byAllocs) {
   const ExpectSite& s = sites.at((size_t)num(site));
   Growth want;
@@ -216,9 +226,9 @@ static V growsAt(V site, V clo, V growth, V byAllocs) {
       double best = 1e30;
       for (int k = 0; k < 3; k++)
         for (int reps = 1;; reps *= 2) {
-          double t0 = now();
+          double t0 = cpuNow();
           for (int i = 0; i < reps; i++) call(n);
-          double dt = now() - t0;
+          double dt = cpuNow() - t0;
           if (dt == 0 && reps >= 1 << 16) return clockStopped = true, 0.0;
           if (dt >= 0.002 || reps >= 1 << 20) { best = std::min(best, dt / reps); break; }
         }

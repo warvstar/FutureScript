@@ -190,8 +190,9 @@ export async function createFut(opts) {
       d.setUint8(p, 2), d.setUint16(p + 2, 0, true), d.setBigUint64(p + 8, 0n, true), d.setBigUint64(p + 16, 0n, true);
       return 0;
     },
-    clock_time_get(id, _prec, p) {
-      const ns = id == 0 ? Date.now() * 1e6 : (performance.timeOrigin + performance.now()) * 1e6;  // (one clock on every thread)
+    clock_time_get(id, _prec, p) {  // 3: this thread's CPU time (expect grows), where the host can say (Node), else the wall's
+      const cpu = id == 3 && globalThis.process?.threadCpuUsage?.();
+      const ns = cpu ? (cpu.user + cpu.system) * 1e3 : id == 0 ? Date.now() * 1e6 : (performance.timeOrigin + performance.now()) * 1e6;  // (one clock on every thread)
       return dv().setBigUint64(p, BigInt(Math.round(ns)), true), 0;
     },
     fd_close: () => 0, fd_seek: () => 70,
