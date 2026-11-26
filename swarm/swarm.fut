@@ -304,13 +304,15 @@ fn submit(w, summary) {
   w.summary = summary
   sh("git add -A", w.wt)
   exec({cmd: ["git", "commit", "-q", "-F", "-"], cwd: w.wt, input: "#" + str(w.task.id) + " " + w.task.title + "\n\n" + summary})
-  if sh("git rev-list --count main..HEAD", w.wt).out.trim() == "0" { return {text: "there are no changes to submit", err: true} }
+  w.empty = sh("git rev-list --count main..HEAD", w.wt).out.trim() == "0"  // main may already do it: the reviewer decides
   if sh("git rebase -q main", w.wt).code != 0 { return {text: conflicted(w), err: true} }
   var r = runTests(w.wt)
   if !r.ok { return {text: "not submitted: the tests fail.\n" + r.report, err: true} }
   w.phase = "review"
   w.tests = r.summary
-  log("w" + str(w.i) + " submits #" + str(w.task.id) + " (" + r.summary + ")")
+  var how = ""
+  if w.empty { how = " with no changes" }
+  log("w" + str(w.i) + " submits #" + str(w.task.id) + how + " (" + r.summary + ")")
   return {text: "submitted; tests: " + r.summary + ". Waiting for review."}
 }
 fn workerRound(w, msg) {  // the reply to a worker's request
@@ -337,9 +339,15 @@ fn workerRound(w, msg) {  // the reply to a worker's request
 }
 
 // ---- review and merge ----
+fn onMain(w) {  // an empty submission: show what main has in the task's files
+  var out = "(none)\n\nThe worker changed nothing and says main already does the task. Approve only if the files below show that it does.\n"
+  for f in w.task.files { out += "\n--- " + f + " ---\n" + clip(readFile(w.wt + "/" + f) || "(missing)", 20000) }
+  return out
+}
 fn reviewRequest(w) {
   var diff = sh("git diff main...HEAD", w.wt).out
   var stat = sh("git diff --stat main...HEAD", w.wt).out
+  if w.empty { diff = onMain(w) }
   return request(system("reviewer"), VERDICT_TOOLS, [{role: "user", content: "Task #" + str(w.task.id) + ": " + w.task.title +
     "\n\n" + w.task.detail + "\n\nWorker's summary: " + w.summary + "\n\nTests: " + w.tests + "\n\nDiff stat:\n" + stat +
     "\n\nDiff:\n" + clip(diff, 60000)}])
