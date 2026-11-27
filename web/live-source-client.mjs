@@ -1,11 +1,11 @@
 import { apply, changes } from "./source-delta.mjs";
 
-export async function followLiveSources(files, onChange, entry) {
+export async function followLiveSources(files, onChange, entry, streamPath = "/live/stream") {
   let first;
   const ready = new Promise(resolve => { first = resolve; });
   let delay = 250;
   function connect() {
-    const url = new URL("/live/stream", location.href);
+    const url = new URL(streamPath, location.href);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     const socket = new WebSocket(url);
     let revision;

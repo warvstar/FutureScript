@@ -145,7 +145,7 @@ export async function runWindowSite({version, main, client, follow, sources: sou
       if (!required.every(([path, line]) => files[path]?.split("\n").includes(line))) return;
       sources = {...files};
       if (running) { fut.changed(); if (!document.hidden) resumeFrame?.(); }
-    }, main);
+    }, main, follow.path);
   }
   window.fut = fut;
   const at2 = (e) => { const c = shown(), r = c.getBoundingClientRect(); return [(e.clientX - r.left) * c.width / r.width, (e.clientY - r.top) * c.height / r.height]; };

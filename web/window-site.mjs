@@ -10,11 +10,17 @@ import { join } from "node:path";
 // @window/action handles start, retry and exit. @window/status returns the last
 // status as JSON. Apps without a service or live sources can omit client/follow.
 export function writeWindowPage(out, options) {
-  const {title, ...settings} = options;
+  const {title, externalBootstrap = false, ...settings} = options;
   const sources = settings.sources ?? "files.json";
   const preload = (sources + "?v=" + encodeURIComponent(settings.version)).replaceAll("&","&amp;").replaceAll('"',"&quot;").replaceAll("<","&lt;");
   const escaped = title.replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
   const args = JSON.stringify(settings).replaceAll("<","\\u003c");
+  const bootstrap = `import {runWindowSite} from "./window-runtime.mjs?v=${encodeURIComponent(settings.version)}";
+runWindowSite(${args}).catch(error => { const el=document.getElementById("boot"); el.hidden=false; el.textContent=error.message; console.error(error); });\n`;
+  const startScript = externalBootstrap
+    ? `<script type="module" src="./window-start.mjs?v=${encodeURIComponent(settings.version)}"></script>`
+    : `<script type="module">\n${bootstrap}</script>`;
+  if (externalBootstrap) writeFileSync(join(out, "window-start.mjs"), bootstrap);
   copyFileSync(new URL("./window-runtime.mjs", import.meta.url), join(out,"window-runtime.mjs"));
   writeFileSync(join(out,"index.html"), `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -29,8 +35,5 @@ html, body {margin:0;height:100%;background:#0b0d10;color:#e4ecdf}
 #boot,#live {position:fixed;top:4px;left:4px;z-index:5;background:#151918;max-width:min(90vw,60em);white-space:pre-wrap}
 </style></head><body><canvas id="screen" tabindex="0"></canvas><canvas id="gpu" tabindex="0"></canvas>
 <div id="ui"></div><div id="boot" role="status">Loading…</div><div id="live" hidden role="status"></div>
-<script type="module">
-import {runWindowSite} from "./window-runtime.mjs?v=${encodeURIComponent(settings.version)}";
-runWindowSite(${args}).catch(error => { const el=document.getElementById("boot"); el.hidden=false; el.textContent=error.message; console.error(error); });
-</script></body></html>\n`);
+${startScript}</body></html>\n`);
 }
