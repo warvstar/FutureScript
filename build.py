@@ -950,23 +950,20 @@ def runner_fmt(exe):
         ROOT / "tests" / "err_char.fut": b"line 1: this character can be in a string or a comment, not in code",
         ROOT / "tests" / "err_recovery_members.fut": b"line 9: use '==' for equality",
     }
-    for path, dirs, files in os.walk(ROOT):
-        dirs[:] = [d for d in dirs if d not in {".git", "build", "node_modules"}]
-        for name in sorted(files):
-            if not name.endswith(".fut"):
-                continue
-            f = Path(path) / name
-            src = f.read_bytes()
-            a = run("--stdin", source=src)  # each pass verifies the compiler's tokens, comments and line boundaries
-            if f in lexical_errors:
-                if a.returncode != 2 or a.stdout or lexical_errors[f] not in a.stderr:
-                    return False, f"{f}: expected a lexical error, got {a.stdout!r} {a.stderr!r}"
-                continue
-            if a.returncode:
-                return False, f"{f}: {a.stderr!r}"
-            b = run("--stdin", source=a.stdout)
-            if b.returncode or a.stdout != b.stdout:
-                return False, f"{f}: second pass differs {b.stderr!r}"
+    tracked = subprocess.run(["git", "ls-files", "-z", "*.fut"], cwd=ROOT, capture_output=True, check=True).stdout
+    for name in sorted(n for n in tracked.decode().split("\0") if n):  # the repo's files (not an editor's clone of it)
+        f = ROOT / name
+        src = f.read_bytes()
+        a = run("--stdin", source=src)  # each pass verifies the compiler's tokens, comments and line boundaries
+        if f in lexical_errors:
+            if a.returncode != 2 or a.stdout or lexical_errors[f] not in a.stderr:
+                return False, f"{f}: expected a lexical error, got {a.stdout!r} {a.stderr!r}"
+            continue
+        if a.returncode:
+            return False, f"{f}: {a.stderr!r}"
+        b = run("--stdin", source=a.stdout)
+        if b.returncode or a.stdout != b.stdout:
+            return False, f"{f}: second pass differs {b.stderr!r}"
 
     with tempfile.TemporaryDirectory() as tmp:
         d = Path(tmp)
