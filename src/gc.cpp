@@ -30,7 +30,8 @@
 namespace {
 constexpr size_t PAGE = 1 << 16, GRAN = 16, PBITS = PAGE / GRAN;
 size_t REGION = WASM ? 256ull << 20 : 8ull << 30, NPAGES = REGION / PAGE;  // the heap's address range; gcRegion may set it
-constexpr size_t MIN_HEAP = (8 << 20) / PAGE;
+// Leave room for the compiled image and allocations made before the next wasm safepoint.
+size_t initialLimit() { return std::min<size_t>((8 << 20) / PAGE, std::max<size_t>(1, NPAGES / 8)); }
 constexpr u32 NONE = ~0u;
 // type: 0 free, 1 small, 2 large head, 3 large tail; cold: madvised; owner: the heap's id (0: none)
 struct Page { uint8_t type, cls; bool cold; uint16_t owner; u32 n; };
@@ -58,7 +59,7 @@ struct Heap {
   std::vector<Obj*> work, owners;
   std::vector<Obj*> reached;           // frozen objects marking met (some, from the stacks, maybe not objects)
   std::unordered_set<Obj*> held;       // frozen objects it holds a reference on (see frozenReconcile)
-  size_t inUse = 0, limit = MIN_HEAP;
+  size_t inUse = 0, limit = initialLimit();
   uint64_t allocated = 0;        // objects allocated from retired runs, and large ones (see gcAllocations)
 };
 
@@ -346,7 +347,12 @@ void collect(Heap& h) {
   }
   h.mine = std::move(keep);
   for (auto& a : h.avail) std::sort(a.rbegin(), a.rend());  // allocate from low addresses up
-  h.limit = std::max(MIN_HEAP, 2 * h.inUse);
+  {
+    Locked lock(pageMu);
+    size_t available = NPAGES - bump + pool.size();
+    size_t target = std::max(initialLimit(), 2 * h.inUse);
+    h.limit = h.inUse + std::min(target - h.inUse, available / 2);
+  }
   G = nullptr;
 #if !__wasm__
   // Keep as many free pages warm as the heap may grow by before the next collection; give the rest back.
@@ -355,8 +361,8 @@ void collect(Heap& h) {
     if (Page& p = pages[pool[j]]; !p.cold) madvise(addr(pool[j]), PAGE, MADV_FREE), p.cold = true;
 #endif
 }
-bool due(Heap& h) {  // over the limit: collect now (natively), or at the next safepoint (wasm). The image never.
-  if (h.image || h.inUse + 1 <= h.limit) return false;
+bool due(Heap& h, size_t needed = 1) {  // over the limit: collect now (natively), or at the next safepoint (wasm). The image never.
+  if (h.image || h.inUse + needed <= h.limit) return false;
   if (!WASM) return collect(h), true;
   return h.wanted = true, __atomic_fetch_or(&vm->poll, 2u, __ATOMIC_RELAXED), false;  // (the ticker sets bits too)
 }
@@ -460,7 +466,7 @@ bool gcWanted() { return cur->wanted; }
 
 static void* allocLarge(Heap& h, size_t bytes) {
   size_t n = (bytes + PAGE - 1) / PAGE;
-  if (h.inUse + n > h.limit) h.inUse += n - 1, due(h), h.inUse -= n - 1;
+  due(h, n);
   size_t i = takePages(h, n);
   h.inUse += n, h.allocated++;
   pages[i].type = 2, pages[i].cls = 0, pages[i].n = (u32)n;

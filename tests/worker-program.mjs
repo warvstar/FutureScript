@@ -31,5 +31,9 @@ fn dispatch(arg) {
   const tagged = {nested:{"\0":"reserved"}};
   assert.throws(() => a.applySync("dispatch", [tagged]), /reserved NUL key/);
   assert.throws(() => a.applySync("dispatch", [JSON.stringify(tagged)]), /reserved NUL key/);
+  // Short-lived request objects must be collected across calls on the same 8 MB instance.
+  for (let i = 0; i < 30000; i++) {
+    assert.equal(a.applySync("dispatch", [{ sequence: i, payload: data }]).sequence, i);
+  }
   assert.equal(a.applySync("dispatch", ["next"]), 3);
 });
