@@ -1,0 +1,31 @@
+// The host argument of a Durable Object event carries that object's storage and namespace bindings.
+// Each socket is an opaque handle, including after hibernation.
+pub extern platform fn sql(any,str,any): any
+pub extern platform fn transaction(any,fn): any
+pub extern platform fn get(any,str): any
+pub extern platform fn put(any,str,any): void
+pub extern platform fn remove(any,str): any
+pub extern platform fn upgrade(any,any,any): any
+pub extern platform fn sockets(any,any): any
+pub extern platform fn attachment(any): any
+pub extern platform fn attach(any,any): void
+pub extern platform fn send(any,any): void
+pub extern platform fn close(any,num,str): void
+pub extern platform fn rpc(any,str,str,str,any): any
+pub extern platform fn schedule(any,num,any): void
+pub extern platform fn autoReply(any,str,str): void
+pub extern platform fn uuid(): str
+pub extern platform fn randomWords(num): any
+pub extern platform fn deferRpc(any,str,str,str,any,any): void
+pub extern platform fn hmacSign(any,str,str): str
+pub extern platform fn hmacVerify(any,str,str,str): any
+pub extern platform fn encode64(str): str
+pub extern platform fn decode64(str): str
+pub extern platform fn alarmAt(any,num): void
+pub extern platform fn forward(any,str,str,str,any): any
+pub extern platform fn body(any,num): any
+pub extern platform fn matches(str,str,str): any
+pub extern platform fn uriComponent(str): str
+pub extern platform fn decodeComponent(str): str
+
+pub extern platform fn trim(str): str

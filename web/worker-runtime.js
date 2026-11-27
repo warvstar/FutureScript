@@ -82,6 +82,39 @@ function lineWriter(log) {  // write(fd, bytes) -> console, a line at a time
 }
 const logLine = (fd, l) => (fd == 2 ? console.error(l) : console.log(l));
 
+// Boot a library once per stateful caller, or share one instance for stateless functions.
+// Worker imports are already-compiled modules. The portable loader below compiles the same assets
+// in environments where that is allowed (Node and browsers).
+export async function openWorkerProgram(bundle) {
+  const { main, keys } = bundle.serve;
+  const errors = [];
+  const fut = await createFut({
+    ...futOptions({ wasm: bundle.wasm, read: p => Object.hasOwn(bundle.files, p) ? enc.encode(bundle.files[p]) : null,
+      module: aheadOfTime(bundle.modules, keys, main), tryModule: bundle.tryModule,
+      write: lineWriter((fd, line) => { if (fd === 2) errors.push(line); logLine(fd, line); }) }),
+    heapMB: bundle.heapMB, std: "/std", importModule: async p => {
+      if (!Object.hasOwn(bundle.jsModules, p)) throw new Error(`foreign module absent from Worker bundle: ${p}`);
+      return bundle.jsModules[p];
+    },
+  });
+  if (await fut.start(main)) throw new Error(`${main} did not start:\n${errors.join("\n")}`);
+  return fut;
+}
+
+export async function readProgramBundle(base, bytes) {
+  const read = path => bytes(new URL(path, base));
+  const b = JSON.parse(dec.decode(await read("bundle.json")));
+  if (!b.library) throw new Error("expected a Fut library bundle");
+  const compile = async path => WebAssembly.compile(await read(path));
+  const [wasm, tryModule, modules, files, jsModules] = await Promise.all([
+    compile("fut.wasm"), compile("try.wasm"),
+    Promise.all(b.modules.map(async key => [key, await compile(`m/${key}.wasm`)])),
+    Promise.all(b.files.map(async path => [path, dec.decode(await read(path.slice(1) + ".txt"))])),
+    Promise.all(b.jsFiles.map(async path => [path, await import(new URL(path.slice(1), base))])),
+  ]);
+  return { ...b, wasm, tryModule, modules: Object.fromEntries(modules), files: Object.fromEntries(files), jsModules: Object.fromEntries(jsModules) };
+}
+
 export function createWorker(bundle) {
   setHeapMB(bundle.heapMB);
   const read = (p) => (p in bundle.files ? enc.encode(bundle.files[p]) : null);

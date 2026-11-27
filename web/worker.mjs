@@ -2,6 +2,8 @@
 // fut on Cloudflare Workers: build bundles that run fut programs and test files with no code generation at run time
 // (see web/worker-runtime.js), and run them under Node the way a Worker would.
 //
+//   node web/worker.mjs build --durable Room --binding ROOMS prog.fut outdir    one object per route with fn durable(event,host)
+//   node web/worker.mjs build --library dispatch [--root dir] prog.fut outdir  import openProgram() from the generated worker.js
 //   node web/worker.mjs build prog.fut outdir         a Worker whose requests go to prog.fut's fn serve(req)
 //   node web/worker.mjs build --tests [--shards N | --max-kb K] [--root dir] [--name w] [--heap-mb M] outdir files...
 //                                                     test files, in shards: outdir/shard-<i>/ each, and
@@ -21,6 +23,7 @@
 // compile to (m/*.wasm), their sources (app/, each as <file>.txt), wrangler.toml, and bundle.json (what worker.js imports, for Node).
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { pathToFileURL } from "node:url";
 import { gzipSync } from "node:zlib";
 import { createFut, tryCallBytes } from "./fut.js";
 import { ROOT, createInterpWorker, createWorker, futOptions, moduleKey, runChild, setHeapMB } from "./worker-runtime.js";
@@ -33,13 +36,21 @@ const die = (m, code = 2) => (process.stderr.write(m.endsWith("\n") ? m : m + "\
 // ---- compiling ahead of time: each program in a fresh instance, as the Worker will ----
 const futWasm = readFileSync(join(repo, "build", "fut.wasm"));
 let futModule, HEAP_MB = 32;  // the wasm heap the bundle's code is compiled for (--heap-mb)
-async function compileProgram(root, file, tests) {
+async function compileProgram(root, file, tests, library) {
   futModule ??= await WebAssembly.compile(futWasm);
   const main = ROOT + "/" + relative(root, file).split(sep).join("/"), keys = [], modules = new Map(), files = new Map(), err = [];
+  const jsFiles = new Map();
+  const local = (p) => {
+    const base = p.startsWith(ROOT + "/") ? root : library && p.startsWith("/std/") ? join(repo, "std") : null;
+    if (!base) return null;
+    const path = resolve(base, p.slice(5));
+    return path.startsWith(base + sep) ? path : null;
+  };
   const read = (p) => {
-    if (!p.startsWith(ROOT + "/")) return null;
+    const path = local(p);
+    if (!path) return null;
     let b;
-    try { b = readFileSync(join(root, p.slice(ROOT.length + 1))); } catch { return null; }
+    try { b = readFileSync(path); } catch { return null; }
     const text = b.toString("utf8");
     if (!Buffer.from(text, "utf8").equals(b)) throw new Error(`${p}: not UTF-8 text (a Worker bundle carries only text sources)`);
     return files.set(p, text), b;
@@ -49,12 +60,19 @@ async function compileProgram(root, file, tests) {
     return keys.push(k), modules.set(k, b.slice()), new WebAssembly.Module(b);
   };
   const write = (fd, b) => err.push(Buffer.from(b).toString());
-  const fut = await createFut(futOptions({ wasm: futModule, read, module, write }));
+  const options = futOptions({ wasm: futModule, read, module, write });
+  if (library) Object.assign(options, { std: "/std", importModule: async path => {
+    const source = local(path);
+    if (!source) throw new Error(`cannot import ${path}`);
+    jsFiles.set(path, source);
+    return import(pathToFileURL(source));
+  } });
+  const fut = await createFut(options);
   const ok = await fut.compile(main, tests);
   if (!ok) throw new Error(`${relative(process.cwd(), file)} did not compile:\n${err.join("")}`);
-  if (!tests && !fut.has("serve")) throw new Error(`${relative(process.cwd(), file)} defines no fn serve(req)`);
+  if (!tests && !fut.has(library ?? "serve")) throw new Error(`${relative(process.cwd(), file)} defines no fn ${library ?? "serve"}`);
   if (tests) fut.checkApi();  // it reads the interface files (.api) fut test checks: they go in the bundle too
-  const prog = { main, keys, modules, files, children: new Map(), names: tests ? fut.tests() : undefined };
+  const prog = { main, keys, modules, files, jsFiles, children: new Map(), names: tests ? fut.tests() : undefined };
   if (tests && [...files.values()].some((t) => /\brun\s*\(/.test(t))) await findChildren(prog, read, module);
   return prog;
 }
@@ -74,7 +92,7 @@ async function findChildren(prog, read, module) {
 }
 
 // ---- writing a bundle ----
-function writeBundle(dir, name, progs, serve) {
+function writeBundle(dir, name, progs, serve, library) {
   rmSync(dir, { recursive: true, force: true }), mkdirSync(join(dir, "m"), { recursive: true });
   const modules = new Map(), files = new Map(), children = {};
   for (const p of progs) {
@@ -89,18 +107,26 @@ function writeBundle(dir, name, progs, serve) {
   for (const [f, t] of files) mkdirSync(dirname(join(dir, f)), { recursive: true }), writeFileSync(join(dir, f + ".txt"), t);
   const keys = [...modules.keys()], paths = [...files.keys()];
   const entry = (p) => ({ main: p.main, keys: p.keys, ...(p.names ? { names: p.names } : {}) });
-  const bundle = { serve: serve ? entry(progs[0]) : null, tests: serve ? [] : progs.map(entry), children, modules: keys, files: paths, heapMB: HEAP_MB };
+  const jsFiles = progs[0].jsFiles;
+  for (const [file, source] of jsFiles) {
+    const dest = join(dir, file);
+    mkdirSync(dirname(dest), { recursive: true });
+    copyFileSync(source, dest);
+  }
+  const bundle = { ...(library ? { library, jsFiles: [...jsFiles.keys()] } : {}), serve: serve ? entry(progs[0]) : null, tests: serve ? [] : progs.map(entry), children, modules: keys, files: paths, heapMB: HEAP_MB };
   writeFileSync(join(dir, "bundle.json"), JSON.stringify(bundle, null, 1));
   const js = [
     "// Generated by web/worker.mjs: the fut programs of this bundle, compiled ahead of time (see runtime.js).",
-    'import { createWorker } from "./runtime.js";', 'import wasm from "./fut.wasm";', 'import tryModule from "./try.wasm";',
+    'import { createWorker, openWorkerProgram } from "./runtime.js";', 'import wasm from "./fut.wasm";', 'import tryModule from "./try.wasm";',
     ...keys.map((k, i) => `import m${i} from "./m/${k}.wasm";`),
     ...paths.map((f, i) => `import f${i} from ".${f}.txt";`),
-    `const bundle = ${JSON.stringify({ serve: bundle.serve, tests: bundle.tests, children, heapMB: HEAP_MB })};`,
+    ...[...jsFiles.keys()].map((f, i) => `import * as j${i} from ${JSON.stringify("." + f)};`),
+    `const bundle = ${JSON.stringify({ serve: bundle.serve, tests: bundle.tests, children, heapMB: HEAP_MB, library })};`,
+    ...(library ? [`bundle.jsModules = { ${[...jsFiles.keys()].map((f,i)=>`${JSON.stringify(f)}: j${i}`).join(", ")} };`] : []),
     `bundle.wasm = wasm, bundle.tryModule = tryModule;`,
     `bundle.modules = { ${keys.map((k, i) => `"${k}": m${i}`).join(", ")} };`,
     `bundle.files = { ${paths.map((f, i) => `${JSON.stringify(f)}: f${i}`).join(", ")} };`,
-    "export default createWorker(bundle);", "",
+    ...(library ? ["export const openProgram = () => openWorkerProgram(bundle);"] : ["export default createWorker(bundle);"]), "",
   ];
   writeFileSync(join(dir, "worker.js"), js.join("\n"));
   writeFileSync(join(dir, "wrangler.toml"), [
@@ -126,11 +152,33 @@ function sizeOf(dir) {  // bytes, and gzipped as an upload is (each file on its 
 }
 const workerName = (s) => ("fut-" + s.toLowerCase().replace(/[^a-z0-9-]+/g, "-")).replace(/-+/g, "-").replace(/^-|-$/g, "").slice(0, 60);
 
-async function buildServe(file, out) {
+async function buildServe(file, out, root, library, durable) {
   file = resolve(file);
-  const p = await compileProgram(dirname(file), file, false), size = writeBundle(resolve(out), workerName(basename(file, ".fut")), [p], true);
+  root = resolve(root ?? dirname(file));
+  if (!file.startsWith(root + sep)) throw new Error("the program must be inside --root");
+  const p = await compileProgram(root, file, false, library), size = writeBundle(resolve(out), workerName(basename(file, ".fut")), [p], true, library);
   console.log(`${out}: ${p.keys.length} modules, ${(size.bytes / 1024).toFixed(0)} KB (${(size.gzip / 1024).toFixed(0)} KB gzipped)`);
-  console.log(`run it: cd ${out} && npx wrangler dev     (deploy: npx wrangler deploy, logged in to Cloudflare)`);
+  if (durable) {
+    copyFileSync(join(here, "durable-runtime.js"), join(out, "durable-runtime.js"));
+    const { name, binding } = durable;
+    writeFileSync(join(out, "entry.js"), [
+      'import { openProgram } from "./worker.js";',
+      'import { durableClass } from "./durable-runtime.js";',
+      'import { toResponse } from "./runtime.js";',
+      `export class ${name} extends durableClass(openProgram) {}`,
+      'let router;',
+      'export default { async fetch(request, env) {',
+      '  const fut = await (router ??= openProgram());',
+      '  const route = fut.applySync("route", [{ method: request.method, url: request.url, headers: Object.fromEntries(request.headers) }]);',
+      `  return typeof route === "string" ? env.${binding}.getByName(route).fetch(request) : toResponse(route);`,
+      '} };', '',
+    ].join("\n"));
+    const config = join(out, "wrangler.toml");
+    const wrangler = readFileSync(config, "utf8").replace('main = "worker.js"', 'main = "entry.js"');
+    writeFileSync(config, wrangler + ['[durable_objects]', `bindings = [{ name = "${binding}", class_name = "${name}" }]`,
+      '[[migrations]]', 'tag = "v1"', `new_sqlite_classes = ["${name}"]`, ''].join("\n"));
+  }
+  if (!library || durable) console.log(`run it: cd ${out} && npx wrangler dev     (deploy: npx wrangler deploy, logged in to Cloudflare)`);
 }
 
 const commonDir = (paths) => paths.map(dirname).reduce((a, b) => { while (!(b + sep).startsWith(a + sep) && a != dirname(a)) a = dirname(a); return a; });
@@ -289,7 +337,10 @@ const flag = (name, hasValue) => {
 };
 if (cmd == "build") {
   const tests = flag("--tests"), shards = flag("--shards", true), maxKb = flag("--max-kb", true), root = flag("--root", true);
-  const pages = flag("--pages", true), name = flag("--name", true), heap = flag("--heap-mb", true);
+  const pages = flag("--pages", true), name = flag("--name", true), heap = flag("--heap-mb", true), library = flag("--library", true);
+  const durableName = flag("--durable", true), binding = flag("--binding", true);
+  if ((binding || durableName) && (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(durableName ?? "") ||
+      !/^[A-Za-z_][A-Za-z0-9_]*$/.test(binding ?? "") || tests || library)) die("give --durable ClassName --binding NAME");
   if (heap) setHeapMB((HEAP_MB = +heap));
   if (flag("--interp")) {
     if (args.length != 1) die(usage);
@@ -299,7 +350,7 @@ if (cmd == "build") {
     await buildTests(args.slice(1), args[0], { shards: shards && +shards, maxKb: maxKb && +maxKb, root, name }).catch((e) => die(e.message));
   } else {
     if (args.length != 2) die(usage);
-    await buildServe(args[0], args[1]).catch((e) => die(e.message));
+    await buildServe(args[0], args[1], root, durableName ? "durable" : library, durableName && { name: durableName, binding }).catch((e) => die(e.message));
   }
 } else if (cmd == "run") {
   const method = flag("--method", true), body = flag("--body", true);

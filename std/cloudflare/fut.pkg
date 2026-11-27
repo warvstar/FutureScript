@@ -1,0 +1,3 @@
+name cloudflare
+version 0.1.0
+js platform ./bindings.js
