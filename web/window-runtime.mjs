@@ -88,7 +88,17 @@ export async function runWindowSite({version, main, client, follow, gpu = false,
       return true;
     },
     async present(rgba, w, h) {
-      if (gpuPresent) gpuPresent();
+      if (gpuPresent) {
+        gpuPresent();
+        for (const view of document.querySelectorAll("canvas[data-gpu-view]")) {
+          const box = view.futViewport;
+          if (!box || !box.width || !box.height) continue;
+          const sx = gpuCanvas.width / box.width, sy = gpuCanvas.height / box.height;
+          const width = Math.max(1, Math.round(box.w * sx)), height = Math.max(1, Math.round(box.h * sy));
+          if (view.width !== width || view.height !== height) { view.width = width; view.height = height; }
+          view.getContext("2d", {alpha:false}).drawImage(gpuCanvas,box.x*sx,box.y*sy,box.w*sx,box.h*sy,0,0,width,height);
+        }
+      }
       else ctx.putImageData(new ImageData(rgba, w, h), 0, 0);
       await new Promise(resolve => {
         const frame = requestAnimationFrame(resolve);
@@ -135,7 +145,7 @@ export async function runWindowSite({version, main, client, follow, gpu = false,
       if (!required.every(([path, line]) => files[path]?.split("\n").includes(line))) return;
       sources = {...files};
       if (running) { fut.changed(); if (!document.hidden) resumeFrame?.(); }
-    });
+    }, main);
   }
   window.fut = fut;
   const at2 = (e) => { const c = shown(), r = c.getBoundingClientRect(); return [(e.clientX - r.left) * c.width / r.width, (e.clientY - r.top) * c.height / r.height]; };
