@@ -66,9 +66,13 @@ export class SocketService {
     if (this.closed || this.loggingIn) return;
     this.generation++;
     this.loggingIn = (async () => {
-      this.program ??= await this.openProgram();
+      if (!this.program) {
+        const program = await this.openProgram();
+        if (this.closed) return;
+        this.program = program;
+      }
       this.invoke("start");
-      if (this.lastFrame) this.invoke("submit", {frame:this.lastFrame});
+      if (this.lastFrame) this.submit(this.lastFrame);
       await this.loginRequest;
     })().catch(error => {
       if (!this.closed) {
@@ -89,8 +93,7 @@ export class SocketService {
     socket.onmessage = ({data}) => {
       if (this.sockets.get(key) !== socket) return;
       try {
-        if (data === "pong") this.invoke("pong", {key});
-        else if (typeof data === "string") this.invoke("message", {key, message:JSON.parse(data)});
+        if (typeof data === "string") this.invoke("text", {key, text:data});
         else this.invoke("bytes", {key, bytes:Array.from(new Uint8Array(data))});
       } catch (error) {
         console.error("Socket input failed", error.message);

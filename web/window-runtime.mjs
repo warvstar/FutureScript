@@ -1,5 +1,5 @@
 // Browser host for a Fut window application, optionally connected to a session service.
-export async function runWindowSite({version, main, client, follow, gpu = false, required = []}) {
+export async function runWindowSite({version, main, client, follow, sources: sourceFile = "files.json", gpu = false, required = []}) {
   const at = p => new URL(p + "?v=" + encodeURIComponent(version), import.meta.url);
   const load = p => import(at(p));
   const {createFut} = await load("./fut.js");
@@ -128,7 +128,7 @@ export async function runWindowSite({version, main, client, follow, gpu = false,
 
   const wasmURL = at("fut.wasm");
   const [files, wasm] = await Promise.all([
-    fetch(at("files.json")).then(r => r.json()),
+    fetch(at(sourceFile)).then(r => r.json()),
     WebAssembly.compileStreaming(fetch(wasmURL)).catch(async () => WebAssembly.compile(await (await fetch(wasmURL)).arrayBuffer())),
   ]);
   let sources = {...files};
