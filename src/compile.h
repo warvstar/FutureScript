@@ -14,12 +14,29 @@ struct CompileDiagnostic {
   std::string file, message, code;
   int line = 1, column = 1;  // one-based byte positions
 };
+struct CompileSymbols {
+  struct Site {
+    int file = -1, offset = 0, length = 0;
+    auto operator<=>(const Site&) const = default;
+  };
+  struct Declaration {
+    Site site;
+    std::string name, kind, container, signature;
+  };
+  enum Role { Read, Write, Decl };
+  struct Occurrence { Site site; int declaration; Role role; };
+  std::vector<std::string> files;
+  std::vector<Declaration> declarations;
+  std::vector<Occurrence> occurrences;
+  std::vector<std::pair<Site, Site>> collisions;  // overlapping declarations; a repeated site marks a name implicit in the source
+};
 struct CompileCheck {
   using Buffers = std::vector<std::pair<std::string, std::string_view>>;
   struct Import { std::string from, to; int line, column; };
   const Buffers& buffers;  // paths normalized with normalize; these sources take precedence over disk
   std::string (*normalize)(const std::string&) = canonicalPath;
   std::vector<Import> imports;  // filled even if the compile fails
+  CompileSymbols symbols;
 };
 // Requires rtInit(). Checks source and tests without loading externs, writing traces or installing code.
 std::vector<CompileDiagnostic> compileDiagnostics(const std::string& path, CompileCheck& check);
@@ -187,7 +204,7 @@ constexpr int HOT = 1000;  // calls before a function is compiled again (tier 2)
 struct TryAt { int r = 0, pc = 0, done = 0; };  // a try being compiled: its record's first slot, branches to patch
 struct Fun {  // per-function emission state
   Code k;
-  struct Local { int sym, home; bool num = false; uint64_t ty = 0; int site = -1; };  // ty: its declared type (0: none), checked at every store  // home >= 0 is a frame slot, < 0 a register (arm64)
+  struct Local { int sym, home; bool num = false; uint64_t ty = 0; int site = -1, symbol = -1; };  // home: frame slot (>= 0) or arm64 register; symbol: editor declaration
   std::vector<Local> locals;                          // num: always holds a number (a range loop variable)
   std::vector<std::pair<int, LV>> caps;     // lambda captures: (sym, where it lives in the parent)
   Fun* parent = nullptr;
@@ -212,6 +229,7 @@ struct Fun {  // per-function emission state
   int npar = 0;
   u32 spec = 0;
   int lambdaName = -1;  // a named lambda resolves its own name to the incoming closure
+  int lambdaSymbol = -1;
   // A parallel for's body (`parallel for i in a..b { }`, compiled as a lambda of i): its variable, and the variables
   // from outside it that it writes as name[...] = (each a closure slot + 1, or -(global slot + 1); and its name).
   int parVar = -1;

@@ -196,6 +196,17 @@ std::string fromUri(std::string_view uri) {
   }
   return normalize(path);
 }
+std::string fileUri(std::string_view path) {
+  std::string uri = "file://";
+  for (unsigned char c : path) {
+    if (idc(c) || digit(c) || c == '/' || c == '-' || c == '.' || c == '~') uri += char(c);
+    else {
+      constexpr char digits[] = "0123456789ABCDEF";
+      uri += '%', uri += digits[c >> 4], uri += digits[c & 15];
+    }
+  }
+  return uri;
+}
 
 struct Position {
   int line, character;
@@ -252,6 +263,16 @@ public:
     return {at(b), at(e)};
   }
 };
+
+struct TextSite {
+  std::string file;
+  int offset, length;
+  auto operator<=>(const TextSite&) const = default;
+  Range range(const Lines& lines) const { return {lines.at(offset), lines.at(offset + length)}; }
+};
+TextSite textSite(const CompileSymbols& index, CompileSymbols::Site site) {
+  return {index.files[site.file], site.offset, site.length};
+}
 
 using Buffers = CompileCheck::Buffers;
 bool source(const std::string& path, const Buffers& buffers, std::string& text) {
@@ -454,28 +475,125 @@ std::string checkSource(const std::string& path, const Buffers& buffers) {
   rtInit();
   CompileCheck check{buffers, normalize};
   auto diagnostics = compileDiagnostics(path, check);
-  Rows errors, imports;
+  Rows errors, imports, files, declarations, occurrences, collisions;
   for (auto& d : diagnostics)
     errors.add("{\"file\":" + quoteJson(d.file) + ",\"message\":" + quoteJson(d.message) + ",\"code\":" + quoteJson(d.code) +
                ",\"line\":" + std::to_string(d.line) + ",\"column\":" + std::to_string(d.column) + "}");
   for (auto& i : check.imports)
     imports.add("{\"from\":" + quoteJson(i.from) + ",\"to\":" + quoteJson(i.to) +
                 ",\"line\":" + std::to_string(i.line) + ",\"column\":" + std::to_string(i.column) + "}");
-  return "{\"errors\":" + errors.end() + ",\"imports\":" + imports.end() + "}";
+  auto site = [](CompileSymbols::Site s) {
+    return std::to_string(s.file) + "," + std::to_string(s.offset) + "," + std::to_string(s.length);
+  };
+  for (auto& f : check.symbols.files) files.add(quoteJson(f));
+  for (auto& d : check.symbols.declarations)
+    declarations.add("[" + site(d.site) + "," + quoteJson(d.name) + "," + quoteJson(d.kind) + "," +
+                     quoteJson(d.container) + "," + quoteJson(d.signature) + "]");
+  for (auto& u : check.symbols.occurrences)
+    occurrences.add("[" + site(u.site) + "," + std::to_string(u.declaration) + "," + std::to_string(u.role) + "]");
+  for (auto& [a, b] : check.symbols.collisions) collisions.add("[" + site(a) + "," + site(b) + "]");
+  return "{\"errors\":" + errors.end() + ",\"imports\":" + imports.end() + ",\"files\":" + files.end() +
+         ",\"declarations\":" + declarations.end() + ",\"occurrences\":" + occurrences.end() +
+         ",\"collisions\":" + collisions.end() + "}";
 }
 
-struct Document {
+struct CheckReport {
+  std::vector<CompileDiagnostic> errors;
+  std::vector<CompileCheck::Import> imports;
+  CompileSymbols symbols;
+};
+std::optional<CheckReport> analyze(const std::string& path, const Buffers& buffers) {
+  auto result = isolated([&] { return checkSource(path, buffers); });
+  if (!result) return {};
+  Json report = JsonParser(*result).parse();
+  CheckReport out;
+  for (auto& i : report.get("imports").list)
+    out.imports.push_back({i.get("from").string, i.get("to").string,
+                           i.get("line").integer(1), i.get("column").integer(1)});
+  for (auto& d : report.get("errors").list)
+    out.errors.push_back({d.get("file").string, d.get("message").string, d.get("code").string,
+                          d.get("line").integer(1), d.get("column").integer(1)});
+  auto site = [](const auto& row, size_t at = 0) {
+    return CompileSymbols::Site{row[at].integer(), row[at + 1].integer(), row[at + 2].integer()};
+  };
+  for (auto& f : report.get("files").list) out.symbols.files.push_back(f.string);
+  for (auto& d : report.get("declarations").list) {
+    auto& row = d.list;
+    out.symbols.declarations.push_back({site(row), row[3].string, row[4].string, row[5].string, row[6].string});
+  }
+  for (auto& u : report.get("occurrences").list) {
+    auto& row = u.list;
+    out.symbols.occurrences.push_back({site(row), row[3].integer(), CompileSymbols::Role(row[4].integer())});
+  }
+  for (auto& c : report.get("collisions").list) out.symbols.collisions.emplace_back(site(c.list), site(c.list, 3));
+  return out;
+}
+struct Document : CheckReport {
   std::string path, text;
   int version = 0;
   Clock::time_point due{};
-  std::vector<CompileDiagnostic> errors;
-  std::vector<CompileCheck::Import> imports;
+  std::map<std::string, std::filesystem::file_time_type> disk;
+  bool checked = false;
   std::string published;
 };
 struct Finding {
   Range range;
   std::string message, code, related;
 };
+
+using Edits = std::map<std::string, std::vector<TextSite>>;
+
+bool identifier(std::string_view name) {
+  return !name.empty() && idc(name.front()) && std::all_of(name.begin() + 1, name.end(), [](char c) { return idc(c) || digit(c); });
+}
+bool keyword(std::string_view name) {
+  for (auto word : {KEYWORDS(SYM_STR)}) if (name == word) return true;
+  int sym = S_FIRST + 1;
+  for (auto word : {EXTRA_SYMS(SYM_STR)}) {
+    if (sym >= S_as && name == word) return true;
+    sym++;
+  }
+  return name == "gpu" || name == "view" || name == "state";
+}
+TextSite afterEdits(TextSite site, const Edits& edits, int length) {
+  auto it = edits.find(site.file);
+  if (it == edits.end()) return site;
+  const auto& sites = it->second;
+  auto e = std::lower_bound(sites.begin(), sites.end(), site.offset, [](const auto& s, int offset) { return s.offset < offset; });
+  if (e != sites.end() && e->offset == site.offset) site.length = length;
+  site.offset += int(e - sites.begin()) * (length - sites.front().length);
+  return site;
+}
+bool sameBindings(const CompileSymbols& before, const CompileSymbols& after, const Edits& edits, int length) {
+  using Edge = std::tuple<TextSite, TextSite, CompileSymbols::Role>;
+  auto graph = [&](const CompileSymbols& index, bool translate) {
+    auto site = [&](CompileSymbols::Site s) {
+      TextSite out = textSite(index, s);
+      return translate ? afterEdits(std::move(out), edits, length) : out;
+    };
+    std::set<Edge> edges;
+    for (auto& u : index.occurrences) edges.emplace(site(u.site), site(index.declarations[u.declaration].site), u.role);
+    std::set<std::pair<TextSite, TextSite>> collisions;
+    for (auto& [a, b] : index.collisions) {
+      auto x = site(a), y = site(b);
+      collisions.emplace(std::minmax(x, y));
+    }
+    return std::pair{std::move(edges), std::move(collisions)};
+  };
+  auto [oldEdges, oldCollisions] = graph(before, true);
+  auto [newEdges, newCollisions] = graph(after, false);
+  return oldEdges == newEdges && std::includes(oldCollisions.begin(), oldCollisions.end(), newCollisions.begin(), newCollisions.end());
+}
+std::string newError(const CheckReport& before, const CheckReport& after) {
+  std::multiset<std::tuple<std::string_view, std::string_view, std::string_view>> old;
+  for (auto& d : before.errors) old.emplace(d.file, d.code, d.message);
+  for (auto& d : after.errors) {
+    auto it = old.find({d.file, d.code, d.message});
+    if (it == old.end()) return d.message;
+    old.erase(it);
+  }
+  return {};
+}
 
 class Server {
   std::map<std::string, Document> documents;
@@ -498,9 +616,20 @@ class Server {
     for (auto& [_, doc] : documents) out.emplace_back(doc.path, doc.text);
     return out;
   }
+  std::string uriFor(const std::string& path) const {
+    for (auto& [uri, d] : documents) if (d.path == path) return uri;
+    return fileUri(path);
+  }
+  static bool imports(const Document& d, const std::string& path) {
+    return std::any_of(d.imports.begin(), d.imports.end(), [&](auto& i) { return i.to == path; });
+  }
+  static auto diskTime(const std::string& path) {
+    std::error_code error;
+    return std::filesystem::last_write_time(path, error);
+  }
   void schedule(const std::string& path, Clock::time_point when) {
     for (auto& [_, d] : documents)
-      if (d.path == path || std::any_of(d.imports.begin(), d.imports.end(), [&](auto& i) { return i.to == path; })) {
+      if (d.path == path || imports(d, path)) {
         d.due = when;
         d.errors.clear();
       }
@@ -571,20 +700,192 @@ class Server {
   }
   void check(Document& doc) {
     doc.due = {};
-    doc.errors.clear();
-    auto result = isolated([&] { return checkSource(doc.path, buffers()); });
+    doc.checked = true;
+    Buffers open = buffers();
+    auto onDisk = [&](const auto& i) {
+      return !i.to.empty() && std::none_of(open.begin(), open.end(), [&](const auto& b) { return b.first == i.to; });
+    };
+    using FileTime = std::filesystem::file_time_type;
+    auto started = FileTime::clock::now();
+    decltype(doc.disk) before;
+    for (auto& i : doc.imports) if (onDisk(i)) before.try_emplace(i.to, diskTime(i.to));
+    auto result = analyze(doc.path, open);
     if (!result) {
+      doc.errors.clear();
+      doc.symbols = {};
       doc.errors.push_back({doc.path, "The compiler process failed while checking this file. See the language server log."});
-      return;
+    } else static_cast<CheckReport&>(doc) = std::move(*result);
+    doc.disk.clear();
+    for (auto& i : doc.imports) if (onDisk(i)) {
+      if (auto old = before.find(i.to); old != before.end()) doc.disk.try_emplace(i.to, old->second);
+      else {
+        auto stamp = diskTime(i.to);
+        // An import discovered during this check may have changed since the compiler read it.
+        doc.disk.try_emplace(i.to, stamp > started ? FileTime::min() : stamp);
+      }
     }
-    Json report = JsonParser(*result).parse();
-    doc.imports.clear();
-    for (auto& i : report.get("imports").list)
-      doc.imports.push_back({i.get("from").string, i.get("to").string,
-                             i.get("line").integer(1), i.get("column").integer(1)});
-    for (auto& d : report.get("errors").list)
-      doc.errors.push_back({d.get("file").string, d.get("message").string, d.get("code").string,
-                            d.get("line").integer(1), d.get("column").integer(1)});
+  }
+  void ensureChecked(Document& d) {
+    if (!d.checked || d.due != Clock::time_point{} ||
+        std::any_of(d.disk.begin(), d.disk.end(), [&](const auto& f) { return diskTime(f.first) != f.second; })) {
+      check(d);
+      publishAll();
+    }
+  }
+  const CheckReport* checkedFor(const std::string& uri, const std::string& path, std::optional<CheckReport>& standalone) {
+    if (auto it = documents.find(uri); it != documents.end()) {
+      ensureChecked(it->second);
+      return &it->second;
+    }
+    for (auto& [_, d] : documents)
+      if (d.path == path || imports(d, path)) {
+        ensureChecked(d);
+        if (d.path == path || imports(d, path)) return &d;
+      }
+    standalone = analyze(path, buffers());
+    return standalone ? &*standalone : nullptr;
+  }
+  static const CompileSymbols::Occurrence* occurrence(const CompileSymbols& index, const std::string& path, size_t byte) {
+    auto f = std::find(index.files.begin(), index.files.end(), path);
+    if (f == index.files.end()) return nullptr;
+    auto key = CompileSymbols::Site{int(f - index.files.begin()), int(byte), INT_MAX};
+    auto it = std::upper_bound(index.occurrences.begin(), index.occurrences.end(), key,
+                               [](const auto& s, const auto& u) { return s < u.site; });
+    if (it == index.occurrences.begin()) return nullptr;
+    const auto& u = *std::prev(it);
+    return u.site.file == key.file && key.offset < u.site.offset + u.site.length ? &u : nullptr;
+  }
+  std::vector<std::pair<std::string_view, const CheckReport*>> related(
+      const CheckReport& root, const std::string& path, const std::string& declaration) {
+    std::string_view entry = path;
+    for (auto& [_, d] : documents) if (&d == &root) entry = d.path;
+    std::vector<std::pair<std::string_view, const CheckReport*>> roots{{entry, &root}};
+    for (auto& [_, d] : documents) {
+      if (&d == &root) continue;
+      // A changed buffer might have just added the import. Current buffers can use their cached import graph.
+      if (d.due != Clock::time_point{}) ensureChecked(d);
+      if (d.path == declaration || imports(d, path) || imports(d, declaration)) {
+        ensureChecked(d);
+        roots.emplace_back(d.path, &d);
+      }
+    }
+    return roots;
+  }
+  static std::map<TextSite, CompileSymbols::Role> uses(
+      const std::vector<std::pair<std::string_view, const CheckReport*>>& roots, const TextSite& target) {
+    std::map<TextSite, CompileSymbols::Role> found;
+    for (auto& [_, root] : roots) {
+      const auto& index = root->symbols;
+      auto file = std::find(index.files.begin(), index.files.end(), target.file);
+      if (file == index.files.end()) continue;
+      CompileSymbols::Site key{int(file - index.files.begin()), target.offset, target.length};
+      for (auto& u : index.occurrences)
+        if (index.declarations[u.declaration].site == key) {
+          auto [it, fresh] = found.try_emplace(textSite(index, u.site), u.role);
+          if (!fresh) it->second = std::max(it->second, u.role);
+        }
+    }
+    return found;
+  }
+  void rename(std::string_view id, const Json& params, const CompileSymbols::Declaration& declaration,
+              const std::map<TextSite, CompileSymbols::Role>& found,
+              const std::vector<std::pair<std::string_view, const CheckReport*>>& roots, Buffers open) {
+    const std::string& name = params.get("newName").string;
+    if (!identifier(name)) return error(id, -32602, "The new name must be a fut identifier.");
+    if (keyword(name)) return error(id, -32602, "Cannot rename to a fut keyword.");
+    if (name == declaration.name) return respond(id, "{\"changes\":{}}");
+
+    Edits edits;
+    for (auto& [site, _] : found) edits[site.file].push_back(site);
+    std::map<std::string, std::string> replacements;
+    std::string changes = "{";
+    for (auto& [path, sites] : edits) {
+      std::string text;
+      if (!source(path, open, text)) return error(id, -32801, "A source file changed while preparing the rename.");
+      Lines lines(text);
+      Rows rows;
+      for (auto& site : sites) {
+        if (size_t(site.offset + site.length) > text.size() || text.compare(site.offset, site.length, declaration.name) != 0)
+          return error(id, -32801, "A source file changed while preparing the rename.");
+        rows.add("{\"range\":" + site.range(lines).json() + ",\"newText\":" + quoteJson(name) + "}");
+      }
+      if (changes.size() > 1) changes += ',';
+      changes += quoteJson(uriFor(path)) + ":" + rows.end();
+      for (auto i = sites.rbegin(); i != sites.rend(); ++i) text.replace(i->offset, i->length, name);
+      auto& edited = replacements.emplace(path, std::move(text)).first->second;
+      auto b = std::find_if(open.begin(), open.end(), [&](const auto& b) { return b.first == path; });
+      if (b == open.end()) open.emplace_back(path, edited);
+      else b->second = edited;
+    }
+    // Recheck the proposed overlays. A rename has to preserve every binding, including uses
+    // of other names that the renamed declaration could capture.
+    for (auto& [path, before] : roots) {
+      auto after = analyze(std::string(path), open);
+      if (!after) return error(id, -32603, "Could not validate the rename.");
+      if (auto message = newError(*before, *after); !message.empty())
+        return error(id, -32602, "Cannot rename '" + declaration.name + "' to '" + name + "'. " + message);
+      if (!sameBindings(before->symbols, after->symbols, edits, int(name.size())))
+        return error(id, -32602, "The new name collides with an existing binding or changes what a name refers to.");
+    }
+    respond(id, "{\"changes\":" + changes + "}}");
+  }
+  void navigate(const std::string& method, const Json& params, std::string_view id) {
+    bool list = method == "textDocument/references" || method == "textDocument/documentHighlight";
+    bool renaming = method == "textDocument/rename", prepare = method == "textDocument/prepareRename";
+    const auto& uri = params.get("textDocument").get("uri").string;
+    auto it = documents.find(uri);
+    std::string path = it == documents.end() ? fromUri(uri) : it->second.path;
+    auto missing = [&] {
+      if (renaming) error(id, -32602, "No resolvable name to rename here.");
+      else respond(id, list ? "[]" : "null");
+    };
+    if (path.empty()) return missing();
+    Buffers open = buffers();
+    std::string text;
+    if (!source(path, open, text)) return missing();
+    Lines lines(text);
+    const auto& p = params.get("position");
+    auto offset = lines.offset({p.get("line").integer(), p.get("character").integer()});
+    if (!offset) return missing();
+    std::optional<CheckReport> standalone;
+    const auto* root = checkedFor(uri, path, standalone);
+    if (!root) return missing();
+    const auto& index = root->symbols;
+    const auto* u = occurrence(index, path, *offset);
+    if (!u) return missing();
+    const auto& declaration = index.declarations[u->declaration];
+    TextSite target = textSite(index, declaration.site);
+    if ((renaming || prepare) && inStd(target.file)) return error(id, -32602, "Cannot rename a name declared in the standard library.");
+    if (prepare)
+      return respond(id, "{\"range\":" + textSite(index, u->site).range(lines).json() + ",\"placeholder\":" + quoteJson(declaration.name) + "}");
+
+    std::map<std::string, std::string> texts;
+    auto location = [&](const TextSite& site) {
+      if (site.file == path) return "{\"uri\":" + quoteJson(uri) + ",\"range\":" + site.range(lines).json() + "}";
+      auto [entry, fresh] = texts.try_emplace(site.file);
+      if (fresh) source(site.file, open, entry->second);
+      if (size_t(site.offset + site.length) > entry->second.size()) return std::string();
+      return "{\"uri\":" + quoteJson(uriFor(site.file)) + ",\"range\":" + site.range(Lines(entry->second)).json() + "}";
+    };
+    if (method == "textDocument/definition") {
+      auto result = location(target);
+      return respond(id, result.empty() ? "null" : std::move(result));
+    }
+    bool highlight = method == "textDocument/documentHighlight";
+    auto roots = highlight ? std::vector<std::pair<std::string_view, const CheckReport*>>{{path, root}} : related(*root, path, target.file);
+    auto found = uses(roots, target);
+    if (renaming) return rename(id, params, declaration, found, roots, std::move(open));
+    bool include = params.get("context").get("includeDeclaration").isTrue();
+    Rows rows;
+    for (auto& [site, role] : found)
+      if (highlight) {
+        if (site.file == path)
+          rows.add("{\"range\":" + site.range(lines).json() + ",\"kind\":" + (role == CompileSymbols::Read ? "2" : "3") + "}");
+      } else if (include || role != CompileSymbols::Decl) {
+        auto loc = location(site);
+        if (!loc.empty()) rows.add(loc);
+      }
+    respond(id, rows.end());
   }
 
   void changed(const std::string& method, const Json& params) {
@@ -631,12 +932,29 @@ class Server {
     if (path.empty()) { respond(id, hovering ? "null" : "[]"); return; }
     const Json& pos = params.get("position");
     Position p{pos.get("line").integer(), pos.get("character").integer()};
+    std::optional<CheckReport> standalone;
+    const CheckReport* root = hovering ? checkedFor(uri, path, standalone) : nullptr;
     if (hovering && it != documents.end()) for (auto& f : findings(it->second)) if (f.range.contains(p)) {
       std::string message = f.message, info = errorExplanation(f.code);
       if (!f.code.empty()) message += " [" + f.code + "]";
       if (!info.empty()) message += "\n\n" + info;
       respond(id, hover(f.range, message));
       return;
+    }
+    if (root) {
+      std::string text;
+      if (source(path, buffers(), text)) {
+        Lines lines(text);
+        if (auto offset = lines.offset(p))
+          if (auto* u = occurrence(root->symbols, path, *offset)) {
+            auto& d = root->symbols.declarations[u->declaration];
+            if (!d.signature.empty()) return respond(id, hover(textSite(root->symbols, u->site).range(lines), d.signature));
+            if (u->role != CompileSymbols::Decl) {
+              std::string signature = d.kind == "parameter" || d.kind == "variant" ? d.name : d.kind + " " + d.name;
+              return respond(id, hover(textSite(root->symbols, u->site).range(lines), signature));
+            }
+          }
+      }
     }
     auto result = isolated([&]() -> std::string {
       std::string text;
@@ -691,7 +1009,9 @@ class Server {
       relatedInfo = caps.get("publishDiagnostics").get("relatedInformation").isTrue();
       respond(request, "{\"serverInfo\":{\"name\":\"fut\"},\"capabilities\":{\"positionEncoding\":\"utf-16\","
                        "\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":{\"includeText\":true}},"
-                       "\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"hoverProvider\":true,\"documentSymbolProvider\":true,\"documentFormattingProvider\":true}}");
+                       "\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"hoverProvider\":true,\"documentSymbolProvider\":true,"
+                       "\"documentFormattingProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,"
+                       "\"documentHighlightProvider\":true,\"renameProvider\":{\"prepareProvider\":true}}}");
     } else if (!initialized) {
       if (!request.empty()) error(request, -32002, "Server not initialized");
     } else if (stopped || name == "initialize") {
@@ -701,6 +1021,8 @@ class Server {
       else if (name == "textDocument/documentSymbol" || name == "textDocument/hover" || name == "textDocument/completion")
         feature(name, params, request);
       else if (name == "textDocument/formatting") formatting(params, request);
+      else if (name == "textDocument/definition" || name == "textDocument/references" || name == "textDocument/documentHighlight" ||
+               name == "textDocument/prepareRename" || name == "textDocument/rename") navigate(name, params, request);
       else error(request, -32601, "Method not found");
     } else if (name == "textDocument/didOpen" || name == "textDocument/didChange" ||
                name == "textDocument/didSave" || name == "textDocument/didClose")

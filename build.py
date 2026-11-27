@@ -1006,7 +1006,7 @@ RUNNER_TESTS = [("std/math: within 1 ulp of libm, exact cases exact", runner_fma
                 ("fut test --json: statuses, details, output", runner_json),
                 ("packages: names, interfaces, boundaries, versions", runner_packages),
                 ("fut map: packages, files, declarations", runner_map),
-                ("fut lsp: diagnostics, outline, hover and completion over stdio", runner_lsp),
+                ("fut lsp: diagnostics, navigation, rename and editor features over stdio", runner_lsp),
                 ("foreign modules: js, wasm, c", runner_modules),
                 ("fut test: tests first, filter, compile error, todo()", runner_text),
                 ("fut api: interfaces written, checked by fut test", runner_api),

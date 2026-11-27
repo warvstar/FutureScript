@@ -824,8 +824,8 @@ bool wanted(const std::string& s) {  // a line starting `view Name` or `state na
 }  // namespace
 
 // Rewrites src in place if it declares views or state (a malformed view fails the compile, at its place in path).
-void viewsRewrite(std::string& src, const std::string& path) {
-  if (!wanted(src)) return;
+bool viewsRewrite(std::string& src, const std::string& path) {
+  if (!wanted(src)) return false;
   Views v(src, path);
   std::string pass1 = v.run();
   State st(pass1);
@@ -838,4 +838,5 @@ void viewsRewrite(std::string& src, const std::string& path) {
 #ifndef __wasm__
   if (getenv("FUT_VIEWS")) fprintf(stderr, "%s\n", src.c_str());  // the rewrite, to see what a view became
 #endif
+  return true;
 }

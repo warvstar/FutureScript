@@ -42,7 +42,7 @@ Agents: [docs/spec.md](docs/spec.md) is the whole language in about 6 KB; every 
 
 Configure Zed or another LSP client to launch `fut lsp` over stdio for `.fut` files. Use the absolute path to `build/fut` if `fut` is outside the editor's PATH.
 
-The server checks open buffers as you edit and save, resolves imports against unsaved buffers and disk, and shows an imported file's errors at the import site. Hover over an error for its `fut explain` rule and fix, or over a declaration name for its signature. The outline uses the same declarations as `fut map`. Completion offers keywords, local declarations, public imports including `std/` packages, and members of recognizable receivers after `.`.
+The server checks open buffers as you edit and save, resolves imports against unsaved buffers and disk, and shows an imported file's errors at the import site. Hover shows declaration signatures and declared types, or an error's `fut explain` rule and fix. Go to Definition follows imports into application and `std/` files. Find References and Rename include the checked program and its open importers. Rename checks for binding collisions and protects standard-library declarations. The server also supplies outlines, completion, and formatting.
 
 ## Language
 

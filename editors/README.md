@@ -2,6 +2,8 @@
 
 The extension adds highlighting, matching brackets, indentation, an outline, and Vim text objects for `.fut` files. It starts the language server with `fut lsp` using the `fut` on the project's PATH.
 
+Go to Definition, Find All References, and Rename Symbol use the compiler's bindings, including unsaved imports. Hover shows declared types and function results. Member navigation follows `self`, class names, declared class types, and direct constructor initializers on variables that are never reassigned. Rename covers the checked files and their open importers, and standard-library definitions are read-only.
+
 ## Install the dev extension
 
 1. In `editors/zed/extension.toml`, set `repository` under `[grammars.fut]` to the absolute `file://` URL of this checkout. From the repository root, `python3 -c 'from pathlib import Path; print(Path.cwd().as_uri())'` prints the URL. Set `rev` to a commit containing the generated parser, such as the output of `git rev-parse HEAD` after checking out this change. Keep `path = "editors/tree-sitter-fut"`.

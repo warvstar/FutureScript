@@ -173,33 +173,88 @@ static Namespaces installedNames;
 using Sources = std::vector<std::pair<std::string, std::string>>;
 static Sources installed, replaced;
 static const Sources* overlay;
-void viewsRewrite(std::string& src, const std::string& path);  // views.cpp
-static bool readSource(const std::string& path, std::string& out, const CompileCheck* check) {
+bool viewsRewrite(std::string& src, const std::string& path);  // views.cpp
+static bool readSource(const std::string& path, std::string& out, const CompileCheck* check, bool* rewritten = nullptr) {
+  auto rewrite = [&] {
+    bool changed = viewsRewrite(out, path);
+    if (rewritten) *rewritten = changed;
+  };
   if (check) for (auto& [file, text] : check->buffers)
     if (file == path) {
       out = text;
-      viewsRewrite(out, path);
+      rewrite();
       return true;
     }
   if (!overlay) {
     if (!readFile(path, out)) return false;
-    viewsRewrite(out, path);
+    rewrite();
     return true;
   }
   for (auto& [f, text] : *overlay) if (f == path) return out = text, true;
   return false;
 }
 
+// All of this state belongs to one editor check. Compiler symbols (including qualified names)
+// and frame homes are temporary. The index sent to the editor identifies bindings by source site.
+struct Navigation {
+  using Site = CompileSymbols::Site;
+  using Role = CompileSymbols::Role;
+  CompileSymbols& out;
+  struct Source { const char* start; size_t bytes; int file; };
+  std::unordered_map<std::string, Source> sources;
+  std::map<Site, int> declared;
+  std::unordered_map<int, int> globals, supers, constructors;
+  std::map<std::pair<int, int>, int> fields, methods, aliases, operations;
+  std::unordered_set<int> reassigned;
+  std::unordered_map<int, uint64_t> paramTypes;
+  const char *ctorStart = nullptr, *ctorEnd = nullptr;
+  int ctorClass = -1;
+  struct MemberUse { Site site; int name, cls, binding; uint64_t type; bool call, super; Role role; };
+  std::vector<MemberUse> members;
+
+  Site site(const std::string& file, const char* start, const Tok& t) const {
+    auto s = sources.find(file);
+    if (t.t != T_ID || s == sources.end() || s->second.start != start) return {};
+    auto pos = uintptr_t(t.p), base = uintptr_t(start);
+    if (pos < base || pos - base >= s->second.bytes || !idc(*t.p)) return {};
+    const char* end = t.p + 1;
+    while (idc(*end) || dig(*end)) end++;
+    return {s->second.file, int(pos - base), int(end - t.p)};
+  }
+  void use(Site site, int id, Role role = CompileSymbols::Read) {
+    if (site.file >= 0 && id >= 0) out.occurrences.push_back({site, id, role});
+  }
+  int declare(Site site, const Tok& t, std::string_view kind, std::string_view container, int earlier = -1) {
+    if (site.file < 0) return -1;
+    auto [it, fresh] = declared.emplace(site, earlier >= 0 ? earlier : int(out.declarations.size()));
+    if (fresh) {
+      if (earlier < 0) out.declarations.push_back({site, std::string(t.p, site.length), std::string(kind), std::string(container), {}});
+      use(site, it->second, CompileSymbols::Decl);
+    }
+    return it->second;
+  }
+  void collision(int first, int second) {
+    if (first < 0 || second < 0 || first == second) return;
+    Site a = out.declarations[first].site, b = out.declarations[second].site;
+    out.collisions.push_back(std::minmax(a, b));
+  }
+  template <class Map, class Key> static int get(const Map& map, const Key& key) {
+    auto it = map.find(key);
+    return it == map.end() ? -1 : it->second;
+  }
+};
+
 struct Compiler : Gen, Namespaces {
   Compiler() : Namespaces(installedNames) {}
   bool reload = false, echo = false, tiering = false, topTry = false, testing = false;  // testing: compile `test` blocks
   std::vector<TestCase> tests;
   std::string owner;
+  Navigation* nav = nullptr;
   // fut test --changed: who the code being compiled belongs to, for the top-level names it uses (traceRef): refKey if
   // set, else owner (a function, a method and their lambdas), else testRefs (a test body; "<top>": top-level code).
   std::string refKey, testRefs = "<top>";
   std::vector<std::pair<const char*, const char*>> traceCuts;  // fns, classes, vars and tests: hashed on their own
-  struct Source { std::string text; bool compiled = false; };
+  struct Source { std::string text; bool compiled = false, rewritten = false; };
   std::unordered_map<std::string, Source> sources;  // by path; nodes are stable, so text pointers stay valid
   std::vector<std::string> files, present;
   std::unordered_map<std::string, Span> spans;
@@ -319,6 +374,123 @@ struct Compiler : Gen, Namespaces {
   static void add(std::string& s, const std::string& n) { s += (s.empty() ? "" : ", ") + n; }
   const char* name(int s) { return symName(s).c_str(); }
   static std::string display(const std::string& nm) { return nm.starts_with("fn@") ? "the function at line " + nm.substr(3) : nm + "()"; }
+  void indexSource(const std::string& path, const Source& s) {
+    if (s.rewritten) return;  // generated view/state tokens have no original byte offsets
+    int id = int(nav->out.files.size());
+    nav->sources.emplace(path, Navigation::Source{s.text.c_str(), s.text.size(), id});
+    nav->out.files.push_back(path);
+  }
+  Navigation::Site indexSite(const Tok& t) { return nav->site(file, srcStart, t); }
+  static CompileSymbols::Role useRole(const Tok& following) {
+    return following.t == '=' || (following.t >= T_ADDEQ && following.t <= T_DIVEQ) ? CompileSymbols::Write : CompileSymbols::Read;
+  }
+  void indexGlobal(const Tok& t, CompileSymbols::Role role = CompileSymbols::Read) {
+    nav->use(indexSite(t), Navigation::get(nav->globals, t.sym), role);
+  }
+  int indexLocal(const Tok& t, std::string_view kind, std::string_view type = {}, int earlier = -1, std::string_view container = {}) {
+    if (container.empty()) container = owner.empty() ? F->k.name : owner;
+    int id = nav->declare(indexSite(t), t, kind, container, earlier);
+    if (id >= 0 && earlier < 0 && !type.empty()) {
+      auto& d = nav->out.declarations[id];
+      d.signature = (kind == "var" ? "var " : "") + d.name + ": ";
+      d.signature += type;
+    }
+    return id;
+  }
+  static int localSymbol(Fun* f, LV v) {
+    if (v.k == LV_CAP) return localSymbol(f->parent, f->caps[v.a].second);
+    if (v.k != LV_LOCAL) return -1;
+    if (f->lambda && v.a == f->cloHome) return f->lambdaSymbol;
+    for (auto it = f->locals.rbegin(); it != f->locals.rend(); ++it) if (it->home == v.a) return it->symbol;
+    return -1;
+  }
+  int binding(LV v) {
+    if (v.k == LV_GLOBAL || v.k == LV_SHARED) return Navigation::get(nav->globals, v.b);
+    return localSymbol(F, v);
+  }
+  static int selfClass(Fun* f, LV v) {
+    if (v.k == LV_CAP) return selfClass(f->parent, f->caps[v.a].second);
+    return v.k == LV_LOCAL && f->cls >= 0 && v.a == f->selfHome ? f->cls : -1;
+  }
+  void indexMember(LV receiver, const Tok& member, bool call) {
+    int cls = selfClass(F, receiver);
+    uint64_t ty = 0;
+    int id = binding(receiver);
+    if (receiver.k == LV_GLOBAL || receiver.k == LV_LOCAL || receiver.k == LV_CAP) {
+      if (receiver.k == LV_GLOBAL)
+        if (auto* g = findGlobal(receiver.b); g && g->kind == 'c') cls = receiver.b;
+      if (cls < 0) ty = varType(F, receiver).first;
+      if (!ty && id >= 0)
+        if (auto p = nav->paramTypes.find(id); p != nav->paramTypes.end()) ty = p->second;
+    }
+    auto site = indexSite(member);
+    // Constructor inference is local to its function/file.
+    if (receiver.k == LV_CAP || (id >= 0 && receiver.k == LV_GLOBAL && nav->out.declarations[id].site.file != site.file)) id = -1;
+    if (site.file >= 0 && (cls >= 0 || ty || id >= 0))
+      nav->members.push_back({site, member.sym, cls, id, ty, call, false, useRole(cur)});
+  }
+  void finishIndex() {
+    for (auto& u : nav->members) {
+      int cls = u.cls;
+      if (cls < 0 && u.type) {
+        uint64_t ty = resolveNow(u.type) & ~TY_OPT;
+        if ((ty & 15) == TY_CLS) cls = int(ty >> 8);
+      }
+      if (cls < 0 && u.binding >= 0 && !u.type && !nav->reassigned.contains(u.binding))
+        cls = Navigation::get(nav->constructors, u.binding);
+      if (u.super) cls = Navigation::get(nav->supers, cls);
+      auto lookup = [&](auto& table) {
+        int c = cls;
+        for (size_t depth = 0; c >= 0 && depth <= nav->supers.size(); depth++, c = Navigation::get(nav->supers, c)) {
+          int id = Navigation::get(table, std::pair{c, u.name});
+          if (id >= 0) return id;
+        }
+        return -1;
+      };
+      int id = u.call ? lookup(nav->methods) : lookup(nav->fields);
+      if (id < 0 && u.role != CompileSymbols::Write) id = u.call ? lookup(nav->fields) : lookup(nav->methods);
+      nav->use(u.site, id, u.role);
+    }
+    auto& uses = nav->out.occurrences;
+    auto key = [](const auto& u) { return std::tuple(u.site, u.declaration, u.role); };
+    std::sort(uses.begin(), uses.end(), [&](const auto& a, const auto& b) { return key(a) < key(b); });
+    uses.erase(std::unique(uses.begin(), uses.end(), [&](const auto& a, const auto& b) { return key(a) == key(b); }), uses.end());
+    // The compiler allows overlapping fields in a class hierarchy. Keep these pairs
+    // so rename can refuse to introduce another overlap even when there are no uses.
+    for (auto& [key, id] : nav->fields) {
+      auto [cls, name] = key;
+      for (size_t depth = 0; cls >= 0 && depth <= nav->supers.size(); depth++, cls = Navigation::get(nav->supers, cls)) {
+        nav->collision(id, Navigation::get(nav->fields, std::pair{cls, name}));
+        nav->collision(id, Navigation::get(nav->methods, std::pair{cls, name}));
+      }
+    }
+    for (auto& [key, id] : nav->methods) {
+      auto [cls, name] = key;
+      cls = Navigation::get(nav->supers, cls);
+      for (size_t depth = 0; cls >= 0 && depth <= nav->supers.size(); depth++, cls = Navigation::get(nav->supers, cls))
+        nav->collision(id, Navigation::get(nav->fields, std::pair{cls, name}));
+    }
+    for (auto& [path, names] : aliases) {
+      auto source = nav->sources.find(path);
+      if (source == nav->sources.end()) continue;
+      file = path;
+      for (auto& [raw, _] : names) {
+        int alias = Navigation::get(nav->aliases, std::pair{source->second.file, raw});
+        int sym = globalSym(raw), global = Navigation::get(nav->globals, sym);
+        nav->collision(alias, global);
+        // Implicit package aliases and builtins have no indexed declaration.
+        if (alias < 0 && global >= 0) {
+          auto site = nav->out.declarations[global].site;
+          nav->out.collisions.emplace_back(site, site);
+        } else if (alias >= 0 && global < 0) {
+          if (auto* g = findGlobal(sym); g && g->kind == 'n') {
+            auto site = nav->out.declarations[alias].site;
+            nav->out.collisions.emplace_back(site, site);
+          }
+        }
+      }
+    }
+  }
   bool isPub(int s) {  // s (as written) is declared `pub` in the current file
     auto it = pubs.find(file);
     return it != pubs.end() && std::find(it->second.begin(), it->second.end(), s) != it->second.end();
@@ -335,6 +507,10 @@ struct Compiler : Gen, Namespaces {
   Tok topName(Tok t, bool asValue = false) {  // the top-level name t (just read) refers to; reads `.name` after a module alias
     const std::string* m = moduleAlias(t.sym);
     if (!m) return t.sym = globalSym(t.sym), t;
+    if (nav) {
+      auto site = indexSite(t);
+      nav->use(site, Navigation::get(nav->aliases, std::pair{site.file, t.sym}));
+    }
     auto root = pkgRootOf.find(*m);
     auto surface = surfaceOf.find(*m);
     bool pkg = root != pkgRootOf.end() || surface != surfaceOf.end();  // tier 2 has only the surface
@@ -470,6 +646,13 @@ struct Compiler : Gen, Namespaces {
   // 3, true, nil); a shape ({name: str, age: num?}); list<T>, map<V>, map<K, V>; a union of them (A | B); `?` after
   // one allows nil. Compound ones are interned by their structure, so equal types have equal codes. ----
   struct Ty { uint64_t code = 0; std::string text; };  // code 0: none written
+  Ty declaredType(std::string_view& written) {
+    if (!accept(':')) return {};
+    const char* start = nav ? tokStart(cur) : nullptr;
+    Ty t = type();
+    if (nav) written = {start, size_t(prevEnd - start)};
+    return t;
+  }
   std::unordered_map<int, uint64_t> typeDefs;  // this compile's `type Name = ...` definitions (committed to globals)
   static std::string codeKey(uint64_t c) { return std::to_string(c); }
   Ty type() {
@@ -546,7 +729,13 @@ struct Compiler : Gen, Namespaces {
           if (at('?') && !cur.nl) next();
           return {TY_ANY, std::string(t.p, prevEnd)};
         }
-        if (auto it = enumDefs.find(n.sym); g->kind == 'c' && it != enumDefs.end() && at('.') && !cur.nl) next(), n.sym = variantNamed(it->first, cur)->sym, next();  // Shape.Circle
+        if (nav) indexGlobal(n);
+        if (auto it = enumDefs.find(n.sym); g->kind == 'c' && it != enumDefs.end() && at('.') && !cur.nl) {
+          next();
+          n.sym = variantNamed(it->first, cur)->sym;
+          if (nav) { Tok variant = cur; variant.sym = n.sym; indexGlobal(variant); }
+          next();
+        }
         ty.code = g->kind == 'c' ? tyClass(n.sym) : TY_NAMED | uint64_t(n.sym) << 8;
       }
     }
@@ -614,7 +803,14 @@ struct Compiler : Gen, Namespaces {
     if (v.at && !v.done) {
       v.done = true;
       detour(v.file, v.src, v.at, v.line, [&] {
+        const char* start = nav ? tokStart(cur) : nullptr;
         Ty t = type();
+        if (nav)
+          if (int id = Navigation::get(nav->globals, sym); id >= 0) {
+            auto& d = nav->out.declarations[id];
+            d.signature = "var " + d.name + ": ";
+            d.signature.append(start, prevEnd);
+          }
         if (t.code != TY_ANY) v.code = t.code, v.site = typeSite("var '" + symName(sym) + "'", t.text);
       });
     }
@@ -666,6 +862,7 @@ struct Compiler : Gen, Namespaces {
     Tok q = topName(prev);
     Global* g = findGlobal(q.sym);
     if (!g || g->kind != 'e') failAt(t.p, t.line, "@unknown-effect unknown effect '%s' (io, clock, random, yield, spawn, chan, or one declared with 'effect')", std::string(t.p, prevEnd).c_str());
+    if (nav) indexGlobal(q);
     uint64_t b = effectBit(q.sym);
     if (!b) failAt(t.p, t.line, "@limit too many effects (a program can declare at most %d)", EFF_LEVEL - EFF_BUILTIN);
     return text += std::string(t.p, prevEnd), b;
@@ -681,7 +878,10 @@ struct Compiler : Gen, Namespaces {
     Tok ot = cur;
     int o = ident();
     if (auto* l = opsOf(t.sym))
-      for (auto [s, a] : *l) if (s == o) return {operationId(symName(t.sym) + "." + symName(o)), a};
+      for (auto [s, a] : *l) if (s == o) {
+        if (nav) nav->use(indexSite(ot), Navigation::get(nav->operations, std::pair{t.sym, o}));
+        return {operationId(symName(t.sym) + "." + symName(o)), a};
+      }
     failAt(ot.p, ot.line, "@undefined-name effect '%s' has no operation '%s'", name(t.sym), name(o));
   }
   void perform(const Tok& t) {  // E.op(args): a call that rt_prep sends to the nearest handler (see effPrep)
@@ -712,7 +912,10 @@ struct Compiler : Gen, Namespaces {
         ident();
         Tok q = topName(prev);
         Global* g = findGlobal(q.sym);
-        if (g && g->kind == 'e') std::tie(op, arity) = effectOp(q);
+        if (g && g->kind == 'e') {
+          if (nav) indexGlobal(q);
+          std::tie(op, arity) = effectOp(q);
+        }
         else if (g && g->kind == 'n' && (op = effBuiltinOp(q.sym))) arity = effOpArity(op);
         else failAt(t.p, t.line, "@unknown-effect '%s' is not an effect's operation (print, clock, sleep, random, run, yield, the graphics builtins, or Effect.name)", std::string(t.p, prevEnd).c_str());
       }
@@ -991,6 +1194,7 @@ struct Compiler : Gen, Namespaces {
           std::none_of(F->locals.begin() + F->scopeAt, F->locals.end(), [&](auto& l) { return l.sym == name.sym; })) {
         int h = home();
         imm(0, NIL), stl(0, h), F->locals.push_back({name.sym, h});
+        if (nav) F->locals.back().symbol = indexLocal(name, start.cur.sym == K_var ? "var" : "fn");
       }
     }
   }
@@ -1090,10 +1294,11 @@ struct Compiler : Gen, Namespaces {
     }
     collect(base, n, H_MAP);
   }
-  Fn* lambda(const Tok& t, bool arrow = false, int sym = -1, int parVar = -1) {  // fn(params) { body }: captures enclosing locals by value into the closure
+  Fn* lambda(const Tok& t, bool arrow = false, int sym = -1, int parVar = -1, int binding = -1) {  // fn(params) { body }: captures enclosing locals by value into the closure
     if (tiering) compileFail("tier 2 does not handle lambdas", false);
     Fun f;
     f.parent = F, f.lambda = true, f.arrow = arrow, f.lambdaName = sym, f.parVar = parVar;
+    if (nav) f.lambdaSymbol = binding;
     Fn* fn = make<Fn>();
     consts.push_back(box(fn));
     fn->code = parserStub(), fn->name = sym >= 0 ? sym : intern((parVar >= 0 ? "parallel@" : "fn@") + std::to_string(t.line));
@@ -1115,6 +1320,7 @@ struct Compiler : Gen, Namespaces {
     if (F->atomics) failAt(kw.p, kw.line, "@atomic parallel for inside atomic { }: its isolates can't be undone (run it after the block)");
     next();  // for
     int nm = ident();
+    int symbol = nav ? indexLocal(prev, "var") : -1;
     if (!atKw(K_in)) fail("@syntax expected 'in'");
     next();
     int base = slot(), lo = slot(), hi = slot(), fs = slot(), ws = slot();
@@ -1124,7 +1330,7 @@ struct Compiler : Gen, Namespaces {
     if (!expr()) helper(H_NUMCHK);
     st(0, hi);
     if (!at('{')) fail("@syntax expected '{' (the body of the parallel for)");
-    lambda(kw, false, -1, nm), st(0, fs);
+    lambda(kw, false, -1, nm, symbol), st(0, fs);
     int lb = F->depth;
     for (auto& [code, name] : parWrites) imm(0, box((double)code)), st(0, slot()), konst(name), st(0, slot());
     collect(lb, (int)parWrites.size() * 2, H_LIST), st(0, ws);
@@ -1143,13 +1349,20 @@ struct Compiler : Gen, Namespaces {
       LV v = resolve(F, s);
       if (v.k == LV_NONE) {
         t.sym = s, t = topName(t, true);
-        if (Global* g = findGlobal(t.sym)) v = {LV_GLOBAL, g->slot, t.sym, true};
+        if (Global* g = findGlobal(t.sym)) {
+          v = {LV_GLOBAL, g->slot, t.sym, true};
+          if (nav) indexGlobal(t);
+        }
         else {
           if (t.sym >= 0) undefined(t);
           imm(0, NIL), v = {LV_BAD};
         }
+      } else if (nav) nav->use(indexSite(t), binding(v));
+      while (accept('.')) {
+        int f = ident();
+        if (nav) indexMember(v, prev, false);
+        load(v), v = {LV_FIELD, 0, f};
       }
-      while (accept('.')) { int f = ident(); load(v), v = {LV_FIELD, 0, f}; }
       load(v);
     }
     st(0, fs);
@@ -1178,6 +1391,7 @@ struct Compiler : Gen, Namespaces {
   void variantValue(const Tok& et) {
     const VariantDef& vd = *variantNamed(et.sym, cur);
     Tok vt = cur;
+    if (nav) { Tok indexed = vt; indexed.sym = vd.sym; indexGlobal(indexed); }
     next();
     Global& g = global(vd.sym);
     int n = (int)vd.fields.size();
@@ -1257,6 +1471,7 @@ struct Compiler : Gen, Namespaces {
       next();
       Tok e = topName(prev);
       if (!enumDefs.count(e.sym)) failAt(pt.p, pt.line, "@match '%s' is not an enum", std::string(pt.p, prevEnd).c_str());
+      if (nav) indexGlobal(e);
       esym = e.sym, expect('.');
     } else if (at(T_ID) && cur.sym >= NKW) {
       if (m.esym >= 0) esym = m.esym;
@@ -1273,14 +1488,17 @@ struct Compiler : Gen, Namespaces {
     if (m.esym < 0) m.esym = esym, m.seen.assign(enumDefs[esym].vs.size(), false);
     if (traceOn && !tiering && !editorCheck) traceRef(!refKey.empty() ? refKey : !owner.empty() ? owner : testRefs, esym);  // the arms depend on its variants
     const VariantDef& vd = *variantNamed(esym, cur);
+    if (nav) { Tok variant = cur; variant.sym = vd.sym; indexGlobal(variant); }
     size_t vi = &vd - enumDefs[esym].vs.data();
     if (m.seen[vi]) failAt(pt.p, pt.line, "@duplicate this match already has an arm for %s", name(vd.raw));
     m.seen[vi] = true;
     next();
     std::vector<int> binds;
+    std::vector<Tok> bindTokens;
     if (at('(') && !cur.nl) {
       for (next(); !accept(')');) {
         binds.push_back(ident());
+        if (nav) bindTokens.push_back(prev);
         if (!at(')')) expect(',');
       }
       if (binds.size() != vd.fields.size()) {
@@ -1300,6 +1518,11 @@ struct Compiler : Gen, Namespaces {
         ldl(0, m.subject), field(vd.fields[i], false);
         int h = home();
         stl(0, h), F->locals.push_back({binds[i], h});
+        if (nav) {
+          int id = F->locals.back().symbol = indexLocal(bindTokens[i], "var");
+          for (auto old = F->locals.begin() + F->scopeAt; old != F->locals.end() - 1; ++old)
+            if (old->sym == binds[i]) nav->collision(old->symbol, id);
+        }
       }
       block();
     });
@@ -1318,6 +1541,7 @@ struct Compiler : Gen, Namespaces {
   LV primary() {
     next();
     Tok t = prev;
+    const char* start = t.p;
     switch (t.t) {
       case T_NUM: return imm(0, box(t.n)), NUM;
       case T_STR: return strLit(t), LV{};
@@ -1345,6 +1569,7 @@ struct Compiler : Gen, Namespaces {
         if (F->cls < 0) failAt(t.p, t.line, "@misplaced 'super' outside a method");
         expect('.');
         int s = ident();
+        if (nav) nav->members.push_back({indexSite(prev), s, F->cls, -1, 0, true, true, CompileSymbols::Read});
         expect('('), ldl(0, F->selfHome), call(s, true);
         return {};
       }
@@ -1357,7 +1582,10 @@ struct Compiler : Gen, Namespaces {
       for (int d = 0; next(), d += (prev.t == '(') - (prev.t == ')'), d > 0;) if (at(T_EOF)) fail("@syntax expected ')'");
       return ldl(0, it->second), LV{};
     }
-    if (LV v = resolve(F, t.sym); v.k != LV_NONE) return v;
+    if (LV v = resolve(F, t.sym); v.k != LV_NONE) {
+      if (nav) nav->use(indexSite(t), binding(v), useRole(cur));
+      return v;
+    }
     t = topName(t, true);
     if (t.sym < 0) return imm(0, NIL), LV{LV_BAD};
     Global* g = findGlobal(t.sym);
@@ -1373,13 +1601,18 @@ struct Compiler : Gen, Namespaces {
     if (pubContract && g->kind != 'n' && !(t.sym < (int)pubSym.size() && pubSym[t.sym]))  // the .api shows the clause, not the name
       failAt(t.p, t.line, "@private %s can only use what its readers can see, and '%s' is private: make it pub, or write the condition without it",
              pubContract, name(prev.sym));
+    if (nav) indexGlobal(t, useRole(cur));
     if (g->kind == 'n' && at('(') && !cur.nl && symName(t.sym) == "print") return next(), printCall(t, *g), LV{};
     if (g->kind == 'f' && at('(') && !cur.nl) return next(), directCall(t, *g), t.sym == F->self || returnsNum(t.sym) ? NUM : LV{};
     if (g->kind == 'c' && enumDefs.count(t.sym)) {
       if (at('.') && !cur.nl) return next(), variantValue(t), LV{};
       if (at('(') && !cur.nl) failAt(t.p, t.line, "@class %s is an enum: make one of its variants, %s.%s", name(t.sym), name(t.sym), name(enumDefs[t.sym].vs.empty() ? t.sym : enumDefs[t.sym].vs[0].raw));
     }
-    if (g->kind == 'c' && at('(') && !cur.nl) return next(), construct(*g), LV{};
+    if (g->kind == 'c' && at('(') && !cur.nl) {
+      next(), construct(*g);
+      if (nav) nav->ctorStart = start, nav->ctorEnd = prevEnd, nav->ctorClass = t.sym;
+      return {};
+    }
     if (g->kind == 'e') return perform(t), LV{};
     if (g->kind == 't') failAt(t.p, t.line, "@not-a-value '%s' is a type: use it after ':' (x: %s)", name(t.sym), name(t.sym));
     if (g->kind == 's') return {LV_SHARED, g->cell, t.sym};
@@ -1395,6 +1628,7 @@ struct Compiler : Gen, Namespaces {
         next();
         Tok ft = cur;
         int s = at(T_ID) ? (next(), prev.sym) : ident();  // keywords too: m.class, as {class: ...} writes
+        if (nav) indexMember(v, ft, at('(') && !cur.nl);
         bool own = v.k == LV_LOCAL && F->cls >= 0 && v.a == F->selfHome;  // self.name
         if (own && !tiering && !(at('(') && !cur.nl))
           fieldUses.push_back({F->cls, s, {ft.p, ft.line, file, srcStart}});  // self.name: checked once every class is known
@@ -1510,6 +1744,7 @@ struct Compiler : Gen, Namespaces {
     if (at(T_NUM)) return hasLit = true, lit = cur.n, next(), 2;
     LV v = resolve(F, cur.sym);
     if (v.k != LV_LOCAL) return 0;
+    if (nav) nav->use(indexSite(cur), binding(v));
     return ldl(1, v.a), next(), rHome = v.a, v.num ? 2 : 1;
   }
   // An if/while condition. `a < b {` compiles to a compare and branch instead of building a boolean.
@@ -1557,8 +1792,9 @@ struct Compiler : Gen, Namespaces {
           next();
           Tok n = cur;
           int s = ident();
-          Ty ty = accept(':') ? type() : Ty{};
-          if (ty.code == TY_ANY) ty = {};
+          std::string_view written;
+          Ty ty = declaredType(written);
+          if (ty.code == TY_ANY) ty.code = 0;
           bool top = F->top && F->scope == 0, init = accept('=');
           std::string what = "var '" + symName(top ? qualify(s) : s) + "'";
           if (ty.code && !init && !acceptsNow(ty.code, NIL)) diagnose(n.p, n.line, "@type %s is %s, so it needs an initial value", what.c_str(), ty.text.c_str());
@@ -1566,17 +1802,31 @@ struct Compiler : Gen, Namespaces {
           bool num = init ? expr() : (imm(0, NIL), false);
           if (ty.code && num && (ty.code & 15) != TY_NUM && ((ty.code & 15) <= TY_CLS || (ty.code & 15) == TY_BUF)) diagnose(v.p, v.line, "@type %s is %s, but its initial value is a number", what.c_str(), ty.text.c_str());
           checkType(ty, what, num);
-          if (top) return gmem(0, global(qualify(s)).slot, true), false;
+          if (top) {
+            int sym = qualify(s);
+            if (nav && init && v.p == nav->ctorStart && prevEnd == nav->ctorEnd)
+              if (int id = Navigation::get(nav->globals, sym); id >= 0) nav->constructors[id] = nav->ctorClass;
+            return gmem(0, global(sym).slot, true), false;
+          }
           int site = ty.code ? typeSite(what, ty.text) : -1;
           bool isNum = ty.code == TY_NUM;  // every store checks it, so it stays a number
           auto it = std::find_if(F->locals.begin() + F->scopeAt, F->locals.end(), [&](auto& l) { return l.sym == s; });
           if (it != F->locals.end()) {  // redeclared in the same block: reuse
             it->ty = ty.code, it->site = site, it->num = isNum;
+            if (nav) {
+              it->symbol = indexLocal(n, "var", written, it->symbol);
+              if (it->symbol >= 0) nav->reassigned.insert(it->symbol);
+            }
             return stl(0, it->home), false;
           }
           int h = num || isNum ? fhome() : home();
           if (stl(0, h), num) prove(h);
-          return F->locals.push_back({s, h, isNum, ty.code, site}), false;
+          F->locals.push_back({s, h, isNum, ty.code, site});
+          if (nav) {
+            int id = F->locals.back().symbol = indexLocal(n, "var", written);
+            if (id >= 0 && init && v.p == nav->ctorStart && prevEnd == nav->ctorEnd) nav->constructors[id] = nav->ctorClass;
+          }
+          return false;
         }
         case K_if: return next(), ifStmt(), false;
         case K_while: {
@@ -1663,6 +1913,7 @@ struct Compiler : Gen, Namespaces {
       if (at(T_ID) && !atKw(K_try)) {
         int s = ident(), h = home();
         stl(0, h), F->locals.push_back({s, h});
+        if (nav) F->locals.back().symbol = indexLocal(prev, "var");
       }
       block();
     });
@@ -1851,6 +2102,7 @@ struct Compiler : Gen, Namespaces {
   }
   void forStmt() {  // for x in a..b { }  |  for x in list/map/string/fiber { }
     int nm = ident();
+    int symbol = nav ? indexLocal(prev, "var") : -1;
     if (!atKw(K_in)) fail("@syntax expected 'in'");
     next();
     scope([&] {
@@ -1866,11 +2118,13 @@ struct Compiler : Gen, Namespaces {
         int v = assignedIn(nm) ? home() : numHome();
         loopTop(lp);
         F->locals.push_back({nm, v, !assignedIn(nm)});
+        if (nav) F->locals.back().symbol = symbol;
         rangeTest(lp, a, b, v);
         return loop(lp, [&] { rangeStep(a); });
       }
       int a = home(), b = home(), v = home();  // the collection, a raw integer index, the element
       stl(0, a), imm(0, 0), stl(0, b), F->locals.push_back({nm, v});
+      if (nav) F->locals.back().symbol = symbol;
       loopTop(lp);
       ldl(0, a), ldl(1, b), helper(H_ITER), exitIfEnd(lp);
       stl(0, v);
@@ -1879,6 +2133,8 @@ struct Compiler : Gen, Namespaces {
   }
   std::string parBase;  // the name of the last outside variable indexed in a parallel for's body
   void assign(LV v, int op) {  // op < 0: plain '=', else compound
+    if (nav)
+      if (int id = binding(v); id >= 0) nav->reassigned.insert(id);
     if (F->parVar >= 0 && (v.k == LV_CAP || v.k == LV_GLOBAL))
       fail("@parallel a parallel for's body can't assign '%s', from outside it: each iteration runs on its own (write each result to a buffer at [i])",
            varName(v).c_str());
@@ -1937,15 +2193,24 @@ struct Compiler : Gen, Namespaces {
   void localFunction() {
     Tok t = cur;
     int sym = ident();
-    lambda(t, false, sym);
+    int id = -1;
+    if (nav) {
+      auto first = F->locals.begin() + F->scopeAt, last = F->locals.end();
+      auto old = std::find_if(first, last, [&](auto& l) { return l.sym == sym; });
+      id = indexLocal(prev, "fn", {}, old == last ? -1 : old->symbol);
+      if (id >= 0 && old != last) nav->reassigned.insert(id);
+    }
+    lambda(t, false, sym, -1, id);
     auto it = std::find_if(F->locals.begin() + F->scopeAt, F->locals.end(), [&](auto& l) { return l.sym == sym; });
     if (it != F->locals.end()) {
       int h = it->home;
       *it = {sym, h};
+      if (nav) it->symbol = id;
       return stl(0, h);
     }
     int h = home();
     stl(0, h), F->locals.push_back({sym, h});
+    if (nav) F->locals.back().symbol = id;
   }
   static constexpr const char* defaultArgument =
       "@syntax fut has no default arguments; pass a map of options, e.g. fn f(a, opts: {b: num?})";
@@ -1971,18 +2236,29 @@ struct Compiler : Gen, Namespaces {
     if (f.parVar >= 0) {  // a parallel for's body: its variable is the parameter, and the block follows
       int h = home();
       f.locals.push_back({f.parVar, h}), homes.push_back(h), ptys.push_back({f.parVar, Ty{}});
+      if (nav) f.locals.back().symbol = f.lambdaSymbol;
     } else if (f.arrow) {  // { n -> body }
       expect('{');
       int s = ident(), h = home();
       f.locals.push_back({s, h}), homes.push_back(h), ptys.push_back({s, Ty{}});
+      if (nav) f.locals.back().symbol = indexLocal(prev, "parameter");
       expect('-'), expect('>');
     } else if (!f.test) {
       expect('(');
       if (!accept(')')) {
         do {
           int s = ident(), h = home();  // not d8..: arguments arrive, and calls pass them, in x registers
+          Tok param = prev;
           f.locals.push_back({s, h}), homes.push_back(h);
-          ptys.push_back({s, accept(':') ? type() : Ty{}});
+          std::string_view written;
+          ptys.push_back({s, declaredType(written)});
+          if (nav) {
+            int id = f.locals.back().symbol = indexLocal(param, "parameter", written);
+            if (id >= 0 && ptys.back().second.code) nav->paramTypes[id] = ptys.back().second.code;
+            for (auto old = f.locals.begin(); old != f.locals.end() - 1; ++old)
+              if (old->sym == s) nav->collision(old->symbol, id);
+            if (f.lambdaName == s) nav->collision(f.lambdaSymbol, id);
+          }
           if (at('=')) failAt(cur.p, cur.line, defaultArgument);
           if (Ty& t = ptys.back().second; t.code && t.code != TY_ANY)  // stores to it are checked too
             f.locals.back().ty = t.code, f.locals.back().num = t.code == TY_NUM, f.locals.back().site = typeSite("argument '" + symName(s) + "' of " + display(nm), t.text);
@@ -2002,6 +2278,9 @@ struct Compiler : Gen, Namespaces {
           do etext += etext.size() > 1 ? ", " : " ", emask |= effectName(etext);
           while (accept(','));
       }
+      if (nav)
+        if (int id = Navigation::get(nav->declared, indexSite(nameTok)); id >= 0 && prevEnd > nameTok.p)
+          nav->out.declarations[id].signature = "fn " + squashed(nameTok.p, prevEnd);
       while (atKw(S_requires) || atKw(S_ensures)) {  // its contract (the prescan has it): compiled below
         next();
         for (int d = 0; !(d == 0 && (at('{') || at('}') || cur.nl)); next()) {
@@ -2129,8 +2408,10 @@ struct Compiler : Gen, Namespaces {
     for (size_t i = 0; spec && i < ptys.size(); i++) {
       int h = homes[first + i];
       in.push_back({ptys[i].first, h});
+      if (nav) in.back().symbol = localSymbol(&f, {LV_LOCAL, h});
       if (!spec->post.empty() && assignedIn(ptys[i].first)) { int c = home(); ldl(0, h), stl(0, c), h = c; }
       out.push_back({ptys[i].first, h});
+      if (nav) out.back().symbol = in.back().symbol;
     }
     auto begin = [=, this] { if (calls) imm(0, box((double)who)), callNative("contract@begin", true); };
     auto end = [=, this] { if (calls) callNative("contract@end", false); };
@@ -2243,9 +2524,11 @@ struct Compiler : Gen, Namespaces {
     ClassDef cd{qualify(ident()), -1, {}};
     if (accept(':')) {
       ident();
-      Global* g = findGlobal(cd.super = topName(prev).sym);
+      Tok base = topName(prev);
+      Global* g = findGlobal(cd.super = base.sym);
       if (!g || g->kind != 'c' || cd.super == cd.sym) failAt(prev.p, prev.line, "@class bad superclass '%s'", name(cd.super));
       if (enumOf(cd.super) >= 0) failAt(prev.p, prev.line, "@class '%s' belongs to an enum: its variants are its only classes (add one to the enum)", name(cd.super));
+      if (nav) indexGlobal(base), nav->supers[cd.sym] = cd.super;
     }
     expect('{');
     while (!accept('}')) {
@@ -2258,9 +2541,12 @@ struct Compiler : Gen, Namespaces {
         if (atKw(K_var)) {  // var name [= constant]: a declared field
           next();
           int s = ident();
+          Tok field = prev;
           for (auto& [x, d] : cd.fields) if (x == s) failAt(prev.p, prev.line, "@duplicate duplicate field '%s'", name(s));
           cd.fields.push_back({s, NIL});
-          Ty ty = accept(':') ? type() : Ty{};
+          std::string_view written;
+          Ty ty = declaredType(written);
+          if (nav) nav->fields[{cd.sym, s}] = indexLocal(field, "field", written, -1, symName(cd.sym));
           bool given = accept('=');
           Tok dt = cur;
           V d = given ? constant() : NIL;
@@ -2317,7 +2603,10 @@ struct Compiler : Gen, Namespaces {
       if (at('(') && !cur.nl)
         for (next(); !accept(')');) {
           int f = ident();
-          Ty ty = accept(':') ? type() : Ty{};
+          Tok field = prev;
+          std::string_view written;
+          Ty ty = declaredType(written);
+          if (nav) nav->fields[{cd.sym, f}] = indexLocal(field, "field", written, -1, symName(cd.sym));
           if (ty.code && ty.code != TY_ANY) cd.ftypes.push_back({f, ty.code, typeSite("field '" + symName(f) + "' of " + symName(cd.sym), ty.text)});
           cd.fields.push_back({f, NIL});
           if (!at(')')) expect(',');
@@ -2390,6 +2679,9 @@ struct Compiler : Gen, Namespaces {
     }
     if (sig.size() > 7) failAt(t.p, t.line, "@limit extern functions take at most 7 parameters");
     char ret = accept(':') ? type(true) : 'v';
+    if (nav)
+      if (int id = Navigation::get(nav->globals, qualify(s)); id >= 0)
+        nav->out.declarations[id].signature = "extern fn " + squashed(t.p, prevEnd);
     // A bare `!` declares that the function performs nothing (sin, strlen): the caller's promise, as its types are.
     // Without it, a call performs io.
     bool pure = at('!') && !cur.nl;
@@ -2493,6 +2785,14 @@ struct Compiler : Gen, Namespaces {
     if (kind == 'f' && !staged.stub) staged.stub = parserStub();
     if (kind == 's' && (staged.cell = editorCheck ? 0 : sharedCell(symName(t.sym))) < 0) failAt(t.p, t.line, "@limit too many shared vars");
     mixEnv(uint64_t(t.sym) << 16 | uint64_t(kind) << 8 | uint64_t(arity), pubRaw), pubRaw = -1;
+  }
+  void indexDeclaration(const Tok& t, std::string_view kind, std::string_view container = {}) {
+    int earlier = Navigation::get(nav->globals, t.sym);
+    int id = nav->declare(indexSite(t), t, kind, container, earlier);
+    if (id >= 0) {
+      nav->globals[t.sym] = id;
+      if (earlier >= 0) nav->reassigned.insert(id);
+    }
   }
   std::string resolvePath(std::string_view rel) {
     std::string p(rel);
@@ -2612,6 +2912,7 @@ struct Compiler : Gen, Namespaces {
     int raw = pubRaw;
     bool pub = d.sym < (int)pubSym.size() && pubSym[d.sym];
     declare(d, 'c', 0);
+    if (nav) indexDeclaration(d, "enum");
     EnumDef& e = enumDefs[d.sym] = {d.sym, {}};
     e.raw = intern(symName(d.sym).substr(symName(d.sym).rfind('.') + 1));
     lex(L);  // {
@@ -2636,6 +2937,7 @@ struct Compiler : Gen, Namespaces {
       Tok vt = v;
       vt.sym = vd.sym, pubRaw = raw;
       declare(vt, 'c', (int)vd.fields.size());
+      if (nav) indexDeclaration(vt, "variant", symName(d.sym));
       if (pub) growAt(pubSym, vd.sym) = true;
       for (int f : vd.fields) mixEnv(uint64_t(vd.sym) << 32 | uint64_t(f) << 2 | 1, raw);
       e.vs.push_back(std::move(vd));
@@ -2708,7 +3010,9 @@ struct Compiler : Gen, Namespaces {
         } else if (t.t == T_ID && t.sym == K_extern && !depth) ext = true, externStart = t.p;
         else if (ext && afterKw && p.sym == K_fn) {
           declaration = externStart, ext = false;
-          declare(q(t), 'x', params());
+          Tok d = q(t);
+          declare(d, 'x', params());
+          if (nav) indexDeclaration(d, "extern fn");
         } else if (t.t == '{') depth++;
         else if (t.t == '}') {
           if ((depth = std::max(0, depth - 1)) == 0) cls = -1, eff = -1;
@@ -2721,6 +3025,7 @@ struct Compiler : Gen, Namespaces {
           declaration = p.p;
           int n = params();
           effOps[eff].push_back({t.sym, n});
+          if (nav) nav->operations[{eff, t.sym}] = nav->declare(indexSite(t), t, "fn", symName(eff));
           mixEnv(uint64_t(eff) << 40 | uint64_t(t.sym) << 8 | uint64_t(n), -2);
         } else if (depth == 0 && afterKw && p.sym == S_enum && !t.nl && t.sym >= NKW && [&] { Lexer s = L; return lex(s).t == '{'; }()) {
           declaration = p.p;
@@ -2729,6 +3034,7 @@ struct Compiler : Gen, Namespaces {
           declaration = p.p;
           Tok d = q(t);
           declare(d, 'e', 0);
+          if (nav) indexDeclaration(d, "effect");
           effOps[eff = d.sym].clear();
         } else if (afterKw && p.sym == K_fn && (depth == 0 || (depth == 1 && cls >= 0))) {
           declaration = p.p;
@@ -2740,6 +3046,10 @@ struct Compiler : Gen, Namespaces {
           int n = sp.arity = params(&sp.retNum, &after);
           open.push_back({qn, p.p, p.line, depth});
           if (!depth) declare(d, 'f', n | (sp.retNum ? 128 : 0));  // callers rely on a `: num` result
+          if (nav) {
+            if (!depth) indexDeclaration(d, "fn");
+            else nav->methods[{cls, t.sym}] = nav->declare(indexSite(t), t, "method", symName(cls));
+          }
           if (after.p != L.p) {
             L = after;
             declScan(L, qn, p, depth ? cls : -1, t.sym);
@@ -2751,6 +3061,7 @@ struct Compiler : Gen, Namespaces {
           Tok d = q(n);
           int raw = pubRaw;  // (declare clears it)
           declare(d, 't', 0);
+          if (nav) indexDeclaration(d, "type");
           skipType(L);  // past it: its braces are a type's, not a block's
           mixEnv(fnv(from, L.p) ^ uint64_t(d.sym) << 32, raw);  // code that checks fields against it compiles against it
         } else if (depth == 0 && afterKw && (p.sym == K_class || p.sym == K_var)) {
@@ -2758,6 +3069,7 @@ struct Compiler : Gen, Namespaces {
           Tok d = q(t);
           bool shared = p.sym == K_var && pp.t == T_ID && pp.sym == S_shared && !p.nl;
           declare(d, p.sym == K_class ? 'c' : shared ? 's' : 'v', 0);
+          if (nav) indexDeclaration(d, p.sym == K_class ? "class" : "var");
           if (p.sym == K_class) {
             enumDefs.erase(d.sym);  // (an enum by this name before a reload)
             cls = d.sym, classAt[cls] = {{t.p, t.line, file, srcStart}, t.sym};
@@ -2806,6 +3118,12 @@ struct Compiler : Gen, Namespaces {
             auto [it, fresh] = aliases[path].emplace(a, m);
             if (!fresh && it->second != m)
               failAt(n.t == T_ID ? n.p : t.p, n.t == T_ID ? n.line : t.line, "@import '%s' already names another import in this file: give one of them a different name with 'as'", symName(a).c_str());
+            if (nav && n.t == T_ID) {
+              auto site = indexSite(n);
+              auto key = std::pair{site.file, a};
+              int id = nav->declare(site, n, "import", "", Navigation::get(nav->aliases, key));
+              if (id >= 0) nav->aliases[key] = id;
+            }
           };
           if (!tg.pkg.empty()) claim(n.t == T_ID ? n.sym : intern(::base(std::string(t.p, (size_t)t.len))), tg.pkg);  // the package's name
           if (sources.count(ip) && !nsOf.count(ip)) return;  // the program's own file: already here, with global names
@@ -2820,12 +3138,13 @@ struct Compiler : Gen, Namespaces {
             if (!sources.count(ip)) isModule[ip] = true;
           } else if (tg.pkg.empty() && isModule[ip]) plainModules[path].push_back(ip);
           if (sources.count(ip)) return;
-          std::string& text = sources[ip].text;
-          if (!readSource(ip, text, editorCheck)) {
+          Source& imported = sources[ip];
+          if (!readSource(ip, imported.text, editorCheck, nav ? &imported.rewritten : nullptr)) {
             unavailableModules.insert(tg.pkg.empty() ? pre : tg.pkg);
             failAt(t.p, t.line, "@import cannot read '%s'", ip.c_str());
           }
-          files.push_back(ip), prescan(ip, text.c_str());
+          if (nav) indexSource(ip, imported);
+          files.push_back(ip), prescan(ip, imported.text.c_str());
         }
       })) continue;
       invalidDecls[declaration] = errorPos;
@@ -2893,9 +3212,13 @@ struct Compiler : Gen, Namespaces {
         Tok n = cur;
         int s = qualify(ident());
         expect('=');
+        const char* start = nav ? tokStart(cur) : nullptr;
         Ty t = type();
         if (resolveNamed(t.code, s)) failAt(n.p, n.line, "@unknown-type type %s is defined as itself", name(s));
         typeDefs[s] = t.code;
+        if (nav)
+          if (int id = Navigation::get(nav->globals, s); id >= 0)
+            nav->out.declarations[id].signature = "type " + symName(n.sym) + " = " + std::string(start, prevEnd);
         return;
       }
       if (atKw(K_import)) {
@@ -3423,11 +3746,13 @@ static bool compileInput(CompileJob& j, std::string& err, bool& atEnd) {
       const Package* p = packageOf(path);
       c.entryDir = p ? p->dir : "";
     }
-    std::string& src = c.sources[path].text;
+    auto& source = c.sources[path];
+    std::string& src = source.text;
     if (text) {
       src = *text;
       viewsRewrite(src, path);
-    } else if (!readSource(path, src, c.editorCheck)) compileFail("cannot read " + path, false);
+    } else if (!readSource(path, src, c.editorCheck, c.nav ? &source.rewritten : nullptr)) compileFail("cannot read " + path, false);
+    if (c.nav) c.indexSource(path, source);
     out = c.run(path, src.c_str());
   }, &j, &err, &atEnd);
   if (!j.c.published) {
@@ -3493,12 +3818,16 @@ std::vector<CompileDiagnostic> compileDiagnostics(const std::string& path, Compi
   c->editorCheck = &check;
   c->collectErrors = c->stageGlobals = c->testing = true;
   check.imports.clear();
+  check.symbols = {};
+  Navigation nav{check.symbols};
+  c->nav = &nav;
   std::string entry = check.normalize(path);
   CompileJob job{*c, entry, nullptr};
   std::string err;
   bool atEnd = false;
   auto pending = std::move(modulesPending);
   bool ok = compileInput(job, err, atEnd);
+  c->finishIndex();
   modulesPending = std::move(pending);
   c->sortReports();
   std::vector<CompileDiagnostic> out;

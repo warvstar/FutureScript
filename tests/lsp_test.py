@@ -62,11 +62,13 @@ class Client:
                 return message
             self.pending.append(message)
 
-    def ask(self, method, params=None):
+    def ask(self, method, params=None, *, error=False):
         self.request_id += 1
         request_id = f"request-{self.request_id}"
         self.send({"id": request_id, "method": method, "params": params or {}})
-        return self.receive(lambda m: m.get("id") == request_id)["result"]
+        response = self.receive(lambda m: m.get("id") == request_id)
+        assert ("error" in response) == error, response
+        return response["error" if error else "result"]
 
     def notify(self, method, params=None, fragments=False):
         self.send({"method": method, "params": params or {}}, fragments)
@@ -80,11 +82,11 @@ class Client:
         self.notify("textDocument/didChange", {"textDocument": {"uri": uri, "version": version},
                                                "contentChanges": [{"text": text}]})
 
-    def doc(self, method, uri, line=None, character=None):
-        params = {"textDocument": {"uri": uri}}
+    def doc(self, method, uri, line=None, character=None, *, error=False, **params):
+        params["textDocument"] = {"uri": uri}
         if line is not None:
             params["position"] = {"line": line, "character": character}
-        return self.ask(f"textDocument/{method}", params)
+        return self.ask(f"textDocument/{method}", params, error=error)
 
     def diagnostics(self, uri, version):
         message = self.receive(lambda m: m.get("method") == "textDocument/publishDiagnostics"
@@ -264,6 +266,172 @@ fn later() {
         print(f"std/lists edits with debounce: {statistics.median(sample):.2f} ms median, {sorted(sample)[28]:.2f} ms p95")
 
 
+def navigation(client, folder):
+    caps = client.ask("initialize")["capabilities"]
+    assert all(caps[k] for k in ("definitionProvider", "referencesProvider", "documentHighlightProvider"))
+    assert caps["renameProvider"]["prepareProvider"]
+    lib = folder / "nav # library.fut"
+    app = folder / "nav app.fut"
+    other = folder / "nav other.fut"
+    library = """pub var count: num = 3
+pub fn increment(n: num): num { return n + count }
+pub class Bucket {
+  var value: num = 0
+  fn read(): num { return self.value }
+  fn twice(): num { return self.read() * 2 }
+}
+pub enum Shape { Circle(radius: num), Empty }
+pub type Size = num
+pub effect Log { fn emit(value: num) }
+"""
+    program = """import "./nav # library.fut" as m
+import "std/lists" as l
+var count = 12
+fn inspect(arg: m.Bucket, measure: m.Size): num {
+  var obj = m.Bucket()
+  var typed: m.Bucket = obj
+  var shape: m.Shape.Circle = m.Shape.Circle(1)
+  var scale: num = 2
+  { var count = 5; print(count) }
+  fn capture(x: num) { return x + scale }
+  print("🦊 {count} {m.count} {capture(1)}")
+  print(typed.value, obj.read(), arg.read(), m.Bucket.read, shape.radius)
+  m.Log.emit(measure)
+  return m.increment(count)
+}
+var sorted = l.sort([3, 1])
+"""
+    sibling = 'import "./nav # library.fut"\nvar answer = increment(count)\n'
+    # Disk holds an older declaration. Navigation and rename must use the open buffer.
+    lib.write_text("\n\npub var count = 0\n")
+    client.open(lib.as_uri(), library)
+    client.open(app.as_uri(), program)
+    client.open(other.as_uri(), sibling)
+    for path in (lib, app, other):
+        assert client.diagnostics(path.as_uri(), 1) == [], path
+
+    def site(text, line, word, after=""):
+        row = text.splitlines()[line]
+        start = row.index(word, row.index(after) + len(after) if after else 0)
+        return line, len(row[:start].encode("utf-16-le")) // 2
+
+    def range_for(text, line, word, after=""):
+        _, col = site(text, line, word, after)
+        return {"start": {"line": line, "character": col},
+                "end": {"line": line, "character": col + len(word)}}
+
+    def loc(path, text, line, word, after=""):
+        return {"uri": path.as_uri(), "range": range_for(text, line, word, after)}
+
+    def request(method, path, text, line, word, after="", **params):
+        return client.doc(method, path.as_uri(), *site(text, line, word, after), **params)
+
+    def definition(line, word, target, content, dest, after=""):
+        return request("definition", app, program, line, word, after) == loc(target, content, dest, word)
+
+    assert definition(13, "count", app, program, 2)
+    assert definition(8, "count", app, program, 8, "print(")
+    assert definition(9, "scale", app, program, 7)
+    assert definition(12, "measure", app, program, 3)
+    assert definition(4, "Bucket", lib, library, 2)
+    assert definition(3, "Size", lib, library, 8)
+    assert definition(6, "Circle", lib, library, 7, "= ")
+    assert definition(11, "radius", lib, library, 7)
+    assert definition(11, "value", lib, library, 3)
+    assert definition(11, "read", lib, library, 4, "obj.")
+    assert definition(11, "read", lib, library, 4, "arg.")
+    assert definition(11, "read", lib, library, 4, "Bucket.")
+    assert definition(12, "Log", lib, library, 9)
+    assert definition(12, "emit", lib, library, 9)
+    assert request("definition", lib, library, 4, "value") == loc(lib, library, 3, "value")
+    assert request("definition", lib, library, 5, "read") == loc(lib, library, 4, "read")
+    assert request("definition", app, program, 10, "m", "{") == loc(app, program, 0, "m", " as ")
+    assert definition(10, "count", lib, library, 0, "m.")
+    std = ROOT / "std" / "lists" / "lists.fut"
+    std_definition = request("definition", app, program, 15, "sort", "l.")
+    assert std_definition["uri"] == std.as_uri(), std_definition
+    std_line = std_definition["range"]["start"]["line"]
+    assert std.read_text().splitlines()[std_line].startswith("pub fn sort(")
+
+    for line, word, after, expected in (
+        (3, "arg", "(", "arg: m.Bucket"),
+        (7, "scale", "", "var scale: num"),
+        (9, "scale", "", "var scale: num"),
+        (12, "measure", "", "measure: m.Size"),
+        (9, "x", "return ", "x: num"),
+        (10, "count", "m.", "var count: num"),
+        (11, "typed", "", "var typed: m.Bucket"),
+        (13, "increment", "", "fn increment(n: num): num"),
+    ):
+        assert request("hover", app, program, line, word, after)["contents"]["value"] == expected
+
+    references = [loc(app, program, 10, "count", "m."), loc(lib, library, 1, "count"), loc(other, sibling, 1, "count")]
+    for include in (False, True):
+        found = request("references", lib, library, 0, "count", context={"includeDeclaration": include})
+        expected = references + ([loc(lib, library, 0, "count")] if include else [])
+        assert sorted(found, key=str) == sorted(expected, key=str), found
+    assert request("documentHighlight", app, program, 10, "count") == [
+        {"range": range_for(program, 2, "count"), "kind": 3},
+        {"range": range_for(program, 10, "count"), "kind": 2},
+        {"range": range_for(program, 13, "count"), "kind": 2},
+    ]
+    assert request("prepareRename", app, program, 10, "count", "m.") == {
+        "range": range_for(program, 10, "count", "m."), "placeholder": "count"}
+
+    rename = request("rename", lib, library, 0, "count", newName="total")["changes"]
+    assert rename == {
+        app.as_uri(): [{"range": range_for(program, 10, "count", "m."), "newText": "total"}],
+        lib.as_uri(): [{"range": range_for(library, line, "count"), "newText": "total"} for line in (0, 1)],
+        other.as_uri(): [{"range": range_for(sibling, 1, "count"), "newText": "total"}],
+    }, rename
+    rename = request("rename", app, program, 2, "count", newName="tally")["changes"]
+    assert rename == {
+        app.as_uri(): [{"range": range_for(program, line, "count"), "newText": "tally"} for line in (2, 10, 13)],
+    }, rename
+    assert "collid" in request("rename", app, program, 7, "scale", newName="x", error=True)["message"]
+    assert "keyword" in request("rename", lib, library, 0, "count", newName="while", error=True)["message"]
+    assert "keyword" in request("rename", lib, library, 0, "count", newName="match", error=True)["message"]
+    assert "standard library" in request("rename", app, program, 15, "sort", "l.", newName="order", error=True)["message"]
+    assert "standard library" in request("prepareRename", app, program, 15, "sort", "l.", error=True)["message"]
+
+    # Check a changed import immediately, before the diagnostics debounce fires.
+    client.change(lib.as_uri(), 2, "\n" + library)
+    assert definition(10, "count", lib, "\n" + library, 1, "m.")
+    broken = program + "var unrelated = missing\n"
+    client.change(app.as_uri(), 2, broken)
+    assert client.diagnostics(app.as_uri(), 2)
+    assert request("definition", app, broken, 13, "increment") == loc(lib, "\n" + library, 2, "increment")
+    assert request("definition", app, broken, 16, "missing") is None
+
+    # Open dependencies take precedence, and a closed dependency is rechecked if its disk version changes.
+    client.notify("textDocument/didClose", {"textDocument": {"uri": lib.as_uri()}})
+    assert client.diagnostics(lib.as_uri(), None) == []
+    lib.write_text("\n\n" + library)
+    target = request("definition", app, broken, 10, "count", "m.")
+    assert target == loc(lib.resolve(), "\n\n" + library, 2, "count"), target
+
+    scope = folder / "scope.fut"
+    scoped = """var total = 0
+fn set(a: num, b: num)
+  requires a >= 0
+{
+  total = a
+  var a = 4
+  total += a
+}
+import "std/lists"
+var spare = 1
+"""
+    client.open(scope.as_uri(), scoped)
+    assert client.diagnostics(scope.as_uri(), 1) == []
+    assert request("definition", scope, scoped, 2, "a", "requires ") == loc(scope, scoped, 1, "a")
+    assert "collid" in request("rename", scope, scoped, 1, "a", newName="b", error=True)["message"]
+    assert "collid" in request("rename", scope, scoped, 9, "spare", newName="lists", error=True)["message"]
+    assert request("documentHighlight", scope, scoped, 0, "total") == [
+        {"range": range_for(scoped, line, "total"), "kind": 3} for line in (0, 4, 6)
+    ]
+
+
 def flat_symbols(client):
     client.ask("initialize")
     uri = (ROOT / "examples" / "bench.fut").as_uri()
@@ -274,7 +442,7 @@ def flat_symbols(client):
 
 def main(exe, timings=False):
     with tempfile.TemporaryDirectory(prefix="fut-lsp-") as folder, tempfile.TemporaryFile() as log:
-        for run in (lambda c: exercise(c, exe, Path(folder), timings), flat_symbols):
+        for run in (lambda c: exercise(c, exe, Path(folder), timings), lambda c: navigation(c, Path(folder)), flat_symbols):
             client = Client(exe, log)
             try:
                 run(client)
