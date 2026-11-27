@@ -283,7 +283,7 @@ std::string base(std::string_view path) { return std::string(path.substr(path.rf
 
 struct Kinds { int symbol, completion; };
 Kinds kinds(const Decl& d) {
-  if (d.kind == "fn" || d.kind == "extern" || d.kind == "test") return {12, 3};
+  if (d.kind == "fn" || d.kind == "view" || d.kind == "extern" || d.kind == "test") return {12, 3};
   if (d.kind == "method" || d.kind == "op") return d.name == "init" ? Kinds{9, 4} : Kinds{6, 2};
   if (d.kind == "class") return {5, 7};
   if (d.kind == "effect") return {11, 8};

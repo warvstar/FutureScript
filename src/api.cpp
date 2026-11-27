@@ -120,7 +120,7 @@ std::vector<Decl> declsOf(const std::string& text) {
   auto& L = S.L;
   auto isKw = Scan::isKw;
   int depth = 0;
-  static const int gpuSym = intern("gpu");
+  static const int gpuSym = intern("gpu"), viewSym = intern("view"), stateSym = intern("state");
   auto isGpu = [](const Tok& t) { return t.t == T_ID && t.sym == gpuSym; };
   auto add = [&](Decl d, const char* start, const char* name) {
     d.start = start - src, d.stop = L.p - src, d.nameAt = name - src;
@@ -153,6 +153,23 @@ std::vector<Decl> declsOf(const std::string& text) {
       auto cl = S.clauses();
       int end = S.bodyEnd();
       add({"fn", symName(n.sym), squash(from, e), "", "", pub, k.line, end, doc, cl}, from, n.p);
+    } else if (isKw(k, viewSym) && (k.nl || out.empty())) {
+      Lexer save = L;
+      Tok n = S.next();
+      const char* end = L.p;
+      if (n.t != T_ID || n.nl) { L = save; continue; }
+      if (Lexer l = L; l.next().t == '(') {
+        Tok p = S.next();
+        end = S.params(p);
+      }
+      Lexer body = L;
+      int stopLine = body.next().t == '{' ? S.bodyEnd() : k.line;
+      add({"view", symName(n.sym), squash(from, end), "", "", false, k.line, stopLine, doc, {}}, from, n.p);
+    } else if (isKw(k, stateSym)) {
+      Lexer save = L;
+      Tok n = S.next();
+      if (n.t != T_ID || n.nl) { L = save; continue; }
+      add({"state", symName(n.sym), squash(from, L.p), "", "", false, k.line, k.line, doc, {}}, from, n.p);
     } else if (isKw(k, S_type)) {  // type Name = <type>
       Lexer save = L;
       Tok n = S.next(), eq = S.next();

@@ -500,7 +500,7 @@ ui.mount("#ui", fn() {
 
 #### Views and state
 
-`state` and `view` write the same pages with less code. They compile to the calls above (`src/views.cpp` rewrites the file first, keeping each line where it was; `FUT_VIEWS=1 fut file.fut` prints the result).
+`state` and `view` compile to the calls above. Diagnostics and editor navigation use the original positions of expressions, including inside handlers and interpolated strings. `FUT_VIEWS=1 fut file.fut` prints the compiler's lowered form.
 
 ```
 state name = ""                 // a variable the page follows: reading it subscribes, assigning it updates

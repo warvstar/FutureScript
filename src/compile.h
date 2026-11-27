@@ -127,6 +127,16 @@ struct Lexer {
   }
 };
 
+// View lowering keeps copied fragments tied to their original byte ranges. Synthetic tokens have no range.
+struct ViewSpan { size_t begin, end, original; };
+struct LoweredView {
+  std::string text;
+  std::vector<ViewSpan> spans;
+  std::vector<size_t> writes;  // original identifier offsets of state assignments lowered to calls
+  size_t origin(size_t offset, size_t length = 1) const;
+};
+bool lowerViews(const std::string& source, const std::string& path, LoweredView& out);
+
 // gpu fn (wgsl.cpp): a top-level function also translated to WGSL. Each file's gpu fns, from their `fn`; a gpu fn
 // calls others of its file by name. alias(s): the package a module alias names ("math"), if s is one.
 struct GpuFnSrc { int sym; const char* p; int line; };
@@ -267,6 +277,10 @@ struct CState {
   CompileCheck* editorCheck = nullptr;
   std::string file;
   const char* srcStart = "";
+  struct ViewInput { const std::string& original; const LoweredView& lowered; };
+  std::unordered_map<const char*, ViewInput> viewInputs;
+  struct SourcePosition { const char *start, *at; int line; };
+  SourcePosition sourcePosition(const char* at, int line) const;
   // A number-literal right operand is not loaded into a register; the binop fast path uses it directly.
   bool hasLit = false;
   double lit = 0;

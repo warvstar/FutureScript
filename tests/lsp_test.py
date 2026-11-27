@@ -432,6 +432,54 @@ var spare = 1
     ]
 
 
+def view_navigation(client, folder):
+    client.ask("initialize")
+    uri = (folder / "widget.fut").as_uri()
+    source = """state count = 1
+fn compute(x) { return x + count }
+view Widget(title) {
+  state local = 0
+  button title on click { local += compute(count) }
+  text "🌱 {title}: {local}"
+  for item in [1, 2] key item { text "{item}" }
+}
+fn buildWidget() { return Widget("leaf") }
+"""
+    client.open(uri, source)
+    assert client.diagnostics(uri, 1) == []
+
+    def bounds(line, word, *, last=False):
+        row = source.splitlines()[line]
+        offset = row.rindex(word) if last else row.index(word)
+        col = len(row[:offset].encode("utf-16-le")) // 2
+        return {"start": {"line": line, "character": col},
+                "end": {"line": line, "character": col + len(word)}}
+
+    def request(method, line, word, *, last=False, **params):
+        pos = bounds(line, word, last=last)["start"]
+        return client.doc(method, uri, pos["line"], pos["character"], **params)
+
+    for use, word, declaration, last in ((4, "compute", 1, False), (5, "title", 2, False),
+                                          (5, "local", 3, False), (6, "item", 6, True),
+                                          (8, "Widget", 2, True)):
+        assert request("definition", use, word, last=last) == {"uri": uri, "range": bounds(declaration, word)}
+    outline = {d["name"]: d["kind"] for d in client.doc("documentSymbol", uri)}
+    assert outline["Widget"] == 12 and outline["count"] == 13, outline
+    assert request("hover", 8, "Widget", last=True)["contents"]["value"] == "view Widget(title)"
+    assert request("documentHighlight", 5, "local") == [
+        {"range": bounds(line, "local"), "kind": kind} for line, kind in ((3, 3), (4, 3), (5, 2))
+    ]
+    rename = request("rename", 5, "title", newName="caption")["changes"]
+    assert rename == {uri: [{"range": bounds(line, "title"), "newText": "caption"} for line in (2, 4, 5)]}
+
+    source = source.replace("{title}", "{missing}").replace("compute(count)", "unknown(count)")
+    client.change(uri, 2, source)
+    diagnostics = client.diagnostics(uri, 2)
+    assert [(d["code"], d["range"]) for d in diagnostics] == [
+        ("undefined-name", bounds(4, "unknown")), ("undefined-name", bounds(5, "missing"))
+    ], diagnostics
+
+
 def flat_symbols(client):
     client.ask("initialize")
     uri = (ROOT / "examples" / "bench.fut").as_uri()
@@ -442,7 +490,8 @@ def flat_symbols(client):
 
 def main(exe, timings=False):
     with tempfile.TemporaryDirectory(prefix="fut-lsp-") as folder, tempfile.TemporaryFile() as log:
-        for run in (lambda c: exercise(c, exe, Path(folder), timings), lambda c: navigation(c, Path(folder)), flat_symbols):
+        for run in (lambda c: exercise(c, exe, Path(folder), timings), lambda c: navigation(c, Path(folder)),
+                    lambda c: view_navigation(c, Path(folder)), flat_symbols):
             client = Client(exe, log)
             try:
                 run(client)

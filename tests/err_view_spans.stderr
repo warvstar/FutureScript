@@ -1,0 +1,6 @@
+err_view_spans.fut:4:12: error: undefined name 'missingHere' [undefined-name]
+      text "{missingHere}"
+             ^
+err_view_spans.fut:7:5: error: undefined name 'nope' [undefined-name]
+      nope()
+      ^

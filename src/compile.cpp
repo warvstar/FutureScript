@@ -13,13 +13,35 @@
 #include "gen_a64.h"
 #endif
 
+CState::SourcePosition CState::sourcePosition(const char* at, int line) const {
+  auto input = viewInputs.find(srcStart);
+  if (input == viewInputs.end()) return {srcStart, at, line};
+  const auto& [original, lowered] = input->second;
+  size_t atByte = uintptr_t(at) - uintptr_t(srcStart);
+  if (atByte > lowered.text.size()) return {srcStart, at, line};
+  size_t offset = atByte == lowered.text.size() ? original.size() : lowered.origin(atByte);
+  if (offset != std::string::npos)
+    return {original.c_str(), original.c_str() + offset, 1 + int(std::count(original.begin(), original.begin() + offset, '\n'))};
+  // A failure in generated code has no original column. Use the line it was emitted on.
+  offset = 0;
+  int on = 1;
+  for (; on < line; on++) {
+    size_t end = original.find('\n', offset);
+    if (end == std::string::npos) break;
+    offset = end + 1;
+  }
+  return {original.c_str(), original.c_str() + offset, on};
+}
+
 void CState::report(const char* pos, int line, const char* fmt, va_list ap) {
   const char* code = takeCode(fmt);
   char b[256];
   vsnprintf(b, sizeof b, fmt, ap);
+  auto source = sourcePosition(pos, line);
+  pos = source.at, line = source.line;
   for (auto& r : reports) if (r.diag.file == file && r.diag.line == line) return;
   const char *ls = pos, *le = pos;
-  while (ls > srcStart && ls[-1] != '\n') ls--;
+  while (ls > source.start && ls[-1] != '\n') ls--;
   while (*le && *le != '\n') le++;
   std::string caret;
   for (const char* c = ls; c < pos; c++) caret += *c == '\t' ? '\t' : ' ';
@@ -173,23 +195,10 @@ static Namespaces installedNames;
 using Sources = std::vector<std::pair<std::string, std::string>>;
 static Sources installed, replaced;
 static const Sources* overlay;
-bool viewsRewrite(std::string& src, const std::string& path);  // views.cpp
-static bool readSource(const std::string& path, std::string& out, const CompileCheck* check, bool* rewritten = nullptr) {
-  auto rewrite = [&] {
-    bool changed = viewsRewrite(out, path);
-    if (rewritten) *rewritten = changed;
-  };
+static bool readSource(const std::string& path, std::string& out, const CompileCheck* check) {
   if (check) for (auto& [file, text] : check->buffers)
-    if (file == path) {
-      out = text;
-      rewrite();
-      return true;
-    }
-  if (!overlay) {
-    if (!readFile(path, out)) return false;
-    rewrite();
-    return true;
-  }
+    if (file == path) return out = text, true;
+  if (!overlay) return readFile(path, out);
   for (auto& [f, text] : *overlay) if (f == path) return out = text, true;
   return false;
 }
@@ -200,7 +209,13 @@ struct Navigation {
   using Site = CompileSymbols::Site;
   using Role = CompileSymbols::Role;
   CompileSymbols& out;
-  struct Source { const char* start; size_t bytes; int file; };
+  struct Source {
+    const char* start;
+    size_t bytes;
+    int file;
+    const LoweredView* lowered;
+    const std::string* original;
+  };
   std::unordered_map<std::string, Source> sources;
   std::map<Site, int> declared;
   std::unordered_map<int, int> globals, supers, constructors;
@@ -219,16 +234,39 @@ struct Navigation {
     if (pos < base || pos - base >= s->second.bytes || !idc(*t.p)) return {};
     const char* end = t.p + 1;
     while (idc(*end) || dig(*end)) end++;
-    return {s->second.file, int(pos - base), int(end - t.p)};
+    size_t length = end - t.p, offset = pos - base;
+    if (auto* lowered = s->second.lowered) offset = lowered->origin(offset, length);
+    if (offset == std::string::npos) return {};
+    return {s->second.file, int(offset), int(length)};
   }
   void use(Site site, int id, Role role = CompileSymbols::Read) {
-    if (site.file >= 0 && id >= 0) out.occurrences.push_back({site, id, role});
+    if (site.file < 0 || id < 0) return;
+    if (role == CompileSymbols::Read) {
+      const auto& src = sources.at(out.files[site.file]);
+      if (src.lowered && std::binary_search(src.lowered->writes.begin(), src.lowered->writes.end(), size_t(site.offset)))
+        role = CompileSymbols::Write;
+    }
+    out.occurrences.push_back({site, id, role});
+  }
+  std::string_view keyword(Site site) const {
+    const auto& src = sources.at(out.files[site.file]);
+    if (!src.lowered) return {};
+    const std::string& text = *src.original;
+    size_t end = site.offset;
+    while (end && (text[end - 1] == ' ' || text[end - 1] == '\t')) end--;
+    size_t start = end;
+    while (start && (idc(text[start - 1]) || dig(text[start - 1]))) start--;
+    return std::string_view(text).substr(start, end - start);
   }
   int declare(Site site, const Tok& t, std::string_view kind, std::string_view container, int earlier = -1) {
     if (site.file < 0) return -1;
     auto [it, fresh] = declared.emplace(site, earlier >= 0 ? earlier : int(out.declarations.size()));
     if (fresh) {
-      if (earlier < 0) out.declarations.push_back({site, std::string(t.p, site.length), std::string(kind), std::string(container), {}});
+      if (earlier < 0) {
+        std::string_view word = keyword(site);
+        if ((kind == "fn" && word == "view") || (kind == "var" && word == "state")) kind = word;
+        out.declarations.push_back({site, std::string(t.p, site.length), std::string(kind), std::string(container), {}});
+      }
       use(site, it->second, CompileSymbols::Decl);
     }
     return it->second;
@@ -254,7 +292,12 @@ struct Compiler : Gen, Namespaces {
   // set, else owner (a function, a method and their lambdas), else testRefs (a test body; "<top>": top-level code).
   std::string refKey, testRefs = "<top>";
   std::vector<std::pair<const char*, const char*>> traceCuts;  // fns, classes, vars and tests: hashed on their own
-  struct Source { std::string text; bool compiled = false, rewritten = false; };
+  struct Source {
+    std::string text;
+    std::optional<LoweredView> view;
+    bool compiled = false;
+    const std::string& code() const { return view ? view->text : text; }
+  };
   std::unordered_map<std::string, Source> sources;  // by path; nodes are stable, so text pointers stay valid
   std::vector<std::string> files, present;
   std::unordered_map<std::string, Span> spans;
@@ -374,10 +417,13 @@ struct Compiler : Gen, Namespaces {
   static void add(std::string& s, const std::string& n) { s += (s.empty() ? "" : ", ") + n; }
   const char* name(int s) { return symName(s).c_str(); }
   static std::string display(const std::string& nm) { return nm.starts_with("fn@") ? "the function at line " + nm.substr(3) : nm + "()"; }
-  void indexSource(const std::string& path, const Source& s) {
-    if (s.rewritten) return;  // generated view/state tokens have no original byte offsets
+  void prepareSource(const std::string& path, Source& s) {
+    if (lowerViews(s.text, path, s.view.emplace()))
+      viewInputs.emplace(s.code().c_str(), ViewInput{s.text, *s.view});
+    else s.view.reset();
+    if (!nav) return;
     int id = int(nav->out.files.size());
-    nav->sources.emplace(path, Navigation::Source{s.text.c_str(), s.text.size(), id});
+    nav->sources.emplace(path, Navigation::Source{s.code().c_str(), s.code().size(), id, s.view ? &*s.view : nullptr, &s.text});
     nav->out.files.push_back(path);
   }
   Navigation::Site indexSite(const Tok& t) { return nav->site(file, srcStart, t); }
@@ -581,10 +627,11 @@ struct Compiler : Gen, Namespaces {
     const char* code = takeCode(fmt);
     char b[256];
     snprintf(b, sizeof b, fmt, args...);
-    const char* ls = t.p;
-    while (ls > srcStart && ls[-1] != '\n') ls--;
+    auto source = sourcePosition(t.p, t.line);
+    const char* ls = source.at;
+    while (ls > source.start && ls[-1] != '\n') ls--;
     *testMissing = std::string(b) + " [" + code + "] at " + ::base(file) + ":" +
-                   std::to_string(t.line) + ":" + std::to_string(t.p - ls + 1);
+                   std::to_string(source.line) + ":" + std::to_string(source.at - ls + 1);
   }
   int globalSym(int s) {  // the file's own names first, then its package's, then global (builtins only, in a package)
     if (auto it = nsOf.find(file); it != nsOf.end())
@@ -2279,8 +2326,10 @@ struct Compiler : Gen, Namespaces {
           while (accept(','));
       }
       if (nav)
-        if (int id = Navigation::get(nav->declared, indexSite(nameTok)); id >= 0 && prevEnd > nameTok.p)
-          nav->out.declarations[id].signature = "fn " + squashed(nameTok.p, prevEnd);
+        if (int id = Navigation::get(nav->declared, indexSite(nameTok)); id >= 0 && prevEnd > nameTok.p) {
+          auto& d = nav->out.declarations[id];
+          d.signature = (d.kind == "view" ? "view " : "fn ") + squashed(nameTok.p, prevEnd);
+        }
       while (atKw(S_requires) || atKw(S_ensures)) {  // its contract (the prescan has it): compiled below
         next();
         for (int d = 0; !(d == 0 && (at('{') || at('}') || cur.nl)); next()) {
@@ -3100,10 +3149,11 @@ struct Compiler : Gen, Namespaces {
           pubNext = false;
           size_t site = 0;
           if (editorCheck) {
-            const char* start = p.p;
-            while (start > src && start[-1] != '\n') start--;
+            auto source = sourcePosition(p.p, p.line);
+            const char* start = source.at;
+            while (start > source.start && start[-1] != '\n') start--;
             site = editorCheck->imports.size();
-            editorCheck->imports.push_back({path, "", p.line, int(p.p - start + 1)});
+            editorCheck->imports.push_back({path, "", source.line, int(source.at - start + 1)});
           }
           Target tg = importTarget(t);
           std::string ip = tg.path;
@@ -3139,12 +3189,12 @@ struct Compiler : Gen, Namespaces {
           } else if (tg.pkg.empty() && isModule[ip]) plainModules[path].push_back(ip);
           if (sources.count(ip)) return;
           Source& imported = sources[ip];
-          if (!readSource(ip, imported.text, editorCheck, nav ? &imported.rewritten : nullptr)) {
+          if (!readSource(ip, imported.text, editorCheck)) {
             unavailableModules.insert(tg.pkg.empty() ? pre : tg.pkg);
             failAt(t.p, t.line, "@import cannot read '%s'", ip.c_str());
           }
-          if (nav) indexSource(ip, imported);
-          files.push_back(ip), prescan(ip, imported.text.c_str());
+          prepareSource(ip, imported);
+          files.push_back(ip), prescan(ip, imported.code().c_str());
         }
       })) continue;
       invalidDecls[declaration] = errorPos;
@@ -3230,7 +3280,7 @@ struct Compiler : Gen, Namespaces {
         if (auto it = sources.find(ip); it != sources.end() && !it->second.compiled) {
           Source& s = it->second;
           s.compiled = true;
-          detour(ip, s.text.c_str(), s.text.c_str(), 1, [&] { topLevel(); });
+          detour(ip, s.code().c_str(), s.code().c_str(), 1, [&] { topLevel(); });
         }
         return;
       }
@@ -3372,7 +3422,7 @@ struct Compiler : Gen, Namespaces {
   void traceFiles() {  // each file's top-level code other than its fns, classes, vars and tests
     std::sort(traceCuts.begin(), traceCuts.end());
     for (auto& f : files) {
-      const std::string& text = sources.at(f).text;
+      const std::string& text = sources.at(f).code();
       const char *a = text.c_str(), *b = a + text.size();
       std::vector<std::pair<const char*, const char*>> cuts;
       for (auto& c : traceCuts) if (c.first >= a && c.first < b) cuts.push_back(c);
@@ -3607,7 +3657,7 @@ struct Compiler : Gen, Namespaces {
     for (auto& [q, info] : gpuInfos) gpuInfoSet(q, std::move(info));
     Compiled out;
     out.files = files, out.tests = std::move(tests);
-    for (auto& f : files) out.sources.push_back({f, sources.at(f).text});
+    for (auto& f : files) out.sources.push_back({f, sources.at(f).code()});
     for (auto& f : files) {  // interfaces: a file's outside packages; a package's (its root's, with re-exports) inside
       if (f.empty() || f[0] == '<') continue;
       const Package* p = pkgOf(f);
@@ -3705,7 +3755,11 @@ struct Compiler : Gen, Namespaces {
     out.log = patched.empty() && added.empty() && removed.empty() && reset.empty() ? "no code changes" : "";
     for (auto [label, list] : {std::pair{"patched ", &patched}, {"added ", &added}, {"removed ", &removed}, {"reset ", &reset}})
       if (!list->empty()) out.log += (out.log.empty() ? "" : "; ") + (label + *list);
-    if (!echo) replaced = std::move(installed), installed = out.sources;
+    if (!echo) {
+      replaced = std::move(installed);
+      installed.clear();
+      for (auto& f : files) installed.push_back({f, std::move(sources.at(f).text)});
+    }
     return out;
   }
 };
@@ -3747,13 +3801,10 @@ static bool compileInput(CompileJob& j, std::string& err, bool& atEnd) {
       c.entryDir = p ? p->dir : "";
     }
     auto& source = c.sources[path];
-    std::string& src = source.text;
-    if (text) {
-      src = *text;
-      viewsRewrite(src, path);
-    } else if (!readSource(path, src, c.editorCheck, c.nav ? &source.rewritten : nullptr)) compileFail("cannot read " + path, false);
-    if (c.nav) c.indexSource(path, source);
-    out = c.run(path, src.c_str());
+    if (text) source.text = *text;
+    else if (!readSource(path, source.text, c.editorCheck)) compileFail("cannot read " + path, false);
+    c.prepareSource(path, source);
+    out = c.run(path, source.code().c_str());
   }, &j, &err, &atEnd);
   if (!j.c.published) {
     for (u32* stub : j.c.newStubs) discardStub(stub);
@@ -3833,7 +3884,7 @@ std::vector<CompileDiagnostic> compileDiagnostics(const std::string& path, Compi
   std::vector<CompileDiagnostic> out;
   for (auto& r : c->reports) out.push_back(std::move(r.diag));
   if (!ok && c->failureText.empty()) {
-    // Manifests, view rewriting and resource limits can fail before the parser reports a diagnostic.
+    // Manifests, view syntax and resource limits can fail before the parser reports a diagnostic.
     auto d = inputDiagnostic(err);
     d.file = d.file.empty() ? entry : check.normalize(d.file);
     if (d.code == "manifest" && !check.imports.empty() && check.imports.back().to.empty())
