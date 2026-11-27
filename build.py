@@ -386,6 +386,40 @@ def runner_json(exe):
     return ok, f"rc={r.returncode} statuses: {status}\n  stdout: {r.stdout[-1500:]!r}\n  stderr: {r.stderr[-500:]!r}"
 
 
+def runner_parallel(exe):
+    if exe.suffix == ".wasm":
+        return True, ""
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        (d / "fut.pkg").write_text("name jobs\n")
+        (d / "fut.test").write_text("jobs 4\nnative-libraries on-call\n")
+        def run(*args):
+            return subprocess.run([str(exe), "test", "--json", *args], cwd=d, capture_output=True, text=True, timeout=15)
+        suite = d / "jobs.fut"
+        suite.write_text('extern fn strlen(str): long !\nextern fn abort()\nvar n=0\n'
+                         'test "slow" { sleep(0.04) n=1 expect n==1 }\n'
+                         'test "untouched" { expect n==0 }\n'
+                         'test "effect" { exec(["/bin/sh","-c","echo once >> marker"]) print("captured") expect strlen("ab")==2 }\n'
+                         'test "crash" { abort() }\ntest "hang" { while true {} }\n'
+                         'test "after" { expect strlen("x")==1 }\ntest "pending" { expect todoFn() }\n')
+        result = run("--timeout", "1", "jobs.fut")
+        rows = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
+        reports = [t for t in rows if t["type"] == "test"]
+        ok = (result.returncode == 1 and [(t["name"], t["status"]) for t in reports] ==
+              [("slow","pass"), ("untouched","pass"), ("effect","pass"), ("crash","error"), ("hang","error"),
+               ("after","pass"), ("pending","pending")] and reports[2]["output"] == "captured\n"
+              and "crashed" in reports[3]["message"] and "timed out" in reports[4]["message"]
+              and (d / "marker").read_text().splitlines() == ["once"])
+        # A missing binding fails before any test runs, even if nothing calls it.
+        suite.write_text('extern fn fut_missing_parallel_test_symbol()\ntest "unused" { expect true }\n')
+        binding = run("jobs.fut")
+        ok = ok and binding.returncode == 2 and "no C function" in binding.stdout
+        suite.write_text('extern fn strlen(str): long !\ntest "seed" { expect strlen("ok")==2 }\n')
+        multi = run("jobs.fut", "jobs.fut")
+        ok = ok and multi.returncode == 0 and multi.stdout.count('"status":"pass"') == 2
+        return ok, f"{result.stdout} {result.stderr}\n{binding.stdout} {binding.stderr}\n{multi.stdout} {multi.stderr}"
+
+
 def runner_text(exe):
     """`fut test` (text) with a filter; a compile error; tests first: all pending, then all passing; todo() bodies."""
     d = ROOT / "build" / "spec"
@@ -1001,6 +1035,7 @@ RUNNER_TESTS = [("std/math: within 1 ulp of libm, exact cases exact", runner_fma
                 ("fetch idleTimeout: a silent server fails fast, a trickling one doesn't", runner_fetch_idle),
                 ("fut --record / --replay: the same run again, sleeps skipped", runner_replay),
                 ("fut test --json: statuses, details, output", runner_json),
+                ("fut test: parallel processes, native fallback, timeouts", runner_parallel),
                 ("packages: names, interfaces, boundaries, versions", runner_packages),
                 ("fut map: packages, files, declarations", runner_map),
                 ("fut lsp: diagnostics, navigation, rename and editor features over stdio", runner_lsp),

@@ -95,6 +95,7 @@ static void rt_hot(void* t, V a1, V a2, V a3, V a4, V a5, V a6, V a7) {  // a ti
 // ---------------- C functions (extern fn): the thunk puts an Ext* in x7 and branches here ----------------
 static V rt_ffi(V a0, V a1, V a2, V a3, V a4, V a5, V a6, Ext* e) {
   if (e->stub) ffiStub(e);
+  if (enterNativeTest) enterNativeTest();  // including an extern declared pure
   volatile V a[] = {a0, a1, a2, a3, a4, a5, a6};  // on the stack, so string arguments stay alive
   int64_t x[8] = {};
   double d[8] = {};
@@ -342,7 +343,10 @@ std::string canonicalPath(const std::string& p) {
   std::string s = r ? r : p;
   return free(r), s;
 }
+bool deferTestLibraries, hasTestLibraries;
+void (*enterNativeTest)();
 void* externLookup(const std::string& lib, const std::string& name, const char** err) {
+  if (deferTestLibraries) return hasTestLibraries = true, (void*)1;  // checked by the native test preflight
   void* h = lib.empty() ? RTLD_DEFAULT : dlopen(lib.c_str(), RTLD_LAZY);
   if (!h) return *err = "cannot load", nullptr;
   return dlsym(h, name.c_str());

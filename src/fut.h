@@ -506,6 +506,10 @@ void rollbackReload(const std::vector<int>& newVars);
 bool readFile(const std::string& path, std::string& out);
 bool saveFile(const std::string& path, const std::string* text);  // null text: remove the file
 std::string canonicalPath(const std::string& path);
+#if !__wasm__
+extern bool deferTestLibraries, hasTestLibraries;
+extern void (*enterNativeTest)();  // from a clean test child, exec before the first foreign call or host I/O
+#endif
 void* externLookup(const std::string& lib, const std::string& name, const char** err);  // an extern's function
 void rtInit();
 void platformInit();  // the JIT or wasm half of rtInit (jit.cpp / wasm.cpp)

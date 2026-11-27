@@ -221,6 +221,13 @@ V n_execAll(V cmds) { return batch<Cmd, ProcResult>(cmds, "execAll", cmdOf, [](c
 // ---- files, environment ----
 V n_readFile(V path) {
   std::string p = strArg(path, "readFile", "the path"), s;
+  if (enterNativeTest) {
+    // A missing file is a read with a known result. An existing path might be a pipe or device:
+    // enter the native process before opening or consuming it.
+    struct stat st;
+    if (stat(p.c_str(), &st) && (errno == ENOENT || errno == ENOTDIR)) return NIL;
+    enterNativeTest();
+  }
   FILE* f = fopen(p.c_str(), "rb");
   if (!f) return NIL;
   char b[65536];

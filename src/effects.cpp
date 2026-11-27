@@ -203,6 +203,12 @@ void* effPrep(Fn* f, V* w, uint64_t n) {
     return invokeCode;
   }
   if (!(vm->allowed & o.effect) || (o.effect == EFF_IO && txnAtomic())) forbidden(what, o.effect, RA());
+#if !__wasm__
+  // In a compiled test template, a foreign call or real host I/O needs the pristine native process.
+  // print is captured, env only reads inherited state, and readFile checks its path before opening it.
+  if (enterNativeTest && !o.user && (o.effect == EFF_IO || o.name == "sleep()") &&
+      op != printOp && o.name != "env()" && o.name != "readFile()") enterNativeTest();
+#endif
   if (traceOn && op != printOp && (o.effect & (EFF_IO | EFF_CLOCK | EFF_RANDOM))) traceImpure();  // (print: captured under fut test)
   if (o.user) rtError(RA(), "@unhandled %s was performed, but nothing handles it (handle { ... } with %s { ... })", what.c_str(), o.name.substr(0, o.name.size() - 1).append("...)").c_str());
   memmove(w, w + 1, n * 8);

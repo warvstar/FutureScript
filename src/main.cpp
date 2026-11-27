@@ -11,6 +11,7 @@
 #include <mach-o/dyld.h>
 #include <fcntl.h>
 #include <spawn.h>
+#include <sstream>
 extern char** environ;
 int lspCommand();
 
@@ -207,14 +208,45 @@ static void waitChange() {  // typed lines still run meanwhile, so the stopped p
     if (__atomic_exchange_n(&vm->poll, 0, __ATOMIC_ACQUIRE) && (evalInbox(), __atomic_exchange_n(&fileChanged, 0, __ATOMIC_ACQUIRE))) return;
 }
 
-// One test in a child process (fork, after the top level ran): its globals, a crash or a hang stay in it.
-// The child sends its report (status letter, then the text) back over a pipe.
-// A program that binds a C library (a `c` module, as std/gpu's over Dawn and Metal) gets a new fut process per test
-// instead (spawned: `fut test --test-child <index>:<fd> file`), which compiles and runs the top level again: system
-// frameworks don't survive a fork.
-static bool spawnTests;
+// Each test has its own process, deadline and report pipe. Programs with C bindings normally exec per test:
+// system frameworks like Metal must be initialized in a fresh process. Suites with inert library constructors
+// can opt to inherit a clean JIT image and exec only when the test reaches a foreign call or host I/O.
+static bool preflight, bindOnly;
 static int childTest = -1, childFd = -1;
 static TestRun childOpts;
+static int jobOverride;
+struct TestSettings {
+  int jobs = 1;
+  bool deferred = false;
+};
+static int positiveCount(const std::string& s) {
+  char* end;
+  long n = strtol(s.c_str(), &end, 10);
+  return !*end && n > 0 && n <= INT_MAX ? (int)n : 0;
+}
+static TestSettings testSettings() {
+  TestSettings settings;
+  const Package* pkg = packageOf(path);
+  std::string config;
+  if (pkg && readFile(pkg->dir + "/fut.test", config)) {
+    std::istringstream lines(config);
+    std::string line;
+    for (int n = 1; std::getline(lines, line); n++) {
+      std::istringstream fields(line);
+      std::string key, value, extra;
+      if (!(fields >> key)) continue;
+      if ((fields >> value) && !(fields >> extra)) {
+        if (key == "jobs") {
+          settings.jobs = value == "auto" ? std::max(1L, sysconf(_SC_NPROCESSORS_ONLN)) : positiveCount(value);
+          if (settings.jobs) continue;
+        } else if (key == "native-libraries" && value == "on-call") { settings.deferred = true; continue; }
+      }
+      compileFail(pkg->dir + "/fut.test:" + std::to_string(n) + ": error: expected jobs auto, jobs <positive count>, or native-libraries on-call", false);
+    }
+  }
+  if (jobOverride) settings.jobs = jobOverride;
+  return settings;
+}
 static void sendReport(int fd, const TestCase& t, int st, const std::string& err) {
   char status;
   std::string text = testReport(t, st != 0, err, status);
@@ -225,55 +257,165 @@ static void sendReport(int fd, const TestCase& t, int st, const std::string& err
     o += n;
   }
 }
-static pid_t spawnTest(int index, int fd, int other) {
+// Build the exec argument vector before forking. An isolate can request the native process too.
+struct NativeTestCommand {
   char exe[4096];
-  uint32_t n = sizeof exe;
-  if (_NSGetExecutablePath(exe, &n)) return -1;
-  std::string which = std::to_string(index) + ":" + std::to_string(fd), seed = std::to_string(isolateSeed);
-  std::vector<const char*> av{exe, "test", "--test-child", which.c_str(), "--seed", seed.c_str()};
-  if (childOpts.json) av.push_back("--json");
-  av.push_back(path.c_str()), av.push_back(nullptr);
-  posix_spawn_file_actions_t fa;
-  posix_spawn_file_actions_init(&fa);
-  posix_spawn_file_actions_addclose(&fa, other);  // what the top level prints was shown once already
-  posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0), posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
-  pid_t pid;
-  int e = posix_spawn(&pid, exe, &fa, nullptr, (char* const*)av.data(), environ);
-  posix_spawn_file_actions_destroy(&fa);
-  return e ? -1 : pid;
-}
-static void isolated(const TestCase& t, int index, void* code, double timeout) {
-  int p[2];
-  fflush(stdout), fflush(stderr);
-  if (pipe(p)) return testFinish(t, true, "cannot create a pipe for the test process\n");
-  pid_t pid = spawnTests ? spawnTest(index, p[1], p[0]) : fork();
-  if (pid < 0) return close(p[0]), close(p[1]), testFinish(t, true, "cannot start the test process\n");
-  if (!pid) {
-    jitForked(), close(p[0]);
-    std::string err;
-    errSink = &err;
-    int st = finish(run(code), &err);
-    sendReport(p[1], t, st, err);
-    _exit(0);
+  std::string which, seed;
+  char* args[12]{};
+  NativeTestCommand(int index, int fd) : which(std::to_string(index) + ":" + std::to_string(fd)), seed(std::to_string(isolateSeed)) {
+    uint32_t n = sizeof exe;
+    if (_NSGetExecutablePath(exe, &n)) exe[0] = 0;
+    size_t i = 0;
+    args[i++] = exe, args[i++] = (char*)"test";
+    if (index >= 0) args[i++] = (char*)"--test-child", args[i++] = which.data();
+    else args[i++] = (char*)(index == -1 ? "--test-top" : "--test-bind");
+    args[i++] = (char*)"--seed", args[i++] = seed.data();
+    if (childOpts.json) args[i++] = (char*)"--json";
+    args[i++] = path.data();
   }
-  close(p[1]);
-  std::string got;
-  bool timedOut = false;
-  int st = reap(pid, {{p[0], &got}}, timeout, timedOut);
-  if (!got.empty()) return testRecord(got[0], got.substr(1));
-  char why[96];
-  if (timedOut) snprintf(why, sizeof why, "timed out after %g s\n", timeout);
-  else if (WIFSIGNALED(st)) snprintf(why, sizeof why, "the test process crashed: %s\n", strsignal(WTERMSIG(st)));
-  else snprintf(why, sizeof why, "the test process exited (status %d) without a report\n", WEXITSTATUS(st));
-  testFinish(t, true, why);
+};
+static NativeTestCommand* nativeCommand;
+[[noreturn]] static void execNativeTest() {
+  execv(nativeCommand->exe, nativeCommand->args);
+  _exit(127);
+}
+static int prepareNativeTests(bool runTop) {
+  NativeTestCommand cmd(runTop ? -1 : -2, -1);
+  fflush(nullptr);
+  pid_t pid;
+  if (posix_spawn(&pid, cmd.exe, nullptr, nullptr, cmd.args, environ))
+    return fputs("fut test: cannot start the native test process\n", stderr), 2;
+  int st;
+  while (waitpid(pid, &st, 0) < 0) if (errno != EINTR) return 2;
+  if (!WIFEXITED(st)) return fputs("fut test: native initialization crashed\n", stderr), 2;
+  return WEXITSTATUS(st);
+}
+struct TestProcess {
+  size_t index;
+  pid_t pid;
+  int fd;
+  double deadline;
+};
+struct TestResult {
+  std::string report, error;
+  bool done = false;
+};
+// Only the parent launches jobs. A forked test inherits the compiled program and top level as before.
+static void runProcesses(const std::vector<TestCase>& tests, int limit, const TestRun& opts, bool fresh, void* nativeTop) {
+  std::vector<TestProcess> active;
+  std::vector<TestResult> results(tests.size());
+  size_t next = 0, printed = 0;
+  fflush(nullptr);
+  while (printed < tests.size()) {
+    while (next < tests.size() && active.size() < (size_t)limit) {
+      size_t i = next++;
+      const auto& t = tests[i];
+      auto& result = results[i];
+      result.done = true;
+      if (!t.pending.empty() || t.name.find(opts.filter) == std::string::npos || traceCached(t)) continue;
+      int p[2];
+      if (pipe(p)) { result.error = "cannot create a pipe for the test process\n"; continue; }
+      // Siblings have no write ends to each other's report pipes. Exec closes inherited read ends.
+      fcntl(p[0], F_SETFD, FD_CLOEXEC);
+      NativeTestCommand cmd((int)i, p[1]);
+      pid_t pid;
+      if (fresh) {
+        posix_spawn_file_actions_t fa;
+        posix_spawn_file_actions_init(&fa);
+        posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+        posix_spawn_file_actions_adddup2(&fa, 1, 2);
+        if (posix_spawn(&pid, cmd.exe, &fa, nullptr, cmd.args, environ)) pid = -1;
+        posix_spawn_file_actions_destroy(&fa);
+      } else pid = fork();
+      if (pid < 0) { close(p[0]), close(p[1]); result.error = "cannot start the test process\n"; continue; }
+      if (!pid) {
+        close(p[0]);
+        for (auto& sibling : active) close(sibling.fd);
+        std::string err;
+        errSink = &err;
+        int st = 0;
+        if (nativeTop) {
+          // The preflight showed top-level output once. Every native test executes its own top level.
+          int sink = open("/dev/null", O_WRONLY);
+          if (sink < 0 || dup2(sink, 1) < 0 || dup2(sink, 2) < 0) _exit(127);
+          close(sink);
+          nativeCommand = &cmd;
+          enterNativeTest = execNativeTest;
+        }
+        jitForked();
+        if (nativeTop) st = finish(run(nativeTop), &err);
+        void* code = testStart(t);
+        if (st) err = "the top level failed in the test's process: " + err;
+        else st = finish(run(code), &err);
+        sendReport(p[1], t, st, err);
+        _exit(0);
+      }
+      close(p[1]);
+      result.done = false;
+      active.push_back({i, pid, p[0], now() + opts.timeout});
+    }
+    // Reports, pending tests and cache updates remain in declaration order, whatever order the children finish.
+    while (printed < next && results[printed].done) {
+      auto& r = results[printed];
+      auto& t = tests[printed++];
+      if (!testStart(t)) continue;
+      if (!r.error.empty()) testFinish(t, true, r.error);
+      else testRecord(r.report[0], r.report.substr(1));
+      r = {};
+    }
+    if (active.empty()) continue;
+    std::vector<pollfd> fds;
+    double deadline = active[0].deadline;
+    for (auto& j : active) {
+      fds.push_back({j.fd, POLLIN, 0});
+      deadline = std::min(deadline, j.deadline);
+    }
+    int ready = poll(fds.data(), fds.size(), (int)(std::max(0., deadline - now()) * 1000) + 1);
+    if (ready < 0 && errno == EINTR) continue;
+    for (size_t i = active.size(); i-- > 0;) {
+      auto& j = active[i];
+      auto& r = results[j.index];
+      bool timeout = now() >= j.deadline;
+      if (timeout) kill(j.pid, SIGKILL);
+      else if (fds[i].revents) {
+        char buf[8192];
+        ssize_t n = read(j.fd, buf, sizeof buf);
+        if (n > 0) { r.report.append(buf, n); continue; }
+        if (n < 0 && errno == EINTR) continue;
+      } else continue;
+      close(j.fd);
+      int st = 0;
+      while (waitpid(j.pid, &st, 0) < 0 && errno == EINTR) {}
+      char why[128] = {};
+      if (timeout) snprintf(why, sizeof why, "timed out after %g s\n", opts.timeout);
+      else if (WIFSIGNALED(st)) snprintf(why, sizeof why, "the test process crashed: %s\n", strsignal(WTERMSIG(st)));
+      else if (r.report.empty() || WEXITSTATUS(st)) snprintf(why, sizeof why, "the test process exited (status %d) without a report\n", WEXITSTATUS(st));
+      r.error = why, r.done = true;
+      active.erase(active.begin() + i);
+    }
+  }
 }
 // fut test: the top level runs once, then each `test` block in order (main() is not called), each in its own process.
 static int runTests(const TestRun& o) {
   testsBegin(o);
+  // Keep native libraries and their constructors out of the forking process. A fresh exec validates
+  // every binding and runs the real top level; a test that touches the host execs before doing so.
+  TestSettings settings;
   Compiled c;
   try {
+    if (childTest < 0 && !preflight && !o.isolates) settings = testSettings();
+    deferTestLibraries = settings.deferred;
     c = compile(path, false, false, nullptr, true);
   } catch (std::exception& e) { return reportCompileError(e.what()), 2; }
+  if (preflight) {
+    if (bindOnly) return 0;
+    std::string err;
+    errSink = &err;
+    int st = finish(run(c.chunk), &err);
+    errSink = nullptr;
+    if (st) reportTopError(err);
+    return st;
+  }
   if (childTest >= 0) {  // spawned for one test: the top level, then it, reported to the parent
     if (childTest >= (int)c.tests.size()) return 2;
     std::string err;
@@ -288,10 +430,6 @@ static int runTests(const TestRun& o) {
     _exit(0);
   }
   childOpts = o;
-  spawnTests = false;
-  for (auto& d : c.packages)
-    if (const Package* p = packageAt(d))
-      for (auto& m : p->mods) spawnTests |= m.kind == "c";
   if (o.isolates) {  // each test in o.isolates isolates at once, each running the top level first
     for (auto& t : c.tests) {
       if (!testStart(t)) continue;
@@ -304,14 +442,21 @@ static int runTests(const TestRun& o) {
   }
   std::string err;
   errSink = &err;
-  int st = testsToRun(c.tests) ? finish(run(c.chunk), &err) : 0;  // --changed with every test cached: nothing runs, not even
-  // the top level. Its isolates are finished before the tests fork: a child process has only the forking thread.
-  jitRetire((u32*)c.chunk);
-  // A public interface out of date fails the run too, reported last so it is what the reader sees with the status.
+  bool runTop = testsToRun(c.tests) != 0;
+  int st = hasTestLibraries ? prepareNativeTests(runTop) : runTop ? finish(run(c.chunk), &err) : 0;
   auto api = [&](int st) { return reportInterfaces(checkInterfaces(c), o.json, path) ? std::max(st, 1) : st; };
-  if (st) return errSink = nullptr, reportTopError(err), api(1);
-  for (size_t i = 0; i < c.tests.size(); i++)
-    if (void* code = testStart(c.tests[i])) isolated(c.tests[i], (int)i, code, o.timeout);
+  if (st) {
+    errSink = nullptr;
+    if (!hasTestLibraries) reportTopError(err);
+    return api(st);
+  }
+  bool fresh = false;
+  if (!settings.deferred)
+    for (auto& d : c.packages)
+      if (const Package* p = packageAt(d))
+        for (auto& m : p->mods) fresh |= m.kind == "c";
+  runProcesses(c.tests, settings.jobs, o, fresh, hasTestLibraries ? c.chunk : nullptr);
+  jitRetire((u32*)c.chunk);
   errSink = nullptr;
   return api(testsEnd());
 }
@@ -441,7 +586,7 @@ int main(int argc, char** argv) {
   std::string replayLog;
   bool record = false;
   const char* usage = "usage: fut [-w | -v | --asm | --isolates n | --seed n | --threads n | --record log | --replay log] [file.fut]   (no file: REPL)\n"
-                      "       fut test [--changed] [--json] [--filter text] [--timeout s] [--isolates n] [--seed n] file.fut...\n"
+                      "       fut test [--changed] [--json] [--filter text] [--timeout s] [--jobs n] [--isolates n] [--seed n] file.fut...\n"
                       "       fut init [dir]   (a new package)\n       fut api [--check] file.fut\n       fut map [--pub] [--json] file.fut [package | file]\n       fut explain [code]\n"
                       "       fut fmt [--check] [--stdin] [file.fut | dir ...]\n"
                       "       fut lsp   (language server over stdio)\n       fut worker build ...   (Cloudflare Workers: node web/worker.mjs)\n";
@@ -461,9 +606,12 @@ int main(int argc, char** argv) {
     } else if (a == "--isolates" && i + 1 < argc && atoi(argv[i + 1]) > 0 && !WASM) topts.isolates = atoi(argv[++i]);
     else if (a == "--seed" && i + 1 < argc && strtoull(argv[i + 1], nullptr, 10) > 0) isolateSeed = strtoull(argv[++i], nullptr, 10);
     else if (a == "--threads" && i + 1 < argc && atoi(argv[i + 1]) > 0) isolateThreads = atoi(argv[++i]);
-    else if (testMode && a == "--json") topts.json = true;
+    else if (testMode && a == "--jobs" && i + 1 < argc) {
+      if (!(jobOverride = positiveCount(argv[++i]))) return fputs(usage, stderr), 2;
+    } else if (testMode && a == "--json") topts.json = true;
     else if (testMode && a == "--filter" && i + 1 < argc) topts.filter = argv[++i];
     else if (testMode && a == "--changed") topts.changed = true;
+    else if (testMode && (a == "--test-top" || a == "--test-bind")) preflight = true, bindOnly = a == "--test-bind";
     else if (testMode && a == "--test-child" && i + 1 < argc && sscanf(argv[i + 1], "%d:%d", &childTest, &childFd) == 2) i++;
     else if (testMode && a == "--timeout" && i + 1 < argc && atof(argv[i + 1]) > 0) topts.timeout = atof(argv[++i]);
     else if ((a == "--record" || a == "--replay") && i + 1 < argc && !testMode) record = a == "--record", replayLog = argv[++i];
@@ -476,6 +624,7 @@ int main(int argc, char** argv) {
       if (testMode) testFiles.push_back(path);
     }
   }
+  if (testMode && !isolateSeed) isolateSeed = 1;
   if (testFiles.size() > 1) {
     int result = 0;
     for (auto& file : testFiles) {
@@ -496,7 +645,6 @@ int main(int argc, char** argv) {
     }
     return result;
   }
-  if (testMode && !isolateSeed) isolateSeed = 1;
   if (watch) isolateSeed = 0;  // -w: a reload stops pool isolates at their polls (seeded ones share the main thread)  // a test's isolates interleave the same way every run
   rtInit();
   if ((testMode || apiMode || mapMode) && path.empty()) return fputs(usage, stderr), 2;
