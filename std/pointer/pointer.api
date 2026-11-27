@@ -1,0 +1,4 @@
+// The public interface of package pointer 0.1.0 (pointer.fut), written by `fut api`. `fut test` fails while it is out of date.
+
+// 0 is primary, 1 secondary, and 2 middle.
+pub fn down(button: num): bool

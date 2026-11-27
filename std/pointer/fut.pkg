@@ -1,0 +1,4 @@
+name pointer
+version 0.1.0
+c mouse /System/Library/Frameworks/CoreGraphics.framework/CoreGraphics
+js mouse ./pointer.js main
