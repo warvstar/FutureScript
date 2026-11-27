@@ -558,7 +558,10 @@ static std::string indent(const std::string& s, const char* pre) {
   }
   return o;
 }
-static std::string where(const TestCase& t) { return t.file.substr(t.file.rfind('/') + 1) + ":" + std::to_string(t.line); }
+static std::string testLocation(const std::string& file, int line) {
+  auto dir = mainFile.substr(0, mainFile.rfind('/') + 1);
+  return (file.starts_with(dir) ? file.substr(dir.size()) : file) + ":" + std::to_string(line);
+}
 static void emit(const std::string& s) { fflush(stdout), fwrite(s.data(), 1, s.size(), stdout), fflush(stdout); }
 // --changed is terse: passes are counted, not listed; in text, what failed follows the summary line.
 static void say(const std::string& s, bool pass) {
@@ -574,7 +577,7 @@ void* testStart(const TestCase& t) {
     pending++;
     if (opts.json) say("{\"type\":\"test\",\"name\":" + json(t.name) + ",\"file\":" + json(t.file) + ",\"line\":" + std::to_string(t.line) +
                        ",\"status\":\"pending\",\"reason\":" + json(t.pending) + "}\n", false);
-    else say("pending " + t.name + " (" + where(t) + "): " + t.pending + "\n", false);
+    else say("pending " + t.name + " (" + testLocation(t.file, t.line) + "): " + t.pending + "\n", false);
     return nullptr;
   }
   if (traceCached(t)) return cachedPasses++, nullptr;
@@ -614,9 +617,9 @@ std::string testReport(const TestCase& t, bool err, const std::string& e, char& 
   std::string s = std::string(failure.set ? "FAIL    " : err ? "ERROR   " : "ok      ") + t.name;
   if (failure.set) {
     const ExpectSite& x = siteAt(failure.site);
-    s += " (" + where(t) + ")\n  " + x.file.substr(x.file.rfind('/') + 1) + ":" + std::to_string(x.line) + ": expect " + oneLine(x.text) + "\n";
+    s += " (" + testLocation(t.file, t.line) + ")\n  " + testLocation(x.file, x.line) + ": expect " + oneLine(x.text) + "\n";
     for (auto& d : details(x, failure)) s += "    " + d + "\n";
-  } else if (err) s += " (" + where(t) + ")\n" + indent("runtime error: " + e.substr(0, e.find_last_not_of('\n') + 1), "  ");
+  } else if (err) s += " (" + testLocation(t.file, t.line) + ")\n" + indent("runtime error: " + e.substr(0, e.find_last_not_of('\n') + 1), "  ");
   else s += "\n";
   if ((failure.set || err) && !printed.empty()) s += "  output:\n" + indent(printed.substr(0, printed.size() - (printed.back() == '\n')), "    ");
   if (failure.set || err) s += indent(isolateSeedNote(), "  ");

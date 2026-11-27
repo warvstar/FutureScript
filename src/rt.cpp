@@ -667,6 +667,14 @@ static void* rt_prep(V* w, uint64_t n, uint64_t sym, V sup, IC* ic) {
     in->cls = c, in->cid = c->id, in->nslots = (uint16_t)cap, in->slots = in->inl();
     for (V* p = in->slots; p < in->slots + cap; p++) __atomic_store_n(p, ABSENT, __ATOMIC_RELAXED);  // no memset call
     w[0] = box(in);
+    for (Class* owner = c; owner; owner = owner->super) {
+      for (auto [sym, kind] : owner->collectionInits) {
+        if (owner != c && c->declared(sym) != owner->declared(sym)) continue;
+        V value = kind == K::List ? box(make<List>()) : box(make<Map>());
+        rt_setf(w[0], sym, value, nullptr);
+        ctor = nullptr;  // inline allocation alone would skip these initializers
+      }
+    }
     if (__atomic_load_n(&c->initEpoch, __ATOMIC_ACQUIRE) != icEpoch)  // isolates may race to fill it: same value
       __atomic_store_n(&c->init, c->find(S_init), __ATOMIC_RELAXED), __atomic_store_n(&c->initEpoch, icEpoch, __ATOMIC_RELEASE);
     if (!(f = __atomic_load_n(&c->init, __ATOMIC_RELAXED))) {

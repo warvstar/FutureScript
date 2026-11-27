@@ -9,6 +9,7 @@
 //     return ui.el("div", nil, [ui.button("+1", fn(e) { n.update(fn(v) { return v + 1 }) }), fn() { return "clicked {n.get()}" }])
 //   })
 import "std/reactive" as r
+import "./snapshot.fut" as snap
 import "std/lists"
 import "std/strings"
 
@@ -121,6 +122,7 @@ fn region(p, before, f, given) {
 // ---- templates (src/views.cpp): a view's element with its fixed part made once and cloned, the rest wired ----
 var tplIds = {}  // key -> [template id, how many nodes an instance gives]
 pub fn tpl(key: str, desc: fn, wire: fn): any {
+  if snap.current { return snap.template(desc,wire) }
   var t = nil
   if tplIds.has(key) { t = tplIds[key] }
   else {
@@ -139,9 +141,9 @@ fn wired(d) {  // how many of desc's nodes fut wires (see dom.js's template)
   for i in 3..d.len() { c += wired(d[i]) }
   return c
 }
-pub fn wire(n, props) { for k in props { prop(n, k, props[k]) } }  // a template's element: its live props
-pub fn hole(marker, c) { addAt(nil, marker, c) }  // a template's place for a child
-pub fn textAt(t, f: fn) { region(nil, nil, f, t) }  // a template's text, kept current
+pub fn wire(n, props) { if snap.current { snap.props(n,props) return } for k in props { prop(n, k, props[k]) } }  // a template's element: its live props
+pub fn hole(marker, c) { if snap.current { snap.fill(marker,c) return } addAt(nil, marker, c) }  // a template's place for a child
+pub fn textAt(t, f: fn) { if snap.current { snap.fill(t,f) return } region(nil, nil, f, t) }  // a template's text, kept current
 
 // Prop k of node n: "on<event>" takes a handler, given {type, value, checked, key, x, y, clientX, clientY, button, ctrl, shift, alt, meta}; a function shows its current
 // result; "class" (a keyword, which a map key may be: {class: ...}), "id" and other attributes take text (nil or false removes one); "value" and "checked" set the
@@ -164,11 +166,15 @@ fn prop(n, k, v) {
 
 // An element: its tag, its props (a map, or nil), and its children (one child or a list).
 pub fn el(tag: str, props, kids): any {
+  if snap.current { return snap.element(tag,props,kids) }
   var n = create(tag)
   if props != nil { for k in props { prop(n, k, props[k]) } }
   add(n, kids)
   return n
 }
+
+// Evaluate a portable view to an element tree and its Fut event handlers for an external renderer.
+pub fn snapshot(view: fn) { return snap.capture(view) }
 
 // Show view() in target (a selector or a node), replacing what was there. The returned function takes it down: its
 // effects stop.
@@ -184,6 +190,7 @@ pub fn mount(target, view: fn): fn {
 // same: changing one item redraws that item, and reordering moves only the items out of place (those not on the
 // longest run that kept its order).
 pub fn each(items: fn, key: fn, view: fn): any {
+  if snap.current { var out=[] for item in items() { out.push(view(item)) } return out }
   var frag = fragment()
   var start = anchor()
   var end = anchor()

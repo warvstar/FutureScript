@@ -149,6 +149,9 @@ pub fn show(view: fn): fn
 // A size in bytes as people read it: 940 B, 12 KB, 3.4 MB.
 pub fn size(bytes: num): str
 
+// Evaluate a portable view to an element tree and its Fut event handlers for an external renderer.
+pub fn snapshot(view: fn)
+
 // A small line of values, no axes: the trend beside a number. values: a list, or a function of one.
 pub fn sparkline(values, props): any
 

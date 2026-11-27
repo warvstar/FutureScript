@@ -22,3 +22,27 @@ class Loose { fn init() { self.anything = 1 } }   // declares nothing: fields co
 var l = Loose()
 l.more = 2
 print(l.anything + l.more)        // expect: 3
+
+class Bag {
+  var items: list<num> = []
+  var counts = {}
+  fn init() { self.items.push(4) }
+}
+class Pack : Bag {}
+fn pack() { return Pack() }
+var first = pack()
+var second = pack()
+first.items.push(5)
+first.counts.x = 2
+print(first.items, second.items, second.counts.len()) // expect: [4, 5] [4] 0
+try { first.items.push("x") } catch e { print("typed") } // expect: typed
+class Counter : Bag { var counts = 7 }
+print(Counter().counts) // expect: 7
+class History { var entries = [] }
+fn history() { return History() }
+var original = history()
+original.entries.push(9)
+print(history().entries) // expect: []
+var snapshot = freeze(original)
+try { snapshot.entries.push(1) } catch e { print("frozen") } // expect: frozen
+print(thaw(snapshot).entries) // expect: [9]

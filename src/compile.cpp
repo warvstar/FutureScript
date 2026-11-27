@@ -118,6 +118,7 @@ struct ClassDef {
   std::vector<std::pair<int, Fn*>> methods;
   std::vector<Member> written;
   std::vector<std::pair<int, V>> fields;  // declared: `var name [: type] [= constant]`
+  std::vector<std::pair<int, K>> collectionInits;
   std::vector<Class::FieldType> ftypes;   // those with a type
   uint8_t sum = 0;                        // Class::sum: 1 an enum, 2 a variant
 };
@@ -144,7 +145,7 @@ static int editDistance(const std::string& a, const std::string& b) {  // for "d
   }
   return row[b.size()];
 }
-struct TypedUse { uint64_t type; int sym; At at; bool call; std::string var; };
+struct TypedUse { int path, sym; At at; bool call; std::string var; };
 // A fn/method in the source. retNum: it declares `: num`, so a direct call's result is known to be a number.
 struct Span { const char *start = nullptr, *end = nullptr; int line = 0, endLine = 0, arity = 0; bool retNum = false; };
 // A contract's clause: where its condition starts, and whether it calls anything (then the checks run in a
@@ -224,7 +225,7 @@ struct Navigation {
   std::unordered_map<int, uint64_t> paramTypes;
   const char *ctorStart = nullptr, *ctorEnd = nullptr;
   int ctorClass = -1;
-  struct MemberUse { Site site; int name, cls, binding; uint64_t type; bool call, super; Role role; };
+  struct MemberUse { Site site; int name, cls, binding; uint64_t type; bool call, super; Role role; int path = 0; };
   std::vector<MemberUse> members;
 
   Site site(const std::string& file, const char* start, const Tok& t) const {
@@ -425,6 +426,11 @@ struct Compiler : Gen, Namespaces {
     int id = int(nav->out.files.size());
     nav->sources.emplace(path, Navigation::Source{s.code().c_str(), s.code().size(), id, s.view ? &*s.view : nullptr, &s.text});
     nav->out.files.push_back(path);
+    if (editorCheck->referenceQuery) {
+      auto& lines = nav->out.lineStarts.emplace_back();
+      lines.push_back(0);
+      for (size_t i = 0; i < s.text.size(); i++) if (s.text[i] == '\n') lines.push_back(i + 1);
+    }
   }
   Navigation::Site indexSite(const Tok& t) { return nav->site(file, srcStart, t); }
   static CompileSymbols::Role useRole(const Tok& following) {
@@ -458,7 +464,30 @@ struct Compiler : Gen, Namespaces {
     if (v.k == LV_CAP) return selfClass(f->parent, f->caps[v.a].second);
     return v.k == LV_LOCAL && f->cls >= 0 && v.a == f->selfHome ? f->cls : -1;
   }
-  void indexMember(LV receiver, const Tok& member, bool call) {
+  // Field types may be declared later in this file or in an importer. Record the
+  // steps now and resolve them after parsing. Use separate alias nodes so invalidating
+  // a reassigned local never changes the declared type of its source field.
+  struct TypePath { int parent, field; uint64_t type; };
+  std::vector<TypePath> paths{{0, -1, 0}};
+  int addPath(int parent, int field, uint64_t type = 0) {
+    if (!parent && !type) return 0;
+    paths.push_back({parent, field, type});
+    return int(paths.size()) - 1;
+  }
+  Fun::Local* pathLocal(Fun* f, LV v) {
+    if (v.k == LV_CAP) return pathLocal(f->parent, f->caps[v.a].second);
+    if (v.k == LV_LOCAL)
+      for (auto i = f->locals.rbegin(); i != f->locals.rend(); ++i) if (i->home == v.a) return &*i;
+    return nullptr;
+  }
+  int valuePath(LV v) {
+    if (tiering) return 0;
+    if (v.path) return v.path;
+    if (auto* local = pathLocal(F, v); local && local->path) return local->path;
+    int cls = selfClass(F, v);
+    return addPath(0, -1, cls >= 0 ? tyClass(cls) : varType(F, v).first);
+  }
+  void indexMember(LV receiver, const Tok& member, bool call, int path = 0) {
     int cls = selfClass(F, receiver);
     uint64_t ty = 0;
     int id = binding(receiver);
@@ -472,14 +501,28 @@ struct Compiler : Gen, Namespaces {
     auto site = indexSite(member);
     // Constructor inference is local to its function/file.
     if (receiver.k == LV_CAP || (id >= 0 && receiver.k == LV_GLOBAL && nav->out.declarations[id].site.file != site.file)) id = -1;
-    if (site.file >= 0 && (cls >= 0 || ty || id >= 0))
-      nav->members.push_back({site, member.sym, cls, id, ty, call, false, useRole(cur)});
+    if (site.file >= 0 && (path || cls >= 0 || ty || id >= 0 || editorCheck->referenceQuery))
+      nav->members.push_back({site, member.sym, cls, id, ty, call, false, useRole(cur), path});
+  }
+  int memberPath(LV receiver, const Tok& field, bool call) {
+    int path = valuePath(receiver);
+    if (nav) indexMember(receiver, field, call, path);
+    if (tiering) return 0;
+    At at{field.p, field.line, file, srcStart};
+    if (selfClass(F, receiver) >= 0) {
+      if (!call) fieldUses.push_back({selfClass(F, receiver), field.sym, at});
+    } else if (path) {
+      std::string name = receiver.k == LV_FIELD ? symName(receiver.b) : varName(receiver);
+      typedUses.push_back({path, field.sym, at, call, name});
+    }
+    return call ? 0 : addPath(path, field.sym);
   }
   void finishIndex() {
     for (auto& u : nav->members) {
       int cls = u.cls;
-      if (cls < 0 && u.type) {
-        uint64_t ty = resolveNow(u.type) & ~TY_OPT;
+      uint64_t inferred = u.type ? u.type : paths[u.path].type;
+      if (cls < 0 && inferred) {
+        uint64_t ty = resolveNow(inferred) & ~TY_OPT;
         if ((ty & 15) == TY_CLS) cls = int(ty >> 8);
       }
       if (cls < 0 && u.binding >= 0 && !u.type && !nav->reassigned.contains(u.binding))
@@ -496,6 +539,7 @@ struct Compiler : Gen, Namespaces {
       int id = u.call ? lookup(nav->methods) : lookup(nav->fields);
       if (id < 0 && u.role != CompileSymbols::Write) id = u.call ? lookup(nav->fields) : lookup(nav->methods);
       nav->use(u.site, id, u.role);
+      if (editorCheck->referenceQuery && id < 0 && cls < 0) nav->out.unresolved.push_back({u.site, symName(u.name), u.role});
     }
     auto& uses = nav->out.occurrences;
     auto key = [](const auto& u) { return std::tuple(u.site, u.declaration, u.role); };
@@ -1124,6 +1168,7 @@ struct Compiler : Gen, Namespaces {
     const char *p = t.p, *e = t.p + t.len;
     std::string lit;
     bool any = false;
+    int line = t.line;
     auto flush = [&](bool force) {
       if (lit.empty() && !force) return;
       if (any) { int s = slot(); st(0, s), konst(lit), combine(s, O_ADD); }
@@ -1132,12 +1177,17 @@ struct Compiler : Gen, Namespaces {
     };
     for (; p < e; p++) {
       if (*p == '\\' && p + 1 < e) {
-        p = escape(p + 1, e, lit, t.line + (int)std::count(t.p, p, '\n'));
+        p = escape(p + 1, e, lit, line);
       } else if (*p == '{') {
         flush(true);  // always start from a string, so `"{x}"` is a string even when x is a number
-        int s = slot(), line = t.line + (int)std::count(t.p, p, '\n');
+        int s = slot();
+        const char* start = p;
         st(0, s), p = interpolation(p + 1, e, line), combine(s, O_ADD);
-      } else lit += *p;
+        line += (int)std::count(start, p, '\n');
+      } else {
+        line += *p == '\n';
+        lit += *p;
+      }
     }
     flush(!any);
   }
@@ -1407,8 +1457,8 @@ struct Compiler : Gen, Namespaces {
       } else if (nav) nav->use(indexSite(t), binding(v));
       while (accept('.')) {
         int f = ident();
-        if (nav) indexMember(v, prev, false);
-        load(v), v = {LV_FIELD, 0, f};
+        int path = memberPath(v, prev, false);
+        load(v), v = {LV_FIELD, 0, f}, v.path = path;
       }
       load(v);
     }
@@ -1592,7 +1642,7 @@ struct Compiler : Gen, Namespaces {
     switch (t.t) {
       case T_NUM: return imm(0, box(t.n)), NUM;
       case T_STR: return strLit(t), LV{};
-      case '(': { LV v; v.num = expr(); return expect(')'), v; }
+      case '(': { LV v; v.num = expr(1, &v.path); return expect(')'), v; }
       case '{': return mapLit(), LV{};
       case '[': { int base = F->depth, n = exprList(']'); return collect(base, n, H_LIST), LV{}; }
       case T_ID: break;
@@ -1675,25 +1725,23 @@ struct Compiler : Gen, Namespaces {
         next();
         Tok ft = cur;
         int s = at(T_ID) ? (next(), prev.sym) : ident();  // keywords too: m.class, as {class: ...} writes
-        if (nav) indexMember(v, ft, at('(') && !cur.nl);
-        bool own = v.k == LV_LOCAL && F->cls >= 0 && v.a == F->selfHome;  // self.name
-        if (own && !tiering && !(at('(') && !cur.nl))
-          fieldUses.push_back({F->cls, s, {ft.p, ft.line, file, srcStart}});  // self.name: checked once every class is known
-        if (!own && !tiering && (v.k == LV_LOCAL || v.k == LV_CAP || v.k == LV_GLOBAL))
-          if (uint64_t ty = varType(F, v).first)
-            typedUses.push_back({ty, s, {ft.p, ft.line, file, srcStart}, at('(') && !cur.nl, varName(v)});
+        int path = memberPath(v, ft, at('(') && !cur.nl);
+        bool own = v.k == LV_LOCAL && F->cls >= 0 && v.a == F->selfHome;
         load(v);
         Cond no;
         auto facts = F->facts;
         bool live = F->live;
         if (optional) no = nonNilCond(), thenBegin(no);
-        v = {LV_FIELD, 0, s}, v.own = own;
+        v = {LV_FIELD, 0, s}, v.own = own, v.path = path;
         if (at('(') && !cur.nl) next(), s == S_push ? pushCall() : call(s, false), v = {};
         if (optional) {
           v = postfixRest(v);
+          int resultPath = v.path;
           load(v), ifEnd(elseBegin(no, false));
           F->facts = facts, F->live = live;
-          return {};
+          LV result;
+          result.path = resultPath;
+          return result;
         }
       } else if (at('[') && !cur.nl) {
         LV base = v;
@@ -1735,13 +1783,21 @@ struct Compiler : Gen, Namespaces {
     internalCall("pow@", base, 2);
     return NUM;
   }
-  bool operand(int* h = nullptr) {  // x0 = a unary expression; returns whether it is known to be a number
+  bool operand(int* h = nullptr, int* path = nullptr) {  // x0 = a unary expression; returns whether it is known to be a number
     LV v = unary();
+    if (path) *path = valuePath(v);
     if (h) *h = v.k == LV_LOCAL ? v.a : NOH;  // the local it came straight from, if any
     load(v);
     return v.num;
   }
-  bool expr(int minp = 1) { int h; bool n = operand(&h); return binRest(minp, n, h), n; }
+  bool expr(int minp = 1, int* path = nullptr) {
+    int h;
+    bool n = operand(&h, path);
+    const char* end = prevEnd;
+    binRest(minp, n, h);
+    if (path && end != prevEnd) *path = 0;
+    return n;
+  }
   bool ternaryBranch() {
     if (at(T_EOF) || at('}') || at(']') || at(')') || at(':') || at(',') || at(';'))
       fail("@syntax write a ternary as 'condition ? yes : no'");
@@ -1840,13 +1896,15 @@ struct Compiler : Gen, Namespaces {
           Tok n = cur;
           int s = ident();
           std::string_view written;
+          bool annotated = at(':');
           Ty ty = declaredType(written);
           if (ty.code == TY_ANY) ty.code = 0;
           bool top = F->top && F->scope == 0, init = accept('=');
           std::string what = "var '" + symName(top ? qualify(s) : s) + "'";
           if (ty.code && !init && !acceptsNow(ty.code, NIL)) diagnose(n.p, n.line, "@type %s is %s, so it needs an initial value", what.c_str(), ty.text.c_str());
           Tok v = cur;
-          bool num = init ? expr() : (imm(0, NIL), false);
+          int path = 0;
+          bool num = init ? expr(1, top || annotated ? nullptr : &path) : (imm(0, NIL), false);
           if (ty.code && num && (ty.code & 15) != TY_NUM && ((ty.code & 15) <= TY_CLS || (ty.code & 15) == TY_BUF)) diagnose(v.p, v.line, "@type %s is %s, but its initial value is a number", what.c_str(), ty.text.c_str());
           checkType(ty, what, num);
           if (top) {
@@ -1859,6 +1917,8 @@ struct Compiler : Gen, Namespaces {
           bool isNum = ty.code == TY_NUM;  // every store checks it, so it stays a number
           auto it = std::find_if(F->locals.begin() + F->scopeAt, F->locals.end(), [&](auto& l) { return l.sym == s; });
           if (it != F->locals.end()) {  // redeclared in the same block: reuse
+            if (it->path && (F->loop || F->retry)) paths[it->path].parent = 0;
+            it->path = 0;
             it->ty = ty.code, it->site = site, it->num = isNum;
             if (nav) {
               it->symbol = indexLocal(n, "var", written, it->symbol);
@@ -1869,6 +1929,7 @@ struct Compiler : Gen, Namespaces {
           int h = num || isNum ? fhome() : home();
           if (stl(0, h), num) prove(h);
           F->locals.push_back({s, h, isNum, ty.code, site});
+          F->locals.back().path = addPath(path, -1);
           if (nav) {
             int id = F->locals.back().symbol = indexLocal(n, "var", written);
             if (id >= 0 && init && v.p == nav->ctorStart && prevEnd == nav->ctorEnd) nav->constructors[id] = nav->ctorClass;
@@ -1930,6 +1991,10 @@ struct Compiler : Gen, Namespaces {
     if (v.k == LV_BAD) return next(), expr(), false;
     if (v.k == LV_VAL || v.ro) fail("@misplaced cannot assign to this");
     next(), assign(v, t == '=' ? -1 : O_ADD + (t - T_ADDEQ));
+    if (auto* local = pathLocal(F, v); local && local->path) {
+      if (F->loop || F->retry || v.k == LV_CAP) paths[local->path].parent = 0;
+      local->path = 0;
+    }
     return false;
   }
   // The body, then `step` (the continue target), a safepoint, and the back-edge to the top.
@@ -2552,19 +2617,19 @@ struct Compiler : Gen, Namespaces {
     Fun f;
     owner = q, fnDefs.push_back({s, function(f, -1, false, q, global(s).stub, nullptr)});
   }
-  // A field's default: the class keeps it and every instance shares it, so it is a constant (a list or map
-  // default would be one object shared by all; such fields are set in init).
+  // Scalar defaults are shared by all instances.
   V constant() {
-    const char* why = "a field's default must be a number, string, true, false or nil (set other values in init)";
+    const char* why = "a field's default must be a number, string, true, false, nil, [] or {} (set other values in init)";
     if (accept('-')) return at(T_NUM) ? (next(), box(-prev.n)) : (fail("@class %s", why), NIL);
     if (accept(T_NUM)) return box(prev.n);
     if (atKw(K_true) || atKw(K_false) || atKw(K_nil)) return next(), prev.sym == K_true ? TRUE_ : prev.sym == K_false ? FALSE_ : NIL;
     if (!at(T_STR)) fail("@class %s", why);
     std::string s;
+    int line = cur.line;
     for (const char *p = cur.p, *e = p + cur.len; p < e; p++) {
       if (*p == '{') fail("@class a field's default can't interpolate: set it in init");
-      if (*p != '\\' || p + 1 == e) { s += *p; continue; }
-      p = escape(p + 1, e, s, cur.line + (int)std::count(cur.p, p, '\n'));
+      if (*p != '\\' || p + 1 == e) { line += *p == '\n'; s += *p; continue; }
+      p = escape(p + 1, e, s, line);
     }
     next();
     return consts.push_back(box(newStr(s))), consts.back();
@@ -2598,10 +2663,18 @@ struct Compiler : Gen, Namespaces {
           if (nav) nav->fields[{cd.sym, s}] = indexLocal(field, "field", written, -1, symName(cd.sym));
           bool given = accept('=');
           Tok dt = cur;
-          V d = given ? constant() : NIL;
+          bool collection = given && (at('[') || at('{'));
+          V d = NIL;
+          if (collection) {
+            bool list = accept('[');
+            if (!list) next();
+            if (!accept(list ? ']' : '}')) fail("@class only empty collection field initializers are supported (set other values in init)");
+            cd.collectionInits.push_back({s, list ? K::List : K::Map});
+            if (ty.code) d = list ? box(make<List>()) : box(make<Map>());
+          } else if (given) d = constant();
           if (ty.code && given && !acceptsNow(ty.code, d)) diagnose(dt.p, dt.line, "@type field '%s' is %s, but its default is not", name(s), ty.text.c_str());
           if (ty.code) cd.ftypes.push_back({s, ty.code, typeSite("field '" + symName(s) + "' of " + symName(cd.sym), ty.text)});
-          cd.fields.back().second = d;
+          cd.fields.back().second = collection ? NIL : d;
           return;
         }
         if (atKw(S_invariant) && !peek().nl) {  // (the prescan has it: compiled into the methods)
@@ -3123,7 +3196,12 @@ struct Compiler : Gen, Namespaces {
             enumDefs.erase(d.sym);  // (an enum by this name before a reload)
             cls = d.sym, classAt[cls] = {{t.p, t.line, file, srcStart}, t.sym};
             Lexer s = L;
-            if (lex(s).t == ':') if (Tok n = lex(s); n.t == T_ID) superAt[cls] = {n.p, n.line, file, srcStart};
+            if (lex(s).t == ':') if (Tok n = lex(s); n.t == T_ID) {
+              superAt[cls] = {n.p, n.line, file, srcStart};
+              Lexer base = s;
+              if (lex(base).t == '.' && lex(base).t == T_ID) s = base;
+              mixEnv(fnv(n.p, s.p) ^ uint64_t(cls) << 32, -2);
+            }
           }
           else if (VarTy& v = varTypes[d.sym] = {}; [&] { Lexer s = L; return lex(s).t == ':'; }()) {  // a typed var
             Lexer s = L;
@@ -3142,7 +3220,13 @@ struct Compiler : Gen, Namespaces {
           clauseScan(L, c, nullptr), classSpec(cls).invariants.push_back(c);
           mixEnv(fnv(from, L.p) ^ uint64_t(cls) << 32, -1);  // editing one recompiles the class's methods
         } else if (depth == 1 && cls >= 0 && afterKw && p.sym == K_var) {  // a declared field: methods compile against them
-          mixEnv(uint64_t(cls) << 32 | uint64_t(t.sym) << 2 | 1, -2);
+          Lexer field = L;
+          uint64_t signature = uint64_t(cls) << 32 | uint64_t(t.sym) << 2 | 1;
+          if (lex(field).t == ':') {
+            skipType(field);
+            signature ^= fnv(L.p, field.p);
+          }
+          mixEnv(signature, -2);
         } else if (depth == 0 && t.t == T_STR && p.t == T_ID && p.sym == K_import) {
           declaration = p.p;
           bool re = pubNext;
@@ -3521,35 +3605,39 @@ struct Compiler : Gen, Namespaces {
   // ---- checks that need every class: overrides, and `self.name` against declared fields ----
   // A class as this compile defines it, else as the running program has it (a class defined at the REPL may
   // extend one from the program).
-  struct ClassView { int super = -1; std::vector<std::pair<int, int>> methods; const std::vector<std::pair<int, V>>* fields = nullptr; };
-  bool view(int sym, ClassView& v) {
-    for (auto& cd : classes)
-      if (cd.sym == sym) {
-        v = {cd.super, {}, &cd.fields};
-        for (auto& [m, f] : cd.methods) if (m != invariantSym()) v.methods.push_back({m, spans[symName(sym) + "." + symName(m)].arity});
-        return true;
-      }
-    Global* g = findGlobal(sym);
-    if (!g || !g->o || g->o->kind != K::Class) return false;
-    Class* c = (Class*)g->o;
-    v = {c->super ? (int)c->super->name : -1, {}, &c->fields};
-    for (auto& [m, f] : c->methods) if (m != invariantSym()) v.methods.push_back({m, f->arity - 1});  // a method's Fn counts self
-    return true;
-  }
+  struct ClassView { int super = -1; std::vector<std::pair<int, int>> methods; const std::vector<std::pair<int, V>>* fields = nullptr; const std::vector<Class::FieldType>* types = nullptr; };
   void diagnoseHere(const At& a, const char* fmt, const std::string& x, const std::string& y = "", const std::string& z = "", const std::string& w = "") {
     file = a.file, srcStart = a.src, lexAtEnd = false;
     diagnose(a.p, a.line, fmt, x.c_str(), y.c_str(), z.c_str(), w.c_str());
   }
   static std::string params(int n) { return std::to_string(n) + (n == 1 ? " parameter" : " parameters"); }
   void checkClasses() {
+    std::unordered_map<int, ClassView> views;
+    for (auto& cd : classes) {
+      auto [it, inserted] = views.try_emplace(cd.sym, ClassView{cd.super, {}, &cd.fields, &cd.ftypes});
+      if (inserted) for (auto& [m, f] : cd.methods) if (m != invariantSym())
+        it->second.methods.push_back({m, spans[symName(cd.sym) + "." + symName(m)].arity});
+    }
+    auto view = [&](int sym) -> const ClassView* {
+      if (auto it = views.find(sym); it != views.end()) return &it->second;
+      Global* g = findGlobal(sym);
+      if (!g || !g->o || g->o->kind != K::Class) return nullptr;
+      Class* c = (Class*)g->o;
+      auto& v = views[sym];
+      v.super = c->super ? (int)c->super->name : -1;
+      v.fields = &c->fields;
+      v.types = &c->ftypes;
+      for (auto& [m, f] : c->methods) if (m != invariantSym()) v.methods.push_back({m, f->arity - 1});
+      return &v;
+    };
     for (auto& cd : classes) {
       if (cd.super < 0 || !superAt.contains(cd.sym)) continue;
-      ClassView v;
+      const ClassView* v;
       std::unordered_set<int> seen{cd.sym};
-      for (int s = cd.super; s >= 0 && view(s, v); s = v.super) {
+      for (int s = cd.super; s >= 0 && (v = view(s)); s = v->super) {
         if (seen.insert(s).second) continue;
         diagnoseHere(superAt.at(cd.sym), "@class bad superclass '%s'", symName(cd.super));
-        cd.super = -1;
+        views.at(cd.sym).super = cd.super = -1;
         break;
       }
     }
@@ -3559,10 +3647,10 @@ struct Compiler : Gen, Namespaces {
     for (auto& cd : classes)
       for (auto& w : cd.written) {
         if (w.sym == S_init) continue;  // constructors don't override
-        ClassView v;
+        const ClassView* v;
         int owner = -1, arity = -1;
-        for (int s = cd.super; s >= 0 && owner < 0 && view(s, v); s = v.super)
-          for (auto [m, a] : v.methods) if (m == w.sym) owner = s, arity = a;
+        for (int s = cd.super; s >= 0 && owner < 0 && (v = view(s)); s = v->super)
+          for (auto [m, a] : v->methods) if (m == w.sym) owner = s, arity = a;
         std::string m = symName(w.sym), q = symName(cd.sym) + "." + m;
         if (owner < 0 && w.over) diagnoseHere(w.at, "@override '%s' is marked override, but no superclass of %s has a method '%s'", m, symName(cd.sym), m);
         if (owner < 0) continue;
@@ -3578,25 +3666,43 @@ struct Compiler : Gen, Namespaces {
           diagnoseHere(w.at, "@override '%s' must declare effects within those of %s, which it overrides (%s), not %s", m, symName(owner) + "." + m,
                    a->second.effText, b->second.eff ? b->second.effText : "none (unchecked)");
       }
+    // Parents precede children. An untyped shadowing field stops lookup in its base.
+    for (auto& p : paths) {
+      if (!p.parent) continue;
+      uint64_t parent = paths[p.parent].type;
+      if (p.field < 0) { p.type = parent; continue; }
+      uint64_t t = resolveNow(parent) & ~TY_OPT;
+      if ((t & 15) == TY_CLS) {
+        for (auto* v = view(int(t >> 8)); v; v = view(v->super)) {
+          for (auto& f : *v->types) if (f.sym == p.field) p.type = f.type;
+          if (p.type || std::any_of(v->fields->begin(), v->fields->end(), [&](auto& f) { return f.first == p.field; })) break;
+          if (v->super < 0) break;
+        }
+      } else if ((t & 15) == TY_EXT) {
+        if (auto* d = typeDesc(t); d && d->k == 's')
+          for (auto [f, type] : d->fields) if (f == p.field) p.type = type;
+      }
+    }
     // x.name where x has a declared type: a shape's fields; a class's methods, and its fields if it declares them.
     for (auto& u : typedUses) {
-      uint64_t t = resolveNow(u.type) & ~TY_OPT;
+      uint64_t type = paths[u.path].type;
+      uint64_t t = resolveNow(type) & ~TY_OPT;
       std::vector<int> names;
       std::string what;
       bool ok = false, isMethod = false;
       if ((t & 15) == TY_CLS) {
-        ClassView v;
+        const ClassView* v;
         bool closed = false;
-        for (int s = int(t >> 8); s >= 0 && view(s, v); s = v.super) {
-          for (auto& [f, d] : *v.fields) closed = true, names.push_back(f), ok |= f == u.sym;
-          for (auto& [m, a] : v.methods) names.push_back(m), isMethod |= m == u.sym;
+        for (int s = int(t >> 8); s >= 0 && (v = view(s)); s = v->super) {
+          for (auto& [f, d] : *v->fields) closed = true, names.push_back(f), ok |= f == u.sym;
+          for (auto& [m, a] : v->methods) names.push_back(m), isMethod |= m == u.sym;
         }
         ok |= isMethod || !closed;  // an open class gets fields by assignment
         what = symName(int(t >> 8));
       } else if (const TypeDesc* d = (t & 15) == TY_EXT ? typeDesc(t) : nullptr; d && d->k == 's') {
         for (auto& [f, _] : d->fields) names.push_back(f), ok |= f == u.sym;
         if (u.call) for (int m : {S_has, S_remove, S_keys, S_values, S_len}) ok |= m == u.sym;  // a map's methods
-        what = (u.type & 15) == TY_NAMED ? symName(int(u.type >> 8)) : typeText(t);
+        what = (type & 15) == TY_NAMED ? symName(int(type >> 8)) : typeText(t);
       } else continue;
       if (ok) continue;
       std::string list, near;
@@ -3610,10 +3716,10 @@ struct Compiler : Gen, Namespaces {
     }
     // Fields: in a class that declares its fields (or inherits declared ones), self.name must be one of them.
     for (auto& u : fieldUses) {
-      ClassView v;
+      const ClassView* v;
       bool closed = false, found = false;
-      for (int s = u.cls; s >= 0 && view(s, v); s = v.super)
-        for (auto& [f, d] : *v.fields) closed = true, found |= f == u.sym;
+      for (int s = u.cls; s >= 0 && (v = view(s)); s = v->super)
+        for (auto& [f, d] : *v->fields) closed = true, found |= f == u.sym;
       if (closed && !found) diagnoseHere(u.at, "@no-field %s has no field '%s' (declare it in the class: var %s)", symName(u.cls), symName(u.sym), symName(u.sym));
     }
   }
@@ -3736,10 +3842,21 @@ struct Compiler : Gen, Namespaces {
     for (auto& d : effDefs) effDefine(d.sym, symName(d.sym), d.ops);
     for (auto& [s, c] : typeDefs) global(s).type = c;  // named types: checks look them up when they run
     for (auto& [s, l] : effOps) effectOps[s] = l;
+    std::string collectionNotes;
+    if (reload) for (auto& cd : classes) {
+      auto* old = global(cd.sym).o;
+      if (!old || old->kind != K::Class) continue;
+      for (auto [field, kind] : cd.collectionInits) {
+        if (((Class*)old)->declared(field)) continue;
+        collectionNotes += "\n[fut] " + symName(cd.sym) + "." + symName(field) + " starts as " +
+                           (kind == K::List ? "[]" : "{}") + " on construction. Unset on existing instances until assigned.";
+      }
+    }
     for (auto& cd : classes) globalObj<Class>(cd.sym);  // all exist before any superclass link is made
     for (auto& cd : classes) {
       Class* c = globalObj<Class>(cd.sym);
       c->super = cd.super >= 0 ? (Class*)global(cd.super).o : nullptr;
+      c->collectionInits = cd.collectionInits;
       c->methods = cd.methods, c->fields = cd.fields, c->ftypes = cd.ftypes, c->sum = cd.sum;
       Locked g(layoutMu);
       size_t n = c->layout.size();
@@ -3755,6 +3872,7 @@ struct Compiler : Gen, Namespaces {
     out.log = patched.empty() && added.empty() && removed.empty() && reset.empty() ? "no code changes" : "";
     for (auto [label, list] : {std::pair{"patched ", &patched}, {"added ", &added}, {"removed ", &removed}, {"reset ", &reset}})
       if (!list->empty()) out.log += (out.log.empty() ? "" : "; ") + (label + *list);
+    out.log += collectionNotes;
     if (!echo) {
       replaced = std::move(installed);
       installed.clear();

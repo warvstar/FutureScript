@@ -1,0 +1,41 @@
+// The public interface of package uisurface 0.1.0 (uisurface.fut), written by `fut api`. `fut test` fails while it is out of date.
+
+pub class Surface {
+  var atlas=0
+  var buttons=[]
+  var count=0
+  var coverage
+  var device
+  var dirty=true
+  var dispose
+  var dom=false
+  var focus=""
+  var handle=0
+  var handlers={}
+  var height=0
+  var layout=0
+  var maxScroll=0
+  var pipeline
+  var quads
+  var revision
+  var rules
+  var scale=0
+  var scroll=0
+  var usedBytes=0
+  var views={}
+  var wheel=0
+  var width=0
+  fn activate(id)
+  fn advance()
+  fn click(x,y)
+  fn close()
+  // Append ordered panel and glyph quads to the caller's WebGPU frame.
+  fn draw(gpu,frame)
+  fn init(title,rules,fonts,dismiss,shortcut)
+  fn inspectTarget()
+  fn releaseGpu()
+  fn scrollBy(delta)
+  // Rebuild a view only when its model or logical viewport changes.
+  fn update(w,h,revision,view)
+  fn viewport(id)
+}

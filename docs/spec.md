@@ -7,6 +7,8 @@ fut f.fut                      run: top level, then main() if defined
 fut test f.fut                 test blocks + contract property tests + .api check. exit 0 pass, 1 fail/pending, 2 compile error
   --json                       one JSON object per line: each test, each compile error, then a summary
   --filter text  --changed     only tests named text / only tests whose inputs changed since the last run
+fut check f.fut                native: check the entry and its imports without running top-level code
+fut refs f.fut C.field [--writes]  native: resolved field uses and possible same-name dynamic uses
 fut map f.fut [--pub] [pkg]    where everything is: packages, files, declarations, line ranges
   --json                       one declaration per line, with a hash of its text
 fut explain [code]             an error code's rule and fix (no code: all codes)
@@ -97,6 +99,7 @@ expect f() == 0                    // closures copy locals; share via list/map o
 class Shape { fn init(n) { self.n = n } fn area() { return 0 } }   // undeclared fields: made by assignment
 class Sq : Shape {
   var n
+  var samples: list<num> = []       // fresh per instance, before init; {} creates a fresh map
   var side: num = 1                // any declared field closes the class: declare all, inherited too
   fn init(s) { super.init("sq") self.side = s }
   override fn area() { return self.side * self.side }  // override required iff replacing

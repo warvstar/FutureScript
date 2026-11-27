@@ -431,6 +431,28 @@ var spare = 1
         {"range": range_for(scoped, line, "total"), "kind": 3} for line in (0, 4, 6)
     ]
 
+    model = folder / "model.fut"
+    nested = """class Pointer { var hover }
+class Other { var hover }
+class Base { var pointer: Pointer }
+class Game : Base {}
+fn use(g: Game, o: Other, unknown) {
+  var p = g.pointer
+  p.hover = g.pointer.hover
+  o.hover = 1
+  p = unknown
+  p.hover = 2
+}
+"""
+    client.open(model.as_uri(), nested)
+    assert client.diagnostics(model.as_uri(), 1) == []
+    field = loc(model, nested, 0, "hover")
+    assert request("definition", model, nested, 6, "hover", "g.pointer.") == field
+    assert request("definition", model, nested, 6, "hover") == field
+    edits = request("rename", model, nested, 0, "hover", newName="hovered")["changes"][model.as_uri()]
+    assert edits == [{"range": range_for(nested, line, "hover", after), "newText": "hovered"}
+                     for line, after in [(0, ""), (6, ""), (6, "g.pointer.")]], edits
+
 
 def view_navigation(client, folder):
     client.ask("initialize")

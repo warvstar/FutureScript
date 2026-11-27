@@ -19,3 +19,20 @@ test "top-level DOM code is a runtime error with code [host]" {
   expect r.out == "1 B\n"
   expect r.err.has("dom.query() is JavaScript (std/ui's dom.js), which only the wasm build loads") && r.err.has(" [host]\n")
 }
+
+view SurfaceCard(model) {
+  column .sheet {
+    text "Count {model.count}"
+    if model.count>0 { button id: "add" "Add" on click { model.count+=1 } }
+  }
+}
+
+test "a native view snapshot resolves template slots and keeps its handlers in Fut" {
+  var model={count:1}
+  var card=fn() { return SurfaceCard(model) }
+  var first=ui.snapshot(card)
+  expect first.tree.kids[0].kids[0]=="Count 1" && first.tree.kids[1].props.id=="add"
+  expect !json(first.tree).has("onclick")
+  first.handlers.add.onclick(nil)
+  expect ui.snapshot(card).tree.kids[0].kids[0]=="Count 2"
+}

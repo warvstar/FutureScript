@@ -179,6 +179,7 @@ struct Class : Obj {
   std::vector<std::pair<int, Fn*>> methods;  // few per class, and looked up only on inline-cache misses
   Layout layout;                              // field syms; the index is the slot, shared by all instances
   std::vector<std::pair<int, V>> fields;      // fields declared in the class body (`var hp = 10`) and their defaults
+  std::vector<std::pair<int, K>> collectionInits;  // fresh empty lists and maps, installed before init
   struct FieldType { int sym; uint64_t type; int site; };
   std::vector<FieldType> ftypes;              // declared fields with a type (`var hp: num = 10`): checked on every store
   uint8_t sum = 0;  // 1: an enum (`enum Shape { ... }`), 2: one of its variants (Shape.Circle): closed, compared by value

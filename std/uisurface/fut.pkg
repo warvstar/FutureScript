@@ -1,0 +1,6 @@
+name uisurface
+version 0.1.0
+c platform ../../build/libfutsurface.dylib
+js platform ./surface.js main
+c paint ../../build/libfutsurface.dylib
+js dialog ./surface.js main

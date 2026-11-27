@@ -1,5 +1,5 @@
 // Driver: run a file, hot-patch it on save (-w), dump its machine code (--asm), or start a REPL.
-#include "fut.h"
+#include "compile.h"
 #include "fmt.h"
 #include <poll.h>
 #include <pthread.h>
@@ -571,9 +571,60 @@ static void onCrash() {
   for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) sigaction(sig, &sa, nullptr);
 }
 
+// Both commands analyze the entry and its imports without executing the program.
+static int inspectCommand(int argc, char** argv, bool refs) {
+  bool writes = false;
+  std::vector<std::string> args;
+  for (int i = 2; i < argc; i++) {
+    if (refs && std::string_view(argv[i]) == "--writes") writes = true;
+    else if (argv[i][0] != '-') args.emplace_back(argv[i]);
+    else return fprintf(stderr, "unknown option: %s\n", argv[i]), 2;
+  }
+  if (args.size() != (refs ? 2u : 1u))
+    return fputs(refs ? "usage: fut refs file.fut Class.field [--writes]\n" : "usage: fut check file.fut\n", stderr), 2;
+  rtInit();
+  CompileCheck::Buffers buffers;
+  CompileCheck check{buffers};
+  check.referenceQuery = refs;
+  auto diagnostics = compileDiagnostics(args[0], check);
+  for (const auto& d : diagnostics)
+    fprintf(stderr, "%s:%d:%d: error: %s [%s]\n", d.file.c_str(), d.line, d.column, d.message.c_str(), d.code.c_str());
+  if (!diagnostics.empty()) return 1;
+  if (!refs) return 0;
+  const auto& index = check.symbols;
+  const auto& query = args[1];
+  int target = -1;
+  for (size_t i = 0; i < index.declarations.size(); i++) {
+    const auto& d = index.declarations[i];
+    std::string qualified = d.container + "." + d.name;
+    if (d.kind != "field" || (qualified != query && !qualified.ends_with("." + query))) continue;
+    if (query.find('.') == std::string::npos) break;
+    if (target >= 0) return fprintf(stderr, "ambiguous field: %s (include the module name)\n", query.c_str()), 2;
+    target = int(i);
+  }
+  if (target < 0) return fprintf(stderr, "unknown field: %s\n", query.c_str()), 2;
+  std::map<CompileSymbols::Site, std::string> results;
+  for (auto& u : index.unresolved)
+    if (u.name == index.declarations[target].name && (!writes || u.role == CompileSymbols::Write))
+      results[u.site] = u.role == CompileSymbols::Write ? "possible write" : "possible read";
+  for (auto& u : index.occurrences)
+    if (u.declaration == target && (!writes || u.role == CompileSymbols::Write))
+      results[u.site] = u.role == CompileSymbols::Decl ? "declaration" : u.role == CompileSymbols::Write ? "write" : "read";
+
+  for (auto& [site, role] : results) {
+    const auto& lines = index.lineStarts[site.file];
+    auto next = std::upper_bound(lines.begin(), lines.end(), size_t(site.offset));
+    printf("%s:%td:%zu: %s %s\n", index.files[site.file].c_str(), next - lines.begin(), site.offset - next[-1] + 1,
+           role.c_str(), query.c_str());
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
   onCrash();
   findStd();
+  if (argc > 1 && (std::string_view(argv[1]) == "check" || std::string_view(argv[1]) == "refs"))
+    return inspectCommand(argc, argv, std::string_view(argv[1]) == "refs");
   if (argc > 1 && std::string(argv[1]) == "explain") return explain(argc > 2 ? argv[2] : nullptr);  // an error code's rule and fix
   if (argc > 1 && std::string(argv[1]) == "worker") return workerCommand(argc, argv);
   if (argc > 1 && std::string(argv[1]) == "init") return initCommand(argc, argv);
@@ -587,7 +638,7 @@ int main(int argc, char** argv) {
   bool record = false;
   const char* usage = "usage: fut [-w | -v | --asm | --isolates n | --seed n | --threads n | --record log | --replay log] [file.fut]   (no file: REPL)\n"
                       "       fut test [--changed] [--json] [--filter text] [--timeout s] [--jobs n] [--isolates n] [--seed n] file.fut...\n"
-                      "       fut init [dir]   (a new package)\n       fut api [--check] file.fut\n       fut map [--pub] [--json] file.fut [package | file]\n       fut explain [code]\n"
+                      "       fut check file.fut\n       fut refs file.fut Class.field [--writes]\n       fut init [dir]   (a new package)\n       fut api [--check] file.fut\n       fut map [--pub] [--json] file.fut [package | file]\n       fut explain [code]\n"
                       "       fut fmt [--check] [--stdin] [file.fut | dir ...]\n"
                       "       fut lsp   (language server over stdio)\n       fut worker build ...   (Cloudflare Workers: node web/worker.mjs)\n";
   if (argc > 1 && std::string_view(argv[1]) == "fmt") return fmtCommand(argc - 2, argv + 2);

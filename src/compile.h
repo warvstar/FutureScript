@@ -28,6 +28,9 @@ struct CompileSymbols {
   std::vector<std::string> files;
   std::vector<Declaration> declarations;
   std::vector<Occurrence> occurrences;
+  std::vector<std::vector<size_t>> lineStarts;  // byte positions in the analyzed snapshot, for CLI references
+  struct UnresolvedMember { Site site; std::string name; Role role; };
+  std::vector<UnresolvedMember> unresolved;
   std::vector<std::pair<Site, Site>> collisions;  // overlapping declarations; a repeated site marks a name implicit in the source
 };
 struct CompileCheck {
@@ -37,6 +40,7 @@ struct CompileCheck {
   std::string (*normalize)(const std::string&) = canonicalPath;
   std::vector<Import> imports;  // filled even if the compile fails
   CompileSymbols symbols;
+  bool referenceQuery = false;
 };
 // Requires rtInit(). Checks source and tests without loading externs, writing traces or installing code.
 std::vector<CompileDiagnostic> compileDiagnostics(const std::string& path, CompileCheck& check);
@@ -200,7 +204,7 @@ inline int opOf(int t) { return BIN[t].second; }
 
 // ---------------- compiler state ----------------
 enum { LV_NONE = -1, LV_VAL, LV_LOCAL, LV_GLOBAL, LV_FIELD, LV_INDEX, LV_CAP, LV_SHARED, LV_BAD };  // LV_SHARED: a shared var (a: its cell)
-struct LV { int k = LV_VAL, a = 0, b = 0; bool ro = false, num = false, own = false; };  // own: self.name  // a not-yet-loaded place, so `x = ...` can store
+struct LV { int k = LV_VAL, a = 0, b = 0; bool ro = false, num = false, own = false; int path = 0; };  // own: self.name  // a not-yet-loaded place, so `x = ...` can store
 constexpr LV NUM{LV_VAL, 0, 0, false, true};  // a value known to be a number
 struct Jumps {  // a few forward branches to patch to one place (no heap allocation)
   int v[12], n = 0;
@@ -214,7 +218,7 @@ constexpr int HOT = 1000;  // calls before a function is compiled again (tier 2)
 struct TryAt { int r = 0, pc = 0, done = 0; };  // a try being compiled: its record's first slot, branches to patch
 struct Fun {  // per-function emission state
   Code k;
-  struct Local { int sym, home; bool num = false; uint64_t ty = 0; int site = -1, symbol = -1; };  // home: frame slot (>= 0) or arm64 register; symbol: editor declaration
+  struct Local { int sym, home; bool num = false; uint64_t ty = 0; int site = -1, symbol = -1, path = 0; };  // home: frame slot (>= 0) or arm64 register; symbol: editor declaration
   std::vector<Local> locals;                          // num: always holds a number (a range loop variable)
   std::vector<std::pair<int, LV>> caps;     // lambda captures: (sym, where it lives in the parent)
   Fun* parent = nullptr;

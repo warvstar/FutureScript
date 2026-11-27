@@ -20,7 +20,7 @@ const ErrCode codes[] = {
     {"unknown-effect", "An effect name or a handled operation isn't one.", "Use io, clock, random, yield, a declared effect, or one of its operations."},
     {"misplaced", "A construct is used where it isn't allowed (self outside a method, break outside a loop, a nested named fn, ...).", "Move it where the message says it belongs."},
     {"duplicate", "A name is declared twice in one scope.", "Rename or remove one of them."},
-    {"class", "A class declaration breaks a rule (its superclass, field defaults, init).", "Follow the message: field defaults are literals; set other values in init."},
+    {"class", "A class declaration breaks a rule (its superclass, field defaults, init).", "Follow the message: use scalar literals, [] or {} for fields; set other values in init."},
     {"override", "A method replaces an inherited one without override, or override replaces nothing, or changes its parameters, types or effects.", "Write override exactly when replacing, and keep the replaced method's signature."},
     {"import", "An import can't be resolved, crosses a package boundary, or forms a cycle.", "Import files by path inside a package and packages by name (with a dep line in fut.pkg)."},
     {"manifest", "A fut.pkg line is malformed.", "Fix the line: name, version, root, dep, js, wasm or c."},

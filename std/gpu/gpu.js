@@ -305,7 +305,11 @@ export async function fg_render(g, shader, vs, fs, attrs, topology) {
   const c = ctx(g), s = c ? get(g, shader, SHADER) : null;
   if (!s) return 0;
   const depth = (topology & 8) != 0;  // 8: test and write the depth buffer (nearer fragments win)
-  topology &= ~8;
+  const blend = topology & 16 ? {
+    color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha" },
+    alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha" },
+  } : undefined;
+  topology &= ~24;
   if (!(topology >= 0 && topology <= 4)) return fail("fg_render: topology is 0 triangle-list, 1 point-list, 2 line-list, 3 triangle-strip, 4 line-strip"), 0;
   const va = [];
   let stride = 0;
@@ -316,7 +320,7 @@ export async function fg_render(g, shader, vs, fs, attrs, topology) {
   const d = {
     layout: "auto",
     vertex: { module: s.p, entryPoint: vs || undefined, buffers: va.length ? [{ arrayStride: stride, stepMode: "vertex", attributes: va }] : [] },
-    fragment: { module: s.p, entryPoint: fs || undefined, targets: [{ format: c.format }] },
+    fragment: { module: s.p, entryPoint: fs || undefined, targets: [{ format: c.format, blend }] },
     primitive: { topology: TOPOLOGIES[topology] },
     depthStencil: { format: "depth24plus", depthWriteEnabled: depth, depthCompare: depth ? "less" : "always" },
   };

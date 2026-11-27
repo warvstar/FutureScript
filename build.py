@@ -135,7 +135,7 @@ def test(exe, only=()):
                if not (exe.suffix != ".wasm" and t.name in WASM_SPECS) and not (exe.suffix == ".wasm" and t.name in NATIVE_SPECS)]
             + [("examples/" + t.name, lambda t=t: spec(t, "examples")) for t in sorted((ROOT / "examples").glob("*.fut"))
                if 'test "' in t.read_text() and not (exe.suffix == ".wasm" and t.name in NATIVE_SPECS)]  # examples with test blocks
-            + [(n, lambda n=n, f=f: check(n, f)) for n, f in RUNNER_TESTS if exe.suffix != ".wasm" or f != runner_lsp]
+            + [(n, lambda n=n, f=f: check(n, f)) for n, f in RUNNER_TESTS if exe.suffix != ".wasm" or f not in (runner_lsp, runner_refs)]
             + (isolateJobs(exe, 4) if exe == OUT else []))  # the plain native build: wasm runs one isolate (docs/isolates.md,
     # phase 5), and the sanitizer builds are slow enough that more load makes timed tests (expect grows) flaky
     jobs = [job for name, job in jobs if not only or any(w in name for w in only)]
@@ -266,6 +266,14 @@ def hot_result_type(exe):
     return ok, f"stdout: {out!r}\n  stderr: {err!r}"
 
 
+def hot_collection_notice(exe):
+    initial = "class State { var ready = false }\nvar existing = State()\nfn main() { while !existing.ready { sleep(0.01) } }\n"
+    updated = initial.replace("var ready", "var items = [] var ready") + (
+        "fn reload() { print(existing.items, State().items) existing.ready = true }\n")
+    out, err = live(exe, {"state.fut": initial}, [("state.fut", updated)])
+    return (out.strip() == "nil []" and "State.items starts as [] on construction" in err), f"stdout: {out!r}\nstderr: {err!r}"
+
+
 def hot_var_type(exe):
     """A top-level var's type is checked at stores from the REPL too; changing it recompiles the functions that store."""
     prog = ("var level{sig}\nfn set(v) {{ level = v }}\n"
@@ -354,7 +362,8 @@ def hot_enum(exe):
     return ok, f"stdout: {out!r}\n  stderr: {err!r}"
 
 
-HOT_TESTS = [("an enum's new variant and an exhaustive match", hot_enum),
+HOT_TESTS = [("new collection fields on existing instances", hot_collection_notice),
+             ("an enum's new variant and an exhaustive match", hot_enum),
              ("methods, errors, main restart", hot_methods_and_main),
              ("packages: per-package recompiles, JS modules", hot_packages),
              ("a changed effect declaration takes effect", hot_effects),
@@ -443,7 +452,13 @@ def runner_text(exe):
     p = run(str(d / "s.fut"))
     ok = ok and p.returncode == 1 and p.stdout.startswith(
         "ok      t\npending Box.open() (s.fut:2): Box.open() is not implemented yet\npending triple() (s.fut:8): triple() is not implemented yet\n")
-    return ok, f"pending run: {a.stdout!r}\n  passing run: {b.stdout!r}\n  filtered: {c.stdout!r}\n  compile error: {e.stdout!r}\n  specs: {p.stdout!r}"
+    # A feature and its tests can have the same filename.
+    (d / "tests").mkdir(exist_ok=True)
+    (d / "tests" / "s.fut").write_text('test "nested" { expect false }\n')
+    (d / "s.fut").write_text('import "./tests/s.fut" as specs\n')
+    nested = run(str(d / "s.fut"))
+    ok = ok and nested.returncode == 1 and "(tests/s.fut:1)\n  tests/s.fut:1: expect false" in nested.stdout
+    return ok, f"pending run: {a.stdout!r}\n  passing run: {b.stdout!r}\n  filtered: {c.stdout!r}\n  compile error: {e.stdout!r}\n  specs: {p.stdout!r}\n  nested: {nested.stdout!r}"
 
 
 def runner_api(exe):
@@ -1025,6 +1040,27 @@ def runner_fmt(exe):
     return True, ""
 
 
+def runner_refs(exe):
+    with tempfile.TemporaryDirectory() as d:
+        src = Path(d) / "refs.fut"
+        src.write_text('class Game { var pointer: Pointer }\nclass Pointer { var hover }\n'
+                       'class Other { var hover }\nfn use(g: Game, o: Other, dynamic) {\n'
+                       '  var p = g.pointer\n  p.hover = g.pointer.hover\n  o.hover = 1\n  dynamic.hover = 2\n}\n'
+                       'throw "top level ran"\n')
+        def run(*args):
+            return subprocess.run([str(exe), *args], text=True, capture_output=True)
+        check = run("check", src)
+        writes = run("refs", src, "Pointer.hover", "--writes")
+        missing = run("refs", src, "Game.missing")
+        src.write_text(src.read_text().replace("g.pointer.hover", "g.pointer.hovre"))
+        bad = run("check", src)
+        ok = (check.returncode == 0 and not check.stdout and not check.stderr and writes.returncode == 0
+              and writes.stdout.splitlines() == [f"{src.resolve()}:6:5: write Pointer.hover",
+                                                  f"{src.resolve()}:8:11: possible write Pointer.hover"]
+              and missing.returncode == 2 and bad.returncode == 1 and "[no-field]" in bad.stderr)
+        return ok, f"{check!r}\n{writes!r}\n{missing!r}\n{bad!r}"
+
+
 def runner_lsp(exe):
     r = subprocess.run([sys.executable, str(ROOT / "tests" / "lsp_test.py"), str(exe)],
                        capture_output=True, text=True, timeout=60)
@@ -1038,6 +1074,7 @@ RUNNER_TESTS = [("std/math: within 1 ulp of libm, exact cases exact", runner_fma
                 ("fut test: parallel processes, native fallback, timeouts", runner_parallel),
                 ("packages: names, interfaces, boundaries, versions", runner_packages),
                 ("fut map: packages, files, declarations", runner_map),
+                ("fut refs and check: field writes without execution", runner_refs),
                 ("fut lsp: diagnostics, navigation, rename and editor features over stdio", runner_lsp),
                 ("foreign modules: js, wasm, c", runner_modules),
                 ("fut test: tests first, filter, compile error, todo()", runner_text),
@@ -1211,6 +1248,8 @@ if __name__ == "__main__":
         install(sys.argv[2] if len(sys.argv) > 2 else None)
     elif cmd == "wasm":
         build(wasm=True, threads="--threads" in sys.argv)
+    elif cmd == "ui":
+        subprocess.run([sys.executable, ROOT / "std/uisurface/build.py"], check=True)
     elif cmd == "gpu":
         sys.exit(gpu("--check" in sys.argv))
     elif cmd == "tsan":

@@ -216,9 +216,10 @@ std::vector<Decl> declsOf(const std::string& text) {
           Tok f = S.next();
           if (f.t != T_ID) continue;
           S.typed(f.p);
-          if (Lexer s = L; s.next().t == '=') {  // its default, a constant: one token, maybe negated
+          if (Lexer s = L; s.next().t == '=') {  // a scalar literal, [], or {}
             L = s;
-            if (S.next().t == '-') S.next();
+            int t = S.next().t;
+            if (t == '-' || t == '[' || t == '{') S.next();
           }
           add({"field", symName(f.sym), squash(m.p, L.p), owner, "", pub, m.line, m.line, md, {}}, m.p, f.p);
           continue;

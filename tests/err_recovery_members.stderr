@@ -1,7 +1,7 @@
 err_recovery_members.fut:2:4: error: 'f' is already defined [duplicate]
   fn f() { return 1 }
      ^
-err_recovery_members.fut:4:17: error: a field's default must be a number, string, true, false or nil (set other values in init) [class]
+err_recovery_members.fut:4:17: error: a field's default must be a number, string, true, false, nil, [] or {} (set other values in init) [class]
     var damaged = ]
                   ^
 err_recovery_members.fut:5:20: error: field 'typed' is str, but its default is not [type]

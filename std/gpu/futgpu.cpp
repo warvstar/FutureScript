@@ -548,7 +548,8 @@ API int64_t fg_render(int64_t g, int64_t shader, const char* vs, const char* fs,
                                                      WGPUPrimitiveTopology_LineList, WGPUPrimitiveTopology_TriangleStrip,
                                                      WGPUPrimitiveTopology_LineStrip};
   bool depth = topology & 8;  // 8: test and write the depth buffer (nearer fragments win)
-  topology &= ~8;
+  bool blend = topology & 16;
+  topology &= ~24;
   if (topology < 0 || topology > 4) return fail("fg_render: topology is 0 triangle-list, 1 point-list, 2 line-list, 3 triangle-strip, 4 line-strip"), 0;
   std::vector<WGPUVertexAttribute> va;
   uint64_t stride = 0;
@@ -567,6 +568,10 @@ API int64_t fg_render(int64_t g, int64_t shader, const char* vs, const char* fs,
   vb.stepMode = WGPUVertexStepMode_Vertex, vb.arrayStride = stride, vb.attributeCount = va.size(), vb.attributes = va.data();
   WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
   target.format = c->format;
+  WGPUBlendState sourceOver = WGPU_BLEND_STATE_INIT;
+  sourceOver.color = {WGPUBlendOperation_Add, WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_OneMinusSrcAlpha};
+  sourceOver.alpha = {WGPUBlendOperation_Add, WGPUBlendFactor_One, WGPUBlendFactor_OneMinusSrcAlpha};
+  if (blend) target.blend = &sourceOver;
   WGPUFragmentState frag = WGPU_FRAGMENT_STATE_INIT;
   frag.module = (WGPUShaderModule)s->p, frag.entryPoint = sv(fs), frag.targetCount = 1, frag.targets = &target;
   WGPURenderPipelineDescriptor d = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
