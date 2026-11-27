@@ -1046,10 +1046,10 @@ static V n_time() {  // seconds since 1970
   clock_gettime(CLOCK_REALTIME, &t);
   return box(t.tv_sec + t.tv_nsec / 1e9);
 }
-static V n_json(V v) { return box(newStr(toJs(v))); }  // JSON text, as for JavaScript
+static V n_json(V v) { return box(newStr(toJs(v, false))); }
 static V n_parseJson(V s) {
   if (!is(s, K::Str)) ERR("@argument parseJson() expects a string, got %s", typeName(s));
-  return fromJs(std::string(as<Str>(s)->sv()));
+  return fromJs(std::string(as<Str>(s)->sv()), false);
 }
 static V n_sleep(V v) { return sleepFor(NUMARG(v, "sleep")), NIL; }
 static V n_floor(V v) { return box(std::floor(NUMARG(v, "floor"))); }

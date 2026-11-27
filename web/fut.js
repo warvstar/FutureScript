@@ -70,6 +70,9 @@ export function jsonCodec(fnOf, refOf, refGet) {
     return v[MARK] == "fn" ? fnOf(v.id) : v[MARK] == "js" ? refGet(v.id) : Number(v.v);
   });
   const toFut = (v) => JSON.stringify(v, (k, x) => {
+    // The FFI reserves NUL as its reference tag. External data cannot supply a pre-encoded host handle.
+    if (x && typeof x === "object" && Object.hasOwn(x, MARK))
+      throw new TypeError("a JavaScript value passed to Fut contains the reserved NUL key");
     if (typeof x == "number") return Number.isFinite(x) ? x : { [MARK]: "num", v: String(x) };
     if (typeof x == "bigint") return Number(x);
     if (x === undefined) return null;
@@ -791,6 +794,16 @@ export async function createFut(opts) {
 
   const pinned = new Map();  // name -> id, for apply()
   let applying = Promise.resolve();  // one apply at a time: they share the main shadow stack
+  let asyncCalls = 0;
+  function namedFunction(name) {
+    let id = pinned.get(name);
+    if (id == null) {
+      id = withStr(name, p => ex.fut_pin_fn(p));
+      if (id < 0) throw new Error(`the program has no function ${name}()`);
+      pinned.set(name, id);
+    }
+    return id;
+  }
 
   return {
     exports: ex,
@@ -816,16 +829,25 @@ export async function createFut(opts) {
     // may wait on fetch() meanwhile). A fut error rejects with a FutError (its text: the message and trace).
     apply(name, args) {
       const go = async () => {
-        let id = pinned.get(name);
-        if (id == null) {
-          if ((id = withStr(name, (p) => ex.fut_pin_fn(p))) < 0) throw new Error(`the program has no function ${name}()`);
-          pinned.set(name, id);
-        }
-        try { return await applyFn(id, () => toFut(args)); }
+        try { return await applyFn(namedFunction(name), () => toFut(args)); }
         catch (e) { throw e instanceof Restart || e instanceof Exit ? e : new FutError(errorText(e)); }
+        finally { asyncCalls--; }
       };
+      asyncCalls++;
       const r = applying.then(go, go);
       return (applying = r.catch(() => {})), r;
+    },
+    // A library started with start() can participate in a synchronous host transaction. Its callback
+    // cannot suspend or overlap an async apply(). Unwind the shadow stack if the callback throws.
+    applySync(name, args) {
+      if (asyncCalls) throw new Error("a Fut call is already queued or suspended");
+      const id = namedFunction(name), sp = spG.value, txn = ex.fut_txn_depth(), eff = ex.fut_eff_enter();
+      ex.fut_sync(1);
+      try { return fromFut(cstr(withStr(toFut(args), p => ex.fut_apply(id, p)))); }
+      catch (e) {
+        spG.value = sp, ex.fut_txn_unwind(txn), opts.interp && ex.fut_interp_reset();
+        throw e instanceof Restart || e instanceof Exit ? e : new FutError(errorText(e));
+      } finally { ex.fut_sync(-1); ex.fut_eff_leave(eff); }
     },
     changed() { (fileChanged = true), poke(); },   // a watched file changed
     type(line) { inbox.push(line), poke(); },      // a line typed into the running program

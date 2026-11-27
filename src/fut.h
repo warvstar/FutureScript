@@ -766,8 +766,8 @@ std::vector<Decl> declsOf(const std::string& text);
 // ---- values crossing into JavaScript (jsval.cpp): JSON text, lists and maps copied; a function fut code passes
 // is pinned (an id JavaScript calls it by); a JavaScript value that is not data comes back as a Ref (by its id) ----
 std::string quoteJson(std::string_view s, bool shortTab = false);
-std::string toJs(V v);                // raises for what can't cross (an instance, a map with non-string keys, ...)
-V fromJs(const std::string& json);
+std::string toJs(V v, bool references = true);                // raises for what can't cross (an instance, a map with non-string keys, ...)
+V fromJs(const std::string& json, bool references = true);
 V jsRef(u32 id);                      // JavaScript value id's Ref: what an extern's any argument or result crosses as, unencoded
 V jsPinned(int id);                   // the function pinned as id (nil if none)
 int jsPin(V f);                       // pin f for JavaScript: its id

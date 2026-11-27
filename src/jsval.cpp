@@ -1,6 +1,6 @@
 // Values crossing between fut and JavaScript (extern fns of js modules, `any` and `fn` types). Both sides speak
 // JSON text: numbers, strings, bools, nil (null), lists (arrays) and maps with string keys (objects) are copied.
-// What is not data crosses by reference, as an object with the key "\u0000" (no JSON data has it):
+// What is not data crosses by reference, as an object with the key "\u0000":
 //   {"\u0000":"fn","id":N}  a fut function JavaScript may call: pinned here (a GC root) until JavaScript drops it
 //   {"\u0000":"js","id":N}  a JavaScript value (an object with methods, a DOM node, a JS function): a Ref here,
 //                           the same Ref for the same value, released to JavaScript when the GC finds it dead
@@ -69,11 +69,12 @@ std::string quoteJson(std::string_view s, bool shortTab) {
   quote(s, o, shortTab ? JsonShortEscapes::NewlineAndTab : JsonShortEscapes::Newline);
   return o;
 }
-static void enc(V v, std::string& o, int depth) {
+static void enc(V v, std::string& o, int depth, bool references) {
   if (depth > 256) ERR("@js a value nested too deeply (or containing itself) to pass to JavaScript");
   if (isNum(v)) {
     double d = num(v);
-    if (std::isnan(d)) o += "{\"\\u0000\":\"num\",\"v\":\"NaN\"}";
+    if (!references && !std::isfinite(d)) o += "null";
+    else if (std::isnan(d)) o += "{\"\\u0000\":\"num\",\"v\":\"NaN\"}";
     else if (std::isinf(d)) o += d > 0 ? "{\"\\u0000\":\"num\",\"v\":\"Infinity\"}" : "{\"\\u0000\":\"num\",\"v\":\"-Infinity\"}";
     else {
       char b[32];
@@ -84,18 +85,19 @@ static void enc(V v, std::string& o, int depth) {
   }
   if (!isObj(v)) { o += v == NIL ? "null" : v == TRUE_ ? "true" : "false"; return; }
   Obj* x = obj(v);
+  if (!references && (x->kind == K::Fn || x->kind == K::Clo || x->kind == K::Ref)) ERR("@argument json() expects data");
   switch (x->kind) {
     case K::Str: return quote(((Str*)x)->sv(), o);
     case K::List: {
       o += '[';
       bool first = true;
-      for (V e : ((List*)x)->v) o += first ? "" : ",", first = false, enc(e, o, depth + 1);
+      for (V e : ((List*)x)->v) o += first ? "" : ",", first = false, enc(e, o, depth + 1, references);
       o += ']';
       return;
     }
     case K::Buf: {
       o += '[';
-      for (size_t i = 0; i < ((Buf*)x)->n; i++) o += i ? "," : "", enc(bufGet((Buf*)x, i), o, depth + 1);
+      for (size_t i = 0; i < ((Buf*)x)->n; i++) o += i ? "," : "", enc(bufGet((Buf*)x, i), o, depth + 1, references);
       o += ']';
       return;
     }
@@ -104,7 +106,9 @@ static void enc(V v, std::string& o, int depth) {
       bool first = true;
       for (auto& [k, e] : ((Map*)x)->e) {
         if (!is(k, K::Str)) ERR("@js a map passed to JavaScript must have string keys (this one has a %s key)", typeName(k));
-        o += first ? "" : ",", first = false, quote(as<Str>(k)->sv(), o), o += ':', enc(e, o, depth + 1);
+        auto key = as<Str>(k)->sv();
+        if (references && key.size() == 1 && key.front() == '\0') ERR("@js a map passed to JavaScript contains the reserved NUL key");
+        o += first ? "" : ",", first = false, quote(key, o), o += ':', enc(e, o, depth + 1, references);
       }
       o += '}';
       return;
@@ -115,15 +119,16 @@ static void enc(V v, std::string& o, int depth) {
     default: ERR("@js a %s can't pass to JavaScript", typeName(v));
   }
 }
-std::string toJs(V v) {
+std::string toJs(V v, bool references) {
   std::string o;
-  enc(v, o, 0);
+  enc(v, o, 0, references);
   return o;
 }
 
 namespace {
 struct Parser {
   const char *p, *e;
+  bool references;
   void ws() { while (p < e && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) p++; }
   [[noreturn]] void bad() { building.clear(), ERR("@js JavaScript gave fut a value it can't read"); }
   bool lit(const char* w) {
@@ -173,7 +178,8 @@ struct Parser {
     return o;
   }
   V keep(V v) { return building.push_back(v), v; }
-  V value() {
+  V value(unsigned depth = 0) {
+    if (depth > 256) bad();
     ws();
     if (p >= e) bad();
     if (lit("null")) return NIL;
@@ -187,7 +193,7 @@ struct Parser {
       ws();
       if (p < e && *p == ']') return p++, box(l);
       for (;;) {
-        l->v.push_back(value());
+        l->v.push_back(value(depth + 1));
         ws();
         if (p < e && *p == ',') { p++; continue; }
         if (p < e && *p == ']') return p++, box(l);
@@ -196,7 +202,7 @@ struct Parser {
     }
     if (*p == '{') {
       p++, ws();
-      if (e - p > 8 && !memcmp(p, "\"\\u0000\"", 8)) return marker();
+      if (references && e - p > 8 && !memcmp(p, "\"\\u0000\"", 8)) return marker();
       Map* m = make<Map>();
       keep(box(m));
       if (p < e && *p == '}') return p++, box(m);
@@ -207,7 +213,7 @@ struct Parser {
         std::string k = str();
         ws();
         if (p >= e || *p++ != ':') bad();
-        mapPut(m, k, value());
+        mapPut(m, k, value(depth + 1));
         ws();
         if (p < e && *p == ',') { p++; continue; }
         if (p < e && *p == '}') return p++, box(m);
@@ -253,9 +259,11 @@ struct Parser {
   }
 };
 }  // namespace
-V fromJs(const std::string& json) {
-  Parser ps{json.data(), json.data() + json.size()};
+V fromJs(const std::string& json, bool references) {
+  Parser ps{json.data(), json.data() + json.size(), references};
   V v = ps.value();
+  ps.ws();
+  if (ps.p != ps.e) ps.bad();
   building.clear();
   return v;
 }
