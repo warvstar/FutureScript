@@ -1,0 +1,62 @@
+name: Web benchmark
+
+on:
+  pull_request:
+    paths: &benchmark_paths
+      - '.github/workflows/web-benchmark.yml'
+      - 'bench/web/**'
+      - 'build.py'
+      - 'src/**'
+      - 'std/**'
+      - 'web/**'
+  push:
+    branches: [main]
+    paths: *benchmark_paths
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Install benchmark tools
+        run: |
+          brew install llvm lld wasi-libc wasi-runtimes
+          python3 -m venv "$RUNNER_TEMP/bench-python"
+          "$RUNNER_TEMP/bench-python/bin/python" -m pip install playwright==1.65.2
+
+      - name: Build and measure
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          build_bench() (
+            cd "$1"
+            npm ci --prefix bench/web
+            python3 build.py wasm
+            python3 build.py wasm --threads
+          )
+
+          args=(--rounds 7 --threads --memory --output build/web-benchmark.md)
+          if [[ -n "$BASE_SHA" ]]; then
+            baseline="$RUNNER_TEMP/fut-benchmark-base"
+            git worktree add --detach "$baseline" "$BASE_SHA"
+            build_bench "$baseline"
+            args+=(--baseline "$baseline")
+          fi
+          build_bench "$GITHUB_WORKSPACE"
+          "$RUNNER_TEMP/bench-python/bin/python" bench/web/run.py "${args[@]}" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: web-benchmark
+          path: build/web-benchmark.md
+          if-no-files-found: error

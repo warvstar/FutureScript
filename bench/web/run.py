@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """fut's std/ui beside React, Solid and plain DOM in Chrome: js-framework-benchmark's keyed table operations.
 
-  cd bench/web && npm install && python3 run.py [--rounds 10] [--apps fut,react,solid,vanilla] [--threads]
+  cd bench/web && npm ci && python3 run.py [--rounds 10] [--apps fut,react,solid,vanilla] [--threads] [--memory]
 
 Each operation is timed from the click until the page has painted it (its DOM shows the change, then a frame); the
-median of the rounds (or --stat min), after one round of warm-up. Needs Python's playwright and Chrome. --threads: fut-mt.wasm too
-(the program on a worker, each DOM call sent to the page's thread)."""
-import argparse, asyncio, statistics, subprocess, sys, time, urllib.request
+median of the rounds (or --stat min), after one round of warm-up. Needs Python's Playwright, Chrome and built wasm
+files. --threads includes fut-mt.wasm (the program on a worker). --memory samples Chrome RSS on separate runs."""
+import argparse, asyncio, statistics, subprocess, sys, time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from playwright.async_api import async_playwright
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 PORT = 8123
+APPS = ("vanilla", "solid", "react", "fut")
+CHROME_ARGS = ["--disable-renderer-backgrounding"]
 
 ROWS = "document.querySelectorAll('#tbody > tr')"
 COUNT = f"{ROWS}.length"
@@ -55,79 +58,170 @@ async def measure(page, op):
       return performance.now() - t;
     }}""")
 
-verbose = False
-stat = "median"
-
-async def run_app(browser, app, rounds):
+@asynccontextmanager
+async def open_app(browser, app):
     page = await browser.new_page(viewport={"width": 1200, "height": 900})
     errors = []
     page.on("pageerror", lambda e: errors.append(str(e)))
-    page.on("console", lambda m: m.type == "error" and "Failed to load resource" not in m.text and errors.append(m.text))  # (fut probes for files)
-    url, t = f"http://127.0.0.1:{PORT}/bench/web/page.html?app={app.replace('-mt', '')}" + ("&threads=1" if app.endswith("-mt") else ""), time.time()
-    await page.goto(url)
+    page.on("console", lambda m: m.type == "error" and "Failed to load resource" not in m.text and errors.append(m.text))  # fut probes for files
+    query = "fut&threads=1" if app == "fut-mt" else app
+    url = f"http://127.0.0.1:{PORT}/bench/web/page.html?app={query}"
     try:
+        t = time.perf_counter()
+        await page.goto(url, timeout=60000)
         await page.wait_for_selector("#run", timeout=60000)
-    except Exception:
-        raise SystemExit(f"{app}: the page didn't start: {errors}")
-    start = (time.time() - t) * 1000
-    await page.evaluate(HELPERS)
-    times = {op[0]: [] for op in OPS}
-    for r in range(rounds + 1):
-        for op in OPS:
-            ms = await measure(page, op)
-            if r: times[op[0]].append(ms)
-            if verbose: print(f"    {app} {op[0]}: {ms:.1f} ms", file=sys.stderr, flush=True)
-    await page.close()
-    if errors: print(f"{app}: {errors[:3]}", file=sys.stderr)
-    pick = min if stat == "min" else statistics.median
+        start = (time.perf_counter() - t) * 1000
+        await page.evaluate(HELPERS)
+        yield page, start
+    except Exception as e:
+        raise RuntimeError(f"{app}: {e}\nBrowser errors: {errors[:3]}") from e
+    finally:
+        await page.close()
+    if errors:
+        raise RuntimeError(f"{app}: {errors[:3]}")
+
+
+async def run_app(browser, app, a):
+    async with open_app(browser, app) as (page, start):
+        times = {op[0]: [] for op in OPS}
+        for r in range(a.rounds + 1):
+            for op in OPS:
+                ms = await measure(page, op)
+                if r: times[op[0]].append(ms)
+                if a.v: print(f"    {app} {op[0]}: {ms:.1f} ms", file=sys.stderr, flush=True)
+    pick = min if a.stat == "min" else statistics.median
     return start, {k: pick(v) for k, v in times.items()}
 
-async def main(a):
-    subprocess.run(["node", "build.mjs"], cwd=HERE, check=True)
-    server = subprocess.Popen(["node", "web/serve.mjs", str(PORT)], cwd=ROOT, stdout=subprocess.DEVNULL)
-    try:
-        for _ in range(100):
-            try: urllib.request.urlopen(f"http://127.0.0.1:{PORT}/bench/web/page.html"); break
-            except OSError: time.sleep(0.1)
-        apps = a.apps.split(",") + (["fut-mt"] if a.threads else [])
-        res = {}
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(channel="chrome", args=["--disable-renderer-backgrounding"])
-            for app in apps:
-                res[app] = await run_app(browser, app, a.rounds)
-                print(f"  {app} done", file=sys.stderr)
-            await browser.close()
-    finally:
-        server.terminate()
-    if {"vanilla", "solid", "react", "fut"} <= set(apps): write_md(apps, res, a)  # (a partial run doesn't replace it)
-    w = max(len(o[0]) for o in OPS)
-    print(f"{'ms (' + stat + ' of ' + str(a.rounds) + ')':<{w}}  " + "  ".join(f"{x:>9}" for x in apps))
-    for op in OPS:
-        print(f"{op[0]:<{w}}  " + "  ".join(f"{res[x][1][op[0]]:>9.1f}" for x in apps))
-    if "vanilla" in res:
-        g = lambda x: statistics.geometric_mean([res[x][1][o[0]] / res["vanilla"][1][o[0]] for o in OPS])
-        print(f"{'× plain DOM (geometric mean)':<{w}}  " + "  ".join(f"{g(x):>9.2f}" for x in apps))
-    print(f"{'page ready (ms)':<{w}}  " + "  ".join(f"{res[x][0]:>9.0f}" for x in apps))
 
-def write_md(apps, res, a):  # -> results.md
-    rel = lambda x, o: res[x][1][o] / res["vanilla"][1][o] if "vanilla" in res else None
-    lines = [f"Chrome, headless, {a.rounds} rounds after one of warm-up; the {a.stat} per operation, from the click to the frame",
-             "that shows it (ms). × plain DOM: how many times as long as apps/vanilla.js. `python3 run.py` writes this.", "",
-             "| Operation | " + " | ".join(apps) + " |", "|---|" + "---:|" * len(apps)]
-    for o, *_ in OPS:
-        lines.append(f"| {o} | " + " | ".join(f"{res[x][1][o]:.1f}" + (f" ({rel(x, o):.2f}×)" if rel(x, o) else "") for x in apps) + " |")
-    if "vanilla" in res:
-        lines.append("| × plain DOM (geometric mean) | " + " | ".join(f"{statistics.geometric_mean([rel(x, o[0]) for o in OPS]):.2f}" for x in apps) + " |")
-    lines.append("| page ready | " + " | ".join(f"{res[x][0]:.0f}" for x in apps) + " |")
-    (HERE / "results.md").write_text("\n".join(lines) + "\n")
+async def chrome_rss(cdp):
+    procs = (await cdp.send("SystemInfo.getProcessInfo"))["processInfo"]
+    pids = ",".join(str(p["id"]) for p in procs)
+    rss = subprocess.check_output(["ps", "-o", "rss=", "-p", pids], text=True)
+    return sum(int(kib) for kib in rss.split()) / 1024
+
+
+async def memory_app(chromium, app):
+    browser = await chromium.launch(channel="chrome", args=CHROME_ARGS)
+    try:
+        cdp = await browser.new_browser_cdp_session()
+        async with open_app(browser, app) as (page, _):
+            await page.evaluate("() => painted()")
+            await page.wait_for_timeout(250)
+            empty = await chrome_rss(cdp)
+            await page.evaluate(f"async () => {{ click('#runlots'); await until(() => {COUNT} == 10000); await painted(); }}")
+            await page.wait_for_timeout(250)
+            full = await chrome_rss(cdp)
+        return empty, full
+    finally:
+        await browser.close()
+
+
+async def run_repo(chromium, root, apps, a):
+    subprocess.run(["node", "build.mjs"], cwd=root / "bench" / "web", check=True)
+    server = await asyncio.create_subprocess_exec("node", "web/serve.mjs", str(PORT), cwd=root, stdout=asyncio.subprocess.PIPE)
+    try:
+        ready = await asyncio.wait_for(server.stdout.readline(), timeout=10)
+        if not ready.startswith(b"fut: http://"):
+            raise RuntimeError(f"the benchmark server did not start on port {PORT}")
+        browser = await chromium.launch(channel="chrome", args=CHROME_ARGS)
+        version = browser.version
+        try:
+            timings = {}
+            for app in apps:
+                timings[app] = await run_app(browser, app, a)
+                print(f"  {app} timings done", file=sys.stderr, flush=True)
+        finally:
+            await browser.close()
+        memory = {}
+        if a.memory:
+            for app in apps:
+                memory[app] = await memory_app(chromium, app)
+                print(f"  {app} memory done", file=sys.stderr, flush=True)
+        return version, timings, memory
+    finally:
+        if server.returncode is None:
+            server.terminate()
+            await server.wait()
+
+async def main(a):
+    async with async_playwright() as p:
+        baseline = None
+        if a.baseline:
+            print(f"Baseline in {a.baseline}", file=sys.stderr, flush=True)
+            baseline = await run_repo(p.chromium, a.baseline.resolve(), a.apps, a)
+        print(f"Candidate in {ROOT}", file=sys.stderr, flush=True)
+        candidate = await run_repo(p.chromium, ROOT, a.apps, a)
+    report = markdown(a, candidate, baseline)
+    print(report, end="")
+    output = a.output
+    if output is None and set(APPS) <= set(a.apps) and not baseline:
+        output = HERE / "results.md"  # a partial run or comparison doesn't replace the checked-in table
+    if output:
+        output.write_text(report)
+
+
+def table(title, apps, rows):
+    lines = [f"| {title} | " + " | ".join(apps) + " |", "|---|" + "---:|" * len(apps)]
+    for name, values in rows:
+        lines.append(f"| {name} | " + " | ".join(values) + " |")
+    return "\n".join(lines)
+
+
+def markdown(a, candidate, baseline):
+    version, timings, memory = candidate
+    ops = [op[0] for op in OPS]
+    apps = a.apps
+    rows = []
+    for op in ops:
+        values = [f"{timings[app][1][op]:.1f}" for app in apps]
+        if "vanilla" in timings:
+            c = timings["vanilla"][1][op]
+            values = [f"{v} ({timings[app][1][op] / c:.2f}×)" for app, v in zip(apps, values)]
+        rows.append((op, values))
+    if "vanilla" in timings:
+        ratios = [statistics.geometric_mean(timings[app][1][op] / timings["vanilla"][1][op] for op in ops) for app in apps]
+        rows.append(("× plain DOM (geometric mean)", [f"{ratio:.2f}" for ratio in ratios]))
+    rows.append(("page ready", [f"{timings[app][0]:.0f}" for app in apps]))
+    sections = [f"Headless Chrome {version}, {a.stat} of {a.rounds} rounds after one warm-up. "
+                "Operations run from click to the frame that shows the change. Ratios are relative to plain DOM.",
+                table("Operation (ms)", apps, rows)]
+    if memory:
+        rows = [("empty table", [f"{memory[app][0]:.1f}" for app in apps]),
+                ("10,000 rows", [f"{memory[app][1]:.1f}" for app in apps]),
+                ("growth", [f"{memory[app][1] - memory[app][0]:+.1f}" for app in apps])]
+        sections += ["Memory uses a fresh browser per app and sums Chrome process RSS 250 ms after each painted state. "
+                     "It includes the renderer and worker, and shared pages can count in more than one process.",
+                     table("Memory (MiB)", apps, rows)]
+    if baseline:
+        base_version, base_times, base_memory = baseline
+        if base_version != version:
+            raise ValueError(f"Chrome changed between runs: {base_version} to {version}")
+        rows = [(op, [f"{(timings[app][1][op] / base_times[app][1][op] - 1):+.1%}" for app in apps]) for op in ops]
+        rows.append(("page ready", [f"{(timings[app][0] / base_times[app][0] - 1):+.1%}" for app in apps]))
+        sections += ["Changes from the base checkout measured on the same runner. Positive numbers are increases.",
+                     table("Timing change", apps, rows)]
+        if memory:
+            rows = [(label, [f"{memory[app][i] - base_memory[app][i]:+.1f}" for app in apps])
+                    for i, label in enumerate(("empty table", "10,000 rows"))]
+            sections.append(table("Memory change (MiB)", apps, rows))
+    return "\n\n".join(sections) + "\n"
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--rounds", type=int, default=10)
-    ap.add_argument("--apps", default="vanilla,solid,react,fut")
+    ap.add_argument("--apps", default=",".join(APPS))
     ap.add_argument("--threads", action="store_true")
+    ap.add_argument("--memory", action="store_true", help="measure Chrome's resident memory in separate runs")
+    ap.add_argument("--baseline", type=Path, help="compare with another checkout with its own built wasm and npm dependencies")
+    ap.add_argument("--output", type=Path, help="write the Markdown report here")
     ap.add_argument("-v", action="store_true", help="each measurement as it's taken")
     ap.add_argument("--stat", choices=["median", "min"], default="median", help="min: the fairer one on a busy machine")
     a = ap.parse_args()
-    verbose, stat = a.v, a.stat
+    a.apps = a.apps.split(",")
+    if a.rounds < 1:
+        ap.error("--rounds must be at least 1")
+    if not set(a.apps) <= set(APPS) or len(a.apps) != len(set(a.apps)):
+        ap.error("--apps must list each selected app once (vanilla,solid,react,fut)")
+    if a.threads:
+        a.apps.append("fut-mt")
     asyncio.run(main(a))
