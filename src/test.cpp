@@ -272,6 +272,12 @@ int propSite(PropSite p) {
 namespace {
 TLS uint64_t prng = 1;  // per isolate: each runs its property tests from the same seed
 ISO_LOCAL(prng);
+TLS const std::vector<double>* mined = nullptr;  // the numbers written in what is being tested (PropSite::nums)
+ISO_LOCAL(mined);
+TLS int sweep = -1;  // the input being made is one of the first, which give each number argument mined[sweep]
+ISO_LOCAL(sweep);
+TLS int unbuilt = 0;  // inputs thrown away because a class argument couldn't be built from them
+ISO_LOCAL(unbuilt);
 uint64_t rnd() { return prng ^= prng >> 12, prng ^= prng << 25, prng ^= prng >> 27, prng * 0x2545F4914F6CDD1Dull; }
 int below(int n) { return n <= 0 ? 0 : (int)(rnd() % (uint64_t)n); }
 double unit() { return double(rnd() >> 11) * 0x1p-53; }
@@ -280,8 +286,10 @@ V gen(uint64_t t, int size, int depth = 0) {
   if ((t & TY_OPT) && !below(8)) return NIL;
   switch (t & 15) {
     case TY_NUM: {
+      if (sweep >= 0) return box((*mined)[sweep]);
       static const double edge[] = {0, 1, -1, 2, -2, 0.5, -0.5, 3, 10, -10, 100, 1000, 1e6, -1e6, 0.1, 255, 256};
-      switch (below(4)) {
+      switch (below(mined && !mined->empty() ? 5 : 4)) {
+        case 4: return box((*mined)[below((int)mined->size())]);
         case 0: return box(edge[below(sizeof edge / sizeof *edge)]);
         case 1: return box(double(below(2 * size + 1) - size));
         case 2: return box(std::round((unit() * 2 - 1) * size * 100) / 100);
@@ -386,9 +394,23 @@ void shrinkArgs(V args, const std::vector<uint64_t>& types, List* out) {
     for (size_t j = at; j < out->v.size(); j++) out->v[j] = replaced(args, i, out->v[j]);
   }
 }
-std::string showCall(const std::string& f, V args) {
+std::string showCall(const std::string& f, V args, const std::vector<std::pair<std::string, int>>& shape = {}) {
+  auto& v = as<List>(args)->v;
+  if (shape.empty()) {
+    std::string s = f + "(";
+    for (size_t i = 0; i < v.size(); i++) s += (i ? ", " : "") + toStr(v[i], true);
+    return s + ")";
+  }
+  size_t k = 0, slot = 0;  // with class arguments: each as the call that built it, Player("a")
+  auto one = [&](auto& self) -> std::string {
+    auto [c, n] = shape[k++];
+    if (c.empty()) return slot < v.size() ? toStr(v[slot++], true) : "?";
+    std::string s = c + "(";
+    for (int i = 0; i < n; i++) s += (i ? ", " : "") + self(self);
+    return s + ")";
+  };
   std::string s = f + "(";
-  for (size_t i = 0; i < as<List>(args)->v.size(); i++) s += (i ? ", " : "") + toStr(as<List>(args)->v[i], true);
+  for (bool first = true; k < shape.size(); first = false) s += (first ? "" : ", ") + one(one);
   return s + ")";
 }
 }  // namespace
@@ -396,7 +418,9 @@ static PropSite& propAt(V site) { Locked l(propsMu); return props.at((size_t)num
 static V propGen(V site, V n) {
   PropSite& p = propAt(site);
   int i = (int)num(n), size = std::min(1 + i / 2, 50);
+  mined = &p.nums, sweep = i < (int)p.nums.size() ? i : -1;
   if (!i) {  // the same inputs every run: seeded by the test
+    unbuilt = 0;
     prng = 1469598103934665603ull;
     for (char c : p.text) prng = (prng ^ (uint8_t)c) * 1099511628211ull;
     prng |= 1;
@@ -454,6 +478,7 @@ static V propShrink(V site, V in, V k) {
   return i < out->v.size() ? out->v[i] : NIL;
 }
 static V propDiscard(V site, V e) {  // e says the input broke a requires of the function (or a method) under test
+  if (is(e, K::Str) && as<Str>(e)->sv() == "prop@unbuilt") return unbuilt++, TRUE_;
   return boxb(is(e, K::Str) && as<Str>(e)->sv().starts_with(propAt(site).discard));
 }
 [[noreturn]] static void propFailed(PropSite& p, const std::string& why) {
@@ -467,7 +492,7 @@ static V propDiscard(V site, V e) {  // e says the input broke a requires of the
 static V propFail(V site, V in, V e, V n) {
   PropSite& p = propAt(site);
   std::string why;
-  if (!p.cls) why = showCall(p.names[0], in);
+  if (!p.cls) why = showCall(p.names[0], in, p.shape);
   else {
     why = "var o = " + showCall(p.names[0], as<List>(in)->v[0]);
     for (V c : as<List>(as<List>(in)->v[1])->v) why += "\n    o." + showCall(p.names[(size_t)num(as<List>(c)->v[0]) + 1], as<List>(c)->v[1]);
@@ -478,6 +503,7 @@ static V propFail(V site, V in, V e, V n) {
 }
 static V propDone(V site, V ok, V n) {  // too few inputs met the requires to call it tested
   if (num(ok) >= 20) return NIL;
+  if (unbuilt * 2 > (int)num(n)) return NIL;  // mostly its class arguments couldn't be built: not the requires' doing
   char b[160];
   snprintf(b, sizeof b, "only %d of %d random inputs met its requires: give its parameters narrower types, or test it by hand", (int)num(ok), (int)num(n));
   propFailed(propAt(site), b);

@@ -3973,6 +3973,53 @@ struct Compiler : Gen, Namespaces {
     for (size_t i = 0; i < n; i++) a += (i ? ", " : "") + std::string(v) + "[" + std::to_string(i) + "]";
     return a;
   }
+  // The numbers written in q (its contract and body), each with its neighbors: random inputs try them.
+  void spanNums(const std::string& q, std::vector<double>& out) {
+    auto it = spans.find(q);
+    if (it == spans.end() || !it->second.start) return;
+    Lexer l{it->second.start, it->second.line, true};
+    for (Tok t = l.next(); t.t != T_EOF && t.p < it->second.end; t = l.next())
+      if (t.t == T_NUM)
+        for (double d : {t.n, t.n - 1, t.n + 1})
+          if (out.size() < 48 && std::find(out.begin(), out.end(), d) == out.end()) out.push_back(d);
+  }
+  // How to make q's arguments from generated values, in the current file (see PropSite::shape): types gets the
+  // values' types, code each argument's code over a@, and pre the statements that build its class arguments. A
+  // class argument is built by its init (or with none, C()) from generated arguments of its own; when building one
+  // throws, the input is thrown away (prop@unbuilt). False: an argument can't be made.
+  bool argPlan(const std::string& q, std::vector<uint64_t>& types, std::vector<std::pair<std::string, int>>& shape, std::string& pre, std::vector<std::string>& code, int depth = 0) {
+    auto it = sigs.find(q);
+    if (!spans.count(q) || it == sigs.end()) return false;
+    std::vector<uint64_t> params(it->second.types.begin(), it->second.types.end() - 1);
+    for (uint64_t t : params) {
+      if (generatable(t)) {
+        code.push_back("a@[" + std::to_string(types.size()) + "]"), types.push_back(t), shape.push_back({"", 0});
+        continue;
+      }
+      uint64_t r = resolveNow(t) & ~TY_OPT;
+      int c = (r & 15) == TY_CLS ? int(r >> 8) : -1;
+      if (c < 0 || depth >= 2 || enumOf(c) >= 0) return false;
+      std::string full = symName(c), raw = full.substr(full.rfind('.') == std::string::npos ? 0 : full.rfind('.') + 1);
+      if (globalSym(intern(raw)) != c) return false;  // not reachable by its plain name here
+      int owner = -1;
+      for (int s = c, hops = 0; s >= 0 && owner < 0; hops++) {  // its init, or the one it inherits (classes this compile defines)
+        auto cd = std::find_if(classes.begin(), classes.end(), [&](auto& x) { return x.sym == s; });
+        if (cd == classes.end() || hops > 16) return false;
+        if (spans.count(symName(s) + ".init")) owner = s;
+        s = cd->super;
+      }
+      size_t at = shape.size();
+      shape.push_back({raw, 0});
+      std::vector<std::string> sub;
+      if (owner >= 0 && !argPlan(symName(owner) + ".init", types, shape, pre, sub, depth + 1)) return false;
+      shape[at].second = (int)sub.size();
+      std::string b = "b@" + std::to_string(at), args;
+      for (auto& x : sub) args += (args.empty() ? "" : ", ") + x;
+      pre += "var " + b + " = nil; try { " + b + " = " + raw + "(" + args + ") } catch x@ { throw \"prop@unbuilt\" }; ";
+      code.push_back(b);
+    }
+    return true;
+  }
   bool isTodo(const std::string& q) { return std::any_of(todos.begin(), todos.end(), [&](auto& t) { return t.first == q; }); }
   void specProperties() {
     struct One { std::string n; At at; bool isFn; const ClassSpec* cs; std::string raw; };
@@ -3986,10 +4033,19 @@ struct Compiler : Gen, Namespaces {
       ps.file = d.at.file, ps.cls = !d.isFn, ps.names = {n};
       if (d.isFn) {
         std::vector<uint64_t> t;
-        if (isTodo(n) || !paramTypes(n, t)) continue;
+        std::vector<std::string> code;
+        std::string pre, keep = file;
+        file = d.at.file;
+        bool ok = !isTodo(n) && argPlan(n, t, ps.shape, pre, code);
+        file = keep;
+        if (!ok) continue;
+        if (std::all_of(ps.shape.begin(), ps.shape.end(), [](auto& x) { return x.first.empty(); })) ps.shape.clear();
         ps.types.push_back(t), ps.line = d.at.line;
+        spanNums(n, ps.nums);
         ps.text = n + "() to keep its contract on random inputs", ps.discard = "the caller broke " + n + "()'s contract:";
-        call = d.raw + "(" + argList("a@", t.size()) + ")";
+        call = pre + d.raw + "(";
+        for (size_t i = 0; i < code.size(); i++) call += (i ? ", " : "") + code[i];
+        call += ")";
       } else {
         std::vector<uint64_t> t;
         if (isTodo(n + ".init") || (spans.count(n + ".init") && !paramTypes(n + ".init", t))) continue;
@@ -4006,6 +4062,8 @@ struct Compiler : Gen, Namespaces {
           ps.names.push_back(symName(m)), ps.types.push_back(mt);
         }
         if (ps.names.size() == 1 && d.cs->invariants.empty()) continue;
+        spanNums(n + ".init", ps.nums);
+        for (size_t i = 1; i < ps.names.size(); i++) spanNums(n + "." + ps.names[i], ps.nums);
         ps.text = n + " to keep its contract over random calls", ps.discard = "the caller broke " + n + ".";
         call = "var x@ = a@[0]; var o@ = " + d.raw + "(" + argList("x@", t.size()) + "); for c@ in a@[1] { var m@ = c@[0]; x@ = c@[1]; try { " +
                dispatch + " } catch e@ { if !prop@discard(S@, e@) { throw e@ } } }";

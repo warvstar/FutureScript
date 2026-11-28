@@ -611,7 +611,10 @@ int expectSite(ExpectSite);  // its number, passed to the expect@ native
 // arguments: types[0] (names[0]: the function). A class's: [init's arguments (types[0]), calls], each call
 // [method i, its arguments (types[i + 1])] (names[0]: the class, then the methods). discard: how an error that
 // says the generated input broke a requires starts.
-struct PropSite { std::string file, text, discard; int line = 0, expect = -1; bool cls = false; std::vector<std::string> names; std::vector<std::vector<uint64_t>> types; };
+// nums: the numbers written in what is under test (and each ±1), which random inputs draw on, so a boundary like
+// `grams <= 500` gets tried. shape (a function's): how its arguments are made from the generated values, in order: a
+// value ("", 0) takes the next one; a class (name, n) is built by its init from the next n arguments.
+struct PropSite { std::string file, text, discard; int line = 0, expect = -1; bool cls = false; std::vector<std::string> names; std::vector<std::vector<uint64_t>> types; std::vector<double> nums; std::vector<std::pair<std::string, int>> shape; };
 int propSite(PropSite);
 void testInit();
 // The strings and headers are borrowed from the request value.

@@ -239,3 +239,16 @@ test "invariants: a fiber paused inside a method doesn't make other callers inne
   f.resume()
   expect g.peek() == 0
 }
+
+fn props(src) { return run({source: src, args: ["test"]}).out }
+test "property tests try the numbers the function is written with" {
+  var out = props("fn ship(g: num): num\n  ensures g > 500 || result == 499\n\{ if g < 500 \{ return 499 } return 899 }")
+  expect out.has("ship(500)\n")
+}
+test "property tests build class arguments with their init" {
+  var src = "class P \{ var xp = 0 var name: str fn init(name: str) \{ self.name = name } }\n" +
+    "fn grow(p: P, a: num): num\n  ensures result >= 0\n\{ if p.name == \"\" && a == 7 \{ return -1 } return 0 }"
+  expect props(src).has("grow(P(\"\"), 7)\n")
+  var never = "class Q \{ fn init(n: num) \{ throw \"no\" } }\nfn f(q: Q): num\n  ensures result == 0\n\{ return 0 }"
+  expect props(never).has("1 test: 1 passed")  // none could be built: untested, as before, not a failure
+}
