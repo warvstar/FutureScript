@@ -293,7 +293,7 @@ class Kernel {
     var spec = {}
     var call = ""
     for i in first..info.names.len() {
-      if info.types[i] == "bool" { throw "gpu {how}(): {name}'s parameter {info.names[i]} is a bool: the GPU takes numbers and vectors as args" }
+      if info.types[i] == "bool" || info.types[i] == "u32" { throw "gpu {how}(): {name}'s parameter {info.names[i]} is a {info.types[i]}: the GPU takes num and vector args" }
       spec[info.names[i]] = info.types[i]
       call += ", args.{info.names[i]}"
     }

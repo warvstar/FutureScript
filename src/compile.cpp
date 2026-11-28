@@ -803,6 +803,11 @@ struct Compiler : Gen, Namespaces {
       for (int i = 0; i < 6; i++) if (symName(prev.sym) == kinds[i]) ty.code = TY_ANY + i;
       for (char et : {'d', 'f', 'u', 'i', 'b'}) if (symName(prev.sym) == bufName(et)) ty.code = TY_BUF | uint64_t(et) << 8;
       for (int n = 2; n <= 4; n++) if (symName(prev.sym) == "vec" + std::to_string(n) + "f") ty.code = TY_BUF | uint64_t('f') << 8 | uint64_t(n) << 16;
+      if (symName(prev.sym) == "u32") {  // a whole number 0 <= n < 2^32: a gpu fn's u32
+        TypeDesc d;
+        d.k = 'w';
+        ty.code = typeIntern("w", d);
+      }
       if ((ty.code == TY_LIST || ty.code == TY_MAP) && at('<') && !cur.nl) {  // list<T>, map<V>, map<K, V>
         bool list = ty.code == TY_LIST;
         next();
@@ -1208,7 +1213,7 @@ struct Compiler : Gen, Namespaces {
     if (t.sym == S_atomic || t.sym == S_handle) return n.t == '{';
     if (t.sym == S_parallel || t.sym == S_shared) return n.t == T_ID && (n.sym == K_for || n.sym == K_var);
     return where == Top && (t.sym == K_import || t.sym == K_class || t.sym == K_extern ||
-                            (pubDecl(n) && t.sym == S_pub) || gpuFn(t, n) ||
+                            (pubDecl(n) && t.sym == S_pub) || gpuFn(t, n) || gpuVar(t, n) ||
                             t.sym == S_enum || t.sym == S_effect || t.sym == S_type || t.sym == S_test);
   }
   // Replay the tokens from the boundary, including braces the failed parse had already consumed.
@@ -1713,7 +1718,7 @@ struct Compiler : Gen, Namespaces {
     if (g->kind == 'e') return perform(t), LV{};
     if (g->kind == 't') failAt(t.p, t.line, "@not-a-value '%s' is a type: use it after ':' (x: %s)", name(t.sym), name(t.sym));
     if (g->kind == 's') return {LV_SHARED, g->cell, t.sym};
-    return {LV_GLOBAL, g->slot, t.sym, g->kind != 'v'};  // b: its symbol, for its type
+    return {LV_GLOBAL, g->slot, t.sym, g->kind != 'v' || gpuVarSyms.count(t.sym) > 0};  // b: its symbol, for its type
   }
   LV postfix() {
     return postfixRest(primary());
@@ -1911,6 +1916,7 @@ struct Compiler : Gen, Namespaces {
             int sym = qualify(s);
             if (nav && init && v.p == nav->ctorStart && prevEnd == nav->ctorEnd)
               if (int id = Navigation::get(nav->globals, sym); id >= 0) nav->constructors[id] = nav->ctorClass;
+            if (gpuFreeze) gpuFreeze = false, callNative("freeze", true);
             return gmem(0, global(sym).slot, true), false;
           }
           int site = ty.code ? typeSite(what, ty.text) : -1;
@@ -1989,6 +1995,7 @@ struct Compiler : Gen, Namespaces {
       return load(v), binRest(1, n, h), true;
     }
     if (v.k == LV_BAD) return next(), expr(), false;
+    if (v.k == LV_GLOBAL && gpuVarSyms.count(v.b)) fail("@gpu %s is a gpu var: it never changes", name(v.b));
     if (v.k == LV_VAL || v.ro) fail("@misplaced cannot assign to this");
     next(), assign(v, t == '=' ? -1 : O_ADD + (t - T_ADDEQ));
     if (auto* local = pathLocal(F, v); local && local->path) {
@@ -3128,7 +3135,8 @@ struct Compiler : Gen, Namespaces {
           Lexer s = L;
           Tok n = lex(s);
           Lexer s2 = s;
-          pubNext = pubDecl(n) || gpuFn(n, lex(s2));
+          Tok n2 = lex(s2);
+          pubNext = pubDecl(n) || gpuFn(n, n2) || gpuVar(n, n2);
         } else if (t.t == T_ID && t.sym == K_extern && !depth) ext = true, externStart = t.p;
         else if (ext && afterKw && p.sym == K_fn) {
           declaration = externStart, ext = false;
@@ -3190,6 +3198,7 @@ struct Compiler : Gen, Namespaces {
           declaration = p.p;
           Tok d = q(t);
           bool shared = p.sym == K_var && pp.t == T_ID && pp.sym == S_shared && !p.nl;
+          if (p.sym == K_var && gpuVar(pp, p)) gpuVarSyms.insert(d.sym);
           declare(d, p.sym == K_class ? 'c' : shared ? 's' : 'v', 0);
           if (nav) indexDeclaration(d, p.sym == K_class ? "class" : "var");
           if (p.sym == K_class) {
@@ -3293,13 +3302,23 @@ struct Compiler : Gen, Namespaces {
     Tok n = peek();
     Lexer s = lx;
     s.next();
-    return pubDecl(n) || gpuFn(n, s.next());
+    Tok n2 = s.next();
+    return pubDecl(n) || gpuFn(n, n2) || gpuVar(n, n2);
   }
   // gpu fn: also translated to WGSL (wgsl.cpp), after the whole program is compiled
   static bool gpuFn(const Tok& a, const Tok& b) {
     static const int gpu = intern("gpu");
     return a.t == T_ID && a.sym == gpu && b.t == T_ID && b.sym == K_fn && !b.nl;
   }
+  // gpu var: a constant the file's gpu fns read (a number, or a list of them, or of such lists). It never changes:
+  // assigning it is a compile error and its value is frozen, so the CPU and the GPU see the same one.
+  static bool gpuVar(const Tok& a, const Tok& b) {
+    static const int gpu = intern("gpu");
+    return a.t == T_ID && a.sym == gpu && b.t == T_ID && b.sym == K_var && !b.nl;
+  }
+  std::unordered_map<std::string, std::vector<GpuFnSrc>> gpuVarSrcs;
+  std::unordered_set<int> gpuVarSyms;  // qualified: they can't be assigned
+  bool gpuFreeze = false;               // the top-level var being compiled is a gpu var: freeze its value
   struct GpuDecl { std::string file; const char* src; size_t i; int q; };
   std::unordered_map<std::string, std::vector<GpuFnSrc>> gpuSrcs;
   std::vector<GpuDecl> gpuDecls;
@@ -3325,7 +3344,7 @@ struct Compiler : Gen, Namespaces {
         file = d.file, srcStart = d.src;
         failAt(p, line, "@gpu %s", m.c_str());
       };
-      attempt([&] { gpuInfos.emplace_back(d.q, wgslOf(gpuSrcs[d.file], d.i, alias, fail)); });
+      attempt([&] { gpuInfos.emplace_back(d.q, wgslOf(gpuSrcs[d.file], gpuVarSrcs[d.file], d.i, alias, fail)); });
     }
   }
   void topLevel() {
@@ -3367,6 +3386,11 @@ struct Compiler : Gen, Namespaces {
           detour(ip, s.code().c_str(), s.code().c_str(), 1, [&] { topLevel(); });
         }
         return;
+      }
+      if (at(T_ID) && [&] { Lexer s = lx; return gpuVar(cur, s.next()); }()) {
+        next();
+        gpuVarSrcs[file].push_back({peek().sym, cur.p, cur.line});
+        gpuFreeze = true;
       }
       // On reload, top-level statements are compiled (to validate them) and then dropped, except
       // initialisers of vars that are new or whose declaration was edited. Other state survives the reload.

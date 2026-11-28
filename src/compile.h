@@ -147,7 +147,7 @@ struct GpuFnSrc { int sym; const char* p; int line; };
 struct GpuInfo { std::string wgsl, entry, result; std::vector<std::string> names, types; };
 // fail(p, line, message) reports what the GPU can't do, and does not return (a compile error)
 using GpuFail = std::function<void(const char*, int, const std::string&)>;
-GpuInfo wgslOf(const std::vector<GpuFnSrc>& fns, size_t i, const std::function<const std::string*(int)>& alias, const GpuFail& fail);
+GpuInfo wgslOf(const std::vector<GpuFnSrc>& fns, const std::vector<GpuFnSrc>& vars, size_t i, const std::function<const std::string*(int)>& alias, const GpuFail& fail);
 void gpuInfoSet(int sym, GpuInfo);
 
 // A type's tokens (see type()), from L: atoms joined by |, each maybe followed by ?. Leaves L after it.

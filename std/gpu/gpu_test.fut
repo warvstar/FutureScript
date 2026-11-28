@@ -108,6 +108,14 @@ gpu fn bands(uv: vec2f, color: vec3f, rows: num): vec4f {
   return row % 2 == 0 ? vec4f(color.x, color.y, color.z, 1) : vec4f(0, 0, 0, 1)
 }
 
+gpu var STEPS: list<u32> = [0x10, 0x3f, 0xff]
+gpu fn ink(i: u32): u32 { return i }
+gpu fn byRow(x: num, row: u32): num { return x + row }
+gpu fn bits(x: num, row: num): num {  // u32s, bitwise operators and a table on the GPU
+  var u: u32 = x
+  return ((u << 2) ^ STEPS[row]) & 0xff
+}
+
 test "map: a gpu fn over each element, on the GPU, as on the CPU" {
   var xs = f32s([1, 2, 3, 4])
   g.map(scale, xs, [3, 0.5])
@@ -124,6 +132,10 @@ test "map: a gpu fn over each element, on the GPU, as on the CPU" {
   var cpu = spin(spin(vec2f(1, 0), math.pi / 4), math.pi / 4)
   expect math.abs(out[0] - cpu.x) < 1e-6 && math.abs(out[1] - cpu.y) < 1e-6 && math.abs(out[1] - 1) < 1e-6
   buf.free()
+  var bs = f32s([0, 1, 7, 200])
+  g.map(bits, bs, [1])
+  expect bs == f32s([bits(0, 1), bits(1, 1), bits(7, 1), bits(200, 1)])
+  expect bs[2] == 35
 }
 
 test "paint: a gpu fn colors each pixel" {
@@ -142,4 +154,6 @@ test "map and paint say what is wrong with a gpu fn's shape or args" {
   expect err(fn() { g.map(scale, f32s(4), [1]) }).has("scale takes 2 args after its first parameter, got 1")
   expect err(fn() { g.frame(0).paint(scale, [1, 2]) }).has("takes uv: vec2f")
   expect err(fn() { g.map(err, f32s(4), []) }).has("err is not a gpu fn")
+  expect err(fn() { g.map(ink, f32s(4), [1]) }).has("ink takes and returns num, vec2f or vec4f")
+  expect err(fn() { g.map(byRow, f32s(4), [1]) }).has("byRow's parameter row is a u32: the GPU takes num and vector args")
 }

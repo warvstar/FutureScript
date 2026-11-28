@@ -9,6 +9,7 @@
 // (`list<num>`, `map<str, User>`). A named type (`type User = {...}`) is looked up when it is checked, like a class, so
 // editing it changes every check of it without recompiling them, and it may refer to itself.
 #include "fut.h"
+#include <cmath>
 #include <unordered_map>
 
 struct TypeSite { std::string what, type; };
@@ -105,6 +106,7 @@ static bool accepts(uint64_t t, V v, int depth, Tags* tags = nullptr) {
           }
           return true;
         }
+        case 'w': return isNum(v) && num(v) >= 0 && num(v) < 4294967296.0 && num(v) == std::trunc(num(v));
         case 'L': {
           if (!is(v, K::List)) return false;
           List* l = as<List>(v);
@@ -193,6 +195,7 @@ std::string typeText(uint64_t t) {
     case 'u': for (uint64_t a : d->alts) o += (o.empty() ? "" : " | ") + typeText(a); return q.empty() ? o : "(" + o + ")?";
     case 'l': return (d->lit == 's' ? "\"" + d->s + "\"" : d->lit == 'n' ? toStr(box(d->n)) : toStr(d->v)) + q;
     case 's': for (auto& [f, ft] : d->fields) o += (o.empty() ? "" : ", ") + symName(f) + ": " + typeText(ft); return "{" + o + "}" + q;
+    case 'w': return "u32" + q;
     case 'L': return "list<" + typeText(d->elem) + ">" + q;
     case 'M': return "map<" + ((d->key & 15) == TY_ANY ? "" : typeText(d->key) + ", ") + typeText(d->elem) + ">" + q;
   }

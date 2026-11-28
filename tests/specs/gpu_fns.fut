@@ -1,6 +1,6 @@
 // gpu fn: a function that also runs on the GPU. On the CPU it is an ordinary function; its WGSL (wgsl(f)) is what
-// std/gpu runs. Its values are numbers (f32 on the GPU), bools and vectors: vec2f, vec3f, vec4f, which on the CPU are
-// f32s of 2, 3 and 4.
+// std/gpu runs. Its values are numbers (f32 on the GPU), u32 whole numbers, bools and vectors: vec2f, vec3f, vec4f,
+// which on the CPU are f32s of 2, 3 and 4. It reads its file's gpu vars: numbers, and tables of them, that never change.
 import "std/math" as math
 fn err(f) { try { f() } catch e { return "{e}" } return "" }
 fn compileErr(src) { return run({source: src}).err }
@@ -71,8 +71,63 @@ test "what the GPU doesn't have is a compile error, saying what to write" {
   expect compileErr("gpu fn f(x: num): num \{ print(x) return x }").has("a gpu fn's statements are var, assignment, if")
   expect compileErr("gpu fn f(x: num): num \{ return f(x) }").has("can't call itself")
   expect compileErr("gpu fn f(v: vec2f): vec2f \{ v.x = 1 return v }").has("vectors don't change in place")
-  expect compileErr("gpu fn f(x: num): num \{ return x & 1 }").has("no bitwise operators")
   expect compileErr("gpu fn f(x: num): str \{ return \"\" }").has("not str")
   expect compileErr("fn h(x) \{ return x }\ngpu fn f(x: num): num \{ return h(x) }").has("h is not a gpu fn of this file")
   expect compileErr("import \"std/math\" as math\ngpu fn f(x: num): num \{ return math.hypot(x, x) }").has("not math.hypot")
+}
+
+test "u32 is a type: a whole number from 0 to 2^32 - 1" {
+  var f = fn(x: u32): u32 { return x }
+  expect f(0) == 0 && f(4294967295) == 4294967295
+  expect err(fn() { f(-1) }).has("must be u32")
+  expect err(fn() { f(1.5) }).has("must be u32")
+  expect err(fn() { f(4294967296) }).has("must be u32")
+}
+
+// Two rows of eight 4-bit inks, as a sprite or a pattern stores them
+gpu var INKS: list<list<u32>> = [
+  [0x12345678, 0x9abcdef0],
+  [0x00000000, 0xffffffff]
+]
+gpu var MASK: u32 = 15
+gpu var WEIGHTS = [0.25, 0.5]  // an f32 table
+gpu fn ink(row: u32, i: u32): u32 {
+  return (INKS[row][i >> 3] >> ((7 - (i & 7)) * 4)) & MASK
+}
+gpu fn inkShade(row: u32, i: u32): num {
+  var k = ink(row, i)            // a u32 local
+  var w = WEIGHTS[i % 2]         // an f32 from a table
+  return k == 15 ? 1 : k * w     // u32 * f32 is f32
+}
+
+test "u32s and gpu vars: bits on the CPU, as on the GPU" {
+  expect ink(0, 0) == 1 && ink(0, 7) == 8 && ink(0, 8) == 9 && ink(0, 15) == 0 && ink(1, 9) == 15
+  expect inkShade(0, 2) == 0.75 && inkShade(0, 3) == 2 && inkShade(1, 8) == 1
+  expect err(fn() { ink(2, 0) }).has("index")       // a table's rows are 0..len-1, as a list's
+  expect err(fn() { INKS[0][0] = 1 }).has("frozen")  // a gpu var never changes
+  var w = wgsl(inkShade)
+  expect w.types == ["u32", "u32"]
+  expect w.result == "f32"
+  expect w.wgsl.has("const g_INKS: array<array<u32, 2>, 2> = array<array<u32, 2>, 2>(array<u32, 2>(305419896u, 2596069104u), array<u32, 2>(0u, 4294967295u));")
+  expect w.wgsl.has("const g_MASK: u32 = 15u;") && w.wgsl.has("const g_WEIGHTS: array<f32, 2> = array<f32, 2>(0.25, 0.5);")
+  expect w.wgsl.has("(g_INKS[l_row][(l_i >> 3u)] >> u32(((7.0 - f32((l_i & 7u))) * 4.0)))")  // - leaves u32s for f32, as fut's numbers
+  expect w.wgsl.has("var l_k: u32 = f_ink(l_row, l_i);") && w.wgsl.has("var l_w: f32 = g_WEIGHTS[(l_i % 2u)];")
+  expect w.wgsl.has("select((f32(l_k) * l_w), 1.0, (l_k == 15u))")
+  expect wgsl(ink).wgsl.has("fn f_ink(p_row: u32, p_i: u32) -> u32 \{")
+}
+
+test "u32s and gpu vars: what doesn't mean the same on both is a compile error" {
+  expect compileErr("gpu var T = [1, 2]\nfn f() \{ T = [3] }").has("T is a gpu var: it never changes")
+  expect compileErr("gpu var T = [1, 2]\ngpu fn f(i: u32): num \{ T = 1 return 0 }").has("T is a gpu var: it never changes")
+  expect compileErr("gpu var T = [[1, 2], [3]]\ngpu fn f(i: u32): num \{ return T[i][0] }").has("lists at one depth are one length")
+  expect compileErr("gpu var T = [[1, 2], 3]\ngpu fn f(i: u32): num \{ return T[i][0] }").has("numbers or lists, the same at every depth")
+  expect compileErr("gpu var T: list<u32> = [1, 0.5]\ngpu fn f(i: u32): u32 \{ return T[i] }").has("0.5 is not a u32")
+  expect compileErr("gpu var T: list<u32> = [1, 2]\ngpu fn f(i: u32): u32 \{ return T }").has("T is a table: index it (T[i])")
+  expect compileErr("gpu var T = [1, 2]\ngpu fn f(i: u32): num \{ return T[i][0] }").has("T has 1 dimension")
+  expect compileErr("gpu var T = len([1])\ngpu fn f(): num \{ return T }").has("written out")
+  expect compileErr("gpu fn f(i: u32): u32 \{ var k = i  k = 0.5  return k }").has("k holds a u32")
+  expect compileErr("gpu fn f(i: u32): u32 \{ return -1 }").has("-1.0 is not a u32")
+  expect compileErr("gpu fn f(x: num): num \{ if x \{ return 1 } return 0 }").has("conditions are bools")
+  expect compileErr("gpu fn f(a: vec2f, b: vec2f): bool \{ return a == b }").has("compare their fields")
+  expect compileErr("gpu fn f(x: num): num \{ return x.y }").has("f32 has no .y")
 }
