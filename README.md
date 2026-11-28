@@ -548,20 +548,30 @@ Every error the compiler or runtime raises ends with a stable code naming the ru
 pkg app 0.0.0  // fut.pkg
   main.fut
     import "geom"  // 1
-    fn main()      // 3-9
+    fn main()      // 3-9, does io
 pkg geom 0.3.0  // ../geom/fut.pkg
   js draw draw.js  // line, fill
   geom.fut  // root
     pub import "./vec.fut"  // 1
-    pub fn area(r)          // 3-5
-    fn hidden()             // 6
+    pub fn area(r)          // 3-5, does nothing
+    fn hidden()             // 6, does nothing
   vec.fut
     pub class Vec    // 1-4
       var x = 0      // 2
-      fn len()       // 3
+      fn len()       // 3, does nothing
 ```
 
-Private names are included; contracts are not (the source and the `.api` have them). The map and the `.api` come from the same reading of the source, so they always agree. `--pub` shows only what other packages can use: each package's interface, and the `pub` names of files in no package. `--json` prints one object per line (`{"type":"fn", "package", "file", "name", "in", "pub", "sig", "line", "end", "hash"}`; `hash` is of the declaration's text, so it changes when the declaration is edited, not when it moves, plus `package`, `module` and `file` records). A last argument keeps one package (`fut map main.fut geom`) or one file.
+Each function that declares no effects says what it does, worked out from its code: the effects it performs, in its own lambdas too, and through every function and method it calls. `does nothing` means it could be declared `!`; `does io, clock` means `! io, clock` would hold. Some calls can't be followed all the way, and the map says so:
+
+```
+fn apply(xs, f)  // 12, does what f does                 (it calls its parameter f: what the caller passes)
+fn stored(m)     // 16, does what it calls through values (m.cb(), a field, a variable: code made elsewhere)
+fn says(h)       // 11, does nothing; .shout() may do io  (h's class isn't known: every class's shout() is counted)
+```
+
+A method call on a value whose class is known (a typed parameter, `self`, a local made by `C(...)`) counts that class's method and its subclasses' overrides. A function that declares effects does at most those, since the runtime holds it to them, so the map shows its declaration instead.
+
+Private names are included; contracts are not (the source and the `.api` have them). The map and the `.api` come from the same reading of the source, so they always agree. `--pub` shows only what other packages can use: each package's interface, and the `pub` names of files in no package. `--json` prints one object per line (`{"type":"fn", "package", "file", "name", "in", "pub", "sig", "line", "end", "hash"}`; `hash` is of the declaration's text, so it changes when the declaration is edited, not when it moves, plus `package`, `module` and `file` records). A function that declares no effects also has `"does"` (effect names), `"doesWhatParams"` (parameter names), `"callsValues"`, `"mayDo"` and `"mayVia"` (method names). A last argument keeps one package (`fut map main.fut geom`) or one file.
 
 ## Fibers
 

@@ -20,6 +20,7 @@ std::vector<V> consts;
 std::string mainFile;
 void (*pollHook)();
 std::string* asmListing;
+bool inferEffectsWanted;
 bool verbose, noTier;
 static_assert(offsetof(Obj, cid) == 4 && sizeof(Str) == 16 && sizeof(Obj) == 8 && offsetof(Class, isize) == CLS_IRUN + 4);
 

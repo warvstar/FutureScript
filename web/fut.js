@@ -907,6 +907,7 @@ export async function createFut(opts) {
     },
     async map(file, pub, json, only) {  // fut map: the packages, files and declarations the program uses; exit status
       path = file;
+      ex.fut_infer_effects(1);  // and what each function does
       if (!(await compileWith(() => withStr(path, (p) => ex.fut_compile(p, 0, 0, 0, 0))))) return 2;
       const n = withStr(only ?? "", (o) => withStr(path, (p) => ex.fut_map(pub ? 1 : 0, json ? 1 : 0, o, p)));
       if (!n && only) write(2, `nothing matches '${only}'\n`);

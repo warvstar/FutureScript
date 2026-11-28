@@ -601,9 +601,56 @@ def runner_map(exe):
           and area.get("package") == "geom" and area.get("line") == 3 and area.get("pub") is True
           and ln.get("in") == "Vec" and ln.get("line") == 3 and ln.get("end") == 3
           and "pkg app" not in f.stdout and "pkg geom" in f.stdout and none.returncode == 1
-          and re.search(r"pub fn area\(r\) +// 3-5\n", marked) and re.search(r"pub class Vec +// 1-5\n", marked) and "invariant" not in marked
+          and re.search(r"pub fn area\(r\) +// 3-5, does nothing\n", marked) and re.search(r"pub class Vec +// 1-5\n", marked) and "invariant" not in marked
           and len(h1.get("area") or "") == 12 and h1["area"] != h2.get("area") and h1.get("len") == h2.get("len") and h1.get("hidden") == h2.get("hidden"))
     return ok, f"text: {t.stdout!r}\n  pub: {p.stdout!r}\n  json: {j.stdout[:400]!r}\n  filtered: {f.stdout!r}\n  contracts marked: {marked!r}"
+
+
+EFFECTS_SRC = """effect Log { fn log(m: str) }
+class Hero {
+  var hp: num = 10
+  fn hit(n: num) { self.hp -= n }
+  fn shout() { print("ow") }
+}
+class Boss : Hero {
+  override fn shout() { print("ROAR") Log.log("roared") }
+}
+fn add(a, b) { return a + b }
+fn says(h) { h.shout() }
+fn tick(h: Hero) { h.shout() h.hit(1) }
+fn apply(xs, f) { for x in xs { f(x) } }
+fn shows() { apply([1], fn(x) { print(x) }) }
+fn passOn(g) { apply([1], g) }
+fn stored(m) { m.cb() }
+fn later() { fn helper() { return clock() } return helper() }
+fn quiet() ! { }
+fn roll() { quiet() return random() }
+fn captured() { handle { print("x") } with print(t) { } }
+fn sends(c) { c.send(1) }
+fn spawner() { return spawn add(1, 2) }
+"""
+
+
+def runner_map_effects(exe):
+    """fut map: what each function that declares no effects does, followed through its calls: its own operations and
+    its lambdas', the fns and methods it calls (a known class's, or every class's method of that name: "may"), the
+    parameters it calls (what f does), and calls of values it can't follow."""
+    d = ROOT / "build" / "mapeff"
+    tree(d, {"eff.fut": EFFECTS_SRC})
+    t = subprocess.run([*runner(exe), "map", str(d / "eff.fut")], capture_output=True, text=True, timeout=60)
+    j = subprocess.run([*runner(exe), "map", "--json", str(d / "eff.fut")], capture_output=True, text=True, timeout=60)
+    recs = {r["name"]: r for r in (json.loads(l) for l in j.stdout.splitlines() if l.startswith("{")) if r.get("type") in ("fn", "method")}
+    want = {"hit(n: num)": "does nothing", "shout()": "does io", "override fn shout()": "does io, Log", "add(a, b)": "does nothing",
+            "says(h)": "does nothing; .shout() may do io, Log", "tick(h: Hero)": "does io, Log", "apply(xs, f)": "does what f does",
+            "shows()": "does io", "passOn(g)": "does what g does", "stored(m)": "does what it calls through values", "later()": "does clock",
+            "roll()": "does random", "captured()": "does nothing", "sends(c)": "does chan", "spawner()": "does spawn"}
+    lines = t.stdout.splitlines()
+    said = lambda k: next((m.group(1) for l in lines if (m := re.search(re.escape(k) + r" +// \d+(?:-\d+)?, (.*)$", l))), None)
+    got = {k: said(k) for k in want}
+    ok = (got == want and not re.search(r"quiet\(\) ! +//.*does", t.stdout)
+          and recs.get("apply", {}).get("doesWhatParams") == ["f"] and recs.get("says", {}).get("mayDo") == ["io", "Log"]
+          and recs.get("says", {}).get("mayVia") == ["shout"] and recs.get("stored", {}).get("callsValues") is True and "does" not in recs.get("quiet", {"does": 1}))
+    return ok, f"got: {got!r}\n  text: {t.stdout!r}"
 
 
 def runner_modules(exe):
@@ -1075,6 +1122,7 @@ RUNNER_TESTS = [("std/math: within 1 ulp of libm, exact cases exact", runner_fma
                 ("fut test: parallel processes, native fallback, timeouts", runner_parallel),
                 ("packages: names, interfaces, boundaries, versions", runner_packages),
                 ("fut map: packages, files, declarations", runner_map),
+                ("fut map: what each function does", runner_map_effects),
                 ("fut refs and check: field writes without execution", runner_refs),
                 ("fut lsp: diagnostics, navigation, rename and editor features over stdio", runner_lsp),
                 ("foreign modules: js, wasm, c", runner_modules),

@@ -477,12 +477,23 @@ char ffiCheck(Ext*, int i, V v);  // argument i's type letter; raises if v does 
 V vmCall(void* code, std::initializer_list<V> args = {});
 V vmEnter(void* code, V* args);  // args: 8 values
 extern std::string* asmListing;
+extern bool inferEffectsWanted;  // fut map: the compile works out what each function does (Compiled::effects)
 
 struct TestCase { std::string name, file, pending; int line = 0; void* code = nullptr; uint64_t hash = 0; };  // a `test "name" { }` block
 // (hash: of its source, name included: fut test --changed)
 // An interface file: the `pub` declarations of a file outside any package, or a package's surface (its root file's,
 // and those it re-exports), with the package's name and version.
 struct ApiUnit { std::string file, api, label; std::vector<std::string> parts; std::string pkg, version; };
+// What a function that declares no effects was found to do (fut map): the effects its code and the functions it calls
+// perform, the parameters it calls (what they do, it does), whether it calls a value it can't follow, and what it may
+// do through a method call whose receiver's class isn't known (via: the methods' names).
+struct FnEffects {
+  std::string file, name;
+  int line = 0;
+  std::vector<std::string> does, params;
+  bool unknown = false;
+  std::vector<std::string> may, via;  // what it may do besides, through calls of these method names on values of unknown class
+};
 struct Compiled {
   void* chunk = nullptr;
   bool mainChanged = false;
@@ -493,6 +504,7 @@ struct Compiled {
   std::vector<int> newVars;  // top-level vars it initialized for the first time
   std::vector<ApiUnit> apis;  // the interface files its sources have
   std::vector<std::string> packages;  // directories of the packages it uses (fut map)
+  std::vector<FnEffects> effects;     // what each function that declares no effects does (fut map)
 };
 struct CompileError : std::runtime_error {  // atEnd: the source ended too early (the REPL reads more)
   bool atEnd;

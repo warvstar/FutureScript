@@ -498,7 +498,30 @@ int writeInterfaces(const Compiled& c, const std::string& program) {  // fut api
 // ---- fut map: every package, file and top-level declaration the program uses, with line ranges ----
 // Generated from the sources each time (never committed, so never stale), in fut's own syntax, for readers who
 // want the layout of a program without reading it: agents deciding where to work, people new to it.
+// What a function that declares no effects does, as fut map shows it: "does io + what f does", "does nothing",
+// "does nothing; .get() may do clock".
+static std::string doesText(const FnEffects& e) {
+  std::string s, names;
+  for (auto& d : e.does) s += (s.empty() ? "" : ", ") + d;
+  for (size_t i = 0; i < e.params.size(); i++) names += (i ? i + 1 == e.params.size() ? " and " : ", " : "") + e.params[i];
+  if (!names.empty()) s += (s.empty() ? "" : " + ") + ("what " + names + (e.params.size() > 1 ? " do" : " does"));
+  if (e.unknown) s += (s.empty() ? "" : " + ") + std::string("what it calls through values");
+  s = "does " + (s.empty() ? "nothing" : s);
+  if (e.may.empty()) return s;
+  std::string may, via;
+  for (auto& m : e.may) may += (may.empty() ? "" : ", ") + m;
+  for (size_t i = 0; i < e.via.size() && i < 3; i++) via += (i ? ", ." : ".") + e.via[i] + "()";
+  if (e.via.size() > 3) via += ", ...";
+  return s + "; " + via + " may do " + may;
+}
 int printMap(const Compiled& c, bool pubOnly, bool asJson, const std::string& only, const std::string& program) {
+  std::map<std::pair<std::string, int>, const FnEffects*> does;  // by file and line
+  for (auto& e : c.effects) does[{e.file, e.line}] = &e;
+  auto doesOf = [&](const std::string& f, const Decl& d) -> const FnEffects* {
+    if (d.kind != "fn" && d.kind != "method") return nullptr;
+    auto it = does.find({f, d.line});
+    return it != does.end() && it->second->name == d.name ? it->second : nullptr;
+  };
   struct Group { const Package* pkg; std::vector<const std::pair<std::string, std::string>*> files; };
   std::vector<Group> groups{{nullptr, {}}};  // first: the files outside any package
   for (auto& d : c.packages) if (const Package* p = packageAt(d)) groups.push_back({p, {}});
@@ -559,7 +582,13 @@ int printMap(const Compiled& c, bool pubOnly, bool asJson, const std::string& on
           if (!d->owner.empty()) o += ",\"in\":" + quoteJson(d->owner);
           if (!d->mod.empty()) o += ",\"module\":" + quoteJson(d->mod);
           o += std::string(",\"pub\":") + (d->pub ? "true" : "false") + ",\"sig\":" + quoteJson(d->sig) + ",\"line\":" + std::to_string(d->line) + ",\"end\":" + std::to_string(d->end) +
-               ",\"hash\":\"" + spanHash(files[i]->second, d->line, d->end) + "\"}\n";
+               ",\"hash\":\"" + spanHash(files[i]->second, d->line, d->end) + "\"";
+          if (const FnEffects* e = doesOf(f, *d)) {  // what it does (it declares nothing)
+            auto list = [&](const std::vector<std::string>& l) { std::string a; for (auto& x : l) a += (a.empty() ? "" : ",") + quoteJson(x); return "[" + a + "]"; };
+            o += ",\"does\":" + list(e->does) + ",\"doesWhatParams\":" + list(e->params) + ",\"callsValues\":" + (e->unknown ? "true" : "false") +
+                 ",\"mayDo\":" + list(e->may) + ",\"mayVia\":" + list(e->via);
+          }
+          o += "}\n";
           n++;
         }
         emit();
@@ -573,7 +602,9 @@ int printMap(const Compiled& c, bool pubOnly, bool asJson, const std::string& on
         std::string l = ind + "  " + (d->owner.empty() ? "" : "  ") + d->sig;
         size_t col = ind.size() + 2 + w + 2;
         l += std::string(l.size() < col ? col - l.size() : 2, ' ');
-        l += "// " + std::to_string(d->line) + (d->end != d->line ? "-" + std::to_string(d->end) : "") + "\n";
+        l += "// " + std::to_string(d->line) + (d->end != d->line ? "-" + std::to_string(d->end) : "");
+        if (const FnEffects* e = doesOf(f, *d)) l += ", " + doesText(*e);
+        l += "\n";
         o += l, n++;
       }
       emit();

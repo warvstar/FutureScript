@@ -513,6 +513,7 @@ static int initCommand(int argc, char** argv) {
 // fut map [--pub] [--json] file.fut [package | file]: the packages, files and declarations the program uses
 static int mapCommand(bool pubOnly, bool json, const std::string& only) {
   Compiled c;
+  inferEffectsWanted = true;  // and what each function does
   try {
     c = compile(path, false, false);
   } catch (std::exception& e) { return fflush(stdout), fprintf(stderr, "%s\n", e.what()), 2; }
