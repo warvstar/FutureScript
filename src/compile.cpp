@@ -380,7 +380,7 @@ struct Compiler : Gen, Namespaces {
   // Values whose static type is known where they meet a declared type: a literal, a constructor, or something declared
   // (a typed var, parameter or field). Checked once every type is known; a clash no value could pass is an error.
   struct ArgVal { int path = 0; bool num = false; const char* p = nullptr; int line = 0; };  // path: its type; num: a number
-  struct CallSite { int callee; std::vector<ArgVal> args; std::string file; const char* src; };  // a direct call of a top-level fn
+  struct CallSite { int callee; std::vector<ArgVal> args; std::string file; const char* src; int cls = -1; const char* at = nullptr; int line = 0; int recv = 0; };  // a direct call of a top-level fn, (cls >= 0) a constructor's, or (recv: the receiver's type path) a method's, callee its name
   struct Expect { uint64_t type; int typePath, field; ArgVal value; std::string what, file; const char* src; };  // typePath: a field's
   std::vector<CallSite> callSites;
   std::vector<Expect> expects;
@@ -1164,7 +1164,10 @@ struct Compiler : Gen, Namespaces {
     if (n) st(0, slot());
     callWindow(base, n, S_push, false);
   }
-  void call(int sym, bool super, std::vector<int>* origins = nullptr) { int base = slot(); st(0, base), callWindow(base, exprList(')', false, nullptr, origins), sym, super); }
+  void call(int sym, bool super, std::vector<int>* origins = nullptr, std::vector<ArgVal>* vals = nullptr) {
+    int base = slot();
+    st(0, base), callWindow(base, exprList(')', false, vals, origins), sym, super);
+  }
   void printCall(const Tok& t, Global& g) {
     int base = slot();
     gmem(0, g.slot), st(0, base);
@@ -1188,11 +1191,16 @@ struct Compiler : Gen, Namespaces {
     imm(0, box((double)size)), st(0, slot());
     gmem(0, findGlobal(intern("vec@of"))->slot), st(0, base), callWindow(base, 2, 0, false);
   }
-  void construct(Global& g, int cls) {  // C(args) for a top-level class C
+  void construct(Global& g, int cls, const Tok& name) {  // C(args) for a top-level class C
     int base = slot();
+    const char* at = name.p;
+    int line = name.line;
     gmem(0, g.slot), st(0, base);
     std::vector<int> origins;
-    constructCall(base, exprList(')', false, nullptr, &origins));
+    std::vector<ArgVal> args;
+    int n = exprList(')', false, tiering ? nullptr : &args, &origins);
+    if (!tiering) callSites.push_back({-1, std::move(args), file, srcStart, cls, at, line});  // checked once every class is known
+    constructCall(base, n);
     effRecord('c', cls, std::move(origins));
   }
   bool returnsNum(int sym) {  // a top-level fn declared `: num`: its returns check that, so callers may rely on it
@@ -1705,6 +1713,8 @@ struct Compiler : Gen, Namespaces {
         ldl(0, m.subject), field(vd.fields[i], false);
         int h = home();
         stl(0, h), F->locals.push_back({binds[i], h});
+        // The arm runs only on this variant, so the name holds its field: the field's declared type, if any (until assigned).
+        if (!tiering) F->locals.back().path = addPath(addPath(addPath(0, -1, tyClass(vd.sym)), vd.fields[i]), -1);
         if (nav) {
           int id = F->locals.back().symbol = indexLocal(bindTokens[i], "var");
           for (auto old = F->locals.begin() + F->scopeAt; old != F->locals.end() - 1; ++old)
@@ -1854,7 +1864,7 @@ struct Compiler : Gen, Namespaces {
       if (at('(') && !cur.nl) failAt(t.p, t.line, "@class %s is an enum: make one of its variants, %s.%s", name(t.sym), name(t.sym), name(enumDefs[t.sym].vs.empty() ? t.sym : enumDefs[t.sym].vs[0].raw));
     }
     if (g->kind == 'c' && at('(') && !cur.nl) {
-      next(), construct(*g, t.sym);
+      next(), construct(*g, t.sym, t);
       if (nav) nav->ctorStart = start, nav->ctorEnd = prevEnd, nav->ctorClass = t.sym;
       return constructed(t.sym);
     }
@@ -1959,6 +1969,15 @@ struct Compiler : Gen, Namespaces {
 
   // A value just made by C(...) or Enum.Variant(...) is exactly that class, so `var p = C()` gives p its type (until p
   // is assigned again) and p.name is checked against C's declared fields and methods, as if p were declared `p: C`.
+  static int builtinKind(uint64_t t) {  // 'l' a list type (list, list<T>), 's' a str type (str, a "literal"), else 0
+    if ((t & 15) == TY_LIST) return 'l';
+    if ((t & 15) == TY_STR) return 's';
+    if (const TypeDesc* d = (t & 15) == TY_EXT ? typeDesc(t) : nullptr) {
+      if (d->k == 'L') return 'l';  // (not a matrix: a gpu fn reads one differently, and says so)
+      if (d->k == 'l' && d->lit == 's') return 's';
+    }
+    return 0;
+  }
   LV constructed(int cls) { return typedValue(tyClass(cls)); }
   LV typedValue(uint64_t type) {  // a value whose type the compiler knows here (a literal's, a constructor's)
     LV v;
@@ -1975,8 +1994,10 @@ struct Compiler : Gen, Namespaces {
         next();
         Tok ft = cur;
         int s = at(T_ID) ? (next(), prev.sym) : ident();  // keywords too: m.class, as {class: ...} writes
-        int receiver = inferEffectsWanted && !tiering && at('(') && !cur.nl ? valuePath(v) : 0, self = selfClass(F, v);
-        int path = memberPath(v, ft, at('(') && !cur.nl);
+        bool isCall = at('(') && !cur.nl;
+        int receiver = inferEffectsWanted && !tiering && isCall ? valuePath(v) : 0, self = selfClass(F, v);
+        int recv = !tiering && isCall && s != S_push ? valuePath(v) : 0;  // its type, if known: the method's params are checked
+        int path = memberPath(v, ft, isCall);
         bool own = v.k == LV_LOCAL && F->cls >= 0 && v.a == F->selfHome;
         load(v);
         Cond no;
@@ -1986,7 +2007,9 @@ struct Compiler : Gen, Namespaces {
         v = {LV_FIELD, 0, s}, v.own = own, v.path = path;
         if (at('(') && !cur.nl) {
           std::vector<int> origins;
-          next(), s == S_push ? pushCall(&origins) : call(s, false, &origins), v = {};
+          std::vector<ArgVal> args;
+          next(), s == S_push ? pushCall(&origins) : call(s, false, &origins, recv ? &args : nullptr), v = {};
+          if (recv) callSites.push_back({s, std::move(args), file, srcStart, -1, ft.p, ft.line, recv});
           effRecord('m', s, std::move(origins), self, receiver);
         }
         if (optional) {
@@ -4267,6 +4290,17 @@ struct Compiler : Gen, Namespaces {
         for (auto& [f, _] : d->fields) names.push_back(f), ok |= f == u.sym;
         if (u.call) for (int m : {S_has, S_remove, S_keys, S_values, S_len}) ok |= m == u.sym;  // a map's methods
         what = (type & 15) == TY_NAMED ? symName(int(type >> 8)) : typeText(t);
+      } else if (int bk = builtinKind(t); bk && !(resolveNow(type) & TY_OPT)) {
+        // A list or str has a fixed set of methods and no fields: anything else throws every time ([no-method], [no-field]).
+        K k = bk == 'l' ? K::List : K::Str;
+        if (u.call && builtinMethod(k, u.sym)) continue;
+        const char* kind = k == K::List ? "list" : "string";
+        std::string name = symName(u.sym), x = u.var == "it" ? (k == K::List ? "l" : "s") : u.var;  // "it": no name (a literal)
+        std::string about = std::string(kind) + " has no " + (u.call ? "method" : "field") + " '" + name + "' (" +
+                            (u.call ? "a " + std::string(kind) + "'s methods: " + builtinMethods(k) : "a " + std::string(kind) + " has methods but no fields") +
+                            ")" + memberHint(k, name, u.call, x);
+        diagnoseHere(u.at, u.call ? "@no-method %s" : "@no-field %s", about);
+        continue;
       } else continue;
       if (ok) continue;
       std::string list, near;
@@ -4306,13 +4340,52 @@ struct Compiler : Gen, Namespaces {
     };
     auto valueType = [&](const ArgVal& a) -> uint64_t { return a.num ? TY_NUM : a.path ? paths[a.path].type : 0; };
     for (auto& c : callSites) {
-      auto it = sigs.find(symName(c.callee));
+      std::string callee = c.cls < 0 ? symName(c.callee) : "";
+      if (c.recv) {  // x.m(args), x of a known class: the m it finds (an override declares the same params)
+        uint64_t t = resolveNow(paths[c.recv].type);
+        if ((t & TY_OPT) || (t & 15) != TY_CLS) continue;
+        int owner = -1;
+        for (int s = int(t >> 8); s >= 0 && owner < 0;) {
+          const ClassView* v = view(s);
+          if (!v) break;
+          for (auto [m, a] : v->methods) if (m == c.callee) owner = s;
+          s = v->super;
+        }
+        if (owner < 0) continue;  // not a method of it: [no-field] says so
+        callee = symName(owner) + "." + symName(c.callee);
+      }
+      if (c.cls >= 0) {  // C(args): C's init, or the one it inherits; none takes no arguments
+        int owner = -1;
+        bool known = true;
+        for (int s = c.cls; s >= 0 && owner < 0;) {
+          const ClassView* v = view(s);
+          if (!v) { known = false; break; }
+          for (auto [m, a] : v->methods) if (m == S_init) owner = s;
+          s = v->super;
+        }
+        if (!known) continue;
+        if (owner < 0) {
+          if (!c.args.empty())
+            diagnoseHere(At{c.at, c.line, c.file, c.src}, "@arity %s takes no arguments (it has no init), got %s", symName(c.cls) + "()", std::to_string(c.args.size()));
+          continue;
+        }
+        callee = symName(owner) + ".init";
+      }
+      auto it = sigs.find(callee);
       if (it == sigs.end()) continue;
       const Sig& s = it->second;
+      if ((c.cls >= 0 || c.recv) && c.args.size() != s.params.size()) {
+        std::string ps;
+        for (size_t i = 0; i < s.params.size(); i++) ps += (i ? ", " : "") + symName(s.params[i]) + (s.types[i] ? ": " + typeText(s.types[i]) : "");
+        size_t n = s.params.size();
+        diagnoseHere(At{c.at, c.line, c.file, c.src}, "@arity %s expects %s (%s), got %s", c.recv ? callee + "()" : symName(c.cls) + "()",
+                     std::to_string(n) + (n == 1 ? " argument" : " arguments"), ps, std::to_string(c.args.size()));
+        continue;
+      }
       for (size_t i = 0; i < c.args.size() && i < s.params.size() && i + 1 < s.types.size(); i++)
         if (uint64_t d = s.types[i], v = valueType(c.args[i]); contradicts(d, v, related))
           diagnoseHere(At{c.args[i].p, c.args[i].line, c.file, c.src}, "@type argument '%s' of %s must be %s, got %s", symName(s.params[i]),
-                       display(symName(c.callee)), typeText(d), staticText(v));
+                       c.cls >= 0 ? symName(c.cls) + "()" : c.recv ? callee + "()" : std::string(display(symName(c.callee))), typeText(d), staticText(v));
     }
     for (auto& e : expects) {
       uint64_t d = e.type;

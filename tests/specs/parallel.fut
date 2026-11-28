@@ -1,6 +1,7 @@
 // parallel for i in a..b { body }: the body runs once for each i, on the isolates of the pool, and the loop ends
 // when every iteration has. The body writes its results to buffers, each only at [i]; what it reads from outside is
 // a frozen copy, and it performs no effects. So the result is the one a plain for gives, however the iterations ran.
+fn missingOf(l) { return l.missing() }  // a call the compiler can't see into: the error comes when it runs
 fn errorOf(f) {
   try { f() } catch e { return e }
   return nil
@@ -54,7 +55,7 @@ test "an error is the one at the lowest i that fails, every run" {
   for r in 0..5 {
     expect errorOf(fn() { parallel for i in 0..100 { out[i] = 1  if i % 10 == 7 { throw "boom " + str(i) } } }) == "parallel for, at i = 7: boom 7"
   }
-  expect errorOf(fn() { parallel for i in 0..100 { if i >= 50 { out[i] = [].missing() } } }).has("parallel for, at i = 50: list has no method 'missing'")
+  expect errorOf(fn() { parallel for i in 0..100 { if i >= 50 { out[i] = missingOf([]) } } }).has("parallel for, at i = 50: list has no method 'missing'")
   expect errorOf(fn() { parallel for i in 0.5..10 { } }).has("whole numbers")
 }
 test "the body can't change what it reads from outside" {

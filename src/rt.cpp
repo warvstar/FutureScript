@@ -497,7 +497,8 @@ static V rt_getf(V o, uint64_t s, IC* ic) {
     if (in->cls->closed()) ERR("@no-field %s has no field '%s'", symName(in->cls->name).c_str(), symName(s).c_str());
   }
   if (is(o, K::Buf)) return vecField(o, s);
-  ERR("@no-field %s has no field '%s'", typeName(o), symName(s).c_str());
+  std::string hint = is(o, K::List) || is(o, K::Str) ? memberHint(obj(o)->kind, symName(s), false, is(o, K::List) ? "l" : "s") : "";
+  ERR("@no-field %s has no field '%s'%s", typeName(o), symName(s).c_str(), hint.c_str());
 }
 // What JIT constructors read from a class: a new instance has room for every field the class has had so far.
 // Hold layoutMu. Isolates construct while it changes: the cell size is written (one word) before the header that
@@ -615,14 +616,38 @@ static void* identCode;  // constructor of a class without init: returns self
 // Resolve a call. w[0] is the callee or receiver, w[1..n] the args; on return the JIT loads x0..x7 from w (x8 = w).
 // ic: a method call's cache (key: receiver header), or a constructor site's (key: the class value).
 int invariantSym() { static int s = intern("inv@"); return s; }
-static const char* methodPackage(V receiver, const std::string& method) {
+bool builtinMethod(K k, int sym) { return builtin(k, (uint64_t)sym) != nullptr; }
+std::string builtinMethods(K k) {  // "push, pop, len, ..." in sym order
+  std::string out;
+  for (size_t s = 0; s < builtins[(int)k].size(); s++)
+    if (builtins[(int)k][s]) out += (out.empty() ? "" : ", ") + symName((int)s);
+  return out;
+}
+// What to use instead of x.name on a list or str that has no such member, written for x (empty: no hint). Shared by the
+// runtime error and the compile-time one, so both say the same thing.
+std::string memberHint(K k, const std::string& name, bool call, const std::string& x) {
   static const char* const lists[] = {"all", "any", "contains", "count", "filter", "find", "flatten",
     "indexOf", "map", "max", "min", "range", "reduce", "reverse", "sort", "sortable", "sortBy", "sum", "unique"};
   static const char* const strings[] = {"count", "endsWith", "lines", "lower", "padEnd", "padStart",
     "repeat", "replace", "reverse", "startsWith", "upper", "words"};
-  if (is(receiver, K::List) && std::find(std::begin(lists), std::end(lists), method) != std::end(lists)) return "lists";
-  if (is(receiver, K::Str) && std::find(std::begin(strings), std::end(strings), method) != std::end(strings)) return "strings";
-  return nullptr;
+  static const char* const alone[] = {"sort", "reverse", "unique", "flatten", "sum", "min", "max", "lines", "lower", "upper", "words"};
+  auto in = [&](auto& names) { return std::find(std::begin(names), std::end(names), name) != std::end(names); };
+  std::string rest = in(alone) ? ")" : ", ...)";
+  if (name == "length" || name == "size" || (name == "len" && !call)) return "; use " + x + ".len() or len(" + x + ")";
+  if (k == K::List) {
+    if (name == "has" || name == "includes") return "; import \"std/lists\" and use lists.contains(" + x + ", v)";
+    if (name == "append" || name == "add") return "; use " + x + ".push(v)";
+    if (call && in(lists)) return "; import \"std/lists\" and use lists." + name + "(" + x + rest;
+  } else if (k == K::Str) {
+    if (name == "includes" || name == "contains") return "; use " + x + ".has(part)";
+    if (name == "indexOf") return "; use " + x + ".find(part)";
+    if (name == "substring" || name == "substr") return "; use " + x + ".slice(a, b)";
+    if (name == "strip") return "; use " + x + ".trim()";
+    if (name == "toUpperCase" || name == "toLowerCase")
+      return std::string("; import \"std/strings\" and use strings.") + (name == "toUpperCase" ? "upper" : "lower") + "(" + x + ")";
+    if (call && in(strings)) return "; import \"std/strings\" and use strings." + name + "(" + x + rest;
+  }
+  return "";
 }
 static void* rt_prep(V* w, uint64_t n, uint64_t sym, V sup, IC* ic) {
   V r = w[0];
@@ -644,10 +669,8 @@ static void* rt_prep(V* w, uint64_t n, uint64_t sym, V sup, IC* ic) {
     }
     if (!f) {
       const auto& method = symName(sym);
-      if (const char* pkg = methodPackage(r, method))
-        ERR("@no-method %s has no method '%s'; import \"std/%s\" and use %s.%s%s",
-            typeName(r), method.c_str(), pkg, pkg, method.c_str(), method == "sort" ? "(l)" : "");
-      ERR("@no-method %s has no method '%s'", typeName(r), method.c_str());
+      std::string hint = is(r, K::List) || is(r, K::Str) ? memberHint(obj(r)->kind, method, true, is(r, K::List) ? "l" : "s") : "";
+      ERR("@no-method %s has no method '%s'%s", typeName(r), method.c_str(), hint.c_str());
     }
     if (ic && is(r, K::Inst) && f->arity == (int)n + 1) *ic = {header(obj(r)), (uint64_t)f->code};
   } else if (is(r, K::Fn)) {

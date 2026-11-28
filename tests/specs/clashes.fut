@@ -31,3 +31,30 @@ test "no error where some value could pass" {
   expect compileErr("fn g(n: num) \{ }\nfn f(s) \{ var x = \"a\" x = s g(x) }") == ""               // assigned again
   expect compileErr("fn f(): num? \{ return }") == ""
 }
+test "a constructor's arguments, and a method's on an instance of a known class" {
+  var cls = "class E \{ var t: str  var n: num  fn init(t: str, n: num) \{ self.t = t self.n = n } fn put(x: str) \{ self.t = x } }\n"
+  expect compileErr(cls + "fn f(e: E) \{ E(e.n, e.t) }").has("argument 't' of E() must be str, got a number [type]")
+  expect compileErr(cls + "fn f() \{ E(\"a\") }").has("E() expects 2 arguments (t: str, n: num), got 1 [arity]")
+  expect compileErr(cls + "class F : E \{ }\nfn f() \{ F(1, 2) }").has("argument 't' of F() must be str, got a number")  // the init it inherits
+  expect compileErr("class A \{ var x = 1 }\nfn f() \{ A(1) }").has("A() takes no arguments (it has no init), got 1 [arity]")
+  expect compileErr(cls + "fn f(e: E) \{ e.put(e.n) }").has("argument 'x' of E.put() must be str, got a number [type]")
+  expect compileErr(cls + "fn f() \{ var e = E(\"a\", 1) e.put(\"b\", 2) }").has("E.put() expects 1 argument (x: str), got 2 [arity]")
+  expect compileErr(cls + "fn f(e: E?) \{ e?.put(1) }") == ""                                  // may be nil: the call is skipped
+  expect compileErr(cls + "fn f(e) \{ e.put(1) }") == ""                                       // not known
+}
+test "a value bound by a match arm has its variant field's type" {
+  var en = "enum Node \{\n  Heading(level: num, text: str)\n  Raw(x)\n}\nfn half(n: num): num \{ return n / 2 }\n"
+  expect compileErr(en + "fn f(n: Node) \{ match n \{ Heading(level, text) \{ half(text) } Raw(x) \{ } } }").has("argument 'n' of half() must be num, got a string")
+  expect compileErr(en + "fn f(n: Node) \{ match n \{ Heading(_, text) \{ text = 2 half(text) } Raw(x) \{ half(x) } } }") == ""  // assigned again; untyped
+}
+test "a list or a string has a fixed set of methods and no fields" {
+  expect compileErr("fn f() \{ var out = [] out.has(1) }").has("list has no method 'has' (a list's methods: push, pop, len, slice, join); import \"std/lists\" and use lists.contains(out, v) [no-method]")
+  expect compileErr("fn f(xs: list<num>) \{ xs.count() }").has("use lists.count(xs, ...)")
+  expect compileErr("fn f(s: str) \{ s.length }").has("string has no field 'length' (a string has methods but no fields); use s.len() or len(s) [no-field]")
+  expect compileErr("fn f() \{ \"a b\".includes(\"a\") }").has("string has no method 'includes'")
+  expect compileErr("fn f() \{ var s = \"a\" s.upper() }").has("strings.upper(s) [no-method]")
+  expect compileErr("fn f(s) \{ var x = [] x = s x.trim() }") == ""                     // assigned again
+  expect compileErr("fn f(s: str?) \{ s?.foo() }") == ""                                // may be nil
+  expect compileErr("fn f() \{ var m = \{} m.foo() m.k }") == ""                        // a map's keys are its fields
+  expect run({source: "var l = [1]\nl.has(1)"}).err.has("list has no method 'has'; import \"std/lists\" and use lists.contains(l, v)")  // the same hint when it runs
+}
