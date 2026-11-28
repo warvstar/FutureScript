@@ -274,7 +274,7 @@ class Kernel {
     self.g = g
     self.info = info
     self.binds = {}
-    var name = info.entry.slice(2, info.entry.len())
+    var name = info.name
     var first = 0
     if how == "map" {
       var t = info.types.len() > 0 ? info.types[0] : "none"
@@ -293,7 +293,7 @@ class Kernel {
     var spec = {}
     var call = ""
     for i in first..info.names.len() {
-      if info.types[i] == "bool" || info.types[i] == "u32" { throw "gpu {how}(): {name}'s parameter {info.names[i]} is a {info.types[i]}: the GPU takes num and vector args" }
+      if !{f32: 1, vec2f: 1, vec3f: 1, vec4f: 1}.has(info.types[i]) { throw "gpu {how}(): {name}'s parameter {info.names[i]} is a {info.types[i]}: the GPU takes num and vector args" }
       spec[info.names[i]] = info.types[i]
       call += ", args.{info.names[i]}"
     }
@@ -330,11 +330,11 @@ class Kernel {
   }
   fn setArgs(args: list, first: num) {
     var n = self.info.names.len() - first
-    if args.len() != n { throw "gpu: {self.info.entry.slice(2, self.info.entry.len())} takes {n} args after its first parameter, got {args.len()}" }
+    if args.len() != n { throw "gpu: {self.info.name} takes {n} args after its first parameter, got {args.len()}" }
     if n == 0 { return }
     var values = {}
     for i in 0..n { values[self.info.names[first + i]] = args[i] }
-    try { self.u.set(values) } catch e { throw "gpu: args of {self.info.entry.slice(2, self.info.entry.len())}: {e}" }
+    try { self.u.set(values) } catch e { throw "gpu: args of {self.info.name}: {e}" }
   }
   fn map(buf: Buffer, args: list) {
     self.setArgs(args, 1)

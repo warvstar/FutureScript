@@ -1,15 +1,21 @@
 // gpu fn: a top-level function compiled for the CPU like any other, and also translated to WGSL, which std/gpu runs on
 // the GPU. The translation re-reads the function's source. It takes the part of fut that means the same on both: f32
-// numbers, u32 whole numbers, bools and vectors (vec2f, vec3f, vec4f), locals, if / while / for over a range, calls of
-// other gpu fns of its file, sqrt, floor, int, std/math's functions, the vector methods, and the file's gpu vars
-// (constant numbers and tables of them). Anything else is a compile error naming what to write instead, so a gpu fn
-// that compiles runs the same on the GPU as on the CPU (up to f32 rounding, and u32 + * << wrapping past 2^32).
+// numbers, u32 whole numbers, bools, vectors (vec2f, vec3f, vec4f), matrices (mat2x2f, mat3x3f, mat4x4f), structs (a
+// `type Name = {field: type, ...}` of the file), locals, if / while / for over a range, calls of other gpu fns of its
+// file, sqrt, floor, int, std/math's functions, the vector methods, and the file's gpu vars (constant numbers and
+// tables of them). Anything else is a compile error naming what to write instead, so a gpu fn that compiles runs the
+// same on the GPU as on the CPU (up to f32 rounding, and u32 + * << wrapping past 2^32).
 //
 // Each expression has a type here, as in WGSL. A whole-number literal takes the type of what it meets (2 is 2.0 beside
 // an f32, 2u beside a u32). u32s stay u32 through & | ^ << >> + * %; - / ** and anything mixed with an f32 compute in
-// f32, as fut computes every number. Where a u32 is wanted (a u32 parameter, var, result, bitwise operand or table
-// index) an f32 is converted with u32(): on the CPU the same value fails the u32 type check or the bitwise operator
-// unless it is whole, so the two agree wherever both run.
+// f32, as fut computes every number. Where a u32 is wanted (a u32 parameter, var, result, bitwise operand or index) an
+// f32 is converted with u32(): on the CPU the same value fails the u32 type check or the bitwise operator unless it is
+// whole, so the two agree wherever both run.
+//
+// Vectors, matrices and structs are values on the GPU. On the CPU they are objects, so a gpu fn never changes one in
+// place except v.x = e on a local vector, which the CPU compiles as v = a copy with x changed (vec@set). A file's
+// functions and gpu vars are named stem_name in WGSL (its file's name), so two files' translations go in one shader;
+// structs keep their names, so hand-written WGSL beside them can use them.
 #include "compile.h"
 #include <cmath>
 #include <map>
@@ -36,26 +42,34 @@ std::string u32Lit(double n) {
 }
 
 // A value's type. WHOLE: a whole-number literal, f32 or u32 by where it goes. TABLE: a gpu var list, until indexed.
-enum Ty { F32, U32, BOOL, V2, V3, V4, WHOLE, TABLE, VOID };
-const char* const TY_NAMES[] = {"f32", "u32", "bool", "vec2f", "vec3f", "vec4f", "f32", "a table", "nothing"};
+// STRUCT + i: the file's i-th struct (GpuCtx::structs).
+enum Ty { F32, U32, BOOL, V2, V3, V4, M2, M3, M4, WHOLE, TABLE, VOID, STRUCT = 32 };
+const char* const TY_NAMES[] = {"f32", "u32", "bool", "vec2f", "vec3f", "vec4f", "mat2x2f", "mat3x3f", "mat4x4f", "f32", "a table", "nothing"};
 bool isVec(int t) { return t >= V2 && t <= V4; }
+bool isMat(int t) { return t >= M2 && t <= M4; }
+bool isScalar(int t) { return t == F32 || t == U32 || t == WHOLE; }
+int size(int t) { return isVec(t) ? t - V2 + 2 : t - M2 + 2; }
 
 // A gpu var: its WGSL constant, and its shape (no dims: a number).
 struct Table { std::string name, wgsl; int elem = F32; std::vector<size_t> dims; };
+struct Struct { std::string name, wgsl; std::vector<std::pair<std::string, int>> fields; };
 struct E { std::string s; int t = F32; double n = 0; const Table* tab = nullptr; size_t depth = 0; };
 struct Sig { std::vector<int> params; std::vector<std::string> names; int result = VOID; };
 
 struct GpuCtx {  // what one translation (a gpu fn and what it uses) works from
-  const std::vector<GpuFnSrc>& fns;
-  const std::vector<GpuFnSrc>& vars;
+  const GpuFile& file;
   std::function<const std::string*(int)> alias;
   const GpuFail& failed;
   std::map<size_t, Sig> sigs;
   std::map<size_t, Table> tables;
   std::vector<size_t> tableOrder;  // as first used
-  std::vector<size_t> tableBusy;
+  std::map<size_t, int> structOf;  // a type decl's index -> its struct
+  std::vector<Struct> structs;     // in the order they are declared to WGSL (a struct after those it holds)
+  std::vector<size_t> busy;        // the types being read, so a struct can't hold itself
   const Sig& sig(size_t i);
   const Table& table(size_t i);
+  int strukt(size_t i, const Tok& from);
+  std::string named(int sym) const { return file.stem + "_" + symName(sym); }
 };
 
 struct Tr {
@@ -92,18 +106,21 @@ struct Tr {
     return nullptr;
   }
   static std::string L(int s) { return "l_" + symName(s); }
-  static std::string tyName(int t) { return TY_NAMES[t]; }
+  std::string tyName(int t) { return t >= STRUCT ? sh.structs[t - STRUCT].name : TY_NAMES[t]; }
 
   int type() {
     Tok t = cur;
     int s = ident();
     const std::string& n = symName(s);
-    if (at('?') || at('|')) fail(cur, "a gpu fn's types are num, u32, bool, vec2f, vec3f or vec4f (no ? or |)");
+    if (at('?') || at('|')) fail(cur, "a gpu fn's types are num, u32, bool, vectors, matrices and the file's structs (no ? or |)");
     if (n == "num" || n == "f32") return F32;
     if (n == "u32") return U32;
     if (n == "bool") return BOOL;
     if (n == "vec2f" || n == "vec3f" || n == "vec4f") return V2 + (n[3] - '2');
-    fail(t, "a gpu fn's parameters and result are num, u32, bool, vec2f, vec3f or vec4f, not " + n);
+    if (n == "mat2x2f" || n == "mat3x3f" || n == "mat4x4f") return M2 + (n[3] - '2');
+    for (size_t i = 0; i < sh.file.types.size(); i++)
+      if (sh.file.types[i].sym == s) return STRUCT + sh.strukt(i, t);
+    fail(t, "a gpu fn's types are num, u32, bool, vec2f/3f/4f, mat2x2f/3x3f/4x4f and the file's types of {fields}, not " + n);
   }
 
   // e as a want: a whole literal becomes either kind of number, a u32 an f32, and an f32 a u32 (see the top)
@@ -119,9 +136,8 @@ struct Tr {
     if (e.t == TABLE) fail(t, e.tab->name + " is a table: index it (" + e.tab->name + "[i])");
     fail(t, "expected " + (want == WHOLE ? std::string("a number") : tyName(want)) + ", got " + tyName(e.t));
   }
-  int num(const E& e, const Tok& t) {  // a scalar's type, as arithmetic takes it
-    if (e.t == BOOL || e.t == VOID || e.t == TABLE) to(e, F32, t);
-    return e.t;
+  void num(const E& e, const Tok& t) {  // a scalar, as arithmetic takes it
+    if (!isScalar(e.t)) to(e, F32, t);
   }
 
   // ---- statements ----
@@ -141,8 +157,10 @@ struct Tr {
     if (c.t != BOOL) fail(t, "a gpu fn's conditions are bools, not " + tyName(c.t) + ": compare (x != 0)");
     return c.s;
   }
+  static int compound(int op) { return op == T_ADDEQ ? '+' : op == T_SUBEQ ? '-' : op == T_MULEQ ? '*' : '/'; }
   void stmt() {
     Tok t = cur;
+    if (accept(';')) return;  // as on the CPU, a ; separates statements on one line
     if (atKw(K_var)) {
       next();
       Tok n = cur;
@@ -150,7 +168,7 @@ struct Tr {
       int ty = accept(':') ? type() : -1;
       if (!accept('=')) fail(n, "a var in a gpu fn needs a value: var " + symName(s) + " = ...");
       Tok vt = cur;
-      E e = expr();
+      E e = value(ty);
       bool typed = ty >= 0;
       if (!typed) ty = e.t == WHOLE ? F32 : e.t;
       if (ty == TABLE) fail(vt, e.tab->name + " is a table: a local holds one of its numbers (" + e.tab->name + "[i])");
@@ -199,17 +217,18 @@ struct Tr {
       if (!value && result != VOID) fail(t, "this gpu fn returns " + tyName(result) + ": return a value");
       if (!value) return line("return;");
       Tok vt = cur;
-      return line("return " + to(expr(), result, vt) + ";");
+      return line("return " + to(this->value(result), result, vt) + ";");
     }
     if (atKw(K_break) || atKw(K_continue)) return next(), line(prev.sym == K_break ? "break;" : "continue;");
     if (at(T_ID) && cur.sym >= NKW) {
       Tok n = peek();
       int op = n.t;
-      if (op == '=' || op == T_ADDEQ || op == T_SUBEQ || op == T_MULEQ || op == T_DIVEQ) {
+      auto assigns = [](int o) { return o == '=' || (o >= T_ADDEQ && o <= T_DIVEQ); };
+      if (assigns(op)) {
         int s = ident();
         Local* l = local(s);
         if (!l) {
-          for (auto& v : sh.vars) if (v.sym == s) fail(t, symName(s) + " is a gpu var: it never changes");
+          for (auto& v : sh.file.vars) if (v.sym == s) fail(t, symName(s) + " is a gpu var: it never changes");
           fail(t, "a gpu fn assigns only its parameters and locals, not " + symName(s));
         }
         int lt = l->t;
@@ -217,21 +236,42 @@ struct Tr {
         Tok o = cur;
         next();
         Tok vt = cur;
-        E v = expr();
-        if (op != '=') v = binop(op == T_ADDEQ ? '+' : op == T_SUBEQ ? '-' : op == T_MULEQ ? '*' : '/', {L(s), lt}, v, o);
+        E v = value(op == '=' ? lt : -1);
+        if (op != '=') v = binop(compound(op), {L(s), lt}, v, o);
         if (lt == U32 && !typed && v.t == F32)
           fail(vt, symName(s) + " holds a u32 (its first value was one), and this is an f32: declare it var " + symName(s) +
                        ": num to hold fractions, or var " + symName(s) + ": u32 to keep whole numbers");
         return line(L(s) + " = " + to(v, lt, vt) + ";");
       }
-      if (n.t == '.') {
+      if (n.t == '.') {  // v.x = e: one component of a local vector
         Lexer s = lx;
-        s.next(), s.next();
-        if (Tok a = s.next(); a.t == '=' || (a.t >= T_ADDEQ && a.t <= T_DIVEQ))
-          fail(t, "vectors don't change in place: make a new one (v = vec2f(v.x, 1))");
+        s.next();
+        Tok f = s.next(), a = s.next();
+        if (assigns(a.t)) {
+          int vs = ident();
+          Local* l = local(vs);
+          if (!l) fail(t, "a gpu fn changes components only of its own vectors: " + symName(vs) + " isn't a parameter or local");
+          if (l->t >= STRUCT) fail(t, "a gpu fn's structs don't change in place: make a new one (" + symName(vs) + " = {...})");
+          if (!isVec(l->t)) fail(t, symName(vs) + " is " + tyName(l->t) + ": only a vector's components can be set");
+          next();
+          int fs = ident();
+          const std::string& fn = symName(fs);
+          if (fn.size() != 1 || std::string("xyzw").find(fn[0]) >= (size_t)size(l->t))
+            fail(f, "a " + tyName(l->t) + " sets one of its components, " + std::string("xyzw").substr(0, size(l->t)) + ", not " + fn);
+          Tok o = cur;
+          next();
+          Tok vt = cur;
+          E v = expr();
+          std::string c = L(vs) + "." + fn;
+          if (a.t != '=') v = binop(compound(a.t), {c, F32}, v, o);
+          if (isVec(v.t)) fail(vt, "a component is a number, not " + tyName(v.t));
+          return line(c + " = " + to(v, F32, vt) + ";");
+        }
       }
-      if (n.t == '[')
-        for (auto& v : sh.vars) if (v.sym == cur.sym) fail(t, symName(v.sym) + " is a gpu var: it never changes");
+      if (n.t == '[') {
+        for (auto& v : sh.file.vars) if (v.sym == cur.sym) fail(t, symName(v.sym) + " is a gpu var: it never changes");
+        fail(t, "a gpu fn doesn't change vectors or matrices by index: set v.x, or make a new one");
+      }
     }
     fail(t, "a gpu fn's statements are var, assignment, if, while, for, return, break and continue");
   }
@@ -255,12 +295,29 @@ struct Tr {
       return {"(" + to(l, ty, op) + " " + o() + " " + to(r, ty, op) + ")", BOOL};
     }
     if (t == '|' || t == '^' || t == '&' || t == T_SHL || t == T_SHR) {
-      if (isVec(l.t) || isVec(r.t)) fail(op, o() + " in a gpu fn takes u32s, not vectors");
+      if (!isScalar(l.t) || !isScalar(r.t)) fail(op, o() + " in a gpu fn takes u32s, not " + tyName(isScalar(l.t) ? r.t : l.t));
       return {"(" + to(l, U32, op) + " " + o() + " " + to(r, U32, op) + ")", U32};
+    }
+    if (isMat(l.t) || isMat(r.t)) {  // m * v, v * m, m * m, m * k
+      if (t != '*') fail(op, "a gpu fn multiplies matrices (m * v, v * m, m * m, m * k), and doesn't " + o() + " them");
+      int n = size(isMat(l.t) ? l.t : r.t);
+      if (isMat(l.t) && isMat(r.t)) {
+        if (l.t != r.t) fail(op, "* on matrices of different sizes: " + tyName(l.t) + " and " + tyName(r.t));
+        return {"(" + l.s + " * " + r.s + ")", l.t};
+      }
+      const E& o2 = isMat(l.t) ? r : l;
+      if (isVec(o2.t)) {
+        if (size(o2.t) != n) fail(op, "* on a " + tyName(isMat(l.t) ? l.t : r.t) + " and a " + tyName(o2.t) + ": a vector of " + std::to_string(n));
+        return {"(" + l.s + " * " + r.s + ")", V2 + n - 2};
+      }
+      num(o2, op);
+      return {"(" + (isMat(l.t) ? l.s : to(l, F32, op)) + " * " + (isMat(r.t) ? r.s : to(r, F32, op)) + ")", M2 + n - 2};
     }
     auto mod = [](const std::string& a, const std::string& b) { return "(" + a + " - " + b + " * floor(" + a + " / " + b + "))"; };  // fut's %: the sign of the divisor
     if (isVec(l.t) || isVec(r.t)) {
       if (isVec(l.t) && isVec(r.t) && l.t != r.t) fail(op, o() + " on vectors of different sizes: " + tyName(l.t) + " and " + tyName(r.t));
+      if (!isVec(l.t)) num(l, op);
+      if (!isVec(r.t)) num(r, op);
       int vt = isVec(l.t) ? l.t : r.t;
       std::string a = isVec(l.t) ? l.s : to(l, F32, op), b = isVec(r.t) ? r.s : to(r, F32, op);
       return {t == '%' ? mod(a, b) : "(" + a + " " + o() + " " + b + ")", vt};
@@ -270,6 +327,36 @@ struct Tr {
     int ty = u ? U32 : F32;
     std::string a = to(l, ty, op), b = to(r, ty, op);
     return {t == '%' && !u ? mod(a, b) : "(" + a + " " + o() + " " + b + ")", ty};
+  }
+  // An expression where a want is expected: a struct's {field: value, ...} needs to know which struct it makes.
+  E value(int want) { return want >= STRUCT && at('{') ? structLit(want) : expr(); }
+  E structLit(int ty) {
+    const Struct& st = sh.structs[ty - STRUCT];
+    Tok t = cur;
+    expect('{');
+    std::vector<std::string> vals(st.fields.size());
+    std::vector<char> given(st.fields.size(), 0);
+    while (!accept('}')) {
+      if (at(T_EOF)) fail(cur, "expected '}'");
+      Tok k = cur;
+      if (!at(T_ID)) fail(cur, "expected a field of " + st.name);
+      next();
+      const std::string& kn = symName(prev.sym);
+      size_t i = 0;
+      while (i < st.fields.size() && st.fields[i].first != kn) i++;
+      if (i == st.fields.size()) fail(k, st.name + " has no field " + kn);
+      if (given[i]) fail(k, kn + " is given twice");
+      expect(':');
+      Tok vt = cur;
+      vals[i] = to(value(st.fields[i].second), st.fields[i].second, vt), given[i] = 1;
+      accept(',');
+    }
+    std::string s = st.name + "(";
+    for (size_t i = 0; i < vals.size(); i++) {
+      if (!given[i]) fail(t, st.name + " needs every field: " + st.fields[i].first + " is missing");
+      s += (i ? ", " : "") + vals[i];
+    }
+    return {s + ")", ty};
   }
   E expr(int minp = 1) {
     E l = unary();
@@ -283,6 +370,8 @@ struct Tr {
         expect(':');
         E b = expr();
         int ty = a.t;
+        if (isMat(a.t) || isMat(b.t) || a.t >= STRUCT || b.t >= STRUCT)
+          fail(at, "?: in a gpu fn chooses between numbers, bools and vectors (WGSL's select): use if for " + tyName(isMat(a.t) || a.t >= STRUCT ? a.t : b.t));
         if (a.t != b.t || a.t == WHOLE) {
           if (isVec(a.t) || isVec(b.t) || a.t == BOOL || b.t == BOOL) fail(at, "?: in a gpu fn chooses between values of one type, got " + tyName(a.t) + " and " + tyName(b.t));
           num(a, at), num(b, at);
@@ -323,6 +412,7 @@ struct Tr {
       if (v.t != e.t) fail(o, "** on a vector takes a vector of its size");
       return {"pow(" + v.s + ", " + e.s + ")", v.t};
     }
+    num(v, o), num(e, o);
     return {"pow(" + to(v, F32, o) + ", " + to(e, F32, o) + ")", F32};
   }
   std::vector<std::pair<E, Tok>> args() {  // after '('
@@ -345,6 +435,7 @@ struct Tr {
     std::string s;
     for (auto& [e, t] : a) {
       if (vt >= 0 && e.t != vt) fail(t, n + "() on vectors takes vectors of one size, got " + tyName(vt) + " and " + tyName(e.t));
+      if (vt < 0) num(e, t);
       s += (s.empty() ? "" : ", ") + (vt >= 0 ? e.s : to(e, F32, t));
     }
     return {s, vt >= 0 ? vt : F32};
@@ -358,24 +449,40 @@ struct Tr {
     else if (at(T_ID) && cur.sym >= NKW) next(), v = named(t);
     else if (at(T_STR)) fail(t, "a gpu fn has no strings");
     else if (at('[')) fail(t, "a gpu fn has no lists: use vec2f, vec3f or vec4f, or a gpu var for a table");
-    else if (at('{')) fail(t, "a gpu fn has no maps");
+    else if (at('{')) fail(t, "a gpu fn makes a struct where its type is known: return {...}, var p: Name = {...}, or an argument");
     else if (atKw(K_fn)) fail(t, "a gpu fn has no lambdas");
     else if (atKw(K_nil)) fail(t, "a gpu fn has no nil");
     else fail(t, "expected a value");
-    while (at('[') && !cur.nl && v.t == TABLE) {
-      next();
-      Tok it = cur;
-      E i = expr();
-      expect(']');
-      v.s += "[" + to(i, U32, it) + "]";
-      if (++v.depth == v.tab->dims.size()) v.t = v.tab->elem;
-    }
-    while (at('.')) {
+    for (;;) {
+      if (at('[') && !cur.nl) {
+        Tok bt = cur;
+        if (v.t != TABLE && !isVec(v.t) && !isMat(v.t))
+          fail(bt, "a gpu fn indexes its gpu vars, vectors and matrices, not " + tyName(v.t));
+        next();
+        Tok it = cur;
+        E i = expr();
+        expect(']');
+        v.s += "[" + to(i, U32, it) + "]";
+        if (v.t == TABLE) {
+          if (++v.depth == v.tab->dims.size()) v.t = v.tab->elem, v.tab = nullptr;
+        } else v = {v.s, isMat(v.t) ? V2 + size(v.t) - 2 : F32};
+        continue;
+      }
+      if (!at('.')) break;
       next();
       Tok f = cur;
       int s = ident();
       const std::string& n = symName(s);
-      if (!isVec(v.t)) fail(f, "a gpu fn's " + tyName(v.t) + " has no ." + n + ": only vectors have fields and methods");
+      if (v.t >= STRUCT) {
+        const Struct& st = sh.structs[v.t - STRUCT];
+        size_t i = 0;
+        while (i < st.fields.size() && st.fields[i].first != n) i++;
+        if (i == st.fields.size()) fail(f, st.name + " has no field " + n);
+        if (at('(') && !cur.nl) fail(f, "a gpu fn's struct has fields, not methods");
+        v = {v.s + "." + n, st.fields[i].second};
+        continue;
+      }
+      if (!isVec(v.t)) fail(f, "a gpu fn's " + tyName(v.t) + " has no ." + n + (isMat(v.t) ? ": index a matrix's columns, m[i]" : ": only vectors and structs have fields"));
       if (at('(') && !cur.nl) {
         next();
         auto a = args();
@@ -390,10 +497,13 @@ struct Tr {
       if (n.size() > 4 || n.find_first_not_of("xyzw") != std::string::npos) {
         if (n.size() > 4 || n.find_first_not_of("rgba") != std::string::npos) fail(f, "a vector's fields are x y z w (or r g b a), and swizzles of them like xy, not " + n);
       }
+      for (char c : n) {
+        size_t k = std::string("xyzw").find(c);
+        if (k == std::string::npos) k = std::string("rgba").find(c);
+        if ((int)k >= size(v.t)) fail(f, "a " + tyName(v.t) + " has no ." + std::string(1, c));
+      }
       v = {v.s + "." + n, n.size() == 1 ? F32 : int(V2 + n.size() - 2)};
     }
-    if (at('[') && !cur.nl) fail(cur, v.tab ? v.tab->name + " has " + std::to_string(v.tab->dims.size()) + " dimension" + (v.tab->dims.size() == 1 ? "" : "s")
-                                            : std::string("a gpu fn indexes only its gpu vars: use v.x, v.y, ... for a vector"));
     if (at('(') && !cur.nl) fail(cur, "a gpu fn calls functions by name");
     return v;
   }
@@ -407,65 +517,82 @@ struct Tr {
     }
     if (call) {
       next();
+      for (size_t i = 0; i < sh.file.fns.size(); i++)
+        if (sh.file.fns[i].sym == s) {
+          if (std::none_of(deps.begin(), deps.end(), [&](auto& d) { return d.first == i; })) deps.push_back({i, t});
+          const Sig g = sh.sig(i);
+          std::string a;
+          size_t k = 0;
+          if (!accept(')')) {
+            do {
+              Tok at = cur;
+              if (k >= g.params.size()) arity(t, n, k + 1, g.params.size());
+              a += (k ? ", " : "") + to(value(g.params[k]), g.params[k], at), k++;
+            } while (accept(','));
+            expect(')');
+          }
+          arity(t, n, k, g.params.size());
+          return {sh.named(s) + "(" + a + ")", g.result};
+        }
       auto a = args();
       if (n == "vec2f" || n == "vec3f" || n == "vec4f") {
         arity(t, n, a.size(), size_t(n[3] - '0'));
         std::string s;
-        for (auto& [e, at] : a) s += (s.empty() ? "" : ", ") + to(e, F32, at);
+        for (auto& [e, at] : a) num(e, at), s += (s.empty() ? "" : ", ") + to(e, F32, at);
         return {n + "(" + s + ")", V2 + (n[3] - '2')};
+      }
+      if (n == "mat2x2f" || n == "mat3x3f" || n == "mat4x4f") {
+        int k = n[3] - '0';
+        arity(t, n, a.size(), (size_t)k);
+        std::string s;
+        for (auto& [e, at] : a) {
+          if (e.t != V2 + k - 2) fail(at, n + "() takes its columns, each a vec" + std::to_string(k) + "f, not " + tyName(e.t));
+          s += (s.empty() ? "" : ", ") + e.s;
+        }
+        return {n + "(" + s + ")", M2 + k - 2};
       }
       if (n == "sqrt" || n == "floor" || n == "int") {
         arity(t, n, a.size(), 1);
         auto [s, ty] = numeric(n, a);
         return {(n == "int" ? "trunc" : n) + "(" + s + ")", ty};
       }
-      for (size_t i = 0; i < sh.fns.size(); i++)
-        if (sh.fns[i].sym == s) {
-          if (std::none_of(deps.begin(), deps.end(), [&](auto& d) { return d.first == i; })) deps.push_back({i, t});
-          const Sig& g = sh.sig(i);
-          arity(t, n, a.size(), g.params.size());
-          std::string s;
-          for (size_t k = 0; k < a.size(); k++) {
-            s += (k ? ", " : "") + to(a[k].first, g.params[k], a[k].second);
-          }
-          return {"f_" + n + "(" + s + ")", g.result};
-        }
-      fail(t, n + " is not a gpu fn of this file: a gpu fn calls gpu fns, sqrt, floor, int, vec2f/3f/4f and std/math's functions");
+      fail(t, n + " is not a gpu fn of this file: a gpu fn calls gpu fns, sqrt, floor, int, vec2f/3f/4f, mat2x2f/3x3f/4x4f and std/math's functions");
     }
     if (at('.') && peek().t == T_ID) {  // a module's member
       const std::string* m = sh.alias(s);
-      if (!m) fail(t, "a gpu fn reads only its parameters, locals and gpu vars: pass " + n + " in as a parameter");
-      next();
-      Tok f = cur;
-      int fs = ident();
-      const std::string& fn = symName(fs);
-      if (*m == "math" && !(at('(') && !cur.nl)) {
-        if (fn == "pi") return {lit(M_PI), F32};
-        if (fn == "e") return {lit(M_E), F32};
-      }
-      if (*m == "math" && at('(') && !cur.nl) {
+      if (m) {
         next();
-        auto a = args();
-        for (size_t i = 0; i < sizeof MATH / sizeof *MATH; i++)
-          if (fn == MATH[i]) {
-            arity(f, fn, a.size(), (size_t)MATH_ARITY[i]);
-            auto [s, ty] = numeric(fn, a);
-            return {fn + "(" + s + ")", ty};
-          }
+        Tok f = cur;
+        int fs = ident();
+        const std::string& fn = symName(fs);
+        if (*m == "math" && !(at('(') && !cur.nl)) {
+          if (fn == "pi") return {lit(M_PI), F32};
+          if (fn == "e") return {lit(M_E), F32};
+        }
+        if (*m == "math" && at('(') && !cur.nl) {
+          next();
+          auto a = args();
+          for (size_t i = 0; i < sizeof MATH / sizeof *MATH; i++)
+            if (fn == MATH[i]) {
+              arity(f, fn, a.size(), (size_t)MATH_ARITY[i]);
+              auto [s, ty] = numeric(fn, a);
+              return {fn + "(" + s + ")", ty};
+            }
+        }
+        fail(f, "a gpu fn calls std/math's " + std::string("acos asin atan atan2 ceil cos exp log log2 pow sin tan trunc abs min max clamp sign") +
+                    " and reads math.pi and math.e, not " + *m + "." + fn);
       }
-      fail(f, "a gpu fn calls std/math's " + std::string("acos asin atan atan2 ceil cos exp log log2 pow sin tan trunc abs min max clamp sign") +
-                  " and reads math.pi and math.e, not " + *m + "." + fn);
     }
-    for (size_t i = 0; i < sh.vars.size(); i++)
-      if (sh.vars[i].sym == s) {
+    for (size_t i = 0; i < sh.file.vars.size(); i++)
+      if (sh.file.vars[i].sym == s) {
         const Table& g = sh.table(i);
-        if (g.dims.empty()) return {"g_" + n, g.elem};
-        return {"g_" + n, TABLE, 0, &g};
+        if (g.dims.empty()) return {sh.named(s), g.elem};
+        return {sh.named(s), TABLE, 0, &g};
       }
     fail(t, "a gpu fn reads only its parameters, locals and gpu vars: pass " + n + " in as a parameter, or declare it gpu var");
   }
 
-  // ---- a function's header, and the whole function: its WGSL, renamed f_name, its parameters copied into locals ----
+  // ---- a function's header, and the whole function: its WGSL, named stem_name, its parameters copied into locals ----
   Sig header(std::vector<int>* syms = nullptr) {
     expect(T_ID);  // fn
     ident();
@@ -497,15 +624,43 @@ struct Tr {
     info.names = g.names;
     for (int p : g.params) info.types.push_back(tyName(p));
     info.result = result == VOID ? "" : tyName(result);
-    std::string head = "fn f_" + symName(f.sym) + "(";
+    info.name = symName(f.sym), info.entry = sh.named(f.sym);
+    std::string head = "fn " + info.entry + "(";
     for (size_t i = 0; i < ps.size(); i++) head += (i ? ", " : "") + std::string("p_") + symName(ps[i]) + ": " + info.types[i];
     out = head + ")" + (info.result.empty() ? "" : " -> " + info.result) + " {\n";
     scopes.emplace_back();
     for (size_t i = 0; i < ps.size(); i++) line("var " + L(ps[i]) + " = p_" + symName(ps[i]) + ";"), scopes.back().push_back({ps[i], g.params[i], true});
     block();
     out += "}\n";
-    info.wgsl = out, info.entry = "f_" + symName(f.sym);
+    info.wgsl = out;
     return info;
+  }
+
+  // ---- a struct: type Name = {field: type, ...} ----
+  Struct strukt(const GpuFnSrc& d) {
+    start(d);
+    next();  // type
+    Struct st;
+    st.name = symName(ident());
+    expect('=');
+    Tok t = cur;
+    if (!accept('{')) fail(t, "a gpu fn's struct is a type of {fields}: type " + st.name + " = {x: num, ...}");
+    while (!accept('}')) {
+      if (at(T_EOF)) fail(cur, "expected '}'");
+      Tok f = cur;
+      int s = ident();
+      for (auto& [n, _] : st.fields) if (n == symName(s)) fail(f, symName(s) + " is listed twice");
+      expect(':');
+      int ft = type();
+      if (ft == VOID || ft == TABLE) fail(f, "a struct's fields are numbers, bools, vectors, matrices and structs");
+      st.fields.push_back({symName(s), ft});
+      accept(',');
+    }
+    if (st.fields.empty()) fail(t, "a struct has fields");
+    st.wgsl = "struct " + st.name + " {\n";
+    for (auto& [n, ft] : st.fields) st.wgsl += "  " + n + ": " + tyName(ft) + ",\n";
+    st.wgsl += "}\n";
+    return st;
   }
 
   // ---- a gpu var: var NAME [: num | u32 | list<...>] = a number, or a list of them, or of such lists ----
@@ -513,7 +668,8 @@ struct Tr {
     start(v);
     next();  // var
     Table g;
-    g.name = symName(ident());
+    int name = ident();
+    g.name = symName(name);
     size_t want = 0;
     bool typed = accept(':');
     if (typed) {
@@ -555,7 +711,7 @@ struct Tr {
       for (size_t i = 0; i < g.dims[d]; i++) s += (i ? ", " : "") + emit(d + 1);
       return s + ")";
     };
-    g.wgsl = "const g_" + g.name + ": " + types[0] + " = " + emit(0) + ";\n";
+    g.wgsl = "const " + sh.named(name) + ": " + types[0] + " = " + emit(0) + ";\n";
     return g;
   }
   // A number, or a list of these, all lists at one depth of one length: vals in order, dims each depth's length.
@@ -586,20 +742,33 @@ struct Tr {
 const Sig& GpuCtx::sig(size_t i) {
   if (auto it = sigs.find(i); it != sigs.end()) return it->second;
   Tr t{*this};
-  t.start(fns[i]);
-  return sigs[i] = t.header();
+  t.start(file.fns[i]);
+  Sig g = t.header();
+  return sigs[i] = g;
 }
 const Table& GpuCtx::table(size_t i) {
   if (auto it = tables.find(i); it != tables.end()) return it->second;
   Tr t{*this};
-  Table g = t.table(vars[i]);
+  Table g = t.table(file.vars[i]);
   tableOrder.push_back(i);
   return tables[i] = std::move(g);
 }
+int GpuCtx::strukt(size_t i, const Tok& from) {
+  if (auto it = structOf.find(i); it != structOf.end()) return it->second;
+  if (std::find(busy.begin(), busy.end(), i) != busy.end())
+    failed(from.p, from.line, "a struct can't hold itself, directly or through others"), abort();
+  busy.push_back(i);
+  Tr t{*this};
+  Struct st = t.strukt(file.types[i]);
+  busy.pop_back();
+  structs.push_back(std::move(st));
+  return structOf[i] = (int)structs.size() - 1;
+}
 }  // namespace
 
-GpuInfo wgslOf(const std::vector<GpuFnSrc>& fns, const std::vector<GpuFnSrc>& vars, size_t i, const std::function<const std::string*(int)>& alias, const GpuFail& fail) {
-  GpuCtx sh{fns, vars, alias, fail};
+GpuInfo wgslOf(const GpuFile& file, size_t i, const std::function<const std::string*(int)>& alias, const GpuFail& fail) {
+  GpuCtx sh{file, alias, fail};
+  const auto& fns = file.fns;
   std::vector<GpuInfo> done(fns.size());
   std::vector<char> state(fns.size(), 0);  // 1 translating, 2 translated
   std::string all;
@@ -614,10 +783,11 @@ GpuInfo wgslOf(const std::vector<GpuFnSrc>& fns, const std::vector<GpuFnSrc>& va
     state[k] = 2;
   };
   visit(i, nullptr);
-  std::string consts;
-  for (size_t k : sh.tableOrder) consts += sh.tables[k].wgsl;
+  std::string decls;
+  for (auto& st : sh.structs) decls += st.wgsl;
+  for (size_t k : sh.tableOrder) decls += sh.tables[k].wgsl;
   GpuInfo r = done[i];
-  r.wgsl = consts + (consts.empty() ? "" : "\n") + all;
+  r.wgsl = decls + (decls.empty() ? "" : "\n") + all;
   return r;
 }
 
@@ -647,7 +817,7 @@ static V n_wgsl(V f) {
   keep[2] = box(types);
   for (auto& n : i.names) names->v.push_back(box(newStr(n)));
   for (auto& t : i.types) types->v.push_back(box(newStr(t)));
-  mapPut(m, "wgsl", box(newStr(i.wgsl))), mapPut(m, "entry", box(newStr(i.entry))), mapPut(m, "result", box(newStr(i.result)));
+  mapPut(m, "wgsl", box(newStr(i.wgsl))), mapPut(m, "entry", box(newStr(i.entry))), mapPut(m, "name", box(newStr(i.name))), mapPut(m, "result", box(newStr(i.result)));
   mapPut(m, "names", box(names)), mapPut(m, "types", box(types));
   return box(m);
 }

@@ -116,6 +116,18 @@ gpu fn bits(x: num, row: num): num {  // u32s, bitwise operators and a table on 
   return ((u << 2) ^ STEPS[row]) & 0xff
 }
 
+type Spin = {p: vec3f, w: num}
+gpu fn spun(v: vec4f, a: num): vec4f {  // a matrix, a struct and v.z += on the GPU
+  var c = math.cos(a)
+  var s = math.sin(a)
+  var m = mat3x3f(vec3f(c, s, 0), vec3f(-s, c, 0), vec3f(0, 0, 1))
+  var q: Spin = {p: m * v.xyz, w: v.w}
+  q = {p: q.p * m * m, w: q.w + 1}
+  var r = q.p
+  r.z += q.w
+  return vec4f(r.x, r.y, r.z, q.w)
+}
+
 test "map: a gpu fn over each element, on the GPU, as on the CPU" {
   var xs = f32s([1, 2, 3, 4])
   g.map(scale, xs, [3, 0.5])
@@ -136,6 +148,11 @@ test "map: a gpu fn over each element, on the GPU, as on the CPU" {
   g.map(bits, bs, [1])
   expect bs == f32s([bits(0, 1), bits(1, 1), bits(7, 1), bits(200, 1)])
   expect bs[2] == 35
+  var sp = f32s([1, 2, 3, 4, -1, 0.5, 2, 0])
+  g.map(spun, sp, [0.7])
+  var c0 = spun(vec4f(1, 2, 3, 4), 0.7)
+  var c1 = spun(vec4f(-1, 0.5, 2, 0), 0.7)
+  for i in 0..4 { expect math.abs(sp[i] - c0[i]) < 1e-5 && math.abs(sp[4 + i] - c1[i]) < 1e-5 }
 }
 
 test "paint: a gpu fn colors each pixel" {

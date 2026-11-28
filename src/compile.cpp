@@ -808,6 +808,12 @@ struct Compiler : Gen, Namespaces {
         d.k = 'w';
         ty.code = typeIntern("w", d);
       }
+      for (int n = 2; n <= 4; n++)  // mat2x2f ...: a list of n columns, each a vecNf
+        if (symName(prev.sym) == "mat" + std::to_string(n) + "x" + std::to_string(n) + "f") {
+          TypeDesc d;
+          d.k = 'X', d.n = n;
+          ty.code = typeIntern("X" + std::to_string(n), d);
+        }
       if ((ty.code == TY_LIST || ty.code == TY_MAP) && at('<') && !cur.nl) {  // list<T>, map<V>, map<K, V>
         bool list = ty.code == TY_LIST;
         next();
@@ -1987,6 +1993,22 @@ struct Compiler : Gen, Namespaces {
         case S_handle: if (peekIs('{') && !peek().nl) return next(), handleStmt(), false; break;
         case S_match: if (isMatch()) return next(), matchStmt(), false; break;
       }
+    if (gpuBody && at(T_ID) && cur.sym >= NKW) {  // v.x = e (v a local vector): v = vec@set(v, x, op, e)
+      Lexer s = lx;
+      Tok d = s.next(), f = s.next(), o = s.next();
+      LV lv = d.t == '.' && f.t == T_ID && (o.t == '=' || (o.t >= T_ADDEQ && o.t <= T_DIVEQ)) ? resolve(F, cur.sym) : LV{LV_NONE};
+      if (lv.k == LV_LOCAL) {
+        next(), next(), next(), next();
+        int base = slot(), a = slot(), b = slot(), c = slot(), e = slot();
+        expr(), st(0, e);
+        imm(0, box((double)(o.t == '=' ? -1 : O_ADD + (o.t - T_ADDEQ)))), st(0, c);
+        imm(0, box((double)f.sym)), st(0, b);
+        ldl(0, lv.a), st(0, a);
+        internalCall("vec@set", base, 4);
+        stl(0, lv.a);
+        return false;
+      }
+    }
     LV v = unary();
     int t = cur.t;
     if (t != '=' && (t < T_ADDEQ || t > T_DIVEQ)) {
@@ -3316,11 +3338,11 @@ struct Compiler : Gen, Namespaces {
     static const int gpu = intern("gpu");
     return a.t == T_ID && a.sym == gpu && b.t == T_ID && b.sym == K_var && !b.nl;
   }
-  std::unordered_map<std::string, std::vector<GpuFnSrc>> gpuVarSrcs;
   std::unordered_set<int> gpuVarSyms;  // qualified: they can't be assigned
   bool gpuFreeze = false;               // the top-level var being compiled is a gpu var: freeze its value
   struct GpuDecl { std::string file; const char* src; size_t i; int q; };
-  std::unordered_map<std::string, std::vector<GpuFnSrc>> gpuSrcs;
+  std::unordered_map<std::string, GpuFile> gpuFiles;  // by file: its gpu fns, gpu vars and types
+  bool gpuBody = false;                              // compiling a gpu fn: v.x = e makes v a new vector
   std::vector<GpuDecl> gpuDecls;
   std::vector<std::pair<int, GpuInfo>> gpuInfos;
   void gpuDecl() {  // at `fn`
@@ -3328,8 +3350,10 @@ struct Compiler : Gen, Namespaces {
     int line = cur.line;
     next();
     Tok n = cur;
+    gpuBody = true;
     fnDecl();
-    auto& fs = gpuSrcs[file];
+    gpuBody = false;
+    auto& fs = gpuFiles[file].fns;
     fs.push_back({n.sym, p, line});
     gpuDecls.push_back({file, srcStart, fs.size() - 1, qualify(n.sym)});
   }
@@ -3344,7 +3368,14 @@ struct Compiler : Gen, Namespaces {
         file = d.file, srcStart = d.src;
         failAt(p, line, "@gpu %s", m.c_str());
       };
-      attempt([&] { gpuInfos.emplace_back(d.q, wgslOf(gpuSrcs[d.file], gpuVarSrcs[d.file], d.i, alias, fail)); });
+      GpuFile& g = gpuFiles[d.file];
+      if (g.stem.empty()) {  // the file's name, as a WGSL identifier: its gpu fns are stem_name
+        std::string b = d.file.substr(d.file.find_last_of("/\\") == std::string::npos ? 0 : d.file.find_last_of("/\\") + 1);
+        if (b.size() > 4 && b.compare(b.size() - 4, 4, ".fut") == 0) b.resize(b.size() - 4);
+        for (char& c : b) if (!isalnum((unsigned char)c)) c = '_';
+        g.stem = b.empty() || isdigit((unsigned char)b[0]) || b[0] == '_' ? "m" + b : b;
+      }
+      attempt([&] { gpuInfos.emplace_back(d.q, wgslOf(g, d.i, alias, fail)); });
     }
   }
   void topLevel() {
@@ -3361,6 +3392,7 @@ struct Compiler : Gen, Namespaces {
       if (atKw(S_enum) && peek().t == T_ID && !peek().nl && peek().sym >= NKW) { next(), enumDecl(); if (trace) traceEnum(item); return; }
       if (atKw(S_test) && peekIs(T_STR)) { next(), testDecl(); if (trace) traceCuts.push_back({item, prevEnd}); return; }
       if (atKw(S_type) && isTypeDecl(lx)) {  // type Name = <type>: checked where it is used, by name
+        gpuFiles[file].types.push_back({peek().sym, cur.p, cur.line});  // (a gpu fn's struct, if one uses it)
         next();
         Tok n = cur;
         int s = qualify(ident());
@@ -3389,7 +3421,7 @@ struct Compiler : Gen, Namespaces {
       }
       if (at(T_ID) && [&] { Lexer s = lx; return gpuVar(cur, s.next()); }()) {
         next();
-        gpuVarSrcs[file].push_back({peek().sym, cur.p, cur.line});
+        gpuFiles[file].vars.push_back({peek().sym, cur.p, cur.line});
         gpuFreeze = true;
       }
       // On reload, top-level statements are compiled (to validate them) and then dropped, except

@@ -421,6 +421,8 @@ static V rt_format(V v, V packed, V prefix) {
 
 static bool isF32s(V v);
 static V elementwise(V a, V b, int op);
+static int matSize(V v);
+static V matMul(V a, V b, int ma, int mb);
 static V vecField(V o, uint64_t s);
 static V rt_binop(V a, V b, uint64_t op) {
   static const char* ops[] = {"+", "-", "*", "/", "%", "==", "!=", "<", "<=", ">", ">=", "&", "|", "^", "<<", ">>"};
@@ -449,6 +451,8 @@ static V rt_binop(V a, V b, uint64_t op) {
     int c = as<Str>(a)->sv().compare(as<Str>(b)->sv());
     return boxb(op == O_LT ? c < 0 : op == O_LE ? c <= 0 : op == O_GT ? c > 0 : c >= 0);
   }
+  if (op == O_MUL && (is(a, K::List) || is(b, K::List)))
+    if (int ma = matSize(a), mb = matSize(b); ma || mb) return matMul(a, b, ma, mb);
   if (op <= O_MOD && (isF32s(a) || isF32s(b))) return elementwise(a, b, (int)op);
   ERR("@operand bad operands for '%s': %s and %s", ops[op], typeName(a), typeName(b));
 }
@@ -975,6 +979,83 @@ static V v_cross(V v, V w) {
   double d[] = {(double)a[1] * b[2] - (double)a[2] * b[1], (double)a[2] * b[0] - (double)a[0] * b[2], (double)a[0] * b[1] - (double)a[1] * b[0]};
   return vecOf(d, 3);
 }
+// v.x = e in a gpu fn: v becomes a new vector with that component changed (op: -1 for =, else O_ADD.. for += ..), so
+// a vector another variable also holds never changes, as on the GPU, where vectors are values.
+static V n_vecSet(V v, V f, V op, V x) {
+  Buf* b = vecArg(v, "a component's assignment");
+  int at[4];
+  if (swizzle((int)num(f), at) != 1 || (size_t)at[0] >= b->n) ERR("@no-field an f32s of %zu has no component '%s' to set", b->n, symName((int)num(f)).c_str());
+  double old = ((float*)b->p)[at[0]], val = vnum(x, "a component's assignment");
+  int o = (int)num(op);
+  double r = o < 0 ? val : o == O_ADD ? old + val : o == O_SUB ? old - val : o == O_MUL ? old * val : old / val;
+  volatile V keep[] = {v};
+  (void)keep;
+  Buf* n = newBuf('f', b->n);
+  b = as<Buf>(v);
+  memcpy(n->p, b->p, b->n * sizeof(float));
+  ((float*)n->p)[at[0]] = (float)r;
+  return box(n);
+}
+// Matrices, as gpu fns use them: mat2x2f(c0, c1), mat3x3f, mat4x4f are lists of their n columns, each a vector of n
+// (m[i] is a column). m * v, v * m (v as a row), m * m and m * k multiply as WGSL does.
+static int matSize(V v) {
+  if (!is(v, K::List)) return 0;
+  auto& c = as<List>(v)->v;
+  size_t n = c.size();
+  if (n < 2 || n > 4) return 0;
+  for (V x : c) if (!isF32s(x) || as<Buf>(x)->n != n) return 0;
+  return (int)n;
+}
+static double matAt(V m, int col, int row) { return ((float*)as<Buf>(as<List>(m)->v[(size_t)col])->p)[row]; }
+static V matOf(const double* d, int n) {  // its columns, one after another
+  List* l = make<List>();
+  volatile V keep[] = {box(l)};
+  (void)keep;
+  for (int c = 0; c < n; c++) {
+    V col = vecOf(d + c * n, (size_t)n);
+    l->v.push_back(col);
+  }
+  return box(l);
+}
+static V matMul(V a, V b, int ma, int mb) {
+  double d[16];
+  if (ma && mb) {
+    if (ma != mb) ERR("@operand '*' on matrices of different sizes: %dx%d and %dx%d", ma, ma, mb, mb);
+    for (int c = 0; c < ma; c++)
+      for (int r = 0; r < ma; r++) {
+        double t = 0;
+        for (int k = 0; k < ma; k++) t += matAt(a, k, r) * matAt(b, c, k);
+        d[c * ma + r] = t;
+      }
+    return matOf(d, ma);
+  }
+  int n = ma ? ma : mb;
+  V m = ma ? a : b, o = ma ? b : a;
+  if (isNum(o)) {
+    for (int c = 0; c < n; c++) for (int r = 0; r < n; r++) d[c * n + r] = matAt(m, c, r) * num(o);
+    return matOf(d, n);
+  }
+  if (!isF32s(o) || as<Buf>(o)->n != (size_t)n)
+    ERR("@operand '*' multiplies a %dx%d matrix by a vector of %d, a matrix of its size or a number, not %s", n, n, n, typeName(o));
+  const float* v = (const float*)as<Buf>(o)->p;
+  for (int i = 0; i < n; i++) {
+    double t = 0;
+    for (int j = 0; j < n; j++) t += ma ? matAt(m, j, i) * v[j] : v[j] * matAt(m, i, j);  // m * v, or v * m: v . column i
+    d[i] = t;
+  }
+  return vecOf(d, (size_t)n);
+}
+static V matMake(std::initializer_list<V> cols, const char* f) {
+  size_t n = cols.size();
+  for (V c : cols)
+    if (!isF32s(c) || as<Buf>(c)->n != n) ERR("@argument %s() takes its %zu columns, each a vector of %zu, got %s", f, n, n, typeName(c));
+  List* l = make<List>();
+  for (V c : cols) l->v.push_back(c);
+  return box(l);
+}
+static V n_mat2(V a, V b) { return matMake({a, b}, "mat2x2f"); }
+static V n_mat3(V a, V b, V c) { return matMake({a, b, c}, "mat3x3f"); }
+static V n_mat4(V a, V b, V c, V d) { return matMake({a, b, c, d}, "mat4x4f"); }
 static V n_slice(V v, V a, V b) {
   if (is(v, K::Str)) return s_slice(v, a, b);
   if (is(v, K::List)) return l_slice(v, a, b);
@@ -1141,7 +1222,8 @@ void rtInit() {
   method<+[](V f) { return boxb(as<Fiber>(f)->state == FIB_DONE); }>(K::Fiber, S_done);
   method<l_push>(K::List, S_push), method<l_pop>(K::List, S_pop), method<n_len>(K::List, S_len);
   method<n_len>(K::Str, S_len), method<n_len>(K::Map, S_len), method<n_len>(K::Buf, S_len);
-  native<n_vec2>("vec2f"), native<n_vec3>("vec3f"), native<n_vec4>("vec4f");
+  native<n_vec2>("vec2f"), native<n_vec3>("vec3f"), native<n_vec4>("vec4f"), native<n_vecSet>("vec@set");
+  native<n_mat2>("mat2x2f"), native<n_mat3>("mat3x3f"), native<n_mat4>("mat4x4f");
   method<v_length>(K::Buf, intern("length")), method<v_dot>(K::Buf, intern("dot"));
   method<v_normalize>(K::Buf, intern("normalize")), method<v_cross>(K::Buf, intern("cross"));
   gfxInit();

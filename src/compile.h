@@ -144,10 +144,11 @@ bool lowerViews(const std::string& source, const std::string& path, LoweredView&
 // gpu fn (wgsl.cpp): a top-level function also translated to WGSL. Each file's gpu fns, from their `fn`; a gpu fn
 // calls others of its file by name. alias(s): the package a module alias names ("math"), if s is one.
 struct GpuFnSrc { int sym; const char* p; int line; };
-struct GpuInfo { std::string wgsl, entry, result; std::vector<std::string> names, types; };
+struct GpuInfo { std::string wgsl, entry, name, result; std::vector<std::string> names, types; };  // name: as fut calls it
 // fail(p, line, message) reports what the GPU can't do, and does not return (a compile error)
 using GpuFail = std::function<void(const char*, int, const std::string&)>;
-GpuInfo wgslOf(const std::vector<GpuFnSrc>& fns, const std::vector<GpuFnSrc>& vars, size_t i, const std::function<const std::string*(int)>& alias, const GpuFail& fail);
+struct GpuFile { std::vector<GpuFnSrc> fns, vars, types; std::string stem; };  // a file's gpu fns, gpu vars and type decls
+GpuInfo wgslOf(const GpuFile& file, size_t i, const std::function<const std::string*(int)>& alias, const GpuFail& fail);
 void gpuInfoSet(int sym, GpuInfo);
 
 // A type's tokens (see type()), from L: atoms joined by |, each maybe followed by ?. Leaves L after it.

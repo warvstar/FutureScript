@@ -107,6 +107,11 @@ static bool accepts(uint64_t t, V v, int depth, Tags* tags = nullptr) {
           return true;
         }
         case 'w': return isNum(v) && num(v) >= 0 && num(v) < 4294967296.0 && num(v) == std::trunc(num(v));
+        case 'X': {  // a matrix: a list of its n columns, each an f32s of n
+          if (!is(v, K::List) || as<List>(v)->v.size() != (size_t)d->n) return false;
+          for (V c : as<List>(v)->v) if (!is(c, K::Buf) || as<Buf>(c)->et != 'f' || as<Buf>(c)->n != (size_t)d->n) return false;
+          return true;
+        }
         case 'L': {
           if (!is(v, K::List)) return false;
           List* l = as<List>(v);
@@ -196,6 +201,7 @@ std::string typeText(uint64_t t) {
     case 'l': return (d->lit == 's' ? "\"" + d->s + "\"" : d->lit == 'n' ? toStr(box(d->n)) : toStr(d->v)) + q;
     case 's': for (auto& [f, ft] : d->fields) o += (o.empty() ? "" : ", ") + symName(f) + ": " + typeText(ft); return "{" + o + "}" + q;
     case 'w': return "u32" + q;
+    case 'X': return "mat" + std::to_string((int)d->n) + "x" + std::to_string((int)d->n) + "f" + q;
     case 'L': return "list<" + typeText(d->elem) + ">" + q;
     case 'M': return "map<" + ((d->key & 15) == TY_ANY ? "" : typeText(d->key) + ", ") + typeText(d->elem) + ">" + q;
   }

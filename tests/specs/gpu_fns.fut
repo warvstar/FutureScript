@@ -53,11 +53,11 @@ test "a gpu fn runs on the CPU like any fn" {
 
 test "wgsl(f): its WGSL, with the gpu fns it calls, and its signature" {
   var w = wgsl(shade)
-  expect w.entry == "f_shade" && w.result == "vec4f"
+  expect w.entry == "gpu_fns_shade" && w.name == "shade" && w.result == "vec4f"
   expect w.names == ["uv", "t"]
   expect w.types == ["vec2f", "f32"]
-  expect w.wgsl.has("fn f_shade(p_uv: vec2f, p_t: f32) -> vec4f \{")
-  expect w.wgsl.has("fn f_wave(p_x: f32, p_t: f32) -> f32 \{")
+  expect w.wgsl.has("fn gpu_fns_shade(p_uv: vec2f, p_t: f32) -> vec4f \{")
+  expect w.wgsl.has("fn gpu_fns_wave(p_x: f32, p_t: f32) -> f32 \{")
   expect w.wgsl.has("pow(sin(((l_x * 2.0) + l_t)), 2.0)")                  // ** is pow; numbers are f32
   expect w.wgsl.has("select((-l_y), l_y, (l_x > 0.0))")                   // ?: is select
   expect w.wgsl.has("(l_i - 2.0 * floor(l_i / 2.0))")                     // % keeps the divisor's sign, as fut's does
@@ -70,7 +70,7 @@ test "what the GPU doesn't have is a compile error, saying what to write" {
   expect compileErr("var K = 2\ngpu fn f(x: num): num \{ return x * K }").has("pass K in as a parameter")
   expect compileErr("gpu fn f(x: num): num \{ print(x) return x }").has("a gpu fn's statements are var, assignment, if")
   expect compileErr("gpu fn f(x: num): num \{ return f(x) }").has("can't call itself")
-  expect compileErr("gpu fn f(v: vec2f): vec2f \{ v.x = 1 return v }").has("vectors don't change in place")
+  expect compileErr("gpu fn f(v: vec2f): vec2f \{ v.x = v return v }").has("a component is a number, not vec2f")
   expect compileErr("gpu fn f(x: num): str \{ return \"\" }").has("not str")
   expect compileErr("fn h(x) \{ return x }\ngpu fn f(x: num): num \{ return h(x) }").has("h is not a gpu fn of this file")
   expect compileErr("import \"std/math\" as math\ngpu fn f(x: num): num \{ return math.hypot(x, x) }").has("not math.hypot")
@@ -108,12 +108,12 @@ test "u32s and gpu vars: bits on the CPU, as on the GPU" {
   var w = wgsl(inkShade)
   expect w.types == ["u32", "u32"]
   expect w.result == "f32"
-  expect w.wgsl.has("const g_INKS: array<array<u32, 2>, 2> = array<array<u32, 2>, 2>(array<u32, 2>(305419896u, 2596069104u), array<u32, 2>(0u, 4294967295u));")
-  expect w.wgsl.has("const g_MASK: u32 = 15u;") && w.wgsl.has("const g_WEIGHTS: array<f32, 2> = array<f32, 2>(0.25, 0.5);")
-  expect w.wgsl.has("(g_INKS[l_row][(l_i >> 3u)] >> u32(((7.0 - f32((l_i & 7u))) * 4.0)))")  // - leaves u32s for f32, as fut's numbers
-  expect w.wgsl.has("var l_k: u32 = f_ink(l_row, l_i);") && w.wgsl.has("var l_w: f32 = g_WEIGHTS[(l_i % 2u)];")
+  expect w.wgsl.has("const gpu_fns_INKS: array<array<u32, 2>, 2> = array<array<u32, 2>, 2>(array<u32, 2>(305419896u, 2596069104u), array<u32, 2>(0u, 4294967295u));")
+  expect w.wgsl.has("const gpu_fns_MASK: u32 = 15u;") && w.wgsl.has("const gpu_fns_WEIGHTS: array<f32, 2> = array<f32, 2>(0.25, 0.5);")
+  expect w.wgsl.has("(gpu_fns_INKS[l_row][(l_i >> 3u)] >> u32(((7.0 - f32((l_i & 7u))) * 4.0)))")  // - leaves u32s for f32, as fut's numbers
+  expect w.wgsl.has("var l_k: u32 = gpu_fns_ink(l_row, l_i);") && w.wgsl.has("var l_w: f32 = gpu_fns_WEIGHTS[(l_i % 2u)];")
   expect w.wgsl.has("select((f32(l_k) * l_w), 1.0, (l_k == 15u))")
-  expect wgsl(ink).wgsl.has("fn f_ink(p_row: u32, p_i: u32) -> u32 \{")
+  expect wgsl(ink).wgsl.has("fn gpu_fns_ink(p_row: u32, p_i: u32) -> u32 \{")
 }
 
 test "u32s and gpu vars: what doesn't mean the same on both is a compile error" {
@@ -123,11 +123,71 @@ test "u32s and gpu vars: what doesn't mean the same on both is a compile error" 
   expect compileErr("gpu var T = [[1, 2], 3]\ngpu fn f(i: u32): num \{ return T[i][0] }").has("numbers or lists, the same at every depth")
   expect compileErr("gpu var T: list<u32> = [1, 0.5]\ngpu fn f(i: u32): u32 \{ return T[i] }").has("0.5 is not a u32")
   expect compileErr("gpu var T: list<u32> = [1, 2]\ngpu fn f(i: u32): u32 \{ return T }").has("T is a table: index it (T[i])")
-  expect compileErr("gpu var T = [1, 2]\ngpu fn f(i: u32): num \{ return T[i][0] }").has("T has 1 dimension")
+  expect compileErr("gpu var T = [1, 2]\ngpu fn f(i: u32): num \{ return T[i][0] }").has("indexes its gpu vars, vectors and matrices, not f32")
   expect compileErr("gpu var T = len([1])\ngpu fn f(): num \{ return T }").has("written out")
   expect compileErr("gpu fn f(i: u32): u32 \{ var k = i  k = 0.5  return k }").has("k holds a u32")
   expect compileErr("gpu fn f(i: u32): u32 \{ return -1 }").has("-1.0 is not a u32")
   expect compileErr("gpu fn f(x: num): num \{ if x \{ return 1 } return 0 }").has("conditions are bools")
   expect compileErr("gpu fn f(a: vec2f, b: vec2f): bool \{ return a == b }").has("compare their fields")
   expect compileErr("gpu fn f(x: num): num \{ return x.y }").has("f32 has no .y")
+}
+
+// Structs, matrices and setting one component, as a posed box needs them
+type Box = {center: vec3f, size: vec3f, lit: bool}
+gpu fn turn(a: num): mat3x3f {
+  var c = math.cos(a); var s = math.sin(a)    // ; between statements, as on the CPU
+  return mat3x3f(vec3f(c, 0, -s), vec3f(0, 1, 0), vec3f(s, 0, c))
+}
+gpu fn pose(b: Box, a: num, lift: num): Box {
+  var p = b.center
+  p.y += lift                       // a new vector on the CPU: b.center doesn't change
+  var m = turn(a) * turn(0)         // m * m
+  var size = b.size
+  if b.lit { size.x = size.x * 2 }
+  return {center: m * p, size: size, lit: b.lit}
+}
+
+test "structs, matrices and v.x = e: the same on the CPU as in WGSL" {
+  var b = {center: vec3f(1, 0, 0), size: vec3f(1, 2, 3), lit: true}
+  var q = pose(b, math.pi / 2, 0.5)
+  expect (q.center - vec3f(0, 0.5, -1)).length() < 1e-6
+  expect q.size == vec3f(2, 2, 3)
+  expect b.center == vec3f(1, 0, 0)  // its vectors are as they were
+  expect b.size == vec3f(1, 2, 3)
+  var m = turn(math.pi / 2)
+  expect (m[0] - vec3f(0, 0, -1)).length() < 1e-6            // m[i] is a column
+  expect (vec3f(1, 0, 0) * m - vec3f(0, 0, 1)).length() < 1e-6  // v * m: v as a row
+  expect (m * 2)[1] == vec3f(0, 2, 0)
+  var w = wgsl(pose)
+  expect w.types == ["Box", "f32", "f32"]
+  expect w.wgsl.has("struct Box \{\n  center: vec3f,\n  size: vec3f,\n  lit: bool,\n}")
+  expect w.wgsl.has("l_p.y = (l_p.y + l_lift);") && w.wgsl.has("l_size.x = (l_size.x * 2.0);")
+  expect w.wgsl.has("var l_m: mat3x3f = (gpu_fns_turn(l_a) * gpu_fns_turn(0.0));")
+  expect w.wgsl.has("return Box((l_m * l_p), l_size, l_b.lit);")
+  expect wgsl(turn).wgsl.has("var l_c: f32 = cos(l_a);\n  var l_s: f32 = sin(l_a);")
+  expect err(fn() { var v = vec2f(1, 2)  v.x = 3 }).has("cannot set field 'x' on f32s")  // only in a gpu fn
+}
+
+test "structs and matrices: what doesn't mean the same on both is a compile error" {
+  var box = "type B = \{c: vec3f}\n"
+  expect compileErr(box + "gpu fn f(b: B): B \{ b.c = vec3f(0, 0, 0) return b }").has("structs don't change in place")
+  expect compileErr(box + "gpu fn f(b: B): B \{ return \{c: vec3f(0, 0, 0), d: 1} }").has("B has no field d")
+  expect compileErr(box + "gpu fn f(b: B): B \{ return \{} }").has("c is missing")
+  expect compileErr(box + "gpu fn f(b: B): num \{ return b.d }").has("'d' is not a field of B")
+  expect compileErr("type B = \{c: str}\ngpu fn f(b: B): num \{ return 1 }").has("not str")
+  expect compileErr("type B = \{c: B}\ngpu fn f(b: B): num \{ return 1 }").has("can't hold itself")
+  expect compileErr("gpu fn f(m: mat2x2f): mat2x2f \{ return m + m }").has("doesn't + them")
+  expect compileErr("gpu fn f(m: mat2x2f, v: vec3f): vec3f \{ return m * v }").has("a vector of 2")
+  expect compileErr("gpu fn f(m: mat2x2f): num \{ return m.x }").has("index a matrix's columns")
+  expect compileErr("gpu fn f(m: mat2x2f): mat2x2f \{ m[0] = vec2f(1, 1) return m }").has("doesn't change vectors or matrices by index")
+  expect compileErr("gpu fn f(v: vec2f): num \{ return v.z }").has("vec2f has no .z")
+  expect compileErr("gpu fn f(x: num): num \{ return x > 0 ? mat2x2f(vec2f(1, 0), vec2f(0, 1)) : x }").has("use if for mat2x2f")
+}
+
+test "u32, mat and a struct of a file are types on the CPU too" {
+  var f = fn(m: mat2x2f): mat2x2f { return m }
+  expect f(mat2x2f(vec2f(1, 0), vec2f(0, 1)))[1] == vec2f(0, 1)
+  expect err(fn() { f([vec2f(1, 0)]) }).has("must be mat2x2f")
+  expect err(fn() { mat2x2f(vec2f(1, 0), vec3f(0, 1, 0)) }).has("each a vector of 2")
+  expect err(fn() { pose({center: vec3f(0, 0, 0)}, 0, 0) }).has("must be Box")
 }
