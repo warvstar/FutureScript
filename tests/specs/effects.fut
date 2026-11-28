@@ -1,6 +1,8 @@
 // Effects: a function declares what it may perform after its result type (`! io, clock`; `!` alone: nothing).
 // The declaration is checked at run time: on entry (the caller must be allowed the effects) and wherever an
-// operation is performed. Handlers answer operations in place: `handle { } with print(s) { }`.
+// operation is performed. Handlers answer operations in place: `handle { } with print(s) { }`. What the compiler can
+// see in a declaring function (an operation, a direct call of a declaring fn) is a compile error instead (the last
+// tests), so the run-time tests reach it through an undeclared fn, which runs under its caller's effects.
 import "../mods/audit.fut" as audit
 extern fn hypot(num, num): num
 
@@ -9,8 +11,10 @@ fn double(x: num): num ! { return x * 2 }
 fn stamp() ! clock, random { return clock() >= 0 && random() < 1 }
 fn helper() { print("from helper") }            // undeclared: runs under whatever its caller allows
 fn quiet() ! { helper() }
-fn timed() ! clock { return save("t") }
-fn measure() ! io { return clock() }
+fn saveVia() { return save("t") }
+fn timed() ! clock { return saveVia() }
+fn clockVia() { return clock() }
+fn measure() ! io { return clockVia() }
 fn tellTime() ! io, clock { return clock() }
 fn ffi() ! { return hypot(3, 4) }
 
@@ -98,7 +102,7 @@ test "a handler outside a function that declares the effect replaces it there (t
   handle { save("mock") } with print(s) { out.push(s) }
   expect out == ["saved mock"]
 }
-fn sealed() ! { print("sealed") }
+fn sealed() ! { helper() }
 test "a handler outside a function that does not declare the effect does not make it allowed" {
   expect throws { handle { sealed() } with print(s) { } } == "print() performs io, which sealed() does not declare (it declares no effects)"
 }
@@ -165,7 +169,7 @@ test "each fiber has its own handlers" {
 test "a fiber may do what the code that created it may do" {
   var make = fn() ! { return fiber(fn() { print("x") }) }
   var f = make()
-  expect throws { f.resume() } == "print() performs io, which the function at line 166 does not declare (it declares no effects)"
+  expect throws { f.resume() } == "print() performs io, which the function at line 170 does not declare (it declares no effects)"
 }
 test "a handler can answer yield in place" {
   var got = []
@@ -219,4 +223,21 @@ test "compile errors" {
   expect bad("handle \{ } with str(x) \{ }").has("'str' is not an effect's operation")
   expect bad("effect E \{ fn op() }\nE.nope()").has("effect 'E' has no operation 'nope'")
   expect bad("effect io \{ }").has("'io' is a builtin effect")
+}
+
+fn compileErr(src) { return run({source: src}).err }
+test "in a declaring function, an undeclared operation or a call of a fn declaring more is a compile error" {
+  expect compileErr("fn f() ! \{ print(1) }").has("print() performs io, which f() does not declare (it declares no effects) [effect]")
+  expect compileErr("fn f() ! io \{ return clock() }").has("clock() performs clock, which f() does not declare (it declares ! io) [effect]")
+  expect compileErr("fn f(): num ! \{ return random() }").has("random() performs random")
+  expect compileErr("fn save() ! io \{ }\nfn f() ! clock \{ save() }").has("save() declares io, but it is called from inside f(), which does not (it declares ! clock) [effect]")
+  expect compileErr("fn f() ! clock \{ later() }\nfn later() ! io, random \{ }").has("later() declares io, random, but it is called from inside f()")
+  expect compileErr("effect Log \{ fn log(m: str) }\nfn f() ! \{ Log.log(\"x\") }").has("Log.log() performs Log, which f() does not declare (it declares no effects) [effect]")
+  expect compileErr("var g = fn() ! clock \{ print(1) }").has("print() performs io, which the function at line 1 does not declare (it declares ! clock)")
+}
+test "what the compiler can't see stays a run-time check" {
+  expect compileErr("fn f() ! \{ handle \{ print(1) } with print(s) \{ } }") == ""     // a handler may answer it
+  expect compileErr("fn g() \{ print(1) }\nfn f() ! \{ g() }") == ""                    // g declares nothing
+  expect compileErr("fn f() ! \{ var p = print\n p(1) }") == ""                          // through a value
+  expect compileErr("fn f() \{ print(1) }\nfn h() ! io \{ f() }\nfn k() ! io, clock \{ h() clock() }") == ""
 }

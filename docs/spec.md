@@ -105,7 +105,8 @@ class Sq : Shape {
   override fn area() { return self.side * self.side }  // override required iff replacing
 }
 expect Sq(3).area() == 9
-expect throws { Sq(1).sid = 2 }
+var sq = Sq(1)
+expect throws { sq.sid = 2 }      // in a fn, p: Sq or var p = Sq(1) makes p.sid a compile error
 ```
 
 ## Enums, match
@@ -140,7 +141,7 @@ fn half(n: num): num ! { return n / 2 }   // types: num str bool list map fn any
 var lvl: num = 1                           // checked on every store
 expect throws { half("x") }
 type User = {name: str, age: num?}         // also A | B, "GET" 3 true nil, list<T>, map<K, V>; pub type
-fn ages(us: list<User>): num ! { return us.len() }   // given u: User, u.nmae is a compile error
+fn ages(us: list<User>): num ! { return us.len() }   // given u: User (or var u = C() in a fn), u.nmae is a compile error
 var us = [{name: "a"}]
 ages(us) expect throws { us.push(3) }      // us is list<User> from now on
 effect Log { fn log(m: str) }
@@ -148,13 +149,14 @@ fn work() ! Log, clock { Log.log("hi") }   // ! = may only do these; bare ! = no
 var out = []
 handle { work() print("p") } with Log.log(m) { out.push(m) } with print(t) { out.push(t) }
 expect out == ["hi", "p"]
-fn bad() ! { print("x") }
+fn say() { print("x") }                    // declares nothing: runs under its caller's effects
+fn bad() ! { say() }                       // fn bad() ! { print("x") } is a compile error [effect]
 expect throws { bad() }
 ```
 
 A list or map that passes `list<T>`/`map<K, V>` keeps that type for good: any later store into it, through any reference, throws unless it fits, and later checks of it cost nothing. A union or a failed check doesn't do this; `slice()` makes an unchecked copy. A shape is checked only when the value crosses the boundary, so a map can change after it passes; use a class to keep fields checked.
 
-Effects: `io` (print, run, extern, graphics, files, env, exec, fetch) `clock` (clock, sleep, time) `random` `yield` `spawn` `chan` (every channel/task op), declared ones; json is pure. A handler's return is the op's result, no resumption.
+Effects: `io` (print, run, extern, graphics, files, env, exec, fetch) `clock` (clock, sleep, time) `random` `yield` `spawn` `chan` (every channel/task op), declared ones; json is pure. A handler's return is the op's result, no resumption. In a function that declares effects (outside its `handle` blocks), an operation it leaves out, or a call of a fn declaring one, is a compile error; anything else (an undeclared fn, a call through a value) is checked when it runs.
 
 Determinism: numbers (`+ - * / %`, sqrt, floor, std/math) give the same bits on every platform. Code whose declared effects leave out `io`, `clock`, `spawn` and `chan` is deterministic, given `seed(n)` if it has `random`; supply the clock with `handle { } with clock() { }`. Steps count the same everywhere: `budget(n, f)` stops runaway code at the same step on every platform; a try inside f can't get past it; an inner budget gets at most what the outer has left.
 

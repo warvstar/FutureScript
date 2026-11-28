@@ -1,7 +1,9 @@
 // Effects: what a function may touch outside itself, declared after its result type (`fn save(p): bool ! io`), and
 // handlers that answer an operation in place (`handle { body } with clock() { return 1000 }`).
 //
-// Like types, a declaration is checked at run time, where it is written: entering a function that declares effects
+// The compiler reports what it can see (compile.cpp effectsChecked: an operation, or a direct call of a declaring fn,
+// in a declaring function outside its handle blocks). Everything is also checked at run time, where it is written
+// (a call through a value, an undeclared fn, code compiled against an older declaration): entering a function that declares effects
 // checks that the code calling it may perform them, then narrows what may be performed to the declared set until
 // the function returns. Performing an operation (print, clock, Log.log) checks it against that set. Functions that
 // declare nothing are unchecked and run under whatever their caller allows, with no extra code at all.

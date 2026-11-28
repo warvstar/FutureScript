@@ -69,5 +69,7 @@ test "seed fixes random()" {
 
 test "seed is a random effect" {
   fn() ! random { seed(1) }()
-  expect throws { fn() ! { seed(1) }() } != nil
+  var s = seed
+  expect throws { fn() ! { s(1) }() } != nil      // through a value: at run time
+  expect run({source: "fn f() ! \{ seed(1) }"}).err.has("seed() performs random, which f() does not declare")
 }

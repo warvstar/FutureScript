@@ -287,7 +287,8 @@ def hot_var_type(exe):
 def hot_effects(exe):
     """Changing a function's declared effects takes effect at the next call, like a changed result type: a call that
     its old declaration forbade succeeds once the new one allows it."""
-    prog = ("fn stamp(){sig} {{ return \"t\" + str(clock() > 0) }}\n"
+    prog = ("fn now() {{ return clock() }}\n"  # undeclared: checked when it runs (a direct clock() is a compile error under ! io)
+            "fn stamp(){sig} {{ return \"t\" + str(now() > 0) }}\n"
             "fn main() {{ var last = \"\"\n"
             "  while true {{ var v = \"\"\n"
             "    try {{ v = stamp() }} catch e {{ v = \"denied\" }}\n"

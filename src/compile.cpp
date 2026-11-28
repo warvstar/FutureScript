@@ -131,16 +131,15 @@ static std::unordered_map<int, EnumDef> enumDefs;
 struct FieldUse { int cls, sym; At at; };  // `self.name` in a method: checked against declared fields
 // `x.name` where x is a variable with a declared type (a shape, or a class): checked against that type's fields once
 // every type is known. Stores to x are checked, so x has its type wherever it is used.
-static int editDistance(const std::string& a, const std::string& b) {  // for "did you mean"
-  std::vector<int> row(b.size() + 1);
+static int editDistance(const std::string& a, const std::string& b) {  // for "did you mean"; swapping two neighbours is one edit
+  std::vector<int> two(b.size() + 1), prev(b.size() + 1), row(b.size() + 1);
   for (size_t j = 0; j <= b.size(); j++) row[j] = (int)j;
   for (size_t i = 1; i <= a.size(); i++) {
-    int diag = row[0];
+    two.swap(prev), prev.swap(row);  // two: row i - 2, prev: row i - 1
     row[0] = (int)i;
     for (size_t j = 1; j <= b.size(); j++) {
-      int up = row[j];
-      row[j] = std::min({row[j] + 1, row[j - 1] + 1, diag + (a[i - 1] != b[j - 1])});
-      diag = up;
+      row[j] = std::min({prev[j] + 1, row[j - 1] + 1, prev[j - 1] + (a[i - 1] != b[j - 1])});
+      if (i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1]) row[j] = std::min(row[j], two[j - 2] + 1);
     }
   }
   return row[b.size()];
@@ -372,6 +371,11 @@ struct Compiler : Gen, Namespaces {
   std::vector<ClassDef> classes;
   std::vector<FieldUse> fieldUses;
   std::vector<TypedUse> typedUses;
+  // A direct call of a top-level fn from a function that declares effects (outside its handle blocks): checked, once
+  // every fn's declaration is known, against what the caller declares.
+  struct EffCall { int callee; uint64_t allowed; std::string who, text; At at; };
+  std::vector<EffCall> effCalls;
+  std::unordered_map<uint64_t, std::string> effBitNames;  // a user effect's bit -> its name, as first declared
   std::vector<std::pair<int, int>> fnDefs;  // (sym, arity)
   std::vector<int> inits;                   // top-level vars initialised by this chunk
   struct Extern { int sym; void* fn; std::string sig; char ret; bool pure, rt = false; std::string stub; };  // pure: declared `!`, performs nothing; rt: fn is the runtime's Fn; stub: what a call raises (a module this build doesn't load)
@@ -956,6 +960,7 @@ struct Compiler : Gen, Namespaces {
     if (nav) indexGlobal(q);
     uint64_t b = effectBit(q.sym);
     if (!b) failAt(t.p, t.line, "@limit too many effects (a program can declare at most %d)", EFF_LEVEL - EFF_BUILTIN);
+    effBitNames.try_emplace(b, t.p, prevEnd);
     return text += std::string(t.p, prevEnd), b;
   }
   const std::vector<std::pair<int, int>>* opsOf(int effSym) {
@@ -978,6 +983,10 @@ struct Compiler : Gen, Namespaces {
   void perform(const Tok& t) {  // E.op(args): a call that rt_prep sends to the nearest handler (see effPrep)
     Tok ot = cur;
     auto [op, arity] = effectOp(t);
+    const std::string& what = operationName(op);  // "Log.log()"
+    uint64_t bit = effectBit(t.sym);
+    effBitNames.try_emplace(bit, what.substr(0, what.rfind('.')));
+    effectUse(t, what, bit);
     if (!at('(') || cur.nl) failAt(ot.p, ot.line, "@syntax expected '(': perform an operation by calling it");
     next();
     int base = slot();
@@ -1259,7 +1268,7 @@ struct Compiler : Gen, Namespaces {
     size_t tee = setF == fun && setAt < nc ? setAt : SIZE_MAX;
     Word oldOp = tee != SIZE_MAX ? k.c[tee] : 0;
 #endif
-    size_t np = pend.size(), nf = fieldUses.size(), nt = typedUses.size();
+    size_t np = pend.size(), nf = fieldUses.size(), nt = typedUses.size(), ne = effCalls.size();
     std::string o = owner, r = refKey, tr = testRefs;
     auto missing = testMissing;
     auto oldValues = olds;
@@ -1280,7 +1289,7 @@ struct Compiler : Gen, Namespaces {
     saved.k = std::move(k);
     *fun = std::move(saved);
     F = fun, loop.restore(), retry.restore();
-    pend.resize(np), fieldUses.resize(nf), typedUses.resize(nt);
+    pend.resize(np), fieldUses.resize(nf), typedUses.resize(nt), effCalls.resize(ne);
     owner = std::move(o), refKey = std::move(r), testRefs = std::move(tr), testMissing = missing;
     olds = oldValues, pubContract = contract, pinLine = pinned, hasLit = lexAtEnd = false;
     synchronize(start, reached, where);
@@ -1485,7 +1494,7 @@ struct Compiler : Gen, Namespaces {
   }
   // Shape.Circle(args), after `Shape.`: a new instance whose fields are the arguments, set in order. A variant with
   // no fields is one value (Shape.Empty), made on first use and kept in a hidden global.
-  void variantValue(const Tok& et) {
+  int variantValue(const Tok& et) {  // returns the variant's class
     const VariantDef& vd = *variantNamed(et.sym, cur);
     Tok vt = cur;
     if (nav) { Tok indexed = vt; indexed.sym = vd.sym; indexGlobal(indexed); }
@@ -1503,7 +1512,7 @@ struct Compiler : Gen, Namespaces {
       gmem(0, g.slot), st(0, base), constructCall(base, 0), gmem(0, one.slot, true);
       ifEnd(e);
       gmem(0, one.slot);
-      return;
+      return vd.sym;
     }
     std::string fs;
     for (int f : vd.fields) add(fs, symName(f));
@@ -1523,6 +1532,7 @@ struct Compiler : Gen, Namespaces {
     }
     if (k != n) diagnose(vt.p, vt.line, "@arity %s expects %d arguments (%s), got %d", name(vd.sym), n, fs.c_str(), k);
     ld(0, o), F->depth = base;
+    return vd.sym;
   }
   // match value { Circle(r) { ... } Rect(w, _) { ... } Empty { ... } else { ... } }: each arm tests the value's
   // variant (is@) and binds its fields in order (_ skips one); arms nest like else-if. Without else, the arms must
@@ -1699,21 +1709,49 @@ struct Compiler : Gen, Namespaces {
       failAt(t.p, t.line, "@private %s can only use what its readers can see, and '%s' is private: make it pub, or write the condition without it",
              pubContract, name(prev.sym));
     if (nav) indexGlobal(t, useRole(cur));
+    if (g->kind == 'n' && at('(') && !cur.nl)
+      if (int op = effBuiltinOp(t.sym)) effectUse(t, effOpName(op), effOpEffect(op));
     if (g->kind == 'n' && at('(') && !cur.nl && symName(t.sym) == "print") return next(), printCall(t, *g), LV{};
+    if (g->kind == 'f' && at('(') && !cur.nl && effectsChecked())
+      effCalls.push_back({t.sym, F->effMask, F->effWho, F->effText, At{t.p, t.line, file, srcStart}});
     if (g->kind == 'f' && at('(') && !cur.nl) return next(), directCall(t, *g), t.sym == F->self || returnsNum(t.sym) ? NUM : LV{};
     if (g->kind == 'c' && enumDefs.count(t.sym)) {
-      if (at('.') && !cur.nl) return next(), variantValue(t), LV{};
+      if (at('.') && !cur.nl) return next(), constructed(variantValue(t));
       if (at('(') && !cur.nl) failAt(t.p, t.line, "@class %s is an enum: make one of its variants, %s.%s", name(t.sym), name(t.sym), name(enumDefs[t.sym].vs.empty() ? t.sym : enumDefs[t.sym].vs[0].raw));
     }
     if (g->kind == 'c' && at('(') && !cur.nl) {
       next(), construct(*g);
       if (nav) nav->ctorStart = start, nav->ctorEnd = prevEnd, nav->ctorClass = t.sym;
-      return {};
+      return constructed(t.sym);
     }
     if (g->kind == 'e') return perform(t), LV{};
     if (g->kind == 't') failAt(t.p, t.line, "@not-a-value '%s' is a type: use it after ':' (x: %s)", name(t.sym), name(t.sym));
     if (g->kind == 's') return {LV_SHARED, g->cell, t.sym};
     return {LV_GLOBAL, g->slot, t.sym, g->kind != 'v'};  // b: its symbol, for its type
+  }
+  // Inside a function that declares effects, outside its handle blocks, exactly those are allowed (its entry narrows
+  // them to the declared set), so an operation of any other effect, or a call of a fn that declares any other, raises
+  // whenever it runs: a compile error. Not in tier 2 (its first compile reported it), nor where a handler may answer.
+  bool effectsChecked() { return F->effDecl && !F->handles && !tiering; }
+  std::string effectNames(uint64_t mask) {
+    static const char* builtin[EFF_BUILTIN] = {"io", "clock", "random", "yield", "spawn", "chan"};
+    std::string s;
+    for (int i = 0; i < EFF_LEVEL; i++)
+      if (mask >> i & 1) add(s, i < EFF_BUILTIN ? builtin[i] : effBitNames.count(1ull << i) ? effBitNames[1ull << i] : "an effect");
+    return s;
+  }
+  static std::string declaresText(uint64_t mask, const std::string& text) { return mask ? "it declares " + text : "it declares no effects"; }
+  void effectUse(const Tok& t, const std::string& what, uint64_t effect) {  // performing an operation of effect
+    if (!effectsChecked() || !effect || (effect & F->effMask)) return;
+    diagnose(t.p, t.line, "@effect %s performs %s, which %s does not declare (%s)", what.c_str(), effectNames(effect).c_str(), F->effWho.c_str(),
+             declaresText(F->effMask, F->effText).c_str());
+  }
+  // A value just made by C(...) or Enum.Variant(...) is exactly that class, so `var p = C()` gives p its type (until p
+  // is assigned again) and p.name is checked against C's declared fields and methods, as if p were declared `p: C`.
+  LV constructed(int cls) {
+    LV v;
+    if (!tiering) v.path = addPath(0, -1, tyClass(cls));
+    return v;
   }
   LV postfix() {
     return postfixRest(primary());
@@ -2423,7 +2461,7 @@ struct Compiler : Gen, Namespaces {
       ldl(0, h), checkType(ty, "argument '" + symName(s) + "' of " + display(nm));
       if (ty.code == TY_NUM) prove(h);
     }
-    if (edecl) effectsIn(emask, effSite(display(nm), emask, etext));
+    if (edecl) effectsIn(emask, effSite(display(nm), emask, etext)), f.effDecl = true, f.effMask = emask, f.effWho = display(nm), f.effText = etext;
     if (spec || inv) contract(f, nm, nameTok.line, spec, inv, ptys, homes, first);
     Tier* tier = nullptr;  // (tier 2 compiles a function again without its contract: one with a contract stays in tier 1)
     if (!f.lambda && !f.test && !tiering && !spec && !inv && !noTier && !editorCheck)
@@ -3706,13 +3744,25 @@ struct Compiler : Gen, Namespaces {
       } else continue;
       if (ok) continue;
       std::string list, near;
+      int nearest = 3;          // suggest the closest name within two edits
+      std::vector<int> listed;  // a method a subclass overrides is listed once
       for (int n : names) {
+        if (std::find(listed.begin(), listed.end(), n) != listed.end()) continue;
+        listed.push_back(n);
         list += (list.empty() ? "" : ", ") + symName(n);
-        if (editDistance(symName(n), symName(u.sym)) <= 2) near = symName(n);
+        if (int d = editDistance(symName(n), symName(u.sym)); d < nearest) nearest = d, near = symName(n);
       }
       std::string msg = "'" + symName(u.sym) + "' is not " + (u.call ? "a method or field" : "a field") + " of " + what + " (" + u.var +
                         " is " + what + ": " + (list.empty() ? "it has none" : list) + ")" + (near.empty() ? "" : "; did you mean '" + near + "'?");
       diagnoseHere(u.at, "@no-field %s", msg);
+    }
+    // Calls from functions that declare effects, of fns that declare effects they don't.
+    for (auto& c : effCalls) {
+      auto it = sigs.find(symName(c.callee));
+      if (it == sigs.end() || !it->second.eff) continue;
+      if (uint64_t extra = it->second.effMask & ~c.allowed)
+        diagnoseHere(c.at, "@effect %s declares %s, but it is called from inside %s, which does not (%s)", display(symName(c.callee)),
+                     effectNames(extra), c.who, declaresText(c.allowed, c.text));
     }
     // Fields: in a class that declares its fields (or inherits declared ones), self.name must be one of them.
     for (auto& u : fieldUses) {
