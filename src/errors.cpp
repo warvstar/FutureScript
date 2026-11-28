@@ -35,6 +35,7 @@ const ErrCode codes[] = {
     {"match", "A match leaves out variants of its enum with no else arm, its value is not one of the enum's variants, or a range arm (a..b) holds no number.", "Add an arm for each variant the message lists (or else { }), and match only values of that enum."},
     {"no-field", "A field is read or written that the object doesn't have (or, in a closed class, didn't declare). A compile error where the type is known: x: C, or a local var x = C(...).", "Declare it in the class (var name) or the shape, or fix the spelling."},
     // run time
+    {"compare", "== or != against a list or map literal: == on lists and maps compares identity, and a literal is a new one, so the result never changes.", "Test emptiness with len(x) == 0. In a test, give the comparison its own expect (or its own part of an expect's && chain): there == compares contents."},
     {"operand", "An operator got operand types it doesn't take.", "Convert first: str(x) for text, int(x) for whole numbers; check for nil."},
     {"no-method", "A method is called that the value doesn't have. A compile error on a list or str whose type is known (a literal, var out = [], xs: list).", "Check the value's type; list, map, str and fiber have a fixed set of methods (the error names the fut spelling, such as lists.contains(l, v) for l.has(v))."},
     {"index", "An index is out of range or not a whole number, or the value can't be indexed.", "Check 0 <= i < len first; pop() needs a non-empty list."},

@@ -1095,7 +1095,7 @@ struct Compiler : Gen, Namespaces {
   void combine(int s, int op) { mv(1, 0), ld(0, s), F->depth--, binop(op); }  // left in slot s, right in x0
   // x0 = x0 op <operand binding tighter than p>; returns whether the result is known to be a number
   bool rhs(int op, int p = 0, bool lnum = false, int lh = NOH) {  // lh: the left operand's local, if any
-    bool rnum = right(p, true, lh);
+    bool rnum = right(p, true, lh, op);
     int rh = rHome;
     binop(op, lnum, rnum), proveOperands(op, lnum, rnum, lh, rh);
     return (lnum && rnum && op <= O_MOD) || op >= O_BAND;
@@ -1104,13 +1104,17 @@ struct Compiler : Gen, Namespaces {
   // x1 = the right operand (x0 kept, if keep); returns whether it is known to be a number. lh: the local x0 was just
   // loaded from, if any. Then x0 need not be saved around the right operand: it is loaded again after (no expression
   // can assign a local), which also keeps it in its FP register for the arithmetic, when it lives in one.
-  bool right(int p, bool keep = true, int lh = NOH) {
+  const char* literalEnd = nullptr;  // where the last [...] or {...} literal ended
+  bool right(int p, bool keep = true, int lh = NOH, int op = -1) {
     rHome = NOH;
     if (int k = simpleOperand(p)) return k == 2;
     int s = slot();
     if (keep && lh != NOH) unload(0, lh);
     else if (keep) st(0, s);
+    Tok first = cur;
+    bool literal = at('[') || at('{');
     bool num = expr(p + 1);
+    if ((op == O_EQ || op == O_NE) && literal && literalEnd == prevEnd) freshCompare(op, first);
     mv(1, 0), F->depth--, rHome = NOH;
     if (keep) lh != NOH ? ldl(0, lh) : ld(0, s);
     return num;
@@ -1791,8 +1795,8 @@ struct Compiler : Gen, Namespaces {
       case T_NUM: return imm(0, box(t.n)), NUM;
       case T_STR: return strLit(t), typedValue(TY_STR);
       case '(': { LV v; v.num = expr(1, &v.path); return expect(')'), v; }
-      case '{': return mapLit(), typedValue(TY_MAP);
-      case '[': { int base = F->depth, n = exprList(']'); return collect(base, n, H_LIST), typedValue(TY_LIST); }
+      case '{': return mapLit(), literalEnd = prevEnd, typedValue(TY_MAP);
+      case '[': { int base = F->depth, n = exprList(']'); return collect(base, n, H_LIST), literalEnd = prevEnd, typedValue(TY_LIST); }
       case T_ID: break;
       default: failAt(t.p, t.line, t.t == T_EOF ? "@syntax unexpected end of file" : "@syntax unexpected '%c'", t.t);
     }
@@ -2086,6 +2090,13 @@ struct Compiler : Gen, Namespaces {
     return expr();
   }
   static bool comparison(int p) { return p == 3 || p == 4; }
+  // x == [...] or x == {...}: == on a list or map asks whether it is the same one, and one made right here is new.
+  void freshCompare(int op, const Tok& at) {
+    const char* what = *at.p == '[' ? "list" : "map";
+    diagnose(at.p, at.line, "@compare this %s is always %s: the %s here is a new one, and %s on a %s compares identity (the same %s?), not contents. "
+             "To test for empty, use len(x) == 0; in a test, give the comparison its own expect (expect a == b compares contents)",
+             op == O_EQ ? "==" : "!=", op == O_EQ ? "false" : "true", what, op == O_EQ ? "==" : "!=", what, what);
+  }
   void singleComparison() {
     if (comparison(prec(cur.t))) fail("@syntax chained comparison: write a < b && b < c");
   }
@@ -2140,7 +2151,7 @@ struct Compiler : Gen, Namespaces {
     if (int t = cur.t, p = prec(t); comparison(p)) {
       next();
       int op = opOf(t);
-      bool rnum = right(4, true, lh);
+      bool rnum = right(4, true, lh, op);
       singleComparison();
       if (at('{')) {
         int rh = rHome;
@@ -2453,13 +2464,38 @@ struct Compiler : Gen, Namespaces {
   }
   // expect a op b | expect x | expect throws/prints/allocs { ... } [op value] | expect grows ... like g. Calls
   // expect@(site, left, right), which checks and, on failure, raises an error naming the source text and the values.
+  // `expect a == b && c == d`: each part of a top-level && chain is checked as its own expect, so its == compares
+  // contents and a failure shows that part's values. (An outer || or ternary keeps it one condition.)
+  bool conjuncts() {
+    Lexer s = lx;
+    bool any = false;
+    for (int d = 0; ; ) {
+      Tok t = s.next();
+      if (t.t == T_EOF || t.t == T_ERR || (d == 0 && (t.t == ';' || (t.nl && !prec(t.t))))) break;
+      if (t.t == '(' || t.t == '[' || t.t == '{') d++;
+      else if (t.t == ')' || t.t == ']' || t.t == '}') { if (--d < 0) break; }
+      else if (d == 0 && (t.t == T_OR || t.t == '?')) return false;
+      else if (d == 0 && t.t == T_AND) any = true;
+    }
+    return any;
+  }
   void expectStmt() {
     int line = cur.line;
     next();
+    if (atKw(S_grows) && !peek().nl && (peekIs('{') || (peek().t == T_ID && peek().sym == S_allocs))) {
+      int base = slot(), siteAt = slot();
+      gmem(0, findGlobal(intern("expect@"))->slot), st(0, base);
+      ExpectSite s{file, "", "", "", line};
+      return growsStmt(base, siteAt, s);
+    }
+    bool parts = !at(T_AND) && conjuncts();
+    do expectOne(line, parts);
+    while (parts && accept(T_AND));
+  }
+  void expectOne(int line, bool part) {  // part: stop at && (the caller checks the next part)
     int base = slot(), siteAt = slot();
     gmem(0, findGlobal(intern("expect@"))->slot), st(0, base);
     ExpectSite s{file, "", "", "", line};
-    if (atKw(S_grows) && !peek().nl && (peekIs('{') || (peek().t == T_ID && peek().sym == S_allocs))) return growsStmt(base, siteAt, s);
     const char* start = tokStart(cur);
     bool throws = s.throws = atKw(S_throws) && peekIs('{'), prints = atKw(S_prints) && peekIs('{'), lnum = false;
     bool allocs = atKw(S_allocs) && peekIs('{');
@@ -2492,14 +2528,14 @@ struct Compiler : Gen, Namespaces {
       expr(5);
       singleComparison();
       s.op = opOf(t), s.right.assign(rs, prevEnd);
-      if (prec(cur.t)) {  // `expect a == b && c`: one condition, checked for truthiness
+      if (prec(cur.t) && !(part && at(T_AND))) {  // `expect a == b || c`: one condition, checked for truthiness
         if (throws || prints || allocs) fail("@syntax expect %s { } compares with one value", throws ? "throws" : prints ? "prints" : "allocs");
         mv(1, 0), ld(0, ls), binop(s.op);
         bool n = false;
         int h = NOH;
         binRest(1, n, h), st(0, ls), s.op = -1, s.left.assign(start, prevEnd), s.right.clear(), imm(0, NIL);
       }
-    } else if (!throws && !prints && !allocs) binRest(1, lnum, lh), st(0, ls), s.left.assign(start, prevEnd), imm(0, NIL);
+    } else if (!throws && !prints && !allocs) binRest(part ? 3 : 1, lnum, lh), st(0, ls), s.left.assign(start, prevEnd), imm(0, NIL);
     else imm(0, NIL);
     st(0, slot());
     s.text = throws || prints || allocs ? (throws ? "throws { ... }" : prints ? "prints { ... }" : "allocs { ... }") + std::string(afterLeft, prevEnd)

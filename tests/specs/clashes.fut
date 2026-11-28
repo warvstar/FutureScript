@@ -58,3 +58,15 @@ test "a list or a string has a fixed set of methods and no fields" {
   expect compileErr("fn f() \{ var m = \{} m.foo() m.k }") == ""                        // a map's keys are its fields
   expect run({source: "var l = [1]\nl.has(1)"}).err.has("list has no method 'has'; import \"std/lists\" and use lists.contains(l, v)")  // the same hint when it runs
 }
+test "an expect checks each part of its && chain on its own: == there compares contents" {
+  var ids = ["a", "b"]
+  expect ids.len() == 2 && ids == ["a", "b"] && ids[0] == "a"
+  expect run({source: "test \"t\" \{ var x = [1] expect len(x) == 1 && x == [2] }", args: ["test"]}).out.has("expect x == [2]\n    x is [1]")
+  expect ids == ["x"] || ids.len() == 2                       // || keeps one condition
+}
+test "== or != against a list or map literal never changes: a compile error" {
+  expect compileErr("fn f(xs) \{ if xs == [] \{ } }").has("this == is always false: the list here is a new one, and == on a list compares identity (the same list?), not contents. To test for empty, use len(x) == 0") 
+  expect compileErr("fn f(m) \{ return m != \{} }").has("this != is always true: the map here is a new one")
+  expect compileErr("fn f(xs) \{ return xs == [1] }").has("[compare]")
+  expect compileErr("fn f(xs, ys) \{ return xs == ys || [1][0] == 1 || \{a: 1}.a == 1 }") == ""   // not a new list or map
+}
