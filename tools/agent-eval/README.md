@@ -93,4 +93,9 @@ was fixed):
 - **A contract helps only when `fut test` reports it.** A clause nothing reported (A4, B4, D5, which need a filled bag,
   cart or project) was fixed in no run.
 - **Reported, Sonnet fixed it every time.** Haiku sometimes left a failing test as "an existing failure", and on C5 it
-  changed the contract to match the bug in 4 of 6 runs ("the body is already correct"), against the doc comment.
+  changed the contract to match the bug in 4 of 6 runs ("the body is already correct").
+- **A note on a broken `ensures`** ("the contract states what the code is meant to do: fix the code, unless ...") left
+  Sonnet at 12/12. On C5c, Haiku fixed the code in 3 of 6 runs (1 of 6 before), changed the contract in 2, and in 1 refused
+  to touch `render.fut` without the user. C5c is a weak test of this: its doc comment says `seen` "remembers how often
+  each base came up", which fits the bug (1 after the first) better than the contract's `seen[base] == 0`, and Haiku
+  cited it.
