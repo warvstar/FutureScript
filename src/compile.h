@@ -44,6 +44,8 @@ struct CompileCheck {
 };
 // Requires rtInit(). Checks source and tests without loading externs, writing traces or installing code.
 std::vector<CompileDiagnostic> compileDiagnostics(const std::string& path, CompileCheck& check);
+// fut map of a program that doesn't compile: the files its imports reach, read from disk (api.cpp; native only)
+Compiled programFromSource(const std::string& path);
 
 // ---------------- lexer ----------------
 enum { T_EOF = 256, T_NUM, T_STR, T_ID, T_EQ, T_NE, T_LE, T_GE, T_DOTDOT, T_AND, T_OR, T_ADDEQ, T_SUBEQ, T_MULEQ, T_DIVEQ, T_SHL, T_SHR, T_POW, T_OPT_DOT, T_ERR };

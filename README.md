@@ -585,6 +585,8 @@ pkg rpghero 0.1.0  // fut.pkg
 
 **Names.** Words after the file keep what they name, all of it within the budget: `fut map main.fut world Hero.attack net`. Each word keeps a package (all of it), a file (by path, `net/wire.fut`, or by name, `wire`), or a declaration (`attack`, or `Hero.attack` for a member; a class comes with its members, and a member with its class). Case doesn't matter. A word's exact matches win; with none, it keeps every name it is part of (`att`: `attack`, `Hero.attackRange`, `combat/attacks.fut`); with none of those either, every name with its letters in order from the start of a word (`hatk`: `Hero.attack`), which the map's first line says it did. When exact matches hide names the word is part of, a note lists them; `*` makes a glob (`*attack*`, `fly*`, `Hero.*`) to ask for them. A test is found by words of its name, never by letters. A word that matches nothing gets a note (`// nothing matches 'nett'`); when no word matches, nothing is printed and the exit status is 1.
 
+**Programs that don't compile.** The map is read from the source, so a compile error doesn't stop it (natively; on wasm it does): the errors go to stderr, and the map shows the files the program's imports reach (the compile `fut check` runs follows them past errors), with a first line saying so (`// it doesn't compile (fut check main.fut lists why), so this map is read from the source alone: ...`; with `--json`, on stderr). It can miss a file only a broken import names, and `--effects` needs a program that compiles.
+
 ## Fibers
 
 A fiber runs a function on a stack of its own. `yield` suspends it from any depth of calls, not just its top function, and hands a value to whoever resumed it.

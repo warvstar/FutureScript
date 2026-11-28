@@ -789,3 +789,44 @@ int printMap(const Compiled& c, bool pubOnly, bool asJson, const std::string& qu
   fflush(stdout), fwrite(out.data(), 1, out.size(), stdout), fflush(stdout);
   return n;
 }
+// A program that doesn't compile, as fut map reads it: the files its imports reach (fut check's compile follows them
+// past errors), as they are on disk, in the packages they are in. Nothing the compile works out (no effects); empty
+// sources if not even the entry could be read. Native: fut check's compile is (and a bad manifest throws).
+#if !__wasm__
+Compiled programFromSource(const std::string& path) {
+  CompileCheck::Buffers buffers;
+  CompileCheck check{buffers};
+  compileDiagnostics(path, check);
+  Compiled c;
+  std::vector<std::string> files{canonicalPath(path)};
+  for (auto& i : check.imports)
+    if (i.to.ends_with(".fut") && std::find(files.begin(), files.end(), i.to) == files.end()) files.push_back(i.to);
+  std::unordered_map<std::string, std::vector<std::string>> reexports;  // file -> what its pub imports name
+  for (auto& f : files) {
+    std::string text;
+    if (!readFile(f, text)) continue;
+    for (auto& d : declsOf(text))
+      if (d.kind == "import" && d.pub)
+        for (auto& i : check.imports) if (canonicalPath(i.from) == f && i.line == d.line && !i.to.empty()) reexports[f].push_back(i.to);
+    c.sources.push_back({f, std::move(text)});
+    try {
+      if (const Package* p = packageOf(f); p && std::find(c.packages.begin(), c.packages.end(), p->dir) == c.packages.end()) c.packages.push_back(p->dir);
+    } catch (std::exception&) {}  // a manifest that doesn't read: its files are shown outside any package
+  }
+  for (auto& [f, text] : c.sources) {  // a package's interface: its root, with what that re-exports (--pub)
+    const Package* p = nullptr;
+    try { p = packageOf(f); } catch (std::exception&) {}
+    if (!p || f != p->root) continue;
+    ApiUnit u{f, "", "package " + p->name, {}, p->name, p->version};
+    for (std::vector<std::string> todo{f}; !todo.empty();) {
+      std::string g = todo.back();
+      todo.pop_back();
+      if (std::find(u.parts.begin(), u.parts.end(), g) != u.parts.end()) continue;
+      u.parts.push_back(g);
+      todo.insert(todo.end(), reexports[g].begin(), reexports[g].end());
+    }
+    c.apis.push_back(std::move(u));
+  }
+  return c;
+}
+#endif

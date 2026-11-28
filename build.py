@@ -609,7 +609,8 @@ def runner_map(exe):
 def runner_map_budget(exe):
     """fut map within a token budget (--budget, 4 bytes a token): all of it if it fits, else top-level declarations (members
     counted), else files, else packages, with a note saying so; and names to show: several, exact ones first (saying which
-    names they hid), else every name a term is part of, else a name with its letters in order; globs; a note for a term that matches nothing."""
+    names they hid), else every name a term is part of, else a name with its letters in order; globs; a note for a term that matches nothing.
+    A program that doesn't compile is mapped from its source (the files its imports reach), with a note saying so."""
     d = ROOT / "build" / "mapbudget"
     tree(d, {**PKG_TREE, "solo.fut": "fn draw() { }\nfn drawAll() { }\nclass Pen {\n  var ink = 0\n  fn draw() { }\n}\n"})
     run = lambda *a: subprocess.run([*runner(exe), "map", *a], capture_output=True, text=True, timeout=60)
@@ -622,6 +623,9 @@ def runner_map_budget(exe):
     two, member, part = run(main, "len", "hidden"), run(main, "Vec.len"), run(main, "uni")
     letters, glob, some = run(main, "hddn"), run(main, "*it"), run(main, "len", "zzz")
     exact, js = run(str(d / "solo.fut"), "draw"), run("--json", main, "len")
+    (d / "geom" / "util.fut").write_text("pub fn sq(x) { return x * }\n")  # it doesn't compile: the map is read from the source
+    broken, brokenPub, brokenJson = run(main), run("--pub", main), run("--json", main)
+    tree(d, PKG_TREE)
     recs = [json.loads(l) for l in js.stdout.splitlines() if l.startswith("{")]
     ok = (full.stdout == nolimit.stdout and not full.stdout.startswith("//")
           and "shows top-level declarations" in top.stdout and re.search(r"pub class Vec +// 1-4, 2 methods\n", top.stdout) and "fn len()" not in top.stdout
@@ -637,9 +641,14 @@ def runner_map_budget(exe):
           and some.returncode == 0 and "// nothing matches 'zzz'" in some.stdout and "fn len()" in some.stdout
           and re.search(r"fn draw\(\) +// 1\n", exact.stdout) and re.search(r"fn draw\(\) +// 5\n", exact.stdout) and "fn drawAll()" not in exact.stdout
           and "1 more name contains 'draw' (*draw* shows them): drawAll" in exact.stdout and "var ink" not in exact.stdout
-          and {r.get("name") for r in recs if r["type"] in ("class", "method")} == {"Vec", "len"})
+          and {r.get("name") for r in recs if r["type"] in ("class", "method")} == {"Vec", "len"}
+          and (exe.suffix == ".wasm" or broken.returncode == 0 and broken.stdout.startswith("// it doesn't compile (fut check ") and "util.fut:1:" in broken.stderr
+          and broken.stdout.split("\n", 1)[1] == full.stdout
+          and "util.fut" not in brokenPub.stdout and "hidden" not in brokenPub.stdout and "pub fn area(r)" in brokenPub.stdout
+          and "read from the source alone" in brokenJson.stderr and all(l.startswith("{") for l in brokenJson.stdout.splitlines())))  # (native: fut check's compile)
     return ok, (f"top: {top.stdout!r}\n  files: {files.stdout!r}\n  packages: {pkgs.stdout!r}\n  tiny: {tiny.stdout!r}\n  two: {two.stdout!r}\n  member: {member.stdout!r}"
-                f"\n  part: {part.stdout!r}\n  letters: {letters.stdout!r}\n  glob: {glob.stdout!r}\n  some: {some.stdout!r}\n  exact: {exact.stdout!r}\n  json: {js.stdout!r}")
+                f"\n  part: {part.stdout!r}\n  letters: {letters.stdout!r}\n  glob: {glob.stdout!r}\n  some: {some.stdout!r}\n  exact: {exact.stdout!r}\n  json: {js.stdout!r}"
+                f"\n  broken: {broken.stdout!r} {broken.stderr!r}\n  broken --pub: {brokenPub.stdout!r}\n  full: {full.stdout!r}")
 
 
 EFFECTS_SRC = """effect Log { fn log(m: str) }

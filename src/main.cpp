@@ -516,7 +516,15 @@ static int mapCommand(bool pubOnly, bool json, bool effects, long budget, const 
   inferEffectsWanted = effects;  // --effects: and what each function does
   try {
     c = compile(path, false, false);
-  } catch (std::exception& e) { return fflush(stdout), fprintf(stderr, "%s\n", e.what()), 2; }
+  } catch (std::exception& e) {  // the map anyway, from the source: what the imports reach
+    c = programFromSource(path);
+    fflush(stdout), fprintf(stderr, "%s\n", e.what());
+    if (c.sources.empty()) return 2;
+    std::string note = "it doesn't compile (fut check " + path + " lists why), so this map is read from the source alone: it may miss files a broken import names" +
+                       (effects ? ", and --effects needs a program that compiles" : "");
+    if (json) fprintf(stderr, "fut map: %s\n", note.c_str());
+    else printf("// %s\n", note.c_str());
+  }
   return printMap(c, pubOnly, json, query, path, budget) || query.empty() ? 0 : (fprintf(stderr, "nothing matches '%s'\n", query.c_str()), 1);
 }
 
