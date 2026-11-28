@@ -601,7 +601,7 @@ def runner_map(exe):
           and area.get("package") == "geom" and area.get("line") == 3 and area.get("pub") is True
           and ln.get("in") == "Vec" and ln.get("line") == 3 and ln.get("end") == 3
           and "pkg app" not in f.stdout and "pkg geom" in f.stdout and none.returncode == 1
-          and re.search(r"pub fn area\(r\) +// 3-5, does nothing\n", marked) and re.search(r"pub class Vec +// 1-5\n", marked) and "invariant" not in marked
+          and re.search(r"pub fn area\(r\) +// 3-5\n", marked) and "does" not in t.stdout + j.stdout and re.search(r"pub class Vec +// 1-5\n", marked) and "invariant" not in marked
           and len(h1.get("area") or "") == 12 and h1["area"] != h2.get("area") and h1.get("len") == h2.get("len") and h1.get("hidden") == h2.get("hidden"))
     return ok, f"text: {t.stdout!r}\n  pub: {p.stdout!r}\n  json: {j.stdout[:400]!r}\n  filtered: {f.stdout!r}\n  contracts marked: {marked!r}"
 
@@ -632,13 +632,13 @@ fn spawner() { return spawn add(1, 2) }
 
 
 def runner_map_effects(exe):
-    """fut map: what each function that declares no effects does, followed through its calls: its own operations and
+    """fut map --effects: what each function that declares no effects does, followed through its calls: its own operations and
     its lambdas', the fns and methods it calls (a known class's, or every class's method of that name: "may"), the
     parameters it calls (what f does), and calls of values it can't follow."""
     d = ROOT / "build" / "mapeff"
     tree(d, {"eff.fut": EFFECTS_SRC})
-    t = subprocess.run([*runner(exe), "map", str(d / "eff.fut")], capture_output=True, text=True, timeout=60)
-    j = subprocess.run([*runner(exe), "map", "--json", str(d / "eff.fut")], capture_output=True, text=True, timeout=60)
+    t = subprocess.run([*runner(exe), "map", "--effects", str(d / "eff.fut")], capture_output=True, text=True, timeout=60)
+    j = subprocess.run([*runner(exe), "map", "--json", "--effects", str(d / "eff.fut")], capture_output=True, text=True, timeout=60)
     recs = {r["name"]: r for r in (json.loads(l) for l in j.stdout.splitlines() if l.startswith("{")) if r.get("type") in ("fn", "method")}
     want = {"hit(n: num)": "does nothing", "shout()": "does io", "override fn shout()": "does io, Log", "add(a, b)": "does nothing",
             "says(h)": "does nothing; .shout() may do io, Log", "tick(h: Hero)": "does io, Log", "apply(xs, f)": "does what f does",
@@ -1122,7 +1122,7 @@ RUNNER_TESTS = [("std/math: within 1 ulp of libm, exact cases exact", runner_fma
                 ("fut test: parallel processes, native fallback, timeouts", runner_parallel),
                 ("packages: names, interfaces, boundaries, versions", runner_packages),
                 ("fut map: packages, files, declarations", runner_map),
-                ("fut map: what each function does", runner_map_effects),
+                ("fut map --effects: what each function does", runner_map_effects),
                 ("fut refs and check: field writes without execution", runner_refs),
                 ("fut lsp: diagnostics, navigation, rename and editor features over stdio", runner_lsp),
                 ("foreign modules: js, wasm, c", runner_modules),

@@ -8,15 +8,16 @@ import { Worker } from "node:worker_threads";
 import { createFut } from "./fut.js";
 import { nodeOptions } from "./node.mjs";
 
-let file = "", watch = false, verbose = false, json = false, filter = "", check = false, pub = false, only = "";
+let file = "", watch = false, verbose = false, json = false, filter = "", check = false, pub = false, only = "", effects = false;
 const testFiles = [];
 const argv = process.argv.slice(2), testing = argv[0] == "test", api = argv[0] == "api", map = argv[0] == "map", explain = argv[0] == "explain";
-const usage = "usage: node web/run.mjs [-w | -v] [--seed n] [file.fut]   (no file: REPL)\n       node web/run.mjs test [--json] [--filter text] file.fut\n       node web/run.mjs api [--check] file.fut\n       node web/run.mjs map [--pub] [--json] file.fut [package | file]\n       node web/run.mjs explain [code]\n";
+const usage = "usage: node web/run.mjs [-w | -v] [--seed n] [file.fut]   (no file: REPL)\n       node web/run.mjs test [--json] [--filter text] file.fut\n       node web/run.mjs api [--check] file.fut\n       node web/run.mjs map [--pub] [--json] [--effects] file.fut [package | file]\n       node web/run.mjs explain [code]\n";
 let seed = 0, threads = 0;  // --seed n: which interleaving of a program's isolates; --threads n: the pool's size (fut-mt.wasm)
 for (let i = testing || api || map ? 1 : 0; i < argv.length && !explain; i++) {
   const a = argv[i];
   if (map && a == "--pub") pub = true;
   else if (map && a == "--json") json = true;
+  else if (map && a == "--effects") effects = true;
   else if (map && file && a[0] != "-") only = a;
   else if (api && a == "--check") check = true;
   else if (testing && a == "--json") json = true;
@@ -72,7 +73,7 @@ function listen(onLine) {
 if (explain) process.exit(fut.explain(argv[1]));
 if (testing || api || map) {
   if (!file) process.stderr.write(usage), process.exit(2);
-  process.exit(testing ? await fut.test(file, json, filter) : api ? await fut.api(file, check) : await fut.map(file, pub, json, only));
+  process.exit(testing ? await fut.test(file, json, filter) : api ? await fut.api(file, check) : await fut.map(file, pub, json, only, effects));
 }
 if (!file) {  // REPL
   listen((l) => { if (l == null) ended = true; else lines.push(l); waiting?.(), (waiting = null); });

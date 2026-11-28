@@ -18,7 +18,7 @@ build/fut test --changed f.fut # rerun only the tests an edit can affect; the re
 build/fut -w file.fut          # run and hot-reload on save (file and its imports); type lines to run them inside it
 build/fut init [dir]           # a new package: fut.pkg, <dir>.fut (main and a test), its .api, .gitignore
 build/fut api file.fut         # write each imported file's .api (its pub declarations); `fut test` checks them
-build/fut map file.fut         # every package, file and declaration the program uses, with line ranges
+build/fut map file.fut         # every package, file and declaration the program uses, with line ranges (--effects: what each fn does)
 build/fut fmt file.fut         # format files in place (directories recurse); --check lists files that need formatting
 build/fut lsp                  # language server for editors, over stdio
 build/fut explain [code]       # an error code's rule and fix ([index], [requires], ...; no code: all of them)
@@ -548,20 +548,20 @@ Every error the compiler or runtime raises ends with a stable code naming the ru
 pkg app 0.0.0  // fut.pkg
   main.fut
     import "geom"  // 1
-    fn main()      // 3-9, does io
+    fn main()      // 3-9
 pkg geom 0.3.0  // ../geom/fut.pkg
   js draw draw.js  // line, fill
   geom.fut  // root
     pub import "./vec.fut"  // 1
-    pub fn area(r)          // 3-5, does nothing
-    fn hidden()             // 6, does nothing
+    pub fn area(r)          // 3-5
+    fn hidden()             // 6
   vec.fut
     pub class Vec    // 1-4
       var x = 0      // 2
-      fn len()       // 3, does nothing
+      fn len()       // 3
 ```
 
-Each function that declares no effects says what it does, worked out from its code: the effects it performs, in its own lambdas too, and through every function and method it calls. `does nothing` means it could be declared `!`; `does io, clock` means `! io, clock` would hold. Some calls can't be followed all the way, and the map says so:
+`--effects` also says what each function that declares no effects does, worked out from its code: the effects it performs, in its own lambdas too, and through every function and method it calls. It is off by default, since most readers want only the layout; name a file to keep it short (`fut map --effects main.fut world.fut`). `does nothing` means it could be declared `!`; `does io, clock` means `! io, clock` would hold. Some calls can't be followed all the way, and the map says so:
 
 ```
 fn apply(xs, f)  // 12, does what f does                 (it calls its parameter f: what the caller passes)
@@ -571,7 +571,7 @@ fn says(h)       // 11, does nothing; .shout() may do io  (h's class isn't known
 
 A method call on a value whose class is known (a typed parameter, `self`, a local made by `C(...)`) counts that class's method and its subclasses' overrides. A function that declares effects does at most those, since the runtime holds it to them, so the map shows its declaration instead.
 
-Private names are included; contracts are not (the source and the `.api` have them). The map and the `.api` come from the same reading of the source, so they always agree. `--pub` shows only what other packages can use: each package's interface, and the `pub` names of files in no package. `--json` prints one object per line (`{"type":"fn", "package", "file", "name", "in", "pub", "sig", "line", "end", "hash"}`; `hash` is of the declaration's text, so it changes when the declaration is edited, not when it moves, plus `package`, `module` and `file` records). A function that declares no effects also has `"does"` (effect names), `"doesWhatParams"` (parameter names), `"callsValues"`, `"mayDo"` and `"mayVia"` (method names). A last argument keeps one package (`fut map main.fut geom`) or one file.
+Private names are included; contracts are not (the source and the `.api` have them). The map and the `.api` come from the same reading of the source, so they always agree. `--pub` shows only what other packages can use: each package's interface, and the `pub` names of files in no package. `--json` prints one object per line (`{"type":"fn", "package", "file", "name", "in", "pub", "sig", "line", "end", "hash"}`; `hash` is of the declaration's text, so it changes when the declaration is edited, not when it moves, plus `package`, `module` and `file` records). With `--effects`, a function that declares no effects also has `"does"` (effect names), `"doesWhatParams"` (parameter names), `"callsValues"`, `"mayDo"` and `"mayVia"` (method names). A last argument keeps one package (`fut map main.fut geom`) or one file.
 
 ## Fibers
 

@@ -511,9 +511,9 @@ static int initCommand(int argc, char** argv) {
 }
 
 // fut map [--pub] [--json] file.fut [package | file]: the packages, files and declarations the program uses
-static int mapCommand(bool pubOnly, bool json, const std::string& only) {
+static int mapCommand(bool pubOnly, bool json, bool effects, const std::string& only) {
   Compiled c;
-  inferEffectsWanted = true;  // and what each function does
+  inferEffectsWanted = effects;  // --effects: and what each function does
   try {
     c = compile(path, false, false);
   } catch (std::exception& e) { return fflush(stdout), fprintf(stderr, "%s\n", e.what()), 2; }
@@ -631,7 +631,7 @@ int main(int argc, char** argv) {
   if (argc > 1 && std::string(argv[1]) == "init") return initCommand(argc, argv);
   bool watch = false, asmMode = false, testMode = argc > 1 && std::string(argv[1]) == "test";
   bool apiMode = argc > 1 && std::string(argv[1]) == "api", apiCheck = false;
-  bool mapMode = argc > 1 && std::string(argv[1]) == "map", mapPub = false, mapJson = false;
+  bool mapMode = argc > 1 && std::string(argv[1]) == "map", mapPub = false, mapJson = false, mapEffects = false;
   std::string mapOnly;
   TestRun topts;
   std::vector<std::string> testFiles;
@@ -639,7 +639,7 @@ int main(int argc, char** argv) {
   bool record = false;
   const char* usage = "usage: fut [-w | -v | --asm | --isolates n | --seed n | --threads n | --record log | --replay log] [file.fut]   (no file: REPL)\n"
                       "       fut test [--changed] [--json] [--filter text] [--timeout s] [--jobs n] [--isolates n] [--seed n] file.fut...\n"
-                      "       fut check file.fut\n       fut refs file.fut Class.field [--writes]\n       fut init [dir]   (a new package)\n       fut api [--check] file.fut\n       fut map [--pub] [--json] file.fut [package | file]\n       fut explain [code]\n"
+                      "       fut check file.fut\n       fut refs file.fut Class.field [--writes]\n       fut init [dir]   (a new package)\n       fut api [--check] file.fut\n       fut map [--pub] [--json] [--effects] file.fut [package | file]\n       fut explain [code]\n"
                       "       fut fmt [--check] [--stdin] [file.fut | dir ...]\n"
                       "       fut lsp   (language server over stdio)\n       fut worker build ...   (Cloudflare Workers: node web/worker.mjs)\n";
   if (argc > 1 && std::string_view(argv[1]) == "fmt") return fmtCommand(argc - 2, argv + 2);
@@ -649,6 +649,7 @@ int main(int argc, char** argv) {
     if (mapMode) {
       if (a == "--pub") mapPub = true;
       else if (a == "--json") mapJson = true;
+      else if (a == "--effects") mapEffects = true;
       else if (a[0] == '-') return fputs(usage, stderr), 2;
       else (path.empty() ? path : mapOnly) = a;
     } else if (apiMode) {
@@ -700,7 +701,7 @@ int main(int argc, char** argv) {
   if (watch) isolateSeed = 0;  // -w: a reload stops pool isolates at their polls (seeded ones share the main thread)  // a test's isolates interleave the same way every run
   rtInit();
   if ((testMode || apiMode || mapMode) && path.empty()) return fputs(usage, stderr), 2;
-  if (mapMode) return mapCommand(mapPub, mapJson, mapOnly);
+  if (mapMode) return mapCommand(mapPub, mapJson, mapEffects, mapOnly);
   if (testMode) return runTests(topts);
   if (apiMode) return apiCommand(apiCheck);
   if (path.empty()) return repl();
