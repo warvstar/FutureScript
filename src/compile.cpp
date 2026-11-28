@@ -502,7 +502,10 @@ struct Compiler : Gen, Namespaces {
   // Field types may be declared later in this file or in an importer. Record the
   // steps now and resolve them after parsing. Use separate alias nodes so invalidating
   // a reassigned local never changes the declared type of its source field.
-  struct TypePath { int parent, field; uint64_t type; };
+  // field: a field's symbol; -1 the parent's own type (an alias); EACH what `for x in` the parent gives (a list<T>'s
+  // T, a map<K, V>'s K); AT what parent[i] gives (T; V or nil). result >= 0: the declared result of that fn (no parent).
+  enum { EACH = -2, AT = -3 };
+  struct TypePath { int parent, field; uint64_t type; int result = -1; };
   std::vector<TypePath> paths{{0, -1, 0}};
   int addPath(int parent, int field, uint64_t type = 0) {
     if (!parent && !type) return 0;
@@ -1862,7 +1865,7 @@ struct Compiler : Gen, Namespaces {
       if (int size = vecSize(t.sym)) return next(), vecCall(*g, size), LV{};
     if (g->kind == 'f' && at('(') && !cur.nl && effectsChecked())
       effCalls.push_back({t.sym, F->effMask, F->effWho, F->effText, At{t.p, t.line, file, srcStart}});
-    if (g->kind == 'f' && at('(') && !cur.nl) return next(), directCall(t, *g), t.sym == F->self || returnsNum(t.sym) ? NUM : LV{};
+    if (g->kind == 'f' && at('(') && !cur.nl) return next(), directCall(t, *g), t.sym == F->self || returnsNum(t.sym) ? NUM : resultOf(t.sym);
     if (g->kind == 'c' && enumDefs.count(t.sym)) {
       if (at('.') && !cur.nl) return next(), constructed(variantValue(t));
       if (at('(') && !cur.nl) failAt(t.p, t.line, "@class %s is an enum: make one of its variants, %s.%s", name(t.sym), name(t.sym), name(enumDefs[t.sym].vs.empty() ? t.sym : enumDefs[t.sym].vs[0].raw));
@@ -1983,6 +1986,11 @@ struct Compiler : Gen, Namespaces {
     return 0;
   }
   LV constructed(int cls) { return typedValue(tyClass(cls)); }
+  LV resultOf(int fn) {  // a call of top-level fn: its declared result's type, once every signature is known
+    LV v;
+    if (!tiering) paths.push_back({0, -1, 0, fn}), v.path = int(paths.size()) - 1;
+    return v;
+  }
   LV typedValue(uint64_t type) {  // a value whose type the compiler knows here (a literal's, a constructor's)
     LV v;
     if (!tiering) v.path = addPath(0, -1, type);
@@ -2027,6 +2035,7 @@ struct Compiler : Gen, Namespaces {
         }
       } else if (at('[') && !cur.nl) {
         LV base = v;
+        int elemOf = tiering ? 0 : valuePath(v);
         next(), load(v);
         int t = slot();
         st(0, t);
@@ -2041,7 +2050,7 @@ struct Compiler : Gen, Namespaces {
           internalCall("slice@", t, 3);
           v = {};
         } else {
-          expect(']'), v = {LV_INDEX, t};
+          expect(']'), v = {LV_INDEX, t}, v.path = addPath(elemOf, AT);
           if (F->parVar >= 0 && (base.k == LV_CAP || base.k == LV_GLOBAL))  // from outside a parallel for's body
             v.b = base.k == LV_CAP ? base.a + 1 : -(base.a + 1), v.own = true, parBase = varName(base);
         }
@@ -2581,7 +2590,8 @@ struct Compiler : Gen, Namespaces {
     if (!atKw(K_in)) fail("@syntax expected 'in'");
     next();
     scope([&] {
-      bool num = expr();
+      int each = 0;
+      bool num = expr(1, tiering ? nullptr : &each);
       Loop lp;
       if (accept(T_DOTDOT)) {  // the bounds must be numbers (checked unless known)
         int a = fhome();
@@ -2599,6 +2609,7 @@ struct Compiler : Gen, Namespaces {
       }
       int a = home(), b = home(), v = home();  // the collection, a raw integer index, the element
       stl(0, a), imm(0, 0), stl(0, b), F->locals.push_back({nm, v});
+      F->locals.back().path = addPath(addPath(each, EACH), -1);
       if (nav) F->locals.back().symbol = symbol;
       loopTop(lp);
       ldl(0, a), ldl(1, b), helper(H_ITER), exitIfEnd(lp);
@@ -4349,10 +4360,18 @@ struct Compiler : Gen, Namespaces {
       }
     // Parents precede children. An untyped shadowing field stops lookup in its base.
     for (auto& p : paths) {
+      if (p.result >= 0)
+        if (auto it = sigs.find(symName(p.result)); it != sigs.end() && !it->second.types.empty()) p.type = it->second.types.back();
       if (!p.parent) continue;
       uint64_t parent = paths[p.parent].type;
-      if (p.field < 0) { p.type = parent; continue; }
+      if (p.field == -1) { p.type = parent; continue; }
       uint64_t t = resolveNow(parent) & ~TY_OPT;
+      if (p.field == EACH || p.field == AT) {
+        const TypeDesc* d = (t & 15) == TY_EXT ? typeDesc(t) : nullptr;
+        if (d && d->k == 'L') p.type = d->elem;
+        else if (d && d->k == 'M') p.type = p.field == EACH ? d->key : d->elem ? d->elem | TY_OPT : 0;
+        continue;
+      }
       if ((t & 15) == TY_CLS) {
         for (auto* v = view(int(t >> 8)); v; v = view(v->super)) {
           for (auto& f : *v->types) if (f.sym == p.field) p.type = f.type;

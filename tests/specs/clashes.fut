@@ -70,3 +70,18 @@ test "== or != against a list or map literal never changes: a compile error" {
   expect compileErr("fn f(xs) \{ return xs == [1] }").has("[compare]")
   expect compileErr("fn f(xs, ys) \{ return xs == ys || [1][0] == 1 || \{a: 1}.a == 1 }") == ""   // not a new list or map
 }
+
+test "a call's declared result, a loop variable and an element are known types" {
+  var item = "class Item \{\n  var name: str\n  fn init(name: str) \{ self.name = name }\n}\nfn mk(): Item \{ return Item(\"a\") }\n"
+  expect compileErr(item + "fn f() \{ var i = mk() return i.nme }").has("'nme' is not a field of Item (i is Item")
+  expect compileErr(item + "fn f() \{ return mk().nme }").has("'nme' is not a field of Item")
+  expect compileErr(item + "fn f(xs: list<Item>) \{ for x in xs \{ print(x.nme) } }").has("'nme' is not a field of Item (x is Item")
+  expect compileErr(item + "fn f(xs: list<Item>) \{ return xs[0].nme }").has("'nme' is not a field of Item")
+  expect compileErr(item + "fn f(m: map<str, Item>) \{ for k in m \{ print(k.size) } }").has("string has no field 'size'")
+  expect compileErr(item + "fn f(m: map<str, Item>) \{ return m[\"a\"].nme }").has("'nme' is not a field of Item")
+  expect compileErr(item + "fn g(n: num) \{ }\nfn f(xs: list<Item>) \{ for x in xs \{ g(x) } }").has("[type]")
+  // untyped, reassigned, or a slice (an unchecked copy): unknown
+  expect compileErr(item + "fn f(xs) \{ for x in xs \{ print(x.nme) } }") == ""
+  expect compileErr(item + "fn f(xs: list<Item>) \{ for x in xs \{ x = 1 print(x.nme) } }") == ""
+  expect compileErr(item + "fn h() \{ return mk() }\nfn f() \{ return h().nme }") == ""
+}
