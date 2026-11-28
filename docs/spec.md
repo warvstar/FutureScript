@@ -139,7 +139,7 @@ match e { Expr.Num(_) { } else { } }   // _ skips a field; Num alone binds none;
 ```fut
 fn half(n: num): num ! { return n / 2 }   // types: num str bool list map fn any Class T?
 var lvl: num = 1                           // checked on every store
-expect throws { half("x") }
+var x = "x" expect throws { half(x) }     // half("x") is a compile error [type]
 type User = {name: str, age: num?}         // also A | B, "GET" 3 true nil, list<T>, map<K, V>; pub type
 fn ages(us: list<User>): num ! { return us.len() }   // given u: User (or var u = C() in a fn), u.nmae is a compile error
 var us = [{name: "a"}]
@@ -154,7 +154,7 @@ fn bad() ! { say() }                       // fn bad() ! { print("x") } is a com
 expect throws { bad() }
 ```
 
-A list or map that passes `list<T>`/`map<K, V>` keeps that type for good: any later store into it, through any reference, throws unless it fits, and later checks of it cost nothing. A union or a failed check doesn't do this; `slice()` makes an unchecked copy. A shape is checked only when the value crosses the boundary, so a map can change after it passes; use a class to keep fields checked.
+A value whose type shows where it is written (a literal, `C(...)`, a typed var, param or result) that the declared type can never take is a compile error; any other is checked when it runs. A list or map that passes `list<T>`/`map<K, V>` keeps that type for good: any later store into it, through any reference, throws unless it fits, and later checks of it cost nothing. A union or a failed check doesn't do this; `slice()` makes an unchecked copy. A shape is checked only when the value crosses the boundary, so a map can change after it passes; use a class to keep fields checked.
 
 Effects: `io` (print, run, extern, graphics, files, env, exec, fetch) `clock` (clock, sleep, time) `random` `yield` `spawn` `chan` (every channel/task op), declared ones; json is pure. A handler's return is the op's result, no resumption. In a function that declares effects (outside its `handle` blocks), an operation it leaves out, or a call of a fn declaring one, is a compile error; anything else (an undeclared fn, a call through a value) is checked when it runs.
 

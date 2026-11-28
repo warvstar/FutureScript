@@ -5,6 +5,7 @@ type User = {name: str, age: num, email: str?}
 type Tree = {value: num, kids: list<Tree>}
 type Scores = map<str, num>
 
+fn id(v) { return v }
 fn verb(m: Method) { return m }
 fn age(u: User) { return u.age }
 fn depth(t: Tree): num {
@@ -34,7 +35,7 @@ test "unions and literals" {
   expect verb("GET") == "GET"
   expect err(fn() { verb("PUT") }).has("must be Method (\"GET\" | \"POST\"), got the string \"PUT\"")
   expect maybe(1) == 1 && maybe("a") == "a" && maybe(nil) == nil
-  expect err(fn() { maybe(true) }).has("must be num | str | nil")
+  expect err(fn() { maybe(id(true)) }).has("must be num | str | nil")
 }
 
 test "shapes: maps and instances, open, with paths in their errors" {

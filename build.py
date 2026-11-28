@@ -280,7 +280,7 @@ def hot_var_type(exe):
             "fn main() {{ while true {{ try {{ set(\"s\") print(\"ok {{level}}\") return }} catch e {{ }} sleep(0.01) }} }}\n")
     out, err = live(exe, {"v.fut": prog.format(sig=": num = 0")},
                     [("<stdin>", "level = \"x\"\nlevel\n"), ("v.fut", prog.format(sig=": str = \"a\""))])
-    ok = out.split() == ["0", "ok", "s"] and "var 'level' must be num, got the string \"x\"" in err
+    ok = out.split() == ["0", "ok", "s"] and "var 'level' must be num, got a string [type]" in err  # a literal: a compile error
     return ok, f"stdout: {out!r}\n  stderr: {err!r}"
 
 

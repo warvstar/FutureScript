@@ -690,6 +690,7 @@ bool fieldOf(V o, int sym, V* out, bool* method);          // o's field or key n
 bool typeAccepts(uint64_t type, V v, int site = -1);  // site: a check at run time, which gives the lists and maps it passes their element type
 void typeWrite(Obj* o, V key, V v, void* ra);  // a store into a list or map that has its element type
 int typeSite(const std::string& what, const std::string& type);  // what a check names when it fails: its number
+const std::string& typeSiteWhat(int site);                        // ... and back: "argument 'n' of half()"
 [[noreturn]] void typeFail(int site, V v, void* ra, uint64_t type = 0);  // type: to say which part failed
 void typesInit();
 

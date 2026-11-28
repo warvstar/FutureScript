@@ -145,6 +145,7 @@ static int editDistance(const std::string& a, const std::string& b) {  // for "d
   return row[b.size()];
 }
 struct TypedUse { int path, sym; At at; bool call; std::string var; };
+constexpr uint64_t TY_NILLIT = TY_OPT;  // a static type (never a declared one): the value nil, as written
 // A fn/method in the source. retNum: it declares `: num`, so a direct call's result is known to be a number.
 struct Span { const char *start = nullptr, *end = nullptr; int line = 0, endLine = 0, arity = 0; bool retNum = false; };
 // A contract's clause: where its condition starts, and whether it calls anything (then the checks run in a
@@ -158,7 +159,7 @@ struct SpecFn { At fn; std::string name; std::vector<Clause> pre, post; std::vec
 struct ClassSpec { At at; std::string name; std::vector<Clause> invariants; std::vector<int> methods; };
 // Each fn/method's parameter and result types (0: none), as last compiled: an override must declare the same.
 // eff: it declares effects (effMask, as written: effText), so an override must declare a subset.
-struct Sig { std::vector<uint64_t> types; std::string text; bool eff = false; uint64_t effMask = 0; std::string effText; };
+struct Sig { std::vector<uint64_t> types; std::string text; bool eff = false; uint64_t effMask = 0; std::string effText; std::vector<int> params; };
 // Each effect's operations (qualified effect symbol -> (operation symbol, arity)), as last compiled: what performs
 // and handlers compile against when the effect is not in the files being compiled (the REPL).
 using EffOps = std::unordered_map<int, std::vector<std::pair<int, int>>>;
@@ -376,6 +377,14 @@ struct Compiler : Gen, Namespaces {
   struct EffCall { int callee; uint64_t allowed; std::string who, text; At at; };
   std::vector<EffCall> effCalls;
   std::unordered_map<uint64_t, std::string> effBitNames;  // a user effect's bit -> its name, as first declared
+  // Values whose static type is known where they meet a declared type: a literal, a constructor, or something declared
+  // (a typed var, parameter or field). Checked once every type is known; a clash no value could pass is an error.
+  struct ArgVal { int path = 0; bool num = false; const char* p = nullptr; int line = 0; };  // path: its type; num: a number
+  struct CallSite { int callee; std::vector<ArgVal> args; std::string file; const char* src; };  // a direct call of a top-level fn
+  struct Expect { uint64_t type; int typePath, field; ArgVal value; std::string what, file; const char* src; };  // typePath: a field's
+  std::vector<CallSite> callSites;
+  std::vector<Expect> expects;
+  bool gpuBody = false;  // compiling a gpu fn: its result's checks are wgsl.cpp's ([gpu])
   std::vector<std::pair<int, int>> fnDefs;  // (sym, arity)
   std::vector<int> inits;                   // top-level vars initialised by this chunk
   struct Extern { int sym; void* fn; std::string sig; char ret; bool pure, rt = false; std::string stub; };  // pure: declared `!`, performs nothing; rt: fn is the runtime's Fn; stub: what a call raises (a module this build doesn't load)
@@ -1094,11 +1103,14 @@ struct Compiler : Gen, Namespaces {
   }
 
   // ---- calls: arguments go to consecutive slots (the "window") ----
-  int exprList(int close, bool keepLast = false) {  // keepLast: leave the last value in x0, not in a slot
+  int exprList(int close, bool keepLast = false, std::vector<ArgVal>* vals = nullptr) {  // keepLast: leave the last value in x0, not in a slot
     int n = 0;
     if (!accept(close)) {
-      do expr(), n++;
-      while (accept(',') && (st(0, slot()), true));
+      do {
+        ArgVal a{0, false, cur.p, cur.line};
+        a.num = expr(1, vals ? &a.path : nullptr), n++;
+        if (vals) vals->push_back(a);
+      } while (accept(',') && (st(0, slot()), true));
       if (!keepLast) st(0, slot());
       expect(close);
     }
@@ -1135,10 +1147,12 @@ struct Compiler : Gen, Namespaces {
     return g.o && g.o->kind == K::Fn ? ((Fn*)g.o)->arity : -1;
   }
   void directCall(const Tok& t, Global& g) {  // known top-level fn: called through its stub; reloads repoint the stub
-    int base = F->depth, n = exprList(')', true), a = arityOf(t.sym, g);
+    std::vector<ArgVal> args;
+    int base = F->depth, n = exprList(')', true, tiering ? nullptr : &args), a = arityOf(t.sym, g);
     if (a < 0) diagnose(t.p, t.line, "@undefined-name '%s' is not defined", name(t.sym));
     else if (a != n) diagnose(t.p, t.line, "@arity '%s' expects %d arguments, got %d", name(t.sym), a, n);
     if (a != n) return F->depth = base, imm(0, NIL);
+    if (n && !tiering) callSites.push_back({t.sym, std::move(args), file, srcStart});
     callDirect(base, n, g.stub);
   }
 
@@ -1268,7 +1282,7 @@ struct Compiler : Gen, Namespaces {
     size_t tee = setF == fun && setAt < nc ? setAt : SIZE_MAX;
     Word oldOp = tee != SIZE_MAX ? k.c[tee] : 0;
 #endif
-    size_t np = pend.size(), nf = fieldUses.size(), nt = typedUses.size(), ne = effCalls.size();
+    size_t np = pend.size(), nf = fieldUses.size(), nt = typedUses.size(), ne = effCalls.size(), nc2 = callSites.size(), nx = expects.size();
     std::string o = owner, r = refKey, tr = testRefs;
     auto missing = testMissing;
     auto oldValues = olds;
@@ -1289,7 +1303,7 @@ struct Compiler : Gen, Namespaces {
     saved.k = std::move(k);
     *fun = std::move(saved);
     F = fun, loop.restore(), retry.restore();
-    pend.resize(np), fieldUses.resize(nf), typedUses.resize(nt), effCalls.resize(ne);
+    pend.resize(np), fieldUses.resize(nf), typedUses.resize(nt), effCalls.resize(ne), callSites.resize(nc2), expects.resize(nx);
     owner = std::move(o), refKey = std::move(r), testRefs = std::move(tr), testMissing = missing;
     olds = oldValues, pubContract = contract, pinLine = pinned, hasLit = lexAtEnd = false;
     synchronize(start, reached, where);
@@ -1651,18 +1665,18 @@ struct Compiler : Gen, Namespaces {
     const char* start = t.p;
     switch (t.t) {
       case T_NUM: return imm(0, box(t.n)), NUM;
-      case T_STR: return strLit(t), LV{};
+      case T_STR: return strLit(t), typedValue(TY_STR);
       case '(': { LV v; v.num = expr(1, &v.path); return expect(')'), v; }
-      case '{': return mapLit(), LV{};
-      case '[': { int base = F->depth, n = exprList(']'); return collect(base, n, H_LIST), LV{}; }
+      case '{': return mapLit(), typedValue(TY_MAP);
+      case '[': { int base = F->depth, n = exprList(']'); return collect(base, n, H_LIST), typedValue(TY_LIST); }
       case T_ID: break;
       default: failAt(t.p, t.line, t.t == T_EOF ? "@syntax unexpected end of file" : "@syntax unexpected '%c'", t.t);
     }
     switch (t.sym) {
-      case K_true: return imm(0, TRUE_), LV{};
-      case K_false: return imm(0, FALSE_), LV{};
-      case K_nil: return imm(0, NIL), LV{};
-      case K_fn: return lambda(t), LV{};
+      case K_true: return imm(0, TRUE_), typedValue(TY_BOOL);
+      case K_false: return imm(0, FALSE_), typedValue(TY_BOOL);
+      case K_nil: return imm(0, NIL), typedValue(TY_NILLIT);
+      case K_fn: return lambda(t), typedValue(TY_FN);
       case K_yield:  // yield [value]: suspend this fiber; evaluates to the value the next resume sends
         if (F->atomics) failAt(t.p, t.line, "@atomic 'yield' inside atomic { }: other code would run while it is half done (yield after it ends)");
         at('}') || at(')') || at(']') || at(',') || at(T_EOF) || cur.nl ? imm(0, NIL) : (void)expr();
@@ -1748,9 +1762,10 @@ struct Compiler : Gen, Namespaces {
   }
   // A value just made by C(...) or Enum.Variant(...) is exactly that class, so `var p = C()` gives p its type (until p
   // is assigned again) and p.name is checked against C's declared fields and methods, as if p were declared `p: C`.
-  LV constructed(int cls) {
+  LV constructed(int cls) { return typedValue(tyClass(cls)); }
+  LV typedValue(uint64_t type) {  // a value whose type the compiler knows here (a literal's, a constructor's)
     LV v;
-    if (!tiering) v.path = addPath(0, -1, tyClass(cls));
+    if (!tiering) v.path = addPath(0, -1, type);
     return v;
   }
   LV postfix() {
@@ -1941,9 +1956,12 @@ struct Compiler : Gen, Namespaces {
           std::string what = "var '" + symName(top ? qualify(s) : s) + "'";
           if (ty.code && !init && !acceptsNow(ty.code, NIL)) diagnose(n.p, n.line, "@type %s is %s, so it needs an initial value", what.c_str(), ty.text.c_str());
           Tok v = cur;
-          int path = 0;
-          bool num = init ? expr(1, top || annotated ? nullptr : &path) : (imm(0, NIL), false);
+          int path = 0, vpath = 0;
+          bool inherit = !top && !annotated, checked = init && ty.code && !tiering;  // inherit: an untyped local takes the value's type
+          bool num = init ? expr(1, inherit || checked ? &vpath : nullptr) : (imm(0, NIL), false);
+          if (inherit) path = vpath;
           if (ty.code && num && (ty.code & 15) != TY_NUM && ((ty.code & 15) <= TY_CLS || (ty.code & 15) == TY_BUF)) diagnose(v.p, v.line, "@type %s is %s, but its initial value is a number", what.c_str(), ty.text.c_str());
+          else if (checked && !num) expects.push_back({ty.code, 0, -1, {vpath, false, v.p, v.line}, what, file, srcStart});
           checkType(ty, what, num);
           if (top) {
             int sym = qualify(s);
@@ -1990,7 +2008,13 @@ struct Compiler : Gen, Namespaces {
           if (F->top) fail("@misplaced 'return' outside a function");
           if (F->parVar >= 0) failAt(prev.p, prev.line, "@parallel a parallel for's body can't return: every iteration runs (write each result to a buffer at [i])");
         {
-          bool n = at('}') || at(T_EOF) || cur.nl ? (imm(0, NIL), false) : expr();
+          ArgVal rv{0, false, cur.p, cur.line};
+          bool bare = at('}') || at(T_EOF) || cur.nl, typed = F->retTy && !tiering && !gpuBody;
+          bool n = bare ? (imm(0, NIL), false) : expr(1, typed ? &rv.path : nullptr);
+          if (typed) {
+            if (bare) rv.path = typedValue(TY_NILLIT).path, rv.p = prev.p, rv.line = prev.line;
+            rv.num = n, expects.push_back({F->retTy, 0, -1, rv, typeSiteWhat(F->retSite), file, srcStart});
+          }
           for (int i = 0; i < F->atomics; i++)  // the last is the outermost: it may run the block again
             i == F->atomics - 1 && F->retry ? commitOrRetry(true) : callNative("atomic@end", true);  // passes x0 through
           for (int i = 0; i < F->handles; i++) callNative("handle@end", true);
@@ -2311,7 +2335,10 @@ struct Compiler : Gen, Namespaces {
     if (v.k == LV_LOCAL || v.k == LV_GLOBAL || v.k == LV_CAP) {
       LV t = v;
       if (op >= 0) load(t);
-      bool num = value(t.num);
+      ArgVal a{0, false, cur.p, cur.line};
+      bool checked = op < 0 && ty.first && !tiering;
+      bool num = checked ? expr(1, &a.path) : value(t.num);
+      if (checked) a.num = num, expects.push_back({ty.first, 0, -1, a, typeSiteWhat(ty.second), file, srcStart});
       storeCheck(ty, num);
       if (v.k == LV_LOCAL) {
         stl(0, v.a);
@@ -2322,7 +2349,11 @@ struct Compiler : Gen, Namespaces {
       int o = slot();
       st(0, o);
       if (op >= 0) field(v.b, false);
-      value(), mv(2, 0), ld(0, o), field(v.own ? v.b : int64_t(v.b | SETF_OUTSIDE), true);
+      ArgVal a{0, false, cur.p, cur.line};
+      bool checked = op < 0 && v.path && !tiering;  // a field whose type may be declared: known once every class is
+      if (checked) a.num = expr(1, &a.path), expects.push_back({0, v.path, v.b, a, "", file, srcStart});
+      else value();
+      mv(2, 0), ld(0, o), field(v.own ? v.b : int64_t(v.b | SETF_OUTSIDE), true);
       if (!v.own) {  // from outside the object: if its class has invariants (rt_setf says so), they must hold now
         int keep = slot();
         st(0, keep);
@@ -2443,7 +2474,8 @@ struct Compiler : Gen, Namespaces {
       if (!f.lambda && !tiering) {  // for the override check: "(num, _): str" (_: untyped)
         Sig& g = sigs[nm];
         g.types.clear(), g.text = "(";
-        for (auto& [s, ty] : ptys) g.types.push_back(ty.code), g.text += (g.text.size() > 1 ? ", " : "") + (ty.code ? ty.text : "_");
+        g.params.clear();
+        for (auto& [s, ty] : ptys) g.types.push_back(ty.code), g.params.push_back(s), g.text += (g.text.size() > 1 ? ", " : "") + (ty.code ? ty.text : "_");
         g.types.push_back(r.code), g.text += ")" + (r.code ? ": " + r.text : "");
         g.eff = edecl, g.effMask = emask, g.effText = etext;
       }
@@ -3347,6 +3379,8 @@ struct Compiler : Gen, Namespaces {
     int line = cur.line;
     next();
     Tok n = cur;
+    struct Back { bool& b; ~Back() { b = false; } } back{gpuBody};  // also when the body fails
+    gpuBody = true;
     fnDecl();
     auto& fs = gpuSrcs[file];
     fs.push_back({n.sym, p, line});
@@ -3649,6 +3683,87 @@ struct Compiler : Gen, Namespaces {
     diagnose(a.p, a.line, fmt, x.c_str(), y.c_str(), z.c_str(), w.c_str());
   }
   static std::string params(int n) { return std::to_string(n) + (n == 1 ? " parameter" : " parameters"); }
+  // A value's static type as a kind a check compares: list<T> is a list, a literal type its kind; 0 if not one.
+  uint64_t valueKind(uint64_t v) {
+    if (v == TY_NILLIT) return v;
+    uint64_t opt = v & TY_OPT;
+    v = resolveNow(v);
+    opt |= v & TY_OPT, v &= ~TY_OPT;
+    if ((v & 15) == TY_EXT) {
+      const TypeDesc* x = typeDesc(v);
+      if (!x) return 0;
+      if (x->k == 'L') v = TY_LIST;
+      else if (x->k == 'M') v = TY_MAP;
+      else if (x->k == 'l') v = x->lit == 's' ? TY_STR : x->lit == 'n' ? TY_NUM : x->v == NIL ? TY_NILLIT : TY_BOOL;
+      else return 0;  // a union or a shape: not one kind
+      if (v == TY_NILLIT) return v;
+    }
+    return (v & 15) >= TY_NUM && (v & 15) <= TY_CLS ? v | opt : 0;
+  }
+  std::string staticText(uint64_t v) {  // for messages: what the value is known to be
+    v = valueKind(v);
+    if (v == TY_NILLIT) return "nil";
+    std::string s;
+    switch (v & 15) {
+      case TY_NUM: s = "a number"; break;
+      case TY_STR: s = "a string"; break;
+      case TY_BOOL: s = "a bool"; break;
+      case TY_LIST: s = "a list"; break;
+      case TY_MAP: s = "a map"; break;
+      case TY_FN: s = "a function"; break;
+      case TY_CLS: {
+        int c = int(v >> 8), e = enumOf(c);
+        const VariantDef* vd = nullptr;
+        if (e >= 0 && e != c) for (auto& x : enumDefs.at(e).vs) if (x.sym == c) vd = &x;
+        s = vd && vd->fields.empty() ? symName(c) : (vd ? "a " : "an instance of ") + symName(c);  // Shape.Empty, a Shape.Circle
+        break;
+      }
+      default: return "a value";
+    }
+    return v & TY_OPT ? s + " or nil" : s;
+  }
+  // Whether no value of static type v passes a check of declared type d, mirroring types.cpp accepts. Both must be
+  // known; anything unknown (0, any, a union value, a shape value) is not a clash. related(a, b): could an instance be
+  // both class a's and class b's (one is the other's ancestor, or the compiler can't tell).
+  template <class Related> bool contradicts(uint64_t d, uint64_t v, Related& related, int depth = 0) {
+    if (!d || !v || depth > 8) return false;
+    d = resolveNow(d);
+    const TypeDesc* x = (d & 15) == TY_EXT ? typeDesc(d) : nullptr;
+    if ((v = valueKind(v)) == TY_NILLIT) {
+      if (d & TY_OPT) return false;
+      switch (d & 15) {
+        case TY_NUM: case TY_STR: case TY_BOOL: case TY_LIST: case TY_MAP: case TY_FN: case TY_CLS: case TY_BUF: return true;
+        case TY_EXT:
+          if (!x) return false;
+          if (x->k == 'u') return std::all_of(x->alts.begin(), x->alts.end(), [&](uint64_t a) { return contradicts(a, v, related, depth + 1); });
+          if (x->k == 'l') return !(x->lit == 'v' && x->v == NIL);
+          return x->k == 's' || x->k == 'L' || x->k == 'M';
+        default: return false;
+      }
+    }
+    if (!v) return false;
+    if (v & TY_OPT) {  // it may be nil: a clash only if nil fails too
+      if (!contradicts(d, TY_NILLIT, related, depth + 1)) return false;
+      v &= ~TY_OPT;
+    }
+    uint64_t k = v & 15;
+    switch (d & 15) {
+      case TY_NUM: case TY_STR: case TY_BOOL: case TY_LIST: case TY_MAP: case TY_FN: return k != (d & 15);
+      case TY_BUF: return true;  // no literal, constructor or declared kind here is a buffer
+      case TY_CLS: return k != TY_CLS || !related(int(v >> 8), int(d >> 8));
+      case TY_EXT:
+        if (!x) return false;
+        switch (x->k) {
+          case 'u': return std::all_of(x->alts.begin(), x->alts.end(), [&](uint64_t a) { return contradicts(a, v, related, depth + 1); });
+          case 'l': return x->lit == 's' ? k != TY_STR : x->lit == 'n' ? k != TY_NUM : x->v == NIL || k != TY_BOOL;
+          case 's': return k != TY_MAP && k != TY_CLS;  // a shape takes a map or an instance with its fields
+          case 'L': return k != TY_LIST;
+          case 'M': return k != TY_MAP;
+        }
+        return false;
+      default: return false;
+    }
+  }
   void checkClasses() {
     std::unordered_map<int, ClassView> views;
     for (auto& cd : classes) {
@@ -3763,6 +3878,46 @@ struct Compiler : Gen, Namespaces {
       if (uint64_t extra = it->second.effMask & ~c.allowed)
         diagnoseHere(c.at, "@effect %s declares %s, but it is called from inside %s, which does not (%s)", display(symName(c.callee)),
                      effectNames(extra), c.who, declaresText(c.allowed, c.text));
+    }
+    // A value whose type is known (a literal, a constructor, something declared) where a declared type can never take
+    // it: an argument of a direct call, a result, a store to a typed var or field. It would fail every time it ran.
+    auto related = [&](int a, int b) {
+      for (int pass = 0; pass < 2; pass++, std::swap(a, b)) {
+        std::unordered_set<int> seen;
+        for (int s = a; s >= 0 && seen.insert(s).second;) {
+          if (s == b) return true;
+          const ClassView* v = view(s);
+          if (!v) return true;  // not known here: don't claim they differ
+          s = v->super;
+        }
+      }
+      return false;
+    };
+    auto valueType = [&](const ArgVal& a) -> uint64_t { return a.num ? TY_NUM : a.path ? paths[a.path].type : 0; };
+    for (auto& c : callSites) {
+      auto it = sigs.find(symName(c.callee));
+      if (it == sigs.end()) continue;
+      const Sig& s = it->second;
+      for (size_t i = 0; i < c.args.size() && i < s.params.size() && i + 1 < s.types.size(); i++)
+        if (uint64_t d = s.types[i], v = valueType(c.args[i]); contradicts(d, v, related))
+          diagnoseHere(At{c.args[i].p, c.args[i].line, c.file, c.src}, "@type argument '%s' of %s must be %s, got %s", symName(s.params[i]),
+                       display(symName(c.callee)), typeText(d), staticText(v));
+    }
+    for (auto& e : expects) {
+      uint64_t d = e.type;
+      std::string what = e.what;
+      if (e.typePath) {  // a field: its declared type (if any), named after the class that declares it
+        d = paths[e.typePath].type, what = "field '" + symName(e.field) + "'";
+        uint64_t t = resolveNow(paths[paths[e.typePath].parent].type) & ~TY_OPT;
+        for (int s = d && (t & 15) == TY_CLS ? int(t >> 8) : -1; s >= 0;) {
+          const ClassView* v = view(s);
+          if (!v) break;
+          if (std::any_of(v->types->begin(), v->types->end(), [&](auto& f) { return f.sym == e.field; })) { what += " of " + symName(s); break; }
+          s = v->super;
+        }
+      }
+      if (uint64_t v = valueType(e.value); contradicts(d, v, related))
+        diagnoseHere(At{e.value.p, e.value.line, e.file, e.src}, "@type %s must be %s, got %s", what, typeText(d), staticText(v));
     }
     // Fields: in a class that declares its fields (or inherits declared ones), self.name must be one of them.
     for (auto& u : fieldUses) {
