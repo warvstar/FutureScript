@@ -1,0 +1,8 @@
+{
+ "project": "A",
+ "bug": "effect",
+ "path": "on",
+ "file": "combat.fut",
+ "line": 54,
+ "description": "Leftover debug print in fleeChance, which declares `!` (no effects)."
+}

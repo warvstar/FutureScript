@@ -1,0 +1,19 @@
+--- a/main.fut
++++ b/main.fut
+@@ -82,3 +82,16 @@
+   expect rows[rows.len() - 1] == "Total                       $29.23"
+   expect prints { printInvoice(inv) } == text + "\n"
+ }
++
++// "Arrives in 3 days, $8.99 shipping"; an empty cart: "Nothing to ship".
++fn deliveryEstimate(cart: Cart, region: str): str {
++  if cart.lines.len() == 0 { return "Nothing to ship" }
++  var q = quoteShipping(cartGrams(cart), region)
++  return "Arrives in {q.days} days, {formatMoney(q.costCents)} shipping"
++}
++
++test "delivery estimate" {
++  var cat = sampleCatalog()
++  expect deliveryEstimate(cartOf(cat, [["TEE-S", 2], ["MUG-BLU", 1]]), "CA") == "Arrives in 3 days, $8.99 shipping"
++  expect deliveryEstimate(Cart(), "CA") == "Nothing to ship"
++}

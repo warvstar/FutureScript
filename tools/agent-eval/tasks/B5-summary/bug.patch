@@ -1,0 +1,11 @@
+--- a/pricing.fut
++++ b/pricing.fut
+@@ -54,7 +54,7 @@
+ pub fn shippingCents(grams: num, region: str): num ! {
+   if grams <= 0 { return 0 }
+   var cents = 899
+-  if grams <= 500 {
++  if grams < 500 {
+     cents = 499
+   } else if grams > 2000 {
+     cents += int((grams - 2000 + 999) / 1000) * 250

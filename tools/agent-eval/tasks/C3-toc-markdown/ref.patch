@@ -1,0 +1,22 @@
+--- a/main.fut
++++ b/main.fut
+@@ -54,3 +54,19 @@
+   expect page("# A & B\ntext") == "<title>A &amp; B</title>\n<h1>A &amp; B</h1>\n<p>text</p>"
+   expect page("just text").has("<title>Untitled</title>")
+ }
++
++// The table of contents as a nested Markdown list of links to each heading.
++fn tocMarkdown(doc: Doc): str {
++  var lines = []
++  for e in toc(doc) {
++    var pad = ""
++    for i in 1..e.level { pad += "  " }
++    lines.push(pad + "- [" + e.text + "](#" + e.anchor + ")")
++  }
++  return lines.join("\n")
++}
++
++test "tocMarkdown" {
++  expect tocMarkdown(parse(sample)) == "- [Getting started](#getting-started)\n  - [Usage](#usage)\n  - [Links](#links)"
++  expect tocMarkdown(parse("plain")) == ""
++}

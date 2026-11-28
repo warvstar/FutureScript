@@ -1,0 +1,27 @@
+Fights are a bit flat, so I want status effects that last a few turns: poison, which hurts at the start of each of its victim's turns, and stun, which makes the victim lose its turn. Players and monsters can both have them.
+
+Please add:
+
+- In entities.fut, a public enum with two variants:
+
+      pub enum Status {
+        Poison(damage: num, turns: num)
+        Stun(turns: num)
+      }
+
+  and a `statuses` field on both Player and Monster: a list of Status, starting empty.
+
+- In combat.fut, two public functions (c is a Player or a Monster):
+
+      pub fn addStatus(c: any, s: Status)
+      pub fn tickStatuses(c: any): map
+
+  `addStatus` gives `s` to `c`. A creature has at most one status of each kind: if it already has one of the same kind (a Poison for a Poison, a Stun for a Stun), the new one replaces it at the same position in `c.statuses`; otherwise the new one goes at the end.
+
+  `tickStatuses` runs at the start of `c`'s turn. It goes through `c.statuses` in order. A Poison takes `damage` hp from `c` through `applyDamage` (so hp never drops below 0) and logs "<name> takes <n> poison damage", where n is the hp actually lost. A Stun logs "<name> is stunned". Then every status has one turn fewer, and those that reach 0 turns are removed; the rest stay in their order. It returns `{log, canAct}`: the log lines in order, and whether `c` may act this turn, which is false if it had a Stun or its hp is 0 after the poison, else true. With no statuses it returns `{log: [], canAct: true}` and changes nothing.
+
+- In main.fut, `simulateBattle` should use them: when a combatant's turn comes (after the existing checks that the battle isn't over and that it is still alive), call `tickStatuses` on it and add its log lines to the battle log; if it can't act, it does nothing else that turn. Everything else about the battle stays the same.
+
+These change the public interfaces of entities.fut and combat.fut, so run `fut api main.fut` to update the .api files.
+
+Add tests for it. `fut test main.fut` must pass when you finish.

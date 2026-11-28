@@ -1,0 +1,22 @@
+--- a/main.fut
++++ b/main.fut
+@@ -32,3 +32,19 @@
+   expect criticalPath(p).len() == 4
+   expect summary(p) == "Website: 1/6 done, 13 days left, 11 days end to end"
+ }
++
++// Names of the people with more than weeks weeks of unfinished work, in team order.
++fn overbooked(p: Project, weeks: num): list<str> {
++  var out = []
++  for who in p.team {
++    if weeksBusy(p, who) > weeks { out.push(who.name) }
++  }
++  return out
++}
++
++test "overbooked" {
++  var p = demoProject()
++  assign(p, "backend", "bo")
++  expect overbooked(p, 1) == ["bo"]
++  expect overbooked(p, 2) == []
++}

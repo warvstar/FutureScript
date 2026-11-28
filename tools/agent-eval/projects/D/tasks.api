@@ -1,0 +1,52 @@
+// The public interface of tasks.fut, written by `fut api`. `fut test` fails while it is out of date.
+
+pub fn assign(p: Project, id: str, name: str)
+
+// The project the tests share: a small website launch.
+pub fn demoProject(): Project
+
+// Can t start now: it isn't done and every task it depends on is?
+pub fn isReady(p: Project, t: Task): bool
+
+pub fn markDone(p: Project, id: str)
+
+// The ids of the first n tasks that are ready to start, in project order.
+pub fn nextUp(p: Project, n: num): list<str>
+
+// A team from text like "Ann: 5, Bo: 2.5": each name with the days a week
+// they can work, more than 0 and at most 7.
+pub fn parseTeam(spec: str): list<Person>
+
+pub class Person {
+  var capacityPerWeek: num
+  var name: str
+  fn init(name: str, capacityPerWeek: num)
+}
+
+pub class Project {
+  var name: str
+  var tasks: list<Task> = []
+  var team: list<Person> = []
+  fn add(t: Task): Task
+  fn find(id: str): Task?
+  fn hire(who: Person): Person
+  fn init(name: str)
+  fn person(name: str): Person?
+}
+
+pub fn remainingDays(p: Project): num !
+
+pub class Task {
+  var assignee: str? = nil
+  var deps: list<str> = []
+  var done: bool = false
+  var durationDays: num
+  var id: str
+  var title: str
+  fn init(id: str, title: str, durationDays: num, deps: list<str>)
+}
+
+// The task with this id, or an error naming it.
+pub fn taskOf(p: Project, id: str): Task
+
+pub fn teamCapacity(team: list<Person>): num !

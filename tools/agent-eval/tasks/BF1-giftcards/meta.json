@@ -1,0 +1,1 @@
+{"project": "B", "kind": "feature", "description": "Gift cards: a GiftCard class with a balance, invoices that track what gift cards paid and what is still due, and the invoice text showing both."}

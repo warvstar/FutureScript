@@ -1,0 +1,11 @@
+--- a/loot.fut
++++ b/loot.fut
+@@ -83,7 +83,7 @@
+ // Sells it out of the bag for half its value, rounded down. Returns the gold paid, 0 when it isn't in the bag.
+ pub fn sellItem(p: Player, it: Item): num ! {
+   var i = findItem(p, it)
+-  if i < 0 { return 0 }
++  if i <= 0 { return 0 }
+   takeAt(p, i)
+   var paid = floor(it.value / 2)
+   p.gold += paid

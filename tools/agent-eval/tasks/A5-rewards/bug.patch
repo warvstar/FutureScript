@@ -1,0 +1,11 @@
+--- a/entities.fut
++++ b/entities.fut
+@@ -53,7 +53,7 @@
+ pub fn gainXp(p: Player, amount: num): num ! {
+   p.xp += amount
+   var gained = 0
+-  while p.xp >= xpForLevel(p.level + 1) {
++  while p.xp > xpForLevel(p.level + 1) {
+     p.level += 1
+     p.maxHp += 5
+     p.atk += 2

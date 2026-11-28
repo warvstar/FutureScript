@@ -1,0 +1,194 @@
+diff -ruN a/combat.api b/combat.api
+--- a/combat.api	2026-11-28 00:34:57
++++ b/combat.api	2026-11-28 01:46:14
+@@ -1,5 +1,8 @@
+ // The public interface of combat.fut, written by `fut api`. `fut test` fails while it is out of date.
+ 
++// Puts s on c, replacing one of the same kind in place, else at the end.
++pub fn addStatus(c: any, s: Status) !
++
+ // Lowers a player's or monster's hp by amount, not below 0. Returns the hp it actually lost.
+ pub fn applyDamage(target: any, amount: num): num !
+ 
+@@ -30,6 +33,10 @@
+ 
+ // One hit: base damage, a 10% chance to crit, then a spread of -1, 0 or +1 (at least 1).
+ pub fn rollDamage(atk: num, def: num): num ! random
++
++// The start of c's turn: poison hurts, stun holds it, then each status loses a turn.
++// Returns {log, canAct}.
++pub fn tickStatuses(c: any): map !
+ 
+ // Who acts this round, fastest first. The player wins speed ties; tied monsters keep list order.
+ // Dead monsters don't act.
+diff -ruN a/combat.fut b/combat.fut
+--- a/combat.fut	2026-11-28 00:35:18
++++ b/combat.fut	2026-11-28 01:46:14
+@@ -64,6 +64,47 @@
+   return applyDamage(p, rollDamage(m.atk, defensePower(p)))
+ }
+ 
++fn sameKind(a: Status, b: Status): bool ! {
++  match a {
++    Poison(_, _) { match b { Status.Poison(_, _) { return true } else { return false } } }
++    Stun(_) { match b { Status.Stun(_) { return true } else { return false } } }
++  }
++}
++
++// Puts s on c, replacing one of the same kind in place, else at the end.
++pub fn addStatus(c: any, s: Status) ! {
++  for i in 0..c.statuses.len() {
++    if sameKind(c.statuses[i], s) {
++      c.statuses[i] = s
++      return
++    }
++  }
++  c.statuses.push(s)
++}
++
++// The start of c's turn: poison hurts, stun holds it, then each status loses a turn.
++// Returns {log, canAct}.
++pub fn tickStatuses(c: any): map ! {
++  var log = []
++  var stunned = false
++  var left = []
++  for s in c.statuses {
++    match s {
++      Poison(damage, turns) {
++        log.push("{c.name} takes {applyDamage(c, damage)} poison damage")
++        if turns > 1 { left.push(Status.Poison(damage, turns - 1)) }
++      }
++      Stun(turns) {
++        log.push("{c.name} is stunned")
++        stunned = true
++        if turns > 1 { left.push(Status.Stun(turns - 1)) }
++      }
++    }
++  }
++  c.statuses = left
++  return {log: log, canAct: !stunned && isAlive(c)}
++}
++
+ // A line for the battle log.
+ pub fn hitLine(attacker: str, target: str, dmg: num): str ! {
+   if dmg == 0 { return "{attacker} misses {target}" }
+@@ -128,4 +169,17 @@
+ test "log lines" {
+   expect hitLine("Ana", "wolf", 3) == "Ana hits wolf for 3"
+   expect hitLine("wolf", "Ana", 0) == "wolf misses Ana"
++}
++
++test "statuses" {
++  var m = makeMonster("slime", 1)
++  addStatus(m, Status.Poison(3, 2))
++  addStatus(m, Status.Stun(1))
++  addStatus(m, Status.Poison(2, 2))
++  expect m.statuses == [Status.Poison(2, 2), Status.Stun(1)]
++  expect tickStatuses(m) == {log: ["slime takes 2 poison damage", "slime is stunned"], canAct: false}
++  expect m.hp == 6
++  expect m.statuses == [Status.Poison(2, 1)]
++  expect tickStatuses(m) == {log: ["slime takes 2 poison damage"], canAct: true}
++  expect tickStatuses(m) == {log: [], canAct: true}
+ }
+diff -ruN a/entities.api b/entities.api
+--- a/entities.api	2026-11-28 00:35:29
++++ b/entities.api	2026-11-28 01:46:14
+@@ -37,6 +37,7 @@
+   var maxHp: num
+   var name: str
+   var speed: num = 4
++  var statuses: list<Status> = []
+   var xpReward: num = 0
+   fn init(name: str, maxHp: num, atk: num, def: num)
+ }
+@@ -52,9 +53,16 @@
+   var maxHp: num = 30
+   var name: str
+   var speed: num = 5
++  var statuses: list<Status> = []
+   var weapon: Item? = nil
+   var xp: num = 0
+   fn init(name: str)
++}
++
++// Something lasting on a player or monster, for a number of its turns.
++pub enum Status {
++  Poison(damage: num, turns: num)
++  Stun(turns: num)
+ }
+ 
+ // Total xp a player needs to reach a level: 0 for level 1, then 10, 40, 90, ...
+diff -ruN a/entities.fut b/entities.fut
+--- a/entities.fut	2026-11-28 00:35:35
++++ b/entities.fut	2026-11-28 01:46:14
+@@ -11,6 +11,12 @@
+   }
+ }
+ 
++// Something lasting on a player or monster, for a number of its turns.
++pub enum Status {
++  Poison(damage: num, turns: num)
++  Stun(turns: num)
++}
++
+ pub class Player {
+   var name: str
+   var hp: num = 30
+@@ -24,6 +30,7 @@
+   var inventory: list = []
+   var weapon: Item? = nil
+   var armor: Item? = nil
++  var statuses: list<Status> = []
+   fn init(name: str) { self.name = name }
+ }
+ 
+@@ -36,6 +43,7 @@
+   var speed: num = 4
+   var xpReward: num = 0
+   var goldReward: num = 0
++  var statuses: list<Status> = []
+   fn init(name: str, maxHp: num, atk: num, def: num) {
+     self.name = name self.maxHp = maxHp self.hp = maxHp self.atk = atk self.def = def
+   }
+diff -ruN a/main.fut b/main.fut
+--- a/main.fut	2026-11-28 00:35:10
++++ b/main.fut	2026-11-28 01:45:49
+@@ -23,7 +23,7 @@
+ }
+ 
+ // Fights until one side is down or maxRounds have passed. Each round everyone standing acts in
+-// turnOrder: the player hits the first monster still standing, each monster hits the player.
++// turnOrder: its statuses tick first (they may stop it acting), then the player hits the first monster still standing, each monster hits the player.
+ // Returns {won, rounds, log}.
+ fn simulateBattle(p: Player, ms: list, maxRounds: num): map ! random {
+   var log = []
+@@ -33,6 +33,9 @@
+     for c in turnOrder(p, ms) {
+       if battleOver(p, ms) { break }
+       if !isAlive(c) { continue }
++      var t = tickStatuses(c)
++      log += t.log
++      if !t.canAct { continue }
+       if isa(c, Player) {
+         var target = livingMonsters(ms)[0]
+         log.push(hitLine(p.name, target.name, playerAttack(p, target)))
+@@ -92,4 +95,19 @@
+   var r = simulateBattle(p, [tough], 3)
+   expect !r.won && r.rounds == 3 && r.log.len() == 6
+   expect isAlive(p) && isAlive(tough)
++}
++
++test "statuses in battle" {
++  seed(4)
++  var p = newHero("Ana")
++  p.def = 50
++  var wolf = makeMonster("wolf", 1)
++  wolf.def = 50
++  wolf.hp = 1000
++  addStatus(p, Status.Stun(2))
++  addStatus(wolf, Status.Poison(4, 1))
++  var r = simulateBattle(p, [wolf], 3)
++  expect r.log.len() == 7
++  expect r.log[0] == "wolf takes 4 poison damage" && r.log[2] == "Ana is stunned"
++  expect r.log[4] == "Ana is stunned" && r.log[6].has("Ana hits wolf")
+ }

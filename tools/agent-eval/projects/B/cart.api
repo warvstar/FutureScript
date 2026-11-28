@@ -1,0 +1,41 @@
+// The public interface of cart.fut, written by `fut api`. `fut test` fails while it is out of date.
+
+// Add qty units of v; a SKU already in the cart gets its quantity raised.
+pub fn addItem(cart: Cart, v: Variant, qty: num): CartLine !
+
+pub class Cart {
+  var code: str? = nil
+  var lines: list<CartLine> = []
+}
+
+pub fn cartGrams(cart: Cart): num !
+
+pub class CartLine {
+  var name: str
+  var qty: num
+  var sku: str
+  var unitCents: num
+  var weightGrams: num
+  fn init(v: Variant, qty: num)
+  fn totalCents(): num
+  fn totalGrams(): num
+}
+
+pub fn itemCount(cart: Cart): num !
+
+// The cart's line for this SKU, or nil.
+pub fn lineFor(cart: Cart, sku: str): CartLine? !
+
+// Drop the line for sku. Returns whether there was one.
+pub fn removeItem(cart: Cart, sku: str): bool !
+
+// Put a line's units back on the shelf, e.g. when an order is cancelled.
+pub fn returnToStock(cat: Catalog, line: CartLine) !
+
+// Set a line's quantity; 0 removes it.
+pub fn setQuantity(cart: Cart, sku: str, qty: num) !
+
+pub fn subtotalCents(cart: Cart): num !
+
+// SKUs of the lines the shelf can't cover right now, in cart order.
+pub fn unavailableLines(cat: Catalog, cart: Cart): list<str> !

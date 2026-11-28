@@ -1,0 +1,24 @@
+--- a/main.fut
++++ b/main.fut
+@@ -32,3 +32,21 @@
+   expect criticalPath(p).len() == 4
+   expect summary(p) == "Website: 1/6 done, 13 days left, 11 days end to end"
+ }
++
++// "id (assignee)" for each of the first slots ready tasks, in project order.
++fn planDay(p: Project, slots: num): list<str> {
++  var out = []
++  for id in nextUp(p, slots) {
++    var t = taskOf(p, id)
++    out.push("{id} ({t.assignee == nil ? "unassigned" : t.assignee})")
++  }
++  return out
++}
++
++test "plan a day" {
++  var p = demoProject()
++  markDone(p, "design")
++  assign(p, "backend", "bo")
++  expect planDay(p, 2) == ["backend (bo)", "frontend (unassigned)"]
++  expect planDay(p, 0) == []
++}

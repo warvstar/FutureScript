@@ -1,0 +1,27 @@
+--- a/main.fut
++++ b/main.fut
+@@ -93,3 +93,24 @@
+   expect !r.won && r.rounds == 3 && r.log.len() == 6
+   expect isAlive(p) && isAlive(tough)
+ }
++
++// Does the player get away? roll in [0, 1) has to be below fleeChance against every monster still standing.
++fn tryFlee(p: Player, ms: list, roll: num): bool ! {
++  for m in livingMonsters(ms) {
++    if roll >= fleeChance(p, m) { return false }
++  }
++  return true
++}
++
++test "fleeing needs to beat every monster standing" {
++  var p = Player("Ana")
++  var slime = makeMonster("slime", 1)
++  var wolf = makeMonster("wolf", 1)
++  expect tryFlee(p, [slime], 0.7)
++  expect !tryFlee(p, [slime, wolf], 0.5)
++  expect tryFlee(p, [slime, wolf], 0.1)
++  wolf.hp = 0
++  expect tryFlee(p, [slime, wolf], 0.5)
++  slime.hp = 0
++  expect tryFlee(p, [slime, wolf], 0.99)
++}

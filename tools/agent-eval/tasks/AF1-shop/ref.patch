@@ -1,0 +1,104 @@
+diff -ruN a/main.fut b/main.fut
+--- a/main.fut	2026-11-28 00:35:10
++++ b/main.fut	2026-11-28 01:45:03
+@@ -93,3 +93,100 @@
+   expect !r.won && r.rounds == 3 && r.log.len() == 6
+   expect isAlive(p) && isAlive(tough)
+ }
++
++// One kind of item a shop carries: the item it copies from and how many are left.
++class ShopLine {
++  var item: Item
++  var count: num
++  fn init(item: Item, count: num) { self.item = item self.count = count }
++}
++
++// A shop with a stock of items, where the player buys and sells.
++class Shop {
++  var name: str
++  var lines: list<ShopLine> = []
++  fn init(name: str) { self.name = name }
++
++  fn lineFor(name: str): ShopLine? {
++    for l in self.lines {
++      if l.item.name == name { return l }
++    }
++    return nil
++  }
++
++  // Adds count of it to the stock; an item of the same name already stocked keeps its stats.
++  fn restock(it: Item, count: num) {
++    var l = self.lineFor(it.name)
++    if l == nil {
++      self.lines.push(ShopLine(it, count))
++    } else {
++      l.count += count
++    }
++  }
++
++  fn stockOf(name: str): num {
++    var l = self.lineFor(name)
++    if l == nil { return 0 }
++    return l.count
++  }
++
++  // The item's value, half as much again (rounded down) when it's the last one; nil when none are left.
++  fn priceOf(name: str): num? {
++    var l = self.lineFor(name)
++    if l == nil || l.count == 0 { return nil }
++    if l.count == 1 { return floor(l.item.value * 1.5) }
++    return l.item.value
++  }
++
++  fn buy(p: Player, name: str): str {
++    var price = self.priceOf(name)
++    if price == nil { return "out of stock" }
++    if p.gold < price { return "not enough gold" }
++    var l = self.lineFor(name)
++    var it = l.item
++    if !addItem(p, Item(it.name, it.kind, it.power, it.weight, it.value)) { return "too heavy" }
++    p.gold -= price
++    l.count -= 1
++    return "ok"
++  }
++
++  fn sell(p: Player, it: Item): num {
++    if findItem(p, it) < 0 { return 0 }
++    var paid = sellItem(p, it)
++    self.restock(it, 1)
++    return paid
++  }
++
++  fn listing(): list {
++    var out = []
++    for l in self.lines {
++      if l.count > 0 { out.push("{l.item.name} x{l.count} - {self.priceOf(l.item.name)}g") }
++    }
++    return out
++  }
++}
++
++test "the shop sells from its stock" {
++  var shop = Shop("Bram's")
++  shop.restock(potion(), 2)
++  shop.restock(Item("Axe", "weapon", 4, 5, 30), 1)
++  expect shop.stockOf("Potion") == 2 && shop.stockOf("Bow") == 0
++  expect shop.priceOf("Potion") == 15 && shop.priceOf("Axe") == 45
++  expect shop.listing() == ["Potion x2 - 15g", "Axe x1 - 45g"]
++  var p = newHero("Ana")
++  expect shop.buy(p, "Axe") == "not enough gold"
++  expect shop.buy(p, "Potion") == "ok"
++  expect p.gold == 5 && shop.stockOf("Potion") == 1 && p.inventory.len() == 2
++  expect shop.buy(p, "Bow") == "out of stock"
++}
++
++test "selling to the shop restocks it" {
++  var shop = Shop("Bram's")
++  var p = Player("Ana")
++  var pelt = Item("Wolf Pelt", "junk", 0, 3, 10)
++  addItem(p, pelt)
++  expect shop.sell(p, pelt) == 5
++  expect shop.sell(p, pelt) == 0
++  expect p.gold == 5 && shop.stockOf("Wolf Pelt") == 1
++  expect shop.listing() == ["Wolf Pelt x1 - 15g"]
++}

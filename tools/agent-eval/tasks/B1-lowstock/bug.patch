@@ -1,0 +1,11 @@
+--- a/pricing.fut
++++ b/pricing.fut
+@@ -77,7 +77,7 @@
+ // Cost and transit time: 3 days domestic, 10 international, one more for parcels over 5 kg.
+ pub fn quoteShipping(grams: num, region: str): ShippingQuote ! {
+   var q = ShippingQuote(region, grams)
+-  q.costCents = shippingCents(grams, region)
++  q.costCents = shippingCents(region, grams)
+   q.days = region == "INTL" ? 10 : 3
+   if grams > 5000 { q.days += 1 }
+   return q

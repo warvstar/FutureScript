@@ -1,0 +1,11 @@
+People take vacations, and right now the schedule acts as if nobody ever does. I want to record time off per person and see how it pushes the schedule.
+
+Days are numbered from the project start: day 0 is the first day, and a task with `{start: 3, finish: 5}` is worked on days 3 and 4.
+
+- In tasks.fut, give `Person` two methods. `takeOff(first: num, days: num)` records that they're away on days `first` through `first + days - 1`. It can be called any number of times, and periods may overlap. It throws `"<name>: bad time off"` (e.g. `"bo: bad time off"`) unless `first` is a whole number >= 0 and `days` is a whole number >= 1. `isAway(day: num): bool` says whether they're away on that day.
+- In schedule.fut, add `pub fn earliestWithLeave(p: Project): map !`. It returns the same shape as `earliest`: task id -> `{start, finish}`, and like `earliest` it schedules every task, done or not. A task becomes ready when all of its deps have finished (day 0 if it has none). If it has an assignee who is on the team, it is worked only on days that person isn't away: `start` is the first day from the ready day on which they're not away, and `finish` is the day after the day its `durationDays`-th day of work is done. A task with no assignee, or whose assignee isn't on the team, isn't affected by anyone's time off, and neither is a 0-day task: those start on the ready day and finish `durationDays` later. Task durations are whole days. For example, in `demoProject()` with "backend" assigned to bo and bo away on days 4 and 5, backend is `{start: 3, finish: 10}` and release is `{start: 12, finish: 13}`.
+- In main.fut, add `fn leaveDelay(p: Project): num` (not pub): how many days longer the project runs end to end because of time off, i.e. the latest finish in `earliestWithLeave(p)` minus `projectLength(p)`. In the example above it is 2. A project with no tasks is 0.
+
+These change public interfaces: `fut api main.fut` updates the .api files.
+
+Add tests for it. `fut test main.fut` must pass when you finish.

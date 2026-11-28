@@ -1,0 +1,1 @@
+{"project": "A", "kind": "feature", "description": "Poison and stun: a Status enum and statuses field (entities), addStatus/tickStatuses (combat), and ticking them in simulateBattle (main)."}

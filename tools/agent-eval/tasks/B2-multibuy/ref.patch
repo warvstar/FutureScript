@@ -1,0 +1,19 @@
+--- a/main.fut
++++ b/main.fut
+@@ -82,3 +82,16 @@
+   expect rows[rows.len() - 1] == "Total                       $29.23"
+   expect prints { printInvoice(inv) } == text + "\n"
+ }
++
++// Buy 2, get 1 free: every third unit of a line is free. What that takes off the cart, in cents.
++fn multibuySavings(cart: Cart): num {
++  var s = 0
++  for l in cart.lines { s += int(l.qty / 3) * l.unitCents }
++  return s
++}
++
++test "multibuy" {
++  var cat = sampleCatalog()
++  expect multibuySavings(cartOf(cat, [["TEE-S", 7], ["MUG-BLU", 2]])) == 3600
++  expect multibuySavings(Cart()) == 0
++}

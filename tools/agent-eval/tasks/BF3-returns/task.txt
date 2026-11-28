@@ -1,0 +1,22 @@
+Customers can send back items from an order they've paid for. We need to put the items back on the shelf, work out the refund, and keep a credit note for the books. Please add this in invoice.fut:
+
+1. Invoice lines need to know their SKU and how much of them has come back. Give InvoiceLine two fields: `sku: str` (buildInvoice sets it to the cart line's SKU) and `returned: num` (units returned so far, starting at 0). The InvoiceLine constructor stays as it is.
+
+2. A pub class `CreditNote` with a constructor `CreditNote(number: num, invoice: num)` and fields `number: num` (the credit note's own number), `invoice: num` (the number of the invoice it's for), `lines: list<InvoiceLine>`, `goods: num`, `tax: num` and `total: num` (cents); a new credit note has no lines and 0 for goods, tax and total. Invoice gets a field `credits: list<CreditNote>`, empty at first, holding the invoice's credit notes in the order they were made.
+
+3. `pub fn returnItems(cat: Catalog, inv: Invoice, items: list, number: num): CreditNote`
+
+   `items` is a list of [sku, qty] pairs, like `[["TEE-S", 2], ["MUG-BLU", 1]]`. It makes a credit note numbered `number` for `inv`, and for each pair, in order:
+   - puts `qty` units of the SKU back on the catalog's shelf (restock);
+   - adds `qty` to the matching invoice line's `returned`;
+   - adds a line to the credit note: an InvoiceLine with the invoice line's label, `qty`, and cents = the unit price paid on the invoice (that line's cents / its qty) times `qty`.
+
+   The note's `goods` is the sum of its lines' cents. The refund doesn't give back the invoice's discount: the refunded amount is goods × (invoice subtotal − invoice discount) / invoice subtotal, rounded half up to whole cents, once for the whole note. `tax` is taxCents of that amount in the invoice's region, and `total` is that amount plus `tax`. Shipping is never refunded. For example, with no discount, returning $48.00 of goods from a CA invoice gives goods 4800, tax 348, total 5148.
+
+   The note is added to the end of `inv.credits` and returned.
+
+   It throws when a pair's qty is not positive, when its SKU is not on the invoice, when qty is more than that line has left to return (its qty minus what was returned before), or when the SKU is no longer in the catalog. When it throws, nothing changes: no stock, no `returned`, no credit note.
+
+These change the public interface of invoice.fut: run `fut api main.fut` to update the `.api` files.
+
+Add tests for it. `fut test main.fut` must pass when you finish.

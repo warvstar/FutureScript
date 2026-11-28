@@ -1,0 +1,11 @@
+The order confirmation email needs a one-line summary. In main.fut, add
+
+    fn orderSummary(cart: Cart, region: str): str
+
+It returns exactly
+
+    <n> items, <weight>, shipping <cost>
+
+where <n> is the total number of units in the cart (itemCount), <weight> is the cart's total weight (cartGrams) formatted with formatKg, and <cost> is shippingCents for that weight and region, formatted with formatMoney. When <n> is 1, write "1 item" instead of "1 items". Examples: "2 items, 1.80 kg, shipping $8.99", "1 item, 350 g, shipping $4.99". An empty cart gives "0 items, 0 g, shipping $0.00". Ignore any discount code. Don't make it pub.
+
+Add a test for it in main.fut. `fut test main.fut` must pass when you finish.

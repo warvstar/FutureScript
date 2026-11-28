@@ -1,0 +1,31 @@
+// The public interface of lexer.fut, written by `fut api`. `fut test` fails while it is out of date.
+
+// Classify one line of source.
+pub fn classify(raw: str, lineNo: num): Line
+
+// The inline tokens of one line of text. A backtick with no closing one is plain text.
+pub fn lexInline(s: str, line: num): list
+
+// Every line of src, classified, numbered from 1.
+pub fn lexLines(src: str): list
+
+// One source line. kind is "heading", "bullet", "ordered", "fence", "rule", "blank" or "text".
+// text is what follows the marker, trimmed; level is the heading level, or the list depth (two spaces of indent per step).
+pub class Line {
+  var kind: str
+  var level: num
+  var lineNo: num
+  var raw: str
+  var text: str
+  fn init(kind: str, text: str, raw: str, lineNo: num, level: num)
+}
+
+// A piece of inline text. kind is "text", "code", "em", "strong", "lbrack", "rbrack", "lparen" or "rparen".
+// col counts bytes from 1.
+pub class Token {
+  var col: num
+  var kind: str
+  var line: num
+  var text: str
+  fn init(kind: str, text: str, line: num, col: num)
+}

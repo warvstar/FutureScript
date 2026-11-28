@@ -1,0 +1,11 @@
+--- a/cart.fut
++++ b/cart.fut
+@@ -98,7 +98,7 @@
+   var out = []
+   for l in cart.lines {
+     var v = findVariant(cat, l.sku)
+-    if v == nil || v.stock < l.qty { out.push(l.sku) }
++    if v == nil || v.stock <= l.qty { out.push(l.sku) }
+   }
+   return out
+ }

@@ -1,0 +1,10 @@
+Some tasks can't start the moment their deps finish: we wait on a vendor, a review, a sign-off. I want to model that wait, and to ask "what if this task slips by N days?" and see every date it knocks on.
+
+- In tasks.fut, give `Task` a field `lagDays: num`, 0 by default: the days the task must wait after its deps finish before it can start.
+- In schedule.fut, make `earliest` honor it: a task starts at the latest finish among its deps (0 if it has none) plus its `lagDays`, and finishes `durationDays` after that. `projectLength`, `gantt` and `summary` should follow from that. `criticalPath` must still trace the chain back through a lagged task: the step before a task is the dep that finishes exactly `lagDays` before the task starts. For example, in `demoProject()` with "frontend" given a lag of 2, frontend is `{start: 5, finish: 9}` and the critical path is design, frontend, integrate, release.
+- In report.fut, `formatTask` should show a lag after the assignee as `, waits <formatDays(lagDays)>`, e.g. `"[ ] frontend    Build pages (4 days, unassigned, waits 2 days)"` (`waits 1 day` for 1). A task with no lag prints exactly as it does now.
+- In main.fut, add `fn whatIf(p: Project, id: str, days: num): list<str>` (not pub). It works out what happens if task `id` waits `days` more days than it does now (on top of any lag it already has), and returns a line for every task whose finish in `earliest` would change, the slipped task included, in topological order (the order `topoOrder(p)` gives): `"<id>: day <old finish> -> day <new finish>"`. It leaves the project exactly as it found it. An unknown id raises the usual `"no task <id> in <project>"` error from `taskOf`. For example, in `demoProject()`, `whatIf(p, "frontend", 3)` is `["frontend: day 7 -> day 10", "integrate: day 10 -> day 12", "release: day 11 -> day 13"]`, and `whatIf(p, "docs", 3)` is `["docs: day 4 -> day 7"]`.
+
+These change public interfaces: `fut api main.fut` updates the .api files.
+
+Add tests for it. `fut test main.fut` must pass when you finish.

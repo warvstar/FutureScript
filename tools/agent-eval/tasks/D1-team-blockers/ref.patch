@@ -1,0 +1,32 @@
+--- a/main.fut
++++ b/main.fut
+@@ -32,3 +32,29 @@
+   expect criticalPath(p).len() == 4
+   expect summary(p) == "Website: 1/6 done, 13 days left, 11 days end to end"
+ }
++
++// Ids of every task that waits on id, directly or through other tasks, in topological order.
++fn blockedBy(p: Project, id: str): list<str> {
++  taskOf(p, id)
++  var waiting = dependents(p)
++  var blocked = {}
++  var todo = [id]
++  while todo.len() > 0 {
++    for next in waiting[todo.pop()] {
++      if !blocked.has(next) {
++        blocked[next] = true
++        todo.push(next)
++      }
++    }
++  }
++  var out = []
++  for t in topoOrder(p) { if blocked.has(t) { out.push(t) } }
++  return out
++}
++
++test "blocked by" {
++  var p = demoProject()
++  expect blockedBy(p, "frontend") == ["integrate", "release"]
++  expect blockedBy(p, "design") == ["backend", "frontend", "integrate", "docs", "release"]
++  expect blockedBy(p, "release") == []
++}

@@ -1,0 +1,8 @@
+{
+ "project": "D",
+ "bug": "effect",
+ "path": "off",
+ "file": "report.fut",
+ "line": 28,
+ "description": "leftover debug print(\"gantt width\", width) in gantt(), which is declared pure (!)"
+}

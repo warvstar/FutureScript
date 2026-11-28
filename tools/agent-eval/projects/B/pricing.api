@@ -1,0 +1,32 @@
+// The public interface of pricing.fut, written by `fut api`. `fut test` fails while it is out of date.
+
+pub enum Discount {
+  Percent(pct: num)
+  Fixed(cents: num)
+  FreeShipping
+}
+
+// How much a discount takes off a subtotal. Never more than the subtotal.
+pub fn discountCents(d: Discount, subtotal: num): num !
+
+// The discount for a code (case-insensitive), or nil when the code is unknown.
+pub fn lookupCode(code: str): Discount? !
+
+// Cost and transit time: 3 days domestic, 10 international, one more for parcels over 5 kg.
+pub fn quoteShipping(grams: num, region: str): ShippingQuote !
+
+// Domestic: up to 500 g 499, up to 2 kg 899, then 250 more per started kg.
+// "INTL" adds a flat 1500. An empty parcel ships free.
+pub fn shippingCents(grams: num, region: str): num !
+
+pub class ShippingQuote {
+  var costCents: num = 0
+  var days: num = 0
+  var grams: num
+  var region: str
+  fn init(region: str, grams: num)
+}
+
+pub fn taxCents(amount: num, region: str): num !
+
+pub fn taxRate(region: str): num !

@@ -1,0 +1,173 @@
+--- a/lexer.api
++++ b/lexer.api
+@@ -9,7 +9,7 @@
+ // Every line of src, classified, numbered from 1.
+ pub fn lexLines(src: str): list
+ 
+-// One source line. kind is "heading", "bullet", "ordered", "fence", "rule", "blank" or "text".
++// One source line. kind is "heading", "bullet", "ordered", "fence", "rule", "quote", "blank" or "text".
+ // text is what follows the marker, trimmed; level is the heading level, or the list depth (two spaces of indent per step).
+ pub class Line {
+   var kind: str
+--- a/lexer.fut
++++ b/lexer.fut
+@@ -12,7 +12,7 @@
+   fn init(kind: str, text: str, line: num, col: num) { self.kind = kind self.text = text self.line = line self.col = col }
+ }
+ 
+-// One source line. kind is "heading", "bullet", "ordered", "fence", "rule", "blank" or "text".
++// One source line. kind is "heading", "bullet", "ordered", "fence", "rule", "quote", "blank" or "text".
+ // text is what follows the marker, trimmed; level is the heading level, or the list depth (two spaces of indent per step).
+ pub class Line {
+   var kind: str
+@@ -69,6 +69,7 @@
+ pub fn classify(raw: str, lineNo: num): Line {
+   var s = raw.trim()
+   if s == "" { return Line("blank", "", raw, lineNo, 0) }
++  if strings.startsWith(s, ">") { return Line("quote", s[1:].trim(), raw, lineNo, 0) }
+   if strings.startsWith(s, "```") { return Line("fence", s[3:].trim(), raw, lineNo, 0) }
+   var hashes = leading(s, "#")
+   if hashes >= 1 && hashes <= 6 && s.len() > hashes && s[hashes] == " " { return Line("heading", s[hashes:].trim(), raw, lineNo, hashes) }
+@@ -109,4 +110,10 @@
+   expect classify("12. twelve", 1).kind == "ordered"
+   expect classify("```py", 1).text == "py"
+   expect classify("   ", 1).kind == "blank"
++}
++
++test "classify quotes" {
++  var q = classify("  > a *b*", 2)
++  expect q.kind == "quote" && q.text == "a *b*" && q.lineNo == 2
++  expect classify(">", 1).text == "" && classify("> # not a heading", 1).kind == "quote"
+ }
+--- a/parser.api
++++ b/parser.api
+@@ -14,6 +14,7 @@
+   Para(parts: list)
+   ListItem(depth: num, ordered: bool, parts: list)
+   CodeBlock(lang: str, text: str)
++  Quote(paras: list)
+   Rule
+   Text(s: str)
+   Em(parts: list)
+--- a/parser.fut
++++ b/parser.fut
+@@ -7,6 +7,7 @@
+   Para(parts: list)
+   ListItem(depth: num, ordered: bool, parts: list)
+   CodeBlock(lang: str, text: str)
++  Quote(paras: list)
+   Rule
+   Text(s: str)
+   Em(parts: list)
+@@ -97,6 +98,18 @@
+   return Node.Para(parseInline(texts.join(" "), lines[0].lineNo))
+ }
+ 
++// A block quote from consecutive quote lines: a line with no text after ">" ends a paragraph; empty ones are dropped.
++fn quote(lines: list): Node {
++  var paras = []
++  var para = []
++  for l in lines {
++    if l.text != "" { para.push(l) continue }
++    if para.len() > 0 { paras.push(paragraph(para)) para = [] }
++  }
++  if para.len() > 0 { paras.push(paragraph(para)) }
++  return Node.Quote(paras)
++}
++
+ // Parse a whole document.
+ pub fn parse(src: str): Doc {
+   var lines = lexLines(src)
+@@ -112,6 +125,10 @@
+       nodes.push(Node.Heading(l.level, l.text, l.lineNo))
+     } else if l.kind == "bullet" || l.kind == "ordered" {
+       nodes.push(Node.ListItem(l.level, l.kind == "ordered", parseInline(l.text, l.lineNo)))
++    } else if l.kind == "quote" {
++      var ql = [l]
++      while i < lines.len() && lines[i].kind == "quote" { ql.push(lines[i]) i += 1 }
++      nodes.push(quote(ql))
+     } else if l.kind == "rule" {
+       nodes.push(Node.Rule)
+     } else if l.kind == "fence" {
+@@ -143,6 +160,11 @@
+   expect d.nodes[2:5] == [Node.ListItem(0, false, [Node.Text("one")]), Node.ListItem(1, false, [Node.Text("two")]), Node.ListItem(0, true, [Node.Text("first")])]
+   expect d.nodes[5:] == [Node.CodeBlock("fut", "var x = 1"), Node.Rule]
+   expect d.headings().len() == 1
++}
++
++test "parse groups quote lines" {
++  var d = parse("intro\n> one *two*\n>three\n>\n> four\n\n>\nafter")
++  expect d.nodes == [Node.Para([Node.Text("intro")]), Node.Quote([Node.Para([Node.Text("one "), Node.Em([Node.Text("two")]), Node.Text(" three")]), Node.Para([Node.Text("four")])]), Node.Quote([]), Node.Para([Node.Text("after")])]
+ }
+ 
+ test "parse keeps a document without a top heading untitled" {
+--- a/render.fut
++++ b/render.fut
+@@ -58,6 +58,11 @@
+         var cls = lang == "" ? "" : " class=\"language-{lang}\""
+         out.push("<pre><code{cls}>" + escape(text) + "</code></pre>")
+       }
++      Quote(paras) {
++        out.push("<blockquote>")
++        for p in paras { match p { Para(parts) { out.push("<p>" + renderInline(parts) + "</p>") } else { } } }
++        out.push("</blockquote>")
++      }
+       Rule { out.push("<hr>") }
+       else { }
+     }
+@@ -124,6 +129,10 @@
+ test "renderDoc groups list items" {
+   var html = renderDoc(parse("# T\n- a\n- b\n1. c\n\npara\n```\n<x>\n```"))
+   expect html == "<h1>T</h1>\n<ul>\n<li>a</li>\n<li>b</li>\n</ul>\n<ol>\n<li>c</li>\n</ol>\n<p>para</p>\n<pre><code>&lt;x&gt;</code></pre>"
++}
++
++test "renderDoc writes quotes" {
++  expect renderDoc(parse("- a\n> x & y\n>\n> z\n- b")) == "<ul>\n<li>a</li>\n</ul>\n<blockquote>\n<p>x &amp; y</p>\n<p>z</p>\n</blockquote>\n<ul>\n<li>b</li>\n</ul>"
+ }
+ 
+ test "slug" {
+--- a/stats.fut
++++ b/stats.fut
+@@ -2,6 +2,7 @@
+ import "render.fut"
+ import "std/strings"
+ import "std/math"
++import "std/lists"
+ 
+ // Every Link node in parts, nested ones too, in order.
+ fn collectLinks(parts: list, out: list) {
+@@ -22,18 +23,20 @@
+     match n {
+       Para(parts) { collectLinks(parts, out) }
+       ListItem(_, _, parts) { collectLinks(parts, out) }
++      Quote(paras) { for p in paras { match p { Para(parts) { collectLinks(parts, out) } else { } } } }
+       else { }
+     }
+   }
+   return out
+ }
+ 
+-// The prose of a block: a heading's text, a paragraph's or list item's plain text. Code and rules have none.
++// The prose of a block: a heading's text, a paragraph's or list item's plain text, a quote's paragraphs. Code and rules have none.
+ fn blockText(n: Node): str {
+   match n {
+     Heading(_, text, _) { return text }
+     Para(parts) { return plain(parts) }
+     ListItem(_, _, parts) { return plain(parts) }
++    Quote(paras) { return paras.len() == 0 ? "" : lists.map(paras, blockText).join(" ") }
+     else { return "" }
+   }
+ }
+@@ -112,6 +115,12 @@
+ test "checkLinks" {
+   var d = parse("[a]() and [b](http://x.io) and *[c](https://ok.io)*\n- [d](my file.md)")
+   expect checkLinks(d) == ["'a': empty url", "'b': insecure http://x.io", "'d': space in my file.md"]
++}
++
++test "quotes count as prose" {
++  var d = parse("> one [two](http://a.io)\n>\n> *three*")
++  expect wordCount(d) == 3
++  expect checkLinks(d) == ["'two': insecure http://a.io"]
+ }
+ 
+ test "profile times with the clock" {

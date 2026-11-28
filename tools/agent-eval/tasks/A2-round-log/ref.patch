@@ -1,0 +1,24 @@
+--- a/main.fut
++++ b/main.fut
+@@ -93,3 +93,21 @@
+   expect !r.won && r.rounds == 3 && r.log.len() == 6
+   expect isAlive(p) && isAlive(tough)
+ }
++
++// total gold in n whole shares that differ by at most 1, the larger ones first.
++fn splitGold(total: num, n: num): list ! {
++  var each = floor(total / n)
++  var extra = total - each * n
++  var shares = []
++  for i in 0..n {
++    if i < extra { shares.push(each + 1) } else { shares.push(each) }
++  }
++  return shares
++}
++
++test "gold splits evenly" {
++  expect splitGold(10, 3) == [4, 3, 3]
++  expect splitGold(9, 3) == [3, 3, 3]
++  expect splitGold(2, 4) == [1, 1, 0, 0]
++  expect splitGold(0, 2) == [0, 0]
++}

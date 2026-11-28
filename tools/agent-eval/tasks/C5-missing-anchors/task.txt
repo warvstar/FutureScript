@@ -1,0 +1,7 @@
+I want to catch broken in-page links. Please add this to main.fut:
+
+Signature: `fn missingAnchors(doc: Doc): list` (non-pub, in main.fut).
+
+Look at every link in the document (links in paragraphs and list items, including ones nested inside emphasis or strong text) whose URL starts with "#". Return the URLs whose part after the "#" is not the anchor of any heading, where headings' anchors are the ones `toc(doc)` assigns. Keep document order and list each URL once, at its first position. If every in-page link resolves (or there are none), return [].
+
+Add a test for it in main.fut. `fut test main.fut` must pass when you finish.

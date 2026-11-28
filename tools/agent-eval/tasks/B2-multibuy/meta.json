@@ -1,0 +1,1 @@
+{"project": "B", "bug": "effect", "path": "off", "file": "cart.fut", "line": 92, "description": "returnToStock is declared `!` (pure) but has a leftover debug print."}

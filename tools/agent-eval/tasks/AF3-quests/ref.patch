@@ -1,0 +1,140 @@
+diff -ruN a/main.fut b/main.fut
+--- a/main.fut	2026-11-28 00:35:10
++++ b/main.fut	2026-11-28 01:47:25
+@@ -93,3 +93,136 @@
+   expect !r.won && r.rounds == 3 && r.log.len() == 6
+   expect isAlive(p) && isAlive(tough)
+ }
++
++// What a quest asks for: monsters of a kind beaten, or items of a name picked up.
++enum Goal {
++  Kill(kind: str, count: num)
++  Collect(item: str, count: num)
++}
++
++// A quest: its goals, how far along each is, and what it pays.
++class Quest {
++  var title: str
++  var goals: list<Goal>
++  var progress: list<num> = []
++  var gold: num
++  var xp: num
++  fn init(title: str, goals: list<Goal>, gold: num, xp: num) {
++    self.title = title self.goals = goals self.gold = gold self.xp = xp
++    for g in goals { self.progress.push(0) }
++  }
++
++  fn need(i: num): num {
++    match self.goals[i] {
++      Kill(_, count) { return count }
++      Collect(_, count) { return count }
++    }
++  }
++
++  fn advance(i: num) {
++    if self.progress[i] < self.need(i) { self.progress[i] += 1 }
++  }
++
++  fn complete(): bool {
++    for i in 0..self.goals.len() {
++      if self.progress[i] < self.need(i) { return false }
++    }
++    return true
++  }
++
++  fn line(): str {
++    var parts = []
++    for i in 0..self.goals.len() {
++      match self.goals[i] {
++        Kill(kind, count) { parts.push("{kind} {self.progress[i]}/{count}") }
++        Collect(item, count) { parts.push("{item} {self.progress[i]}/{count}") }
++      }
++    }
++    var s = "{self.title}: {parts.join(", ")}"
++    if self.complete() { s += " (ready)" }
++    return s
++  }
++}
++
++// The quests the player has taken on and those already turned in.
++class QuestLog {
++  var active: list<Quest> = []
++  var done: list<str> = []
++
++  fn accept(q: Quest): bool {
++    for t in self.done {
++      if t == q.title { return false }
++    }
++    for a in self.active {
++      if a.title == q.title { return false }
++    }
++    self.active.push(q)
++    return true
++  }
++
++  fn recordKills(ms: list) {
++    for m in ms {
++      if isAlive(m) { continue }
++      for q in self.active {
++        for i in 0..q.goals.len() {
++          match q.goals[i] { Goal.Kill(kind, _) { if kind == m.name { q.advance(i) } } else { } }
++        }
++      }
++    }
++  }
++
++  fn pickUp(p: Player, it: Item): bool {
++    if !addItem(p, it) { return false }
++    for q in self.active {
++      for i in 0..q.goals.len() {
++        match q.goals[i] { Goal.Collect(item, _) { if item == it.name { q.advance(i) } } else { } }
++      }
++    }
++    return true
++  }
++
++  fn turnIn(p: Player): list {
++    var titles = []
++    var still = []
++    for q in self.active {
++      if q.complete() {
++        p.gold += q.gold
++        gainXp(p, q.xp)
++        self.done.push(q.title)
++        titles.push(q.title)
++      } else {
++        still.push(q)
++      }
++    }
++    self.active = still
++    return titles
++  }
++
++  fn status(): list {
++    var out = []
++    for q in self.active { out.push(q.line()) }
++    return out
++  }
++}
++
++test "quests track kills and pickups" {
++  var log = QuestLog()
++  var hunt = Quest("Wolf Hunt", [Goal.Kill("wolf", 2), Goal.Collect("Wolf Pelt", 1)], 30, 10)
++  expect log.accept(hunt)
++  expect !log.accept(Quest("Wolf Hunt", [], 0, 0))
++  var a = makeMonster("wolf", 1)
++  var b = makeMonster("wolf", 1)
++  a.hp = 0
++  log.recordKills([a, b])
++  expect log.status() == ["Wolf Hunt: wolf 1/2, Wolf Pelt 0/1"]
++  var p = newHero("Ana")
++  expect log.pickUp(p, Item("Wolf Pelt", "junk", 0, 3, 10))
++  b.hp = 0
++  log.recordKills([b])
++  expect hunt.complete()
++  expect log.status() == ["Wolf Hunt: wolf 2/2, Wolf Pelt 1/1 (ready)"]
++  expect log.turnIn(p) == ["Wolf Hunt"]
++  expect p.gold == 50 && p.level == 2
++  expect log.status() == []
++  expect !log.accept(hunt)
++}

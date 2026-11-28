@@ -1,0 +1,184 @@
+diff -ruN a/invoice.api b/invoice.api
+--- a/invoice.api	2026-11-28 00:34:39
++++ b/invoice.api	2026-11-28 01:45:37
+@@ -4,6 +4,17 @@
+ // An unknown discount code is ignored.
+ pub fn buildInvoice(number: num, cart: Cart, region: str): Invoice !
+ 
++// Money given back for returned goods: one line per returned SKU, at the price paid before any discount.
++pub class CreditNote {
++  var goods: num = 0
++  var invoice: num
++  var lines: list<InvoiceLine> = []
++  var number: num
++  var tax: num = 0
++  var total: num = 0
++  fn init(number: num, invoice: num)
++}
++
+ pub fn formatInvoice(inv: Invoice): str !
+ 
+ // Under 1000 g in grams ("350 g"), from 1000 g up in kilograms with two decimals ("1.25 kg").
+@@ -13,6 +24,7 @@
+ pub fn formatMoney(cents: num): str !
+ 
+ pub class Invoice {
++  var credits: list<CreditNote> = []
+   var discount: num = 0
+   var lines: list<InvoiceLine> = []
+   var number: num
+@@ -28,6 +40,8 @@
+   var cents: num
+   var label: str
+   var qty: num
++  var returned: num = 0
++  var sku: str = ""
+   fn init(label: str, qty: num, cents: num)
+ }
+ 
+@@ -35,3 +49,8 @@
+ pub fn packingSlip(cart: Cart): str !
+ 
+ pub fn printInvoice(inv: Invoice) ! io
++
++// Take back [sku, qty] pairs from an invoice: put them back on the shelf and record a credit note on it.
++// The refund keeps the invoice's discount share and refunds the tax on the rest; shipping is not refunded.
++// All or nothing: throws, changing nothing, on an unknown SKU or more units than are left to return.
++pub fn returnItems(cat: Catalog, inv: Invoice, items: list, number: num): CreditNote !
+diff -ruN a/invoice.fut b/invoice.fut
+--- a/invoice.fut	2026-11-28 00:33:40
++++ b/invoice.fut	2026-11-28 01:45:37
+@@ -1,4 +1,5 @@
+ // Turning a cart into an invoice, and the invoice into text.
++import "catalog.fut"
+ import "cart.fut"
+ import "pricing.fut"
+ 
+@@ -6,6 +7,8 @@
+   var label: str
+   var qty: num
+   var cents: num
++  var sku: str = ""
++  var returned: num = 0
+   fn init(label: str, qty: num, cents: num) {
+     self.label = label
+     self.qty = qty
+@@ -22,18 +25,35 @@
+   var shipping: num = 0
+   var tax: num = 0
+   var total: num = 0
++  var credits: list<CreditNote> = []
+   fn init(number: num, region: str) {
+     self.number = number
+     self.region = region
+   }
+ }
+ 
++// Money given back for returned goods: one line per returned SKU, at the price paid before any discount.
++pub class CreditNote {
++  var number: num
++  var invoice: num
++  var lines: list<InvoiceLine> = []
++  var goods: num = 0
++  var tax: num = 0
++  var total: num = 0
++  fn init(number: num, invoice: num) {
++    self.number = number
++    self.invoice = invoice
++  }
++}
++
+ // Tax is charged on the discounted subtotal; shipping is not taxed.
+ // An unknown discount code is ignored.
+ pub fn buildInvoice(number: num, cart: Cart, region: str): Invoice ! {
+   var inv = Invoice(number, region)
+   for l in cart.lines {
+-    inv.lines.push(InvoiceLine(l.name, l.qty, l.totalCents()))
++    var line = InvoiceLine(l.name, l.qty, l.totalCents())
++    line.sku = l.sku
++    inv.lines.push(line)
+   }
+   inv.subtotal = subtotalCents(cart)
+   inv.shipping = shippingCents(cartGrams(cart), region)
+@@ -45,6 +65,39 @@
+   inv.tax = taxCents(inv.subtotal - inv.discount, region)
+   inv.total = inv.subtotal - inv.discount + inv.shipping + inv.tax
+   return inv
++}
++
++// Take back [sku, qty] pairs from an invoice: put them back on the shelf and record a credit note on it.
++// The refund keeps the invoice's discount share and refunds the tax on the rest; shipping is not refunded.
++// All or nothing: throws, changing nothing, on an unknown SKU or more units than are left to return.
++pub fn returnItems(cat: Catalog, inv: Invoice, items: list, number: num): CreditNote ! {
++  var note = CreditNote(number, inv.number)
++  atomic {
++    for it in items {
++      var sku = it[0]
++      var qty = it[1]
++      if qty <= 0 { throw "return quantity must be positive" }
++      var line = nil
++      for l in inv.lines {
++        if l.sku == sku { line = l }
++      }
++      if line == nil { throw "{sku} is not on invoice #{inv.number}" }
++      if qty > line.qty - line.returned { throw "only {line.qty - line.returned} of {sku} left to return" }
++      var v = findVariant(cat, sku)
++      if v == nil { throw "{sku} is no longer sold" }
++      restock(v, qty)
++      line.returned += qty
++      var cents = line.cents / line.qty * qty
++      note.lines.push(InvoiceLine(line.label, qty, cents))
++      note.goods += cents
++    }
++    var paid = inv.subtotal == 0 ? 0 : note.goods * (inv.subtotal - inv.discount) / inv.subtotal
++    var refund = floor(paid + 0.5)
++    note.tax = taxCents(refund, inv.region)
++    note.total = refund + note.tax
++    inv.credits.push(note)
++  }
++  return note
+ }
+ 
+ // 1234 -> "$12.34", -500 -> "-$5.00"
+diff -ruN a/main.fut b/main.fut
+--- a/main.fut	2026-11-28 00:34:39
++++ b/main.fut	2026-11-28 01:45:37
+@@ -82,3 +82,38 @@
+   expect rows[rows.len() - 1] == "Total                       $29.23"
+   expect prints { printInvoice(inv) } == text + "\n"
+ }
++
++test "returns" {
++  var cat = sampleCatalog()
++  var cart = cartOf(cat, [["TEE-S", 3], ["MUG-BLU", 2]])
++  var inv = checkout(cat, cart, 10, "CA")
++  expect findVariant(cat, "TEE-S").stock == 9
++  var note = returnItems(cat, inv, [["TEE-S", 2], ["MUG-BLU", 1]], 501)
++  expect note.invoice == 10
++  expect note.lines.len() == 2
++  expect note.lines[0].label == "Organic tee, S"
++  expect note.lines[0].cents == 3600
++  expect note.goods == 4800
++  expect note.tax == 348
++  expect note.total == 5148
++  expect findVariant(cat, "TEE-S").stock == 11
++  expect findVariant(cat, "MUG-BLU").stock == 7
++  expect inv.credits.len() == 1
++  expect inv.lines[0].returned == 2
++}
++
++test "returns keep the discount and are all or nothing" {
++  var cat = sampleCatalog()
++  var cart = cartOf(cat, [["TEE-M", 2], ["LAMP", 1]])
++  cart.code = "SPRING25"
++  var inv = checkout(cat, cart, 11, "NY")
++  var note = returnItems(cat, inv, [["TEE-M", 1]], 502)
++  expect note.goods == 1800
++  expect note.tax == 54
++  expect note.total == 1350 + 54
++  expect throws { returnItems(cat, inv, [["LAMP", 1], ["TEE-M", 2]], 503) }
++  expect throws { returnItems(cat, inv, [["MUG-BLU", 1]], 503) }
++  expect findVariant(cat, "LAMP").stock == 1
++  expect inv.lines[1].returned == 0
++  expect inv.credits.len() == 1
++}

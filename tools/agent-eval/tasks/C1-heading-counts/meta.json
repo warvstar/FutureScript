@@ -1,0 +1,8 @@
+{
+  "project": "C",
+  "bug": "effect",
+  "path": "off",
+  "file": "stats.fut",
+  "line": 74,
+  "description": "linkDensity is declared `!` (pure) but keeps a leftover debug print."
+}

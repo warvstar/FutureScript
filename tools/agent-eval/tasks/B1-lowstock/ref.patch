@@ -1,0 +1,22 @@
+--- a/main.fut
++++ b/main.fut
+@@ -82,3 +82,19 @@
+   expect rows[rows.len() - 1] == "Total                       $29.23"
+   expect prints { printInvoice(inv) } == text + "\n"
+ }
++
++// SKUs of variants with at most threshold units on the shelf, in catalog order.
++fn lowStock(cat: Catalog, threshold: num): list<str> {
++  var out = []
++  for p in cat.products {
++    for v in p.variants {
++      if v.stock <= threshold { out.push(v.sku) }
++    }
++  }
++  return out
++}
++
++test "low stock" {
++  expect lowStock(sampleCatalog(), 3) == ["TEE-M", "TEE-L", "LAMP"]
++  expect lowStock(Catalog(), 3) == []
++}

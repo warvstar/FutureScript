@@ -1,0 +1,8 @@
+{
+ "project": "A",
+ "bug": "type",
+ "path": "off",
+ "file": "main.fut",
+ "line": 49,
+ "description": "narrateRound calls hitLine(m.name, taken, p.name): the num param taken goes to hitLine's target: str and p.name to dmg: num (arguments swapped)."
+}

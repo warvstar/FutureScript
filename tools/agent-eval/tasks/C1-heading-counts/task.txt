@@ -1,0 +1,7 @@
+Please add a function to main.fut that tells me how a document's headings are spread across levels.
+
+Signature: `fn headingCounts(doc: Doc): list` (keep it non-pub, in main.fut).
+
+It returns a list of exactly six numbers: how many headings of level 1, 2, 3, 4, 5 and 6 the document has, in that order (index 0 is level 1). Levels that don't occur count 0, so a document with no headings gives [0, 0, 0, 0, 0, 0].
+
+Add a test for it in main.fut. `fut test main.fut` must pass when you finish.

@@ -1,0 +1,24 @@
+I keep my notes with a front-matter header, and mdlite should understand it instead of rendering it as a rule and a paragraph:
+
+---
+title: Release notes
+author: Ann Lee
+date: 2026-11-01
+---
+# 2.0
+...
+
+Parser (parser.fut):
+- A document has front matter when its first line, trimmed, is "---" and a later line, trimmed, is also "---". The front matter is the lines between the first line and the first such closing line. If no closing line follows, the document has no front matter and parses as it does now.
+- Each front matter line that contains ":" gives a key and a value: the key is the text before the first ":", trimmed and lower-cased; the value is the text after it, trimmed, and if the value is at least two characters long and starts and ends with a double quote, those two quotes are removed. Lines with no ":" or whose key is empty are skipped. If a key comes again, the later value replaces the earlier one.
+- Give `Doc` a field `meta: map`, empty by default (so `Doc(nodes)` still works), mapping each key to its value, keys in the order they first appear. Add a method `fn metaValue(key: str): str` to Doc that returns the value for key, or "" if there is none.
+- Front matter (both "---" lines included) makes no nodes. The document's nodes come from the lines after it, and their line numbers still count from the first line of the source.
+- `doc.title` is the front matter's "title" value when it has a non-empty one; otherwise it is the first level-1 heading's text, as now.
+
+Renderer (render.fut): add `pub fn renderHead(doc: Doc): str`. It returns the page head: a line `<title>T</title>`, T being the document's title or "Untitled" when that is "", then one line `<meta name="KEY" content="VALUE">` for each front matter key other than "title", in the order of `meta`. T, KEY and VALUE are written with `escape`. Lines are joined with "\n", no trailing newline.
+
+main.fut: `page(src)` returns `renderHead(doc)`, then "\n", then `renderDoc(doc)`.
+
+This changes public interfaces: `fut api main.fut` updates the .api files.
+
+Add tests for it. `fut test main.fut` must pass when you finish.

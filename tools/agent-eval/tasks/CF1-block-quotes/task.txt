@@ -1,0 +1,13 @@
+mdlite should support block quotes. Right now a line like "> Simple is better" comes out as a paragraph with a literal "&gt;" in it; I want it to become a <blockquote>.
+
+Lexer (lexer.fut): `classify` gives a line whose trimmed text starts with ">" the kind "quote", whatever follows the ">" (so "> # Title" is a quote line, not a heading). The Line's text is what follows the ">", trimmed, and may be "". Update the comment on Line that lists the kinds.
+
+Parser (parser.fut): add a block variant `Quote(paras: list)` to `Node`, right after `CodeBlock`. A run of consecutive quote lines makes one Quote node. Inside it, a quote line with empty text separates paragraphs; the other lines are grouped into paragraphs the same way top-level text lines are (joined with single spaces, then parsed as inline text), and each becomes a `Node.Para`, so `paras` is a list of Para nodes in order. Empty quote lines never make an empty paragraph, so a quote made only of ">" lines is `Node.Quote([])`. A quote line ends a paragraph in progress, and a line that isn't a quote line ends the quote (a following text line starts a new paragraph outside it). For example "> one *two*\n>three\n>\n> four" parses to `Node.Quote([Node.Para([Node.Text("one "), Node.Em([Node.Text("two")]), Node.Text(" three")]), Node.Para([Node.Text("four")])])`.
+
+Renderer (render.fut): `renderDoc` writes a Quote as "<blockquote>" on its own line, then each paragraph as "<p>...</p>" on its own line (rendered like a top-level paragraph), then "</blockquote>". An empty quote is "<blockquote>\n</blockquote>". Like any other block, a quote closes an open list.
+
+Stats (stats.fut): the text of a quote's paragraphs is prose, so `wordCount` counts it, and the links in a quote's paragraphs are links of the document, so `checkLinks` and `summarize` see them, in document order.
+
+Adding the variant changes parser.fut's public interface: `fut api main.fut` updates the .api files.
+
+Add tests for it. `fut test main.fut` must pass when you finish.

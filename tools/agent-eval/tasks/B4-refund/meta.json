@@ -1,0 +1,1 @@
+{"project": "B", "bug": "logic", "path": "off", "file": "cart.fut", "line": 101, "description": "unavailableLines uses <= instead of <, so a line the shelf covers exactly is reported unavailable."}

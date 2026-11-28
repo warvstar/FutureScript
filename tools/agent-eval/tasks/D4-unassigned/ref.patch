@@ -1,0 +1,22 @@
+--- a/main.fut
++++ b/main.fut
+@@ -32,3 +32,19 @@
+   expect criticalPath(p).len() == 4
+   expect summary(p) == "Website: 1/6 done, 13 days left, 11 days end to end"
+ }
++
++// Ids of unfinished tasks nobody has been given, in project order.
++fn unassigned(p: Project): list<str> {
++  var out = []
++  for t in p.tasks {
++    if !t.done && t.assignee == nil { out.push(t.id) }
++  }
++  return out
++}
++
++test "unassigned" {
++  var p = demoProject()
++  assign(p, "backend", "bo")
++  markDone(p, "design")
++  expect unassigned(p) == ["frontend", "integrate", "docs", "release"]
++}

@@ -1,0 +1,11 @@
+--- a/tasks.fut
++++ b/tasks.fut
+@@ -101,7 +101,7 @@
+     var days = parseNum(bits[1].trim())
+     if days == nil { throw "bad capacity for {bits[0].trim()}" }
+     var person = Person(bits[0].trim(), days)
+-    if person.capacityPerWeek <= 0 || person.capacityPerWeek > 7 {
++    if person.capacity <= 0 || person.capacity > 7 {
+       throw "{person.name} can't work {days} days a week"
+     }
+     team.push(person)

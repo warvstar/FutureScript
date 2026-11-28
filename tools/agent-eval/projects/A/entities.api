@@ -1,0 +1,61 @@
+// The public interface of entities.fut, written by `fut api`. `fut test` fails while it is out of date.
+
+// Attack including the equipped weapon.
+pub fn attackPower(p: Player): num !
+
+// Defense including the equipped armor.
+pub fn defensePower(p: Player): num !
+
+// Adds xp, levelling the player up each time their total reaches xpForLevel(level + 1).
+// Each level adds 5 max hp, 2 atk and 1 def; any level gained heals to full.
+// Returns how many levels were gained.
+pub fn gainXp(p: Player, amount: num): num !
+
+// A player or monster that still stands.
+pub fn isAlive(c: any): bool !
+
+pub class Item {
+  var kind: str
+  var name: str
+  var power: num
+  var value: num
+  var weight: num
+  fn init(name: str, kind: str, power: num, weight: num, value: num)
+}
+
+// A named boss for the end of a floor: slow, tough, and carrying 40 gold per level.
+pub fn makeBoss(name: str, level: num): Monster !
+
+// A monster of a known kind. Each level above 1 adds 20% to its hp, atk and rewards (rounded down).
+pub fn makeMonster(kind: str, level: num): Monster !
+
+pub class Monster {
+  var atk: num
+  var def: num
+  var goldReward: num = 0
+  var hp: num
+  var maxHp: num
+  var name: str
+  var speed: num = 4
+  var xpReward: num = 0
+  fn init(name: str, maxHp: num, atk: num, def: num)
+}
+
+pub class Player {
+  var armor: Item? = nil
+  var atk: num = 5
+  var def: num = 2
+  var gold: num = 0
+  var hp: num = 30
+  var inventory: list = []
+  var level: num = 1
+  var maxHp: num = 30
+  var name: str
+  var speed: num = 5
+  var weapon: Item? = nil
+  var xp: num = 0
+  fn init(name: str)
+}
+
+// Total xp a player needs to reach a level: 0 for level 1, then 10, 40, 90, ...
+pub fn xpForLevel(level: num): num !

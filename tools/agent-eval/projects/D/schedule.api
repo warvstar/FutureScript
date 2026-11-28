@@ -1,0 +1,22 @@
+// The public interface of schedule.fut, written by `fut api`. `fut test` fails while it is out of date.
+
+// Days of unfinished work assigned to who.
+pub fn assignedDays(p: Project, who: Person): num !
+
+// Give every unfinished, unassigned task (in topological order) to whoever
+// has the fewest weeks of work so far; ties go to whoever joined the team first.
+// Returns "task: person" for each assignment made.
+pub fn autoAssign(p: Project): list<str>
+
+// The chain of tasks that sets the project length, first task first.
+pub fn criticalPath(p: Project): list<str> !
+
+// Task id -> {start, finish} in days from the project start, with every task
+// starting as soon as all of its deps have finished.
+pub fn earliest(p: Project): map !
+
+// Days from the start until the last task finishes.
+pub fn projectLength(p: Project): num !
+
+// Weeks it would take who to finish everything assigned to them.
+pub fn weeksBusy(p: Project, who: Person): num !

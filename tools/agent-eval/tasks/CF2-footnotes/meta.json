@@ -1,0 +1,1 @@
+{"project": "C", "kind": "feature", "description": "Footnotes: [^label] references, [^label]: definitions collected into Doc.notes, rendered numbered at the end; checkLinks covers them."}

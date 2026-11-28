@@ -1,0 +1,7 @@
+Please add a low-stock report to the shop backend. In main.fut, add
+
+    fn lowStock(cat: Catalog, threshold: num): list<str>
+
+It returns the SKUs of every variant whose stock is at most `threshold` (a variant with exactly `threshold` units counts, and so does one with 0), in catalog order: products in the order they were added to the catalog, and within a product its variants in the order they were added. A catalog with no products gives []. Don't make it pub.
+
+Add a test for it in main.fut (sampleCatalog() is handy). `fut test main.fut` must pass when you finish.

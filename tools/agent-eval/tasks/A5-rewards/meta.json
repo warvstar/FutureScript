@@ -1,0 +1,8 @@
+{
+ "project": "A",
+ "bug": "logic",
+ "path": "on",
+ "file": "entities.fut",
+ "line": 56,
+ "description": "gainXp levels up only when xp goes past xpForLevel(level + 1), not when it reaches it (> instead of >=), contradicting its doc comment."
+}

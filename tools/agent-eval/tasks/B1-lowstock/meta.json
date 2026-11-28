@@ -1,0 +1,1 @@
+{"project": "B", "bug": "type", "path": "off", "file": "pricing.fut", "line": 80, "description": "quoteShipping calls shippingCents(region, grams) with the arguments swapped: the str region goes to the num grams param."}

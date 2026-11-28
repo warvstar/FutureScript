@@ -1,0 +1,19 @@
+--- a/main.fut
++++ b/main.fut
+@@ -54,3 +54,16 @@
+   expect page("# A & B\ntext") == "<title>A &amp; B</title>\n<h1>A &amp; B</h1>\n<p>text</p>"
+   expect page("just text").has("<title>Untitled</title>")
+ }
++
++// How many headings the document has of each level: six counts, the first for level 1.
++fn headingCounts(doc: Doc): list {
++  var counts = [0, 0, 0, 0, 0, 0]
++  for h in doc.headings() { counts[h.level - 1] += 1 }
++  return counts
++}
++
++test "headingCounts" {
++  expect headingCounts(parse(sample)) == [1, 2, 0, 0, 0, 0]
++  expect headingCounts(parse("#### a\n#### b\n###### c")) == [0, 0, 0, 2, 0, 1]
++  expect headingCounts(parse("no headings")) == [0, 0, 0, 0, 0, 0]
++}

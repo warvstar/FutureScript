@@ -1,0 +1,10 @@
+--- a/cart.fut
++++ b/cart.fut
+@@ -89,6 +89,7 @@
+ // Put a line's units back on the shelf, e.g. when an order is cancelled.
+ pub fn returnToStock(cat: Catalog, line: CartLine) ! {
+   var v = findVariant(cat, line.sku)
++  print("returning {line.qty} x {line.sku} to stock")
+   if v == nil { throw "{line.sku} is no longer sold" }
+   restock(v, line.qty)
+ }

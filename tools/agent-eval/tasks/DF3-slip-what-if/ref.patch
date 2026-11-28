@@ -1,0 +1,126 @@
+--- a/main.fut
++++ b/main.fut
+@@ -32,3 +32,36 @@
+   expect criticalPath(p).len() == 4
+   expect summary(p) == "Website: 1/6 done, 13 days left, 11 days end to end"
+ }
++
++// What if task id slipped by days more? "<id>: day <old> -> day <new>" for each
++// task whose finish moves, in topological order. The project is left as it was.
++fn whatIf(p: Project, id: str, days: num): list<str> {
++  var t = taskOf(p, id)
++  var before = earliest(p)
++  t.lagDays += days
++  var after = earliest(p)
++  t.lagDays -= days
++  var out = []
++  for tid in topoOrder(p) {
++    if before[tid].finish != after[tid].finish {
++      out.push("{tid}: day {before[tid].finish} -> day {after[tid].finish}")
++    }
++  }
++  return out
++}
++
++test "lag" {
++  var p = demoProject()
++  p.find("frontend").lagDays = 2
++  expect earliest(p)["frontend"] == {start: 5, finish: 9}
++  expect criticalPath(p) == ["design", "frontend", "integrate", "release"]
++  expect formatTask(p.find("frontend")) == "[ ] frontend    Build pages (4 days, unassigned, waits 2 days)"
++}
++
++test "what if a task slips" {
++  var p = demoProject()
++  expect whatIf(p, "docs", 3) == ["docs: day 4 -> day 7"]
++  expect whatIf(p, "frontend", 3) == ["frontend: day 7 -> day 10", "integrate: day 10 -> day 12", "release: day 11 -> day 13"]
++  expect p.find("frontend").lagDays == 0
++  expect throws { whatIf(p, "qa", 1) } == "no task qa in Website"
++}
+--- a/report.api
++++ b/report.api
+@@ -3,6 +3,7 @@
+ pub fn formatDays(n: num): str !
+ 
+ // "[x] design    Design pages (3 days, ann)"; [ ] while not done.
++// A task with a lag ends ", waits 2 days)".
+ pub fn formatTask(t: Task): str !
+ 
+ // A bar per task, one column per day: "backend      |   #####   |".
+--- a/report.fut
++++ b/report.fut
+@@ -8,10 +8,12 @@
+ }
+ 
+ // "[x] design    Design pages (3 days, ann)"; [ ] while not done.
++// A task with a lag ends ", waits 2 days)".
+ pub fn formatTask(t: Task): str ! {
+   var box = t.done ? "[x]" : "[ ]"
+   var who = t.assignee == nil ? "unassigned" : t.assignee
+-  return "{box} {strings.padEnd(t.id, 12, " ")}{t.title} ({formatDays(t.durationDays)}, {who})"
++  var lag = t.lagDays > 0 ? ", waits {formatDays(t.lagDays)}" : ""
++  return "{box} {strings.padEnd(t.id, 12, " ")}{t.title} ({formatDays(t.durationDays)}, {who}{lag})"
+ }
+ 
+ // One formatTask line per task, in topological order.
+--- a/schedule.api
++++ b/schedule.api
+@@ -12,7 +12,7 @@
+ pub fn criticalPath(p: Project): list<str> !
+ 
+ // Task id -> {start, finish} in days from the project start, with every task
+-// starting as soon as all of its deps have finished.
++// starting its lagDays after all of its deps have finished.
+ pub fn earliest(p: Project): map !
+ 
+ // Days from the start until the last task finishes.
+--- a/schedule.fut
++++ b/schedule.fut
+@@ -5,7 +5,7 @@
+ import "graph.fut"
+ 
+ // Task id -> {start, finish} in days from the project start, with every task
+-// starting as soon as all of its deps have finished.
++// starting its lagDays after all of its deps have finished.
+ pub fn earliest(p: Project): map ! {
+   var out = {}
+   for id in topoOrder(p) {
+@@ -14,6 +14,7 @@
+     for d in t.deps {
+       if out.has(d) { start = math.max(start, out[d].finish) }
+     }
++    start += t.lagDays
+     out[id] = {start: start, finish: start + t.durationDays}
+   }
+   return out
+@@ -38,8 +39,9 @@
+   var t = taskOf(p, last)
+   while spans[t.id].start > 0 {
+     var prev = nil
++    var ready = spans[t.id].start - t.lagDays
+     for d in t.deps {
+-      if spans.has(d) && spans[d].finish == spans[t.id].start { prev = d break }
++      if spans.has(d) && spans[d].finish == ready { prev = d break }
+     }
+     if prev == nil { break }
+     path.push(prev)
+--- a/tasks.api
++++ b/tasks.api
+@@ -42,6 +42,7 @@
+   var done: bool = false
+   var durationDays: num
+   var id: str
++  var lagDays: num = 0
+   var title: str
+   fn init(id: str, title: str, durationDays: num, deps: list<str>)
+ }
+--- a/tasks.fut
++++ b/tasks.fut
+@@ -16,6 +16,7 @@
+   var deps: list<str> = []
+   var assignee: str? = nil
+   var done: bool = false
++  var lagDays: num = 0       // days it must wait after its deps finish before it can start
+   fn init(id: str, title: str, durationDays: num, deps: list<str>) {
+     self.id = id
+     self.title = title

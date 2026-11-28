@@ -1,0 +1,20 @@
+--- a/main.fut
++++ b/main.fut
+@@ -82,3 +82,17 @@
+   expect rows[rows.len() - 1] == "Total                       $29.23"
+   expect prints { printInvoice(inv) } == text + "\n"
+ }
++
++// "3 items, 1.25 kg, shipping $8.99"; a single unit: "1 item, ...".
++fn orderSummary(cart: Cart, region: str): str {
++  var n = itemCount(cart)
++  var g = cartGrams(cart)
++  var noun = n == 1 ? "item" : "items"
++  return "{n} {noun}, {formatKg(g)}, shipping {formatMoney(shippingCents(g, region))}"
++}
++
++test "order summary" {
++  var cat = sampleCatalog()
++  expect orderSummary(cartOf(cat, [["LAMP", 1], ["TEE-M", 1]]), "NY") == "2 items, 1.80 kg, shipping $8.99"
++  expect orderSummary(cartOf(cat, [["MUG-BLU", 1]]), "CA") == "1 item, 350 g, shipping $4.99"
++}

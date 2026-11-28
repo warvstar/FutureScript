@@ -1,0 +1,43 @@
+--- a/main.fut
++++ b/main.fut
+@@ -54,3 +54,40 @@
+   expect page("# A & B\ntext") == "<title>A &amp; B</title>\n<h1>A &amp; B</h1>\n<p>text</p>"
+   expect page("just text").has("<title>Untitled</title>")
+ }
++
++// The "#..." link URLs that name no heading's anchor, once each, in order.
++fn missingAnchors(doc: Doc): list {
++  var anchors = {}
++  for e in toc(doc) { anchors[e.anchor] = true }
++  var out = []
++  for n in doc.nodes {
++    match n {
++      Para(parts) { addMissing(parts, anchors, out) }
++      ListItem(_, _, parts) { addMissing(parts, anchors, out) }
++      else { }
++    }
++  }
++  return out
++}
++
++fn addMissing(parts: list, anchors: map, out: list) {
++  for p in parts {
++    match p {
++      Link(_, url) {
++        if url.len() > 0 && url[0] == "#" && !anchors.has(url[1:]) {
++          var seen = false
++          for u in out { if u == url { seen = true } }
++          if !seen { out.push(url) }
++        }
++      }
++      Em(inner) { addMissing(inner, anchors, out) }
++      Strong(inner) { addMissing(inner, anchors, out) }
++      else { }
++    }
++  }
++}
++
++test "missingAnchors" {
++  expect missingAnchors(parse("# Intro\n## Step two\n\n[a](#intro) [b](#step-two) [c](#gone) *[d](#gone)* [e](https://x.io)")) == ["#gone"]
++  expect missingAnchors(parse(sample)) == []
++}
