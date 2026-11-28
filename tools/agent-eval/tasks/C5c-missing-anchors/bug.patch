@@ -1,0 +1,55 @@
+diff -ruN a/render.api b/render.api
+--- a/render.api	2026-11-28 02:56:53
++++ b/render.api	2026-11-28 02:56:53
+@@ -27,3 +27,5 @@
+ 
+ // base the first time; then base-1, base-2, ... for each repeat. seen remembers how often each base came up.
+ pub fn uniqueAnchor(base: str, seen: map): str
++  ensures old(seen.has(base)) || (result == base && seen[base] == 0)
++  ensures !old(seen.has(base)) || result == "{base}-{seen[base]}"
+diff -ruN a/render.fut b/render.fut
+--- a/render.fut	2026-11-28 02:56:53
++++ b/render.fut	2026-11-28 02:56:53
+@@ -84,8 +84,11 @@
+ }
+ 
+ // base the first time; then base-1, base-2, ... for each repeat. seen remembers how often each base came up.
+-pub fn uniqueAnchor(base: str, seen: map): str {
+-  if !seen.has(base) { seen[base] = 0 return base }
++pub fn uniqueAnchor(base: str, seen: map): str
++  ensures old(seen.has(base)) || (result == base && seen[base] == 0)
++  ensures !old(seen.has(base)) || result == "{base}-{seen[base]}"
++{
++  if !seen.has(base) { seen[base] = 1 return base }
+   seen[base] += 1
+   return "{base}-{seen[base]}"
+ }
+diff -ruN a/stats.api b/stats.api
+--- a/stats.api	2026-11-28 02:56:53
++++ b/stats.api	2026-11-28 02:56:53
+@@ -13,6 +13,9 @@
+ 
+ // Whole minutes to read words at wpm words a minute, rounded up: 0 words take 0 minutes.
+ pub fn readingMinutes(words: num, wpm: num): num !
++  requires words >= 0 && wpm > 0
++  ensures result * wpm >= words
++  ensures result == 0 || (result - 1) * wpm < words
+ 
+ // The numbers for a document's info panel, at 200 words a minute.
+ pub fn summarize(doc: Doc): Summary
+diff -ruN a/stats.fut b/stats.fut
+--- a/stats.fut	2026-11-28 02:56:53
++++ b/stats.fut	2026-11-28 02:56:53
+@@ -50,7 +50,11 @@
+ }
+ 
+ // Whole minutes to read words at wpm words a minute, rounded up: 0 words take 0 minutes.
+-pub fn readingMinutes(words: num, wpm: num): num ! {
++pub fn readingMinutes(words: num, wpm: num): num !
++  requires words >= 0 && wpm > 0
++  ensures result * wpm >= words
++  ensures result == 0 || (result - 1) * wpm < words
++{
+   if words == 0 { return 0 }
+   return math.ceil(words / wpm)
+ }

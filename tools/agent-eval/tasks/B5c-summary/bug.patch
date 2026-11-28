@@ -1,0 +1,56 @@
+diff -ruN a/cart.api b/cart.api
+--- a/cart.api	2026-11-28 02:56:53
++++ b/cart.api	2026-11-28 02:56:53
+@@ -39,3 +39,4 @@
+ 
+ // SKUs of the lines the shelf can't cover right now, in cart order.
+ pub fn unavailableLines(cat: Catalog, cart: Cart): list<str> !
++  ensures result.len() == lists.count(cart.lines, fn(l) { var v = findVariant(cat, l.sku) return v == nil || v.stock < l.qty })
+diff -ruN a/cart.fut b/cart.fut
+--- a/cart.fut	2026-11-28 02:56:53
++++ b/cart.fut	2026-11-28 02:56:53
+@@ -1,3 +1,4 @@
++import "std/lists"
+ // A shopper's cart: one line per SKU, with the price and weight captured when it was added.
+ import "catalog.fut"
+ 
+@@ -94,7 +95,9 @@
+ }
+ 
+ // SKUs of the lines the shelf can't cover right now, in cart order.
+-pub fn unavailableLines(cat: Catalog, cart: Cart): list<str> ! {
++pub fn unavailableLines(cat: Catalog, cart: Cart): list<str> !
++  ensures result.len() == lists.count(cart.lines, fn(l) { var v = findVariant(cat, l.sku) return v == nil || v.stock < l.qty })
++{
+   var out = []
+   for l in cart.lines {
+     var v = findVariant(cat, l.sku)
+diff -ruN a/pricing.api b/pricing.api
+--- a/pricing.api	2026-11-28 02:56:53
++++ b/pricing.api	2026-11-28 02:56:53
+@@ -18,6 +18,7 @@
+ // Domestic: up to 500 g 499, up to 2 kg 899, then 250 more per started kg.
+ // "INTL" adds a flat 1500. An empty parcel ships free.
+ pub fn shippingCents(grams: num, region: str): num !
++  ensures grams <= 0 || grams > 500 || result == (region == "INTL" ? 1999 : 499)
+ 
+ pub class ShippingQuote {
+   var costCents: num = 0
+diff -ruN a/pricing.fut b/pricing.fut
+--- a/pricing.fut	2026-11-28 02:56:53
++++ b/pricing.fut	2026-11-28 02:56:53
+@@ -51,10 +51,12 @@
+ 
+ // Domestic: up to 500 g 499, up to 2 kg 899, then 250 more per started kg.
+ // "INTL" adds a flat 1500. An empty parcel ships free.
+-pub fn shippingCents(grams: num, region: str): num ! {
++pub fn shippingCents(grams: num, region: str): num !
++  ensures grams <= 0 || grams > 500 || result == (region == "INTL" ? 1999 : 499)
++{
+   if grams <= 0 { return 0 }
+   var cents = 899
+-  if grams <= 500 {
++  if grams < 500 {
+     cents = 499
+   } else if grams > 2000 {
+     cents += int((grams - 2000 + 999) / 1000) * 250

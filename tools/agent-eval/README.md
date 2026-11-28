@@ -79,3 +79,18 @@ is rejected elsewhere; the same 12 feature tasks × 3 runs, compared with the `5
 
 The pitfall is gone, and turns fell by 1.6 per task on average, more on the tasks it used to hit (AF2: 22 → 16 on
 Haiku, 19 → 14 on Sonnet; DF1: 14 → 10 on Sonnet). No run hit the new `[compare]` error.
+
+**Contracts** (`A4c`–`D5c`: seven of the logic-bug controls with the doc comment's rule also written as
+`requires`/`ensures`; D4 has none, since `parseTeam` throws on bad input; 3 runs per model; a pass means the planted bug
+was fixed):
+
+| build | Sonnet | Haiku | bugs `fut test` reports |
+|---|---|---|---|
+| `3257a03`, doc comment only | 0/21 | 0/21 | none |
+| `3257a03`, with contracts | 6/21 | 2/21 | C4, C5 (property tests) |
+| `prop-gen` `c6308aa`, with contracts | 12/21 | 8/21 | also A5 (a `Player` built by its init), B5 (500 g, a number in the function) |
+
+- **A contract helps only when `fut test` reports it.** A clause nothing reported (A4, B4, D5, which need a filled bag,
+  cart or project) was fixed in no run.
+- **Reported, Sonnet fixed it every time.** Haiku sometimes left a failing test as "an existing failure", and on C5 it
+  changed the contract to match the bug in 4 of 6 runs ("the body is already correct"), against the doc comment.

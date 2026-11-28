@@ -1,0 +1,31 @@
+diff -ruN a/tasks.api b/tasks.api
+--- a/tasks.api	2026-11-28 03:06:01
++++ b/tasks.api	2026-11-28 03:06:01
+@@ -12,6 +12,8 @@
+ 
+ // The ids of the first n tasks that are ready to start, in project order.
+ pub fn nextUp(p: Project, n: num): list<str>
++  requires n >= 0
++  ensures result.len() <= n
+ 
+ // A team from text like "Ann: 5, Bo: 2.5": each name with the days a week
+ // they can work, more than 0 and at most 7.
+diff -ruN a/tasks.fut b/tasks.fut
+--- a/tasks.fut	2026-11-28 03:06:01
++++ b/tasks.fut	2026-11-28 03:06:01
+@@ -81,10 +81,13 @@
+ }
+ 
+ // The ids of the first n tasks that are ready to start, in project order.
+-pub fn nextUp(p: Project, n: num): list<str> {
++pub fn nextUp(p: Project, n: num): list<str>
++  requires n >= 0
++  ensures result.len() <= n
++{
+   var out = []
+   for t in p.tasks {
+-    if out.len() >= n { break }
++    if out.len() > n { break }
+     if isReady(p, t) { out.push(t.id) }
+   }
+   return out

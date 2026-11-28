@@ -1,0 +1,7 @@
+Please add a function to main.fut for drinking a potion:
+
+    fn usePotion(p: Player): bool
+
+It drinks the first potion in the player's bag (the first item in `p.inventory` whose kind is "potion"): the player's hp goes up by the potion's `power`, but never above `maxHp`, and that potion leaves the bag (the rest of the bag keeps its order). It returns true. If the player's hp is already full, or there is no potion in the bag, nothing changes and it returns false.
+
+Add a test block for it in main.fut. `fut test main.fut` must pass when you finish.

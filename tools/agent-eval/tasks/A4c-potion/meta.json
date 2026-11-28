@@ -1,0 +1,9 @@
+{
+ "project": "A",
+ "bug": "logic",
+ "path": "off",
+ "file": "loot.fut",
+ "line": 86,
+ "description": "sellItem checks `i <= 0` instead of `i < 0`, so the first item in the bag can't be sold (returns 0, nothing changes). The function states its rule as ensures clauses.",
+ "contract": true
+}

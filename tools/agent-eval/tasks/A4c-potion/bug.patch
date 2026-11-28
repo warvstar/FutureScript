@@ -1,0 +1,52 @@
+diff -ruN a/entities.api b/entities.api
+--- a/entities.api	2026-11-28 02:56:52
++++ b/entities.api	2026-11-28 02:56:52
+@@ -10,6 +10,7 @@
+ // Each level adds 5 max hp, 2 atk and 1 def; any level gained heals to full.
+ // Returns how many levels were gained.
+ pub fn gainXp(p: Player, amount: num): num !
++  ensures p.xp < xpForLevel(p.level + 1)
+ 
+ // A player or monster that still stands.
+ pub fn isAlive(c: any): bool !
+diff -ruN a/entities.fut b/entities.fut
+--- a/entities.fut	2026-11-28 02:56:52
++++ b/entities.fut	2026-11-28 02:56:52
+@@ -50,7 +50,9 @@
+ // Adds xp, levelling the player up each time their total reaches xpForLevel(level + 1).
+ // Each level adds 5 max hp, 2 atk and 1 def; any level gained heals to full.
+ // Returns how many levels were gained.
+-pub fn gainXp(p: Player, amount: num): num ! {
++pub fn gainXp(p: Player, amount: num): num !
++  ensures p.xp < xpForLevel(p.level + 1)
++{
+   p.xp += amount
+   var gained = 0
+   while p.xp >= xpForLevel(p.level + 1) {
+diff -ruN a/loot.api b/loot.api
+--- a/loot.api	2026-11-28 02:56:52
++++ b/loot.api	2026-11-28 02:56:52
+@@ -30,3 +30,5 @@
+ 
+ // Sells it out of the bag for half its value, rounded down. Returns the gold paid, 0 when it isn't in the bag.
+ pub fn sellItem(p: Player, it: Item): num !
++  ensures old(findItem(p, it)) >= 0 || result == 0
++  ensures old(findItem(p, it)) < 0 || result == floor(it.value / 2)
+diff -ruN a/loot.fut b/loot.fut
+--- a/loot.fut	2026-11-28 02:56:52
++++ b/loot.fut	2026-11-28 02:56:52
+@@ -81,9 +81,12 @@
+ }
+ 
+ // Sells it out of the bag for half its value, rounded down. Returns the gold paid, 0 when it isn't in the bag.
+-pub fn sellItem(p: Player, it: Item): num ! {
++pub fn sellItem(p: Player, it: Item): num !
++  ensures old(findItem(p, it)) >= 0 || result == 0
++  ensures old(findItem(p, it)) < 0 || result == floor(it.value / 2)
++{
+   var i = findItem(p, it)
+-  if i < 0 { return 0 }
++  if i <= 0 { return 0 }
+   takeAt(p, i)
+   var paid = floor(it.value / 2)
+   p.gold += paid

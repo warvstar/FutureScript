@@ -22,8 +22,8 @@ def check(task, compilers):
         with tempfile.TemporaryDirectory() as d:
             start = f'{d}/start'
             make_project(task, start)
-            if meta.get('kind', 'planted') == 'planted' and name == 'new' and meta.get('bug') != 'logic':
-                pass  # the new compiler may reject a planted bug at compile time: that is the point
+            if meta.get('kind', 'planted') == 'planted' and (meta.get('contract') or name == 'new' and meta.get('bug') != 'logic'):
+                pass  # the new compiler may reject a planted bug at compile time, a contract's property test may catch it: that is the point
             else:
                 ok, s = own_tests(start, root)
                 if not ok:
