@@ -607,7 +607,7 @@ def runner_map(exe):
 
 
 def runner_map_budget(exe):
-    """fut map within a token budget (--budget, 4 bytes a token): all of it if it fits, else top-level declarations (members
+    """fut map within a token budget (--budget; 2.3 characters a token, a run of spaces as one): all of it if it fits, else top-level declarations (members
     counted), else files, else packages, with a note saying so; and names to show: several, exact ones first (saying which
     names they hid), else every name a term is part of, else a name with its letters in order; globs; a note for a term that matches nothing.
     A program that doesn't compile is mapped from its source (the files its imports reach), with a note saying so."""
@@ -615,11 +615,12 @@ def runner_map_budget(exe):
     tree(d, {**PKG_TREE, "solo.fut": "fn draw() { }\nfn drawAll() { }\nclass Pen {\n  var ink = 0\n  fn draw() { }\n}\n"})
     run = lambda *a: subprocess.run([*runner(exe), "map", *a], capture_output=True, text=True, timeout=60)
     main = str(d / "app" / "main.fut")
+    tokens = lambda out: (len(re.sub(" +", " ", out)) * 10 + 22) // 23  # as fut map counts them
     body = lambda out: "".join(l for l in out.splitlines(True) if not l.startswith("// the whole map") and not l.startswith("// For more"))
     full, nolimit = run(main), run("--budget", "0", main)
-    top = run("--budget", str(len(full.stdout) // 4 - 1), main)
-    files = run("--budget", str((len(body(top.stdout)) + 3) // 4 - 1), main)
-    pkgs, tiny = run("--budget", str((len(body(files.stdout)) + 3) // 4 - 1), main), run("--budget", "1", main)
+    top = run("--budget", str(tokens(full.stdout) - 1), main)
+    files = run("--budget", str(tokens(body(top.stdout)) - 1), main)
+    pkgs, tiny = run("--budget", str(tokens(body(files.stdout)) - 1), main), run("--budget", "1", main)
     two, member, part = run(main, "len", "hidden"), run(main, "Vec.len"), run(main, "uni")
     letters, glob, some = run(main, "hddn"), run(main, "*it"), run(main, "len", "zzz")
     exact, js = run(str(d / "solo.fut"), "draw"), run("--json", main, "len")

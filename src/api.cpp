@@ -546,8 +546,13 @@ static int matchTier(const std::string& term, const std::vector<std::string>& wh
   if (!sentence) for (auto& n : parts) if (letters(term, n)) return 1;
   return 0;
 }
-// About how many tokens a model reads the map as: 4 bytes each (tokenizers make 4.6 of it, the alignment included).
-static size_t tokensAbout(const std::string& s) { return (s.size() + 3) / 4; }
+// About how many tokens a model reads the map as, rounded up: 2.3 characters each, a run of spaces (the alignment)
+// as one. Tokenizers make 2.3 to 2.6 of a full map's characters a token, and 3.2 of a list of files or packages.
+static size_t tokensAbout(const std::string& s) {
+  size_t n = 0;
+  for (size_t i = 0; i < s.size(); i++) n += s[i] != ' ' || i == 0 || s[i - 1] != ' ';
+  return (n * 10 + 22) / 23;
+}
 static std::string thousands(size_t n) { return n >= 1000 ? std::to_string((n + 500) / 1000) + "k" : std::to_string(n); }
 static std::string counted(size_t n, const std::string& what) { return std::to_string(n) + " " + what + (n == 1 ? "" : "s"); }
 
