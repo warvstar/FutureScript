@@ -180,7 +180,7 @@ test "structs and matrices: what doesn't mean the same on both is a compile erro
   expect compileErr("gpu fn f(m: mat2x2f): mat2x2f \{ return m + m }").has("doesn't + them")
   expect compileErr("gpu fn f(m: mat2x2f, v: vec3f): vec3f \{ return m * v }").has("a vector of 2")
   expect compileErr("gpu fn f(m: mat2x2f): num \{ return m.x }").has("index a matrix's columns")
-  expect compileErr("gpu fn f(m: mat2x2f): mat2x2f \{ m[0] = vec2f(1, 1) return m }").has("doesn't change vectors or matrices by index")
+  expect compileErr("gpu fn f(m: mat2x2f): mat2x2f \{ m[0] = vec2f(1, 1) return m }").has("sets by index only a vector's components, and m is mat2x2f: make a new matrix")
   expect compileErr("gpu fn f(v: vec2f): num \{ return v.z }").has("vec2f has no .z")
   expect compileErr("gpu fn f(x: num): num \{ return x > 0 ? mat2x2f(vec2f(1, 0), vec2f(0, 1)) : x }").has("use if for mat2x2f")
 }
@@ -263,4 +263,33 @@ test "math.fract, floor of a vector and v.distance(w): the same on the CPU as in
   expect err(fn() { vec2f(0, 0).distance(vec3f(0, 0, 0)) }).has("different lengths")
   expect ripple(vec2f(3, 4), vec2f(0, 0.5)) == math.fract(vec2f(3, 3.5).length() * 2)
   expect wgsl(ripple).wgsl.has("return fract((distance(l_p, l_center) * 2.0));")
+}
+
+// v[i] = e sets a local vector's component by index (on the CPU, v becomes a copy with it changed).
+gpu fn corner(face: u32, k: u32): vec3f {
+  var axis = face >> 1
+  var q = vec3f(0)
+  q[axis] = face % 2
+  q[(axis + 1) % 3] = k == 1 || k == 2 ? 1 : 0
+  q[(axis + 2) % 3] += k >= 2 ? 1 : 0
+  return q - 0.5
+}
+gpu fn glowOf(sun: glow.Light): num { return glow.lit(sun, vec3f(0, 1, 0)) + corner(0, 0).x }
+
+test "v[i] = e: a component by index, the same on the CPU as in WGSL" {
+  expect corner(0, 0) == vec3f(-0.5, -0.5, -0.5)
+  expect corner(3, 2) == vec3f(0.5, 0.5, 0.5)
+  expect corner(5, 1) == vec3f(0.5, -0.5, 0.5)
+  var w = wgsl(corner).wgsl
+  expect w.has("l_q[l_axis] = f32((l_face % 2u));") && w.has("l_q[((l_axis + 1u) % 3u)] = select(0.0, 1.0, ((l_k == 1u) || (l_k == 2u)));")
+  expect w.has("l_q[((l_axis + 2u) % 3u)] = (l_q[((l_axis + 2u) % 3u)] + select(0.0, 1.0, (l_k >= 2u)));")
+}
+
+test "wgsl([f, g]): several gpu fns in one shader, what they share declared once" {
+  var w = wgsl([glowOf, bright, corner])
+  expect w.entries == ["gpu_fns_glowOf", "gpu_fns_bright", "gpu_fns_corner"]
+  expect len(w.wgsl.split("struct Light")) == 2 && len(w.wgsl.split("fn glow_lit(")) == 2
+  expect len(w.wgsl.split("fn gpu_fns_corner(")) == 2 && w.wgsl.has("const glow_LEVELS: u32 = 4u;")
+  expect w.wgsl.find("struct Light") < w.wgsl.find("fn ")  // structs and consts first
+  expect err(fn() { wgsl([glowOf, 3]) }).has("expects a gpu fn, or a list of them")
 }

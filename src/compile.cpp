@@ -2060,7 +2060,7 @@ struct Compiler : Gen, Namespaces {
         case S_handle: if (peekIs('{') && !peek().nl) return next(), handleStmt(), false; break;
         case S_match: if (isMatch()) return next(), matchStmt(), false; break;
       }
-    if (gpuBody && at(T_ID) && cur.sym >= NKW) {  // v.x = e (v a local vector): v = vec@set(v, x, op, e)
+    if (gpuBody && at(T_ID) && cur.sym >= NKW) {  // v.x = e, v[i] = e (v a local vector): v = a copy with that changed
       Lexer s = lx;
       Tok d = s.next(), f = s.next(), o = s.next();
       LV lv = d.t == '.' && f.t == T_ID && (o.t == '=' || (o.t >= T_ADDEQ && o.t <= T_DIVEQ)) ? resolve(F, cur.sym) : LV{LV_NONE};
@@ -2072,6 +2072,22 @@ struct Compiler : Gen, Namespaces {
         imm(0, box((double)f.sym)), st(0, b);
         ldl(0, lv.a), st(0, a);
         internalCall("vec@set", base, 4);
+        stl(0, lv.a);
+        return false;
+      }
+      lv = d.t == '[' ? resolve(F, cur.sym) : LV{LV_NONE};
+      if (lv.k == LV_LOCAL) {  // v[i] = e: v = vec@at(v, i, op, e)
+        next(), next();
+        int base = slot(), a = slot(), b = slot(), c = slot(), e = slot();
+        expr(), st(0, b);
+        expect(']');
+        int op = cur.t;
+        if (op != '=' && (op < T_ADDEQ || op > T_DIVEQ)) fail("@gpu expected '=': a gpu fn's statement v[i] sets a component (v[i] = e)");
+        next();
+        expr(), st(0, e);
+        imm(0, box((double)(op == '=' ? -1 : O_ADD + (op - T_ADDEQ)))), st(0, c);
+        ldl(0, lv.a), st(0, a);
+        internalCall("vec@at", base, 4);
         stl(0, lv.a);
         return false;
       }

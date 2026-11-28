@@ -144,7 +144,11 @@ bool lowerViews(const std::string& source, const std::string& path, LoweredView&
 // gpu fn (wgsl.cpp): a top-level function also translated to WGSL. Each file's gpu fns, from their `fn`; a gpu fn
 // calls others of its file by name, and those of a file it imports as x.name.
 struct GpuFnSrc { int sym; const char* p; int line; };
-struct GpuInfo { std::string wgsl, entry, name, result; std::vector<std::string> names, types; };  // name: as fut calls it
+struct GpuInfo {  // name: as fut calls it. decls: each struct, const and fn of wgsl, by its WGSL name, for wgsl([f, g])
+  std::string wgsl, entry, name, result;
+  std::vector<std::string> names, types;
+  std::vector<std::pair<std::string, std::string>> decls;
+};
 // fail(file, p, line, message) reports what the GPU can't do, and does not return (a compile error)
 struct GpuFile;
 using GpuFail = std::function<void(const GpuFile&, const char*, int, const std::string&)>;  // where, in that file's source

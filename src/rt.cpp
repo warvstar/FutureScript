@@ -1041,6 +1041,21 @@ static V n_vecSet(V v, V f, V op, V x) {
   ((float*)n->p)[at[0]] = (float)r;
   return box(n);
 }
+static V n_vecAt(V v, V i, V op, V x) {  // v[i] = e in a gpu fn: a copy of v with that component changed
+  Buf* b = vecArg(v, "a component's assignment");
+  double k = vnum(i, "a component's index");
+  if (k != std::trunc(k) || k < 0 || k >= (double)b->n) ERR("@index an f32s of %zu has no component %s", b->n, toStr(i, true).c_str());
+  double old = ((float*)b->p)[(size_t)k], val = vnum(x, "a component's assignment");
+  int o = (int)num(op);
+  double r = o < 0 ? val : o == O_ADD ? old + val : o == O_SUB ? old - val : o == O_MUL ? old * val : old / val;
+  volatile V keep[] = {v};
+  (void)keep;
+  Buf* n = newBuf('f', b->n);
+  b = as<Buf>(v);
+  memcpy(n->p, b->p, b->n * sizeof(float));
+  ((float*)n->p)[(size_t)k] = (float)r;
+  return box(n);
+}
 // Matrices, as gpu fns use them: mat2x2f(c0, c1), mat3x3f, mat4x4f are lists of their n columns, each a vector of n
 // (m[i] is a column). m * v, v * m (v as a row), m * m and m * k multiply as WGSL does.
 static int matSize(V v) {
@@ -1280,7 +1295,7 @@ void rtInit() {
   method<+[](V f) { return boxb(as<Fiber>(f)->state == FIB_DONE); }>(K::Fiber, S_done);
   method<l_push>(K::List, S_push), method<l_pop>(K::List, S_pop), method<n_len>(K::List, S_len);
   method<n_len>(K::Str, S_len), method<n_len>(K::Map, S_len), method<n_len>(K::Buf, S_len);
-  native<n_vec2>("vec2f"), native<n_vec3>("vec3f"), native<n_vec4>("vec4f"), native<n_vecSet>("vec@set");
+  native<n_vec2>("vec2f"), native<n_vec3>("vec3f"), native<n_vec4>("vec4f"), native<n_vecSet>("vec@set"), native<n_vecAt>("vec@at");
   native<n_vecOf>("vec@of"), native<n_unpack4x8unorm>("unpack4x8unorm");
   native<n_mat2>("mat2x2f"), native<n_mat3>("mat3x3f"), native<n_mat4>("mat4x4f");
   method<v_length>(K::Buf, intern("length")), method<v_dot>(K::Buf, intern("dot")), method<v_distance>(K::Buf, intern("distance"));

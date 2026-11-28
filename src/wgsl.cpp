@@ -14,9 +14,10 @@
 // whole, so the two agree wherever both run.
 //
 // Vectors, matrices and structs are values on the GPU. On the CPU they are objects, so a gpu fn never changes one in
-// place except v.x = e on a local vector, which the CPU compiles as v = a copy with x changed (vec@set). A file's
-// functions and gpu vars are named stem_name in WGSL (its file's name), so two files' translations go in one shader;
-// structs keep their names, so hand-written WGSL beside them can use them.
+// place except v.x = e and v[i] = e on a local vector, which the CPU compiles as v = a copy with that changed (vec@set,
+// vec@at). A file's functions and gpu vars are named stem_name in WGSL (its file's name), so two files' translations go
+// in one shader; structs keep their names, so hand-written WGSL beside them can use them. wgsl([f, g]) joins several
+// translations, declaring once what they share.
 #include "compile.h"
 #include <cmath>
 #include <map>
@@ -52,7 +53,7 @@ bool isScalar(int t) { return t == F32 || t == U32 || t == WHOLE; }
 int size(int t) { return isVec(t) ? t - V2 + 2 : t - M2 + 2; }
 
 // A gpu var: its WGSL constant, and its shape (no dims: a number).
-struct Table { std::string name, wgsl; int elem = F32; std::vector<size_t> dims; };
+struct Table { std::string name, id, wgsl; int elem = F32; std::vector<size_t> dims; };  // id: its WGSL name
 struct Struct { std::string name, wgsl; std::vector<std::pair<std::string, int>> fields; };
 struct E { std::string s; int t = F32; double n = 0; const Table* tab = nullptr; size_t depth = 0; };
 struct Sig { std::vector<int> params; std::vector<std::string> names; int result = VOID; };
@@ -346,9 +347,25 @@ struct Tr {
           return line(c + " = " + to(v, F32, vt) + ";");
         }
       }
-      if (n.t == '[') {
+      if (n.t == '[') {  // v[i] = e: one component of a local vector, by index
         for (auto& v : home.vars) if (v.sym == cur.sym) fail(t, symName(v.sym) + " is a gpu var: it never changes");
-        fail(t, "a gpu fn doesn't change vectors or matrices by index: set v.x, or make a new one");
+        int vs = ident();
+        Local* l = local(vs);
+        if (!l) fail(t, "a gpu fn changes components only of its own vectors: " + symName(vs) + " isn't a parameter or local");
+        if (!isVec(l->t)) fail(t, "a gpu fn sets by index only a vector's components, and " + symName(vs) + " is " + tyName(l->t) + (isMat(l->t) ? ": make a new matrix" : ""));
+        next();
+        Tok it = cur;
+        E i = expr();
+        expect(']');
+        Tok o = cur;
+        if (!assigns(o.t)) fail(o, "expected '=': a gpu fn's statement v[i] sets a component (v[i] = e)");
+        next();
+        Tok vt = cur;
+        E v = expr();
+        std::string c = L(vs) + "[" + to(i, U32, it) + "]";
+        if (o.t != '=') v = binop(compound(o.t), {c, F32}, v, o);
+        if (isVec(v.t)) fail(vt, "a component is a number, not " + tyName(v.t));
+        return line(c + " = " + to(v, F32, vt) + ";");
       }
     }
     fail(t, "a gpu fn's statements are var, assignment, if, match, while, for, return, break and continue");
@@ -835,7 +852,8 @@ struct Tr {
       for (size_t i = 0; i < g.dims[d]; i++) s += (i ? ", " : "") + emit(d + 1);
       return s + ")";
     };
-    g.wgsl = "const " + wgslName(home, name) + ": " + types[0] + " = " + emit(0) + ";\n";
+    g.id = wgslName(home, name);
+    g.wgsl = "const " + g.id + ": " + types[0] + " = " + emit(0) + ";\n";
     return g;
   }
   // A number, or a list of these, all lists at one depth of one length: vals in order, dims each depth's length.
@@ -898,6 +916,7 @@ GpuInfo wgslOf(const GpuFile& file, size_t i, const GpuModule& module, const Gpu
   std::map<Key, GpuInfo> done;
   std::map<Key, char> state;  // 1 translating, 2 translated
   std::string all;
+  std::vector<std::pair<std::string, std::string>> fnDecls;
   std::function<void(Key, const GpuFile*, const Tok*)> visit = [&](Key k, const GpuFile* in, const Tok* from) {
     const GpuFnSrc& f = k.first->fns[k.second];
     if (state[k] == 2) return;
@@ -907,13 +926,15 @@ GpuInfo wgslOf(const GpuFile& file, size_t i, const GpuModule& module, const Gpu
     done[k] = t.function(f);
     for (auto& [d, at] : t.deps) visit(d, k.first, &at);
     all += done[k].wgsl + "\n";
+    fnDecls.push_back({done[k].entry, done[k].wgsl});
     state[k] = 2;
   };
   visit({&file, i}, nullptr, nullptr);
   std::string decls;
-  for (auto& st : sh.structs) decls += st.wgsl;
-  for (Key k : sh.tableOrder) decls += sh.tables[k].wgsl;
   GpuInfo r = done[{&file, i}];
+  for (auto& st : sh.structs) decls += st.wgsl, r.decls.push_back({st.name, st.wgsl});
+  for (Key k : sh.tableOrder) decls += sh.tables[k].wgsl, r.decls.push_back({sh.tables[k].id, sh.tables[k].wgsl});
+  r.decls.insert(r.decls.end(), fnDecls.begin(), fnDecls.end());
   r.wgsl = decls + (decls.empty() ? "" : "\n") + all;
   return r;
 }
@@ -925,8 +946,8 @@ void gpuInfoSet(int sym, GpuInfo i) {
   std::lock_guard g(gpuMu);
   gpuInfos[sym] = std::move(i);
 }
-static V n_wgsl(V f) {
-  if (!is(f, K::Fn)) ERR("@argument wgsl() expects a gpu fn, got %s", typeName(f));
+static GpuInfo gpuInfoOf(V f) {
+  if (!is(f, K::Fn)) ERR("@argument wgsl() expects a gpu fn, or a list of them, got %s", typeName(f));
   GpuInfo i;
   bool found = false;
   {  // (no error while holding the lock: an error unwinds past the guard)
@@ -935,6 +956,37 @@ static V n_wgsl(V f) {
     if (it != gpuInfos.end()) i = it->second, found = true;
   }
   if (!found) ERR("@argument wgsl(): %s is not a gpu fn (declare it gpu fn %s(...))", symName(as<Fn>(f)->name).c_str(), symName(as<Fn>(f)->name).c_str());
+  return i;
+}
+// wgsl([f, g, ...]): their translations in one, each struct, const and fn once (what they share, they share), and the
+// entries, in order. Two declarations of one name that differ (structs of one name from two files) are an error.
+static V wgslOfAll(V fs) {
+  std::vector<GpuInfo> infos;
+  for (V f : as<List>(fs)->v) infos.push_back(gpuInfoOf(f));
+  std::map<std::string, std::string> seen;
+  std::string types, fns, clash;
+  for (auto& i : infos)
+    for (auto& [name, text] : i.decls) {
+      auto [it, fresh] = seen.emplace(name, text);
+      if (!fresh) {
+        if (it->second != text && clash.empty()) clash = name;
+        continue;
+      }
+      (text.compare(0, 3, "fn ") == 0 ? fns : types) += text + (text.compare(0, 3, "fn ") == 0 ? "\n" : "");
+    }
+  if (!clash.empty()) ERR("@argument wgsl(): these gpu fns use two different declarations named %s (structs of one name in two files?): rename one", clash.c_str());
+  Map* m = make<Map>();
+  volatile V keep[2] = {box(m)};
+  (void)keep;
+  List* entries = make<List>();
+  keep[1] = box(entries);
+  for (auto& i : infos) entries->v.push_back(box(newStr(i.entry)));
+  mapPut(m, "wgsl", box(newStr(types + (types.empty() ? "" : "\n") + fns))), mapPut(m, "entries", box(entries));
+  return box(m);
+}
+static V n_wgsl(V f) {
+  if (is(f, K::List)) return wgslOfAll(f);
+  GpuInfo i = gpuInfoOf(f);
   Map* m = make<Map>();
   volatile V keep[3] = {box(m)};
   (void)keep;
