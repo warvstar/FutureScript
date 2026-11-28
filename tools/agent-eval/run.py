@@ -158,6 +158,7 @@ def main():
     ap.add_argument('--new', required=True, help='fut checkout with it (built)')
     ap.add_argument('--models', default='sonnet')
     ap.add_argument('--reps', type=int, default=1)
+    ap.add_argument('--sides', default='old,new', help='which compilers to run (new alone: compare with an earlier run)')
     ap.add_argument('--jobs', type=int, default=6)
     ap.add_argument('--budget', type=float, default=3, help='max dollars per run')
     ap.add_argument('--timeout', type=int, default=1800, help='max seconds per run')
@@ -170,7 +171,7 @@ def main():
     tasks = [t for t in all_tasks if not a.tasks or any(fnmatch.fnmatch(t, p) for p in a.tasks)]
     if not tasks:
         sys.exit('no task matches')
-    jobs = [(t, c, m, r) for r in range(a.reps) for m in a.models.split(',') for t in tasks for c in ('old', 'new')]
+    jobs = [(t, c, m, r) for r in range(a.reps) for m in a.models.split(',') for t in tasks for c in a.sides.split(',')]
 
     def safe(j):
         try:

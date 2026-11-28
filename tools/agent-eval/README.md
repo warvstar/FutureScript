@@ -66,3 +66,16 @@ audit code outside the task.
   and cost about 4 turns each, compared within the same task.
 - **Other recurring errors:** Haiku's brace mistakes that leave a method outside its class (`'self' outside a
   method`, `'init' is already defined`), Sonnet's default arguments, and `s.slice(a)` with one argument.
+
+**Expect parts** (`e526391`, where each `&&` part of a top-level `expect` is its own deep comparison, and `== []`
+is rejected elsewhere; the same 12 feature tasks × 3 runs, compared with the `5973225` runs above):
+
+| model | build | passed | turns | cost | failed expects | `==`-in-`&&` failures (runs hit) |
+|---|---|---|---|---|---|---|
+| Sonnet | `5973225` | 36/36 | 15.7 | $0.333 | 27 | 20 (11) |
+| Sonnet | `e526391` | 36/36 | 14.5 | $0.318 | 12 | 0 (0) |
+| Haiku | `5973225` | 36/36 | 19.7 | $0.024 | 26 | 20 (8) |
+| Haiku | `e526391` | 36/36 | 17.8 | $0.023 | 5 | 0 (0) |
+
+The pitfall is gone, and turns fell by 1.6 per task on average, more on the tasks it used to hit (AF2: 22 → 16 on
+Haiku, 19 → 14 on Sonnet; DF1: 14 → 10 on Sonnet). No run hit the new `[compare]` error.
