@@ -503,8 +503,9 @@ struct Compiler : Gen, Namespaces {
   // steps now and resolve them after parsing. Use separate alias nodes so invalidating
   // a reassigned local never changes the declared type of its source field.
   // field: a field's symbol; -1 the parent's own type (an alias); EACH what `for x in` the parent gives (a list<T>'s
-  // T, a map<K, V>'s K); AT what parent[i] gives (T; V or nil). result >= 0: the declared result of that fn (no parent).
-  enum { EACH = -2, AT = -3 };
+  // T, a map<K, V>'s K); AT what parent[i] gives (T; V or nil); CALL the declared result of method `result` of the
+  // parent's class (overrides declare the same types). result >= 0 without a parent: the declared result of that fn.
+  enum { EACH = -2, AT = -3, CALL = -4 };
   struct TypePath { int parent, field; uint64_t type; int result = -1; };
   std::vector<TypePath> paths{{0, -1, 0}};
   int addPath(int parent, int field, uint64_t type = 0) {
@@ -2021,6 +2022,7 @@ struct Compiler : Gen, Namespaces {
           std::vector<int> origins;
           std::vector<ArgVal> args;
           next(), s == S_push ? pushCall(&origins) : call(s, false, &origins, recv ? &args : nullptr), v = {};
+          if (recv) paths.push_back({recv, CALL, 0, s}), v.path = int(paths.size()) - 1;
           if (recv) callSites.push_back({s, std::move(args), file, srcStart, -1, ft.p, ft.line, recv});
           effRecord('m', s, std::move(origins), self, receiver);
         }
@@ -4360,12 +4362,24 @@ struct Compiler : Gen, Namespaces {
       }
     // Parents precede children. An untyped shadowing field stops lookup in its base.
     for (auto& p : paths) {
-      if (p.result >= 0)
+      if (p.result >= 0 && !p.parent)
         if (auto it = sigs.find(symName(p.result)); it != sigs.end() && !it->second.types.empty()) p.type = it->second.types.back();
       if (!p.parent) continue;
       uint64_t parent = paths[p.parent].type;
       if (p.field == -1) { p.type = parent; continue; }
       uint64_t t = resolveNow(parent) & ~TY_OPT;
+      if (p.field == CALL) {
+        for (int c = (t & 15) == TY_CLS ? int(t >> 8) : -1, hops = 0; c >= 0 && hops < 64; hops++) {  // the class that defines it
+          const ClassView* v = view(c);
+          if (!v) break;
+          if (std::any_of(v->methods.begin(), v->methods.end(), [&](auto& m) { return m.first == p.result; })) {
+            if (auto it = sigs.find(symName(c) + "." + symName(p.result)); it != sigs.end() && !it->second.types.empty()) p.type = it->second.types.back();
+            break;
+          }
+          c = v->super;
+        }
+        continue;
+      }
       if (p.field == EACH || p.field == AT) {
         const TypeDesc* d = (t & 15) == TY_EXT ? typeDesc(t) : nullptr;
         if (d && d->k == 'L') p.type = d->elem;

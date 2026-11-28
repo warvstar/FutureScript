@@ -85,3 +85,10 @@ test "a call's declared result, a loop variable and an element are known types" 
   expect compileErr(item + "fn f(xs: list<Item>) \{ for x in xs \{ x = 1 print(x.nme) } }") == ""
   expect compileErr(item + "fn h() \{ return mk() }\nfn f() \{ return h().nme }") == ""
 }
+test "a method's declared result is known on a known receiver" {
+  var src = "class Item \{\n  var name: str\n  fn init(name: str) \{ self.name = name }\n}\nclass Shelf \{\n  fn top(): Item \{ return Item(\"a\") }\n  fn any() \{ return Item(\"a\") }\n}\nclass Wide : Shelf \{\n  override fn top(): Item \{ return Item(\"b\") }\n}\n"
+  expect compileErr(src + "fn f(s: Shelf) \{ return s.top().nme }").has("'nme' is not a field of Item")
+  expect compileErr(src + "fn f(s: Wide) \{ var i = s.top() return i.nme }").has("'nme' is not a field of Item (i is Item")
+  expect compileErr(src + "fn f(s: Shelf) \{ return s.any().nme }") == ""   // no declared result
+  expect compileErr(src + "fn f(s) \{ return s.top().nme }") == ""           // receiver unknown
+}
