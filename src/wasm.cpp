@@ -700,7 +700,7 @@ EXPORT(fut_poll) u32* futPoll() { return &vm->poll; }
 // fut map: the declarations of the last compile; the number shown. fut_infer_effects first: the next compiles work out
 // what each function does too (Compiled::effects).
 EXPORT(fut_infer_effects) void futInferEffects(int on) { inferEffectsWanted = on; }
-EXPORT(fut_map) int futMap(int pub, int json, const char* only, const char* program) { return printMap(last, pub, json, only, program); }
+EXPORT(fut_map) int futMap(int pub, int json, const char* query, const char* program, int budget) { return printMap(last, pub, json, query, program, budget); }
 // A fut function JavaScript holds (pinned as id), called with args (a JSON array): its result as JSON text. An
 // error in it propagates as a fut exception. Called directly while an extern call is in progress (a callback, as
 // Array.map makes), else at a safepoint, through a promising wrapper.

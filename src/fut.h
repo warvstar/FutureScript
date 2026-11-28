@@ -768,7 +768,8 @@ std::string apiPath(const std::string& file);                               // g
 std::vector<ApiIssue> checkInterfaces(const Compiled&);
 int reportInterfaces(const std::vector<ApiIssue>&, bool json, const std::string& program);  // fut test; the number
 int writeInterfaces(const Compiled&, const std::string& program);                           // fut api; the number
-int printMap(const Compiled&, bool pubOnly, bool json, const std::string& only, const std::string& program);  // fut map
+// fut map: query is names (packages, files, declarations; parts and globs too); budget is in tokens (0: no limit)
+int printMap(const Compiled&, bool pubOnly, bool json, const std::string& query, const std::string& program, long budget);
 // The token scan shared by fut map, fut api and the language server.
 struct Decl {
   std::string kind, name, sig, owner, mod;
