@@ -180,7 +180,7 @@ class Acct {
 expect throws { Acct().take(1) }
 ```
 
-Clauses: one per line, run effect-free and undone. `fut test` property-tests contracts with typed params. `todo()` body = pending.
+Clauses: one per line, run effect-free and undone. `fut test` property-tests contracts with typed params (a class one is built by its `init` from random arguments), trying the numbers the function is written with (500 and 499, 501 for `<= 500`) first. `todo()` body = pending.
 
 ## Tests
 
