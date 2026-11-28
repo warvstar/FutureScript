@@ -24,8 +24,8 @@
 
 namespace {
 const char* const MATH[] = {"acos", "asin", "atan", "atan2", "ceil", "cos", "exp", "log", "log2", "pow", "sin", "tan",
-                            "trunc", "abs", "min", "max", "clamp", "sign"};
-const int MATH_ARITY[] = {1, 1, 1, 2, 1, 1, 1, 1, 1, 2, 1, 1, 1, 1, 2, 2, 3, 1};
+                            "trunc", "abs", "min", "max", "clamp", "sign", "fract"};
+const int MATH_ARITY[] = {1, 1, 1, 2, 1, 1, 1, 1, 1, 2, 1, 1, 1, 1, 2, 2, 3, 1, 1};
 
 std::string lit(double n) {
   char b[40];
@@ -564,8 +564,8 @@ struct Tr {
       if (at('(') && !cur.nl) {
         next();
         auto a = args();
-        size_t want = n == "length" || n == "normalize" ? 0 : n == "dot" || n == "cross" ? 1 : 9;
-        if (want == 9) fail(f, "a gpu fn's vectors have the methods length(), dot(v), normalize() and cross(v), not " + n + "()");
+        size_t want = n == "length" || n == "normalize" ? 0 : n == "dot" || n == "cross" || n == "distance" ? 1 : 9;
+        if (want == 9) fail(f, "a gpu fn's vectors have the methods length(), dot(v), distance(v), normalize() and cross(v), not " + n + "()");
         arity(f, n, a.size(), want);
         if (want == 1 && a[0].first.t != v.t) fail(a[0].second, n + "() takes a " + tyName(v.t) + ", got " + tyName(a[0].first.t));
         if (n == "cross" && v.t != V3) fail(f, "cross() is for vec3f");
@@ -703,7 +703,7 @@ struct Tr {
               return {fn + "(" + s + ")", ty};
             }
         }
-        fail(f, "a gpu fn calls std/math's " + std::string("acos asin atan atan2 ceil cos exp log log2 pow sin tan trunc abs min max clamp sign mix smoothstep") +
+        fail(f, "a gpu fn calls std/math's " + std::string("acos asin atan atan2 ceil cos exp log log2 pow sin tan trunc abs min max clamp sign fract mix smoothstep") +
                     " and reads math.pi and math.e, not " + *m + "." + fn);
       }
     }

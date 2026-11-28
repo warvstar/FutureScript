@@ -66,6 +66,11 @@ pub fn smoothstep(lo: num, hi: num, x: num): num ! {
   return t * t * (3 - 2 * t)
 }
 
+// n's fraction: n - floor(n), from 0 up to 1, as WGSL's fract. A number, or a vector (each of its numbers').
+pub fn fract(n) ! {
+  return n - floor(n)
+}
+
 // -1, 0 or 1.
 pub fn sign(n: num): num ! {
   if n > 0 { return 1 }

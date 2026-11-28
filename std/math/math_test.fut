@@ -15,6 +15,8 @@ test "helpers" {
   expect mix(2, 4, 0.25) == 2.5
   expect mix(vec2f(0, 2), vec2f(4, 6), 0.5) == vec2f(2, 4)
   expect mix(vec2f(0, 2), vec2f(4, 6), vec2f(0, 1)) == vec2f(0, 6)
+  expect fract(2.25) == 0.25 && fract(-0.25) == 0.75 && fract(3) == 0
+  expect fract(vec2f(1.5, -0.25)) == vec2f(0.5, 0.75)
   expect smoothstep(0, 2, -1) == 0 && smoothstep(0, 2, 1) == 0.5 && smoothstep(0, 2, 3) == 1
 }
 fn pure(): num ! { return pow(2, 2) + abs(-1) + round(0.4) }

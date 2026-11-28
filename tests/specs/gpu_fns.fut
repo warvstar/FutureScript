@@ -249,3 +249,18 @@ test "gpu fns, gpu vars and types of an imported file" {
   expect w.wgsl.has("return (glow_lit(l_sun, l_n) * f32((l_k % glow_LEVELS)));")
   expect w.wgsl.find("fn glow_lit") < w.wgsl.find("fn gpu_fns_bright")  // what it calls comes first
 }
+
+gpu fn ripple(p: vec2f, center: vec2f): num { return math.fract(p.distance(center) * 2) }
+gpu fn cellOf(p: vec3f): vec3f { return math.fract(floor(p * 4) * 0.37) }
+
+test "math.fract, floor of a vector and v.distance(w): the same on the CPU as in WGSL" {
+  expect floor(vec2f(1.5, -0.5)) == vec2f(1, -1)
+  expect sqrt(vec2f(4, 9)) == vec2f(2, 3)
+  expect math.fract(vec2f(1.25, -0.25)) == vec2f(0.25, 0.75)
+  expect cellOf(vec3f(0.3, 0.6, -0.1)) == math.fract(vec3f(1, 2, -1) * 0.37)
+  expect wgsl(cellOf).wgsl.has("return fract((floor((l_p * 4.0)) * 0.37));")
+  expect vec2f(3, 4).distance(vec2f(0, 0)) == 5 && vec3f(1, 2, 3).distance(vec3f(1, 2, 3)) == 0
+  expect err(fn() { vec2f(0, 0).distance(vec3f(0, 0, 0)) }).has("different lengths")
+  expect ripple(vec2f(3, 4), vec2f(0, 0.5)) == math.fract(vec2f(3, 3.5).length() * 2)
+  expect wgsl(ripple).wgsl.has("return fract((distance(l_p, l_center) * 2.0));")
+}

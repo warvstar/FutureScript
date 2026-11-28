@@ -969,6 +969,16 @@ static double vdot(Buf* a, Buf* b, const char* f) {
 }
 static V v_length(V v) { Buf* b = vecArg(v, "length"); return box(std::sqrt(vdot(b, b, "length"))); }
 static V v_dot(V v, V w) { return box(vdot(vecArg(v, "dot"), vecArg(w, "dot"), "dot")); }
+static V v_distance(V v, V w) {
+  Buf *a = vecArg(v, "distance"), *b = vecArg(w, "distance");
+  if (a->n != b->n) ERR("@argument distance() on f32s of different lengths: %zu and %zu", a->n, b->n);
+  double d = 0;
+  for (size_t i = 0; i < a->n; i++) {
+    double e = (double)((float*)a->p)[i] - ((float*)b->p)[i];
+    d += e * e;
+  }
+  return box(std::sqrt(d));
+}
 static V v_normalize(V v) {
   Buf* b = vecArg(v, "normalize");
   double l = std::sqrt(vdot(b, b, "normalize"));
@@ -1176,8 +1186,21 @@ static V n_parseJson(V s) {
   return fromJs(std::string(as<Str>(s)->sv()), false);
 }
 static V n_sleep(V v) { return sleepFor(NUMARG(v, "sleep")), NIL; }
-static V n_floor(V v) { return box(std::floor(NUMARG(v, "floor"))); }
-static V n_sqrt(V v) { return box(std::sqrt(NUMARG(v, "sqrt"))); }
+// floor and sqrt of a number, or of each of an f32s' (a vector's) numbers, as WGSL's
+template <double (*F)(double)> static V eachOf(V v, const char* f) {
+  if (isNum(v)) return box(F(num(v)));
+  if (!is(v, K::Buf) || !isF32s(v)) ERR("@argument %s() expects a number or a vector, got %s", f, typeName(v));
+  Buf* b = as<Buf>(v);
+  volatile V keep = v;
+  (void)keep;
+  Buf* r = newBuf('f', b->n);
+  for (size_t i = 0; i < b->n; i++) ((float*)r->p)[i] = (float)F(((float*)b->p)[i]);
+  return box(r);
+}
+static double floorOf(double x) { return std::floor(x); }
+static double sqrtOf(double x) { return std::sqrt(x); }
+static V n_floor(V v) { return eachOf<floorOf>(v, "floor"); }
+static V n_sqrt(V v) { return eachOf<sqrtOf>(v, "sqrt"); }
 static V l_push(V l, V v) {
   if (obj(l)->typed & 1) typeWrite(obj(l), NIL, v, RA());
   touch(obj(l)), as<List>(l)->v.push_back(v);
@@ -1260,7 +1283,7 @@ void rtInit() {
   native<n_vec2>("vec2f"), native<n_vec3>("vec3f"), native<n_vec4>("vec4f"), native<n_vecSet>("vec@set");
   native<n_vecOf>("vec@of"), native<n_unpack4x8unorm>("unpack4x8unorm");
   native<n_mat2>("mat2x2f"), native<n_mat3>("mat3x3f"), native<n_mat4>("mat4x4f");
-  method<v_length>(K::Buf, intern("length")), method<v_dot>(K::Buf, intern("dot"));
+  method<v_length>(K::Buf, intern("length")), method<v_dot>(K::Buf, intern("dot")), method<v_distance>(K::Buf, intern("distance"));
   method<v_normalize>(K::Buf, intern("normalize")), method<v_cross>(K::Buf, intern("cross"));
   gfxInit();
   gpuInit();

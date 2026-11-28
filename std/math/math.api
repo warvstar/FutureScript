@@ -27,6 +27,9 @@ pub var e
 
 pub extern fn exp(num): num !
 
+// n's fraction: n - floor(n), from 0 up to 1, as WGSL's fract. A number, or a vector (each of its numbers').
+pub fn fract(n) !
+
 pub extern fn hypot(num, num): num !
 
 // Is n not a number (0 / 0)?
