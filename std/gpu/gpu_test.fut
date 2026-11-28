@@ -128,6 +128,18 @@ gpu fn spun(v: vec4f, a: num): vec4f {  // a matrix, a struct and v.z += on the 
   return vec4f(r.x, r.y, r.z, q.w)
 }
 
+gpu fn sorted(x: num): num {  // match (a switch), vector shorthands, unpack4x8unorm, mix and smoothstep on the GPU
+  var k: u32 = x
+  var r = vec2f(0)
+  match k {
+    0 { r = vec2f(1, 0) }
+    1, 2 { r = vec2f(math.mix(2, 4, x / 4), 1) }
+    5..9 { r = unpack4x8unorm(k * 0x10203).xy * 8 }
+    else { r = vec2f(math.smoothstep(0, 20, x), -1) }
+  }
+  return vec3f(r, 1).x + r.y
+}
+
 test "map: a gpu fn over each element, on the GPU, as on the CPU" {
   var xs = f32s([1, 2, 3, 4])
   g.map(scale, xs, [3, 0.5])
@@ -153,6 +165,12 @@ test "map: a gpu fn over each element, on the GPU, as on the CPU" {
   var c0 = spun(vec4f(1, 2, 3, 4), 0.7)
   var c1 = spun(vec4f(-1, 0.5, 2, 0), 0.7)
   for i in 0..4 { expect math.abs(sp[i] - c0[i]) < 1e-5 && math.abs(sp[4 + i] - c1[i]) < 1e-5 }
+  var ks = f32s(12)
+  for i in 0..12 { ks[i] = i }
+  g.map(sorted, ks, [])
+  for i in 0..12 { expect math.abs(ks[i] - sorted(i)) < 1e-5 }
+  expect sorted(0) == 1 && sorted(2) == 4
+  expect math.abs(sorted(9) - (math.smoothstep(0, 20, 9) - 1)) < 1e-6  // r holds f32s
 }
 
 test "paint: a gpu fn colors each pixel" {

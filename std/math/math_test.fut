@@ -12,6 +12,10 @@ test "helpers" {
   expect sign(-2) == -1 && sign(0) == 0
   expect round(2.5) == 3 && round(-2.5) == -3 && round(1.4) == 1
   expect isNaN(0 / 0) && !isNaN(1)
+  expect mix(2, 4, 0.25) == 2.5
+  expect mix(vec2f(0, 2), vec2f(4, 6), 0.5) == vec2f(2, 4)
+  expect mix(vec2f(0, 2), vec2f(4, 6), vec2f(0, 1)) == vec2f(0, 6)
+  expect smoothstep(0, 2, -1) == 0 && smoothstep(0, 2, 1) == 0.5 && smoothstep(0, 2, 3) == 1
 }
 fn pure(): num ! { return pow(2, 2) + abs(-1) + round(0.4) }
 test "callable from code that performs nothing" {

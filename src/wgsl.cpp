@@ -1,8 +1,9 @@
 // gpu fn: a top-level function compiled for the CPU like any other, and also translated to WGSL, which std/gpu runs on
 // the GPU. The translation re-reads the function's source. It takes the part of fut that means the same on both: f32
 // numbers, u32 whole numbers, bools, vectors (vec2f, vec3f, vec4f), matrices (mat2x2f, mat3x3f, mat4x4f), structs (a
-// `type Name = {field: type, ...}` of the file), locals, if / while / for over a range, calls of other gpu fns of its
-// file, sqrt, floor, int, std/math's functions, the vector methods, and the file's gpu vars (constant numbers and
+// `type Name = {field: type, ...}` of the file), locals, if / while / for over a range / match on a u32 (a switch),
+// calls of other gpu fns of its file, sqrt, floor, int, unpack4x8unorm, std/math's functions (mix and smoothstep
+// too), the vector methods, and the file's gpu vars (constant numbers and
 // tables of them). Anything else is a compile error naming what to write instead, so a gpu fn that compiles runs the
 // same on the GPU as on the CPU (up to f32 rounding, and u32 + * << wrapping past 2^32).
 //
@@ -81,6 +82,7 @@ struct Tr {
   std::vector<std::pair<size_t, Tok>> deps;  // the gpu fns it calls, and where it first does
   std::string out;
   int result = VOID, indent = 1, tmp = 0;
+  int arms = 0;  // match arms open inside the innermost loop: WGSL's break there would leave only the switch
 
   [[noreturn]] void fail(const Tok& t, const std::string& m) { sh.failed(t.p, t.line, m), abort(); }
   void next() {
@@ -151,11 +153,57 @@ struct Tr {
     scopes.pop_back();
   }
   void body() { indent++, block(), indent--; }
+  void loopBody() {
+    int outer = arms;
+    arms = 0, body(), arms = outer;
+  }
   std::string cond() {
     Tok t = cur;
     E c = expr();
     if (c.t != BOOL) fail(t, "a gpu fn's conditions are bools, not " + tyName(c.t) + ": compare (x != 0)");
     return c.s;
+  }
+  // match k { 0 { } 1, 2 { } 4..8 { } else { } }: WGSL's switch, on a u32, each range listed out as its cases
+  void match() {
+    next();
+    Tok st = cur;
+    E v = expr();
+    if (v.t != U32 && v.t != WHOLE)
+      fail(st, "a gpu fn matches a u32 (WGSL's switch), not " + tyName(v.t) + (v.t == F32 ? ": declare it u32 (var k: u32 = ...)" : ""));
+    line("switch (" + to(v, U32, st) + ") {"), indent++;
+    expect('{');
+    std::vector<double> seen;
+    bool otherwise = false;
+    while (!accept('}')) {
+      if (at(T_EOF)) fail(cur, "expected '}'");
+      if (atKw(K_else)) {
+        next(), line("default: {"), arms++, body(), arms--, line("}"), otherwise = true;
+        if (!accept('}')) fail(cur, "the else arm is the last arm of a match: expected '}'");
+        break;
+      }
+      std::string cases;
+      do {
+        Tok vt = cur;
+        auto number = [&] {
+          bool neg = accept('-');
+          if (!at(T_NUM)) fail(cur, "a gpu fn's match has arms of numbers (1), several (1, 2) and ranges (1..4), then else");
+          next();
+          return neg ? -prev.n : prev.n;
+        };
+        double a = number(), b = a + 1;
+        if (accept(T_DOTDOT)) b = number();
+        if (!isU32(a) || !isU32(b - 1) || b <= a)
+          fail(vt, "a u32 matches whole numbers from 0 to 4294967295, and a range a..b holds a up to, not including, b");
+        if (b - a > 256) fail(vt, "a range in a gpu fn's match holds at most 256 numbers: WGSL lists each as a case");
+        for (double x = a; x < b; x++) {
+          if (std::find(seen.begin(), seen.end(), x) != seen.end()) fail(vt, "an earlier arm of this match already holds " + u32Lit(x));
+          seen.push_back(x), cases += (cases.empty() ? "" : ", ") + u32Lit(x);
+        }
+      } while (accept(','));
+      line("case " + cases + ": {"), arms++, body(), arms--, line("}");
+    }
+    if (!otherwise) line("default: {}");
+    indent--, line("}");
   }
   static int compound(int op) { return op == T_ADDEQ ? '+' : op == T_SUBEQ ? '-' : op == T_MULEQ ? '*' : '/'; }
   void stmt() {
@@ -190,7 +238,7 @@ struct Tr {
     }
     if (atKw(K_while)) {
       next();
-      line("while (" + cond() + ") {"), body();
+      line("while (" + cond() + ") {"), loopBody();
       return line("}");
     }
     if (atKw(K_for)) {
@@ -206,7 +254,7 @@ struct Tr {
       line("{"), indent++;
       line("let " + end + " = " + b + ";");
       line("for (var " + L(s) + " = " + a + "; " + L(s) + " < " + end + "; " + L(s) + " += 1.0) {");
-      scopes.push_back({{s, F32, true}}), body(), scopes.pop_back();
+      scopes.push_back({{s, F32, true}}), loopBody(), scopes.pop_back();
       line("}"), indent--;
       return line("}");
     }
@@ -219,7 +267,15 @@ struct Tr {
       Tok vt = cur;
       return line("return " + to(this->value(result), result, vt) + ";");
     }
-    if (atKw(K_break) || atKw(K_continue)) return next(), line(prev.sym == K_break ? "break;" : "continue;");
+    if (atKw(K_break) || atKw(K_continue)) {
+      if (arms) fail(t, std::string("a gpu fn's match arm doesn't ") + (cur.sym == K_break ? "break" : "continue") +
+                            " its loop (in WGSL's switch it would leave the match): set a flag, and test it after the match");
+      return next(), line(prev.sym == K_break ? "break;" : "continue;");
+    }
+    if (at(T_ID) && cur.sym >= NKW && symName(cur.sym) == "match" && !local(cur.sym)) {
+      Tok n = peek();
+      if (!n.nl && n.t != '=' && n.t != '.' && n.t != T_EOF && n.t != '{' && !(n.t >= T_ADDEQ && n.t <= T_DIVEQ)) return match();
+    }
     if (at(T_ID) && cur.sym >= NKW) {
       Tok n = peek();
       int op = n.t;
@@ -273,7 +329,7 @@ struct Tr {
         fail(t, "a gpu fn doesn't change vectors or matrices by index: set v.x, or make a new one");
       }
     }
-    fail(t, "a gpu fn's statements are var, assignment, if, while, for, return, break and continue");
+    fail(t, "a gpu fn's statements are var, assignment, if, match, while, for, return, break and continue");
   }
 
   // ---- expressions: fut's precedence, fully parenthesized ----
@@ -535,11 +591,20 @@ struct Tr {
           return {sh.named(s) + "(" + a + ")", g.result};
         }
       auto a = args();
-      if (n == "vec2f" || n == "vec3f" || n == "vec4f") {
-        arity(t, n, a.size(), size_t(n[3] - '0'));
+      if (n == "vec2f" || n == "vec3f" || n == "vec4f") {  // a number for each component, one for all, or numbers and vectors
+        int k = n[3] - '0', got = 0;
         std::string s;
-        for (auto& [e, at] : a) num(e, at), s += (s.empty() ? "" : ", ") + to(e, F32, at);
-        return {n + "(" + s + ")", V2 + (n[3] - '2')};
+        for (auto& [e, at] : a) {
+          if (isVec(e.t)) s += (s.empty() ? "" : ", ") + e.s, got += size(e.t);
+          else num(e, at), s += (s.empty() ? "" : ", ") + to(e, F32, at), got++;
+        }
+        if (got != k && !(a.size() == 1 && got == 1))
+          fail(t, n + "() takes one number for every component, or numbers and vectors of " + std::to_string(k) + " components in all, got " + std::to_string(got));
+        return {n + "(" + s + ")", V2 + (k - 2)};
+      }
+      if (n == "unpack4x8unorm") {
+        arity(t, n, a.size(), 1);
+        return {"unpack4x8unorm(" + to(a[0].first, U32, a[0].second) + ")", V4};
       }
       if (n == "mat2x2f" || n == "mat3x3f" || n == "mat4x4f") {
         int k = n[3] - '0';
@@ -556,7 +621,7 @@ struct Tr {
         auto [s, ty] = numeric(n, a);
         return {(n == "int" ? "trunc" : n) + "(" + s + ")", ty};
       }
-      fail(t, n + " is not a gpu fn of this file: a gpu fn calls gpu fns, sqrt, floor, int, vec2f/3f/4f, mat2x2f/3x3f/4x4f and std/math's functions");
+      fail(t, n + " is not a gpu fn of this file: a gpu fn calls gpu fns, sqrt, floor, int, vec2f/3f/4f, mat2x2f/3x3f/4x4f, unpack4x8unorm and std/math's functions");
     }
     if (at('.') && peek().t == T_ID) {  // a module's member
       const std::string* m = sh.alias(s);
@@ -572,6 +637,26 @@ struct Tr {
         if (*m == "math" && at('(') && !cur.nl) {
           next();
           auto a = args();
+          if (fn == "mix") {  // a and b numbers or vectors of one size; t a number, or a vector of theirs
+            arity(f, fn, a.size(), 3);
+            auto& [x, xt] = a[0];
+            auto& [y, yt] = a[1];
+            auto& [k, kt] = a[2];
+            int ty = isVec(x.t) ? x.t : F32;
+            if ((isVec(x.t) || isVec(y.t)) && x.t != y.t) fail(yt, "mix() blends values of one type, got " + tyName(x.t) + " and " + tyName(y.t));
+            if (isVec(k.t) && k.t != ty) fail(kt, "mix()'s t is a number or a " + tyName(ty) + ", got " + tyName(k.t));
+            auto arg = [&](const E& e, const Tok& at) { return isVec(e.t) ? e.s : (num(e, at), to(e, F32, at)); };
+            return {"mix(" + arg(x, xt) + ", " + arg(y, yt) + ", " + arg(k, kt) + ")", ty};
+          }
+          if (fn == "smoothstep") {
+            arity(f, fn, a.size(), 3);
+            std::string s;
+            for (auto& [e, at] : a) {
+              if (!isScalar(e.t)) fail(at, "smoothstep() takes numbers, got " + tyName(e.t));
+              s += (s.empty() ? "" : ", ") + to(e, F32, at);
+            }
+            return {"smoothstep(" + s + ")", F32};
+          }
           for (size_t i = 0; i < sizeof MATH / sizeof *MATH; i++)
             if (fn == MATH[i]) {
               arity(f, fn, a.size(), (size_t)MATH_ARITY[i]);
@@ -579,7 +664,7 @@ struct Tr {
               return {fn + "(" + s + ")", ty};
             }
         }
-        fail(f, "a gpu fn calls std/math's " + std::string("acos asin atan atan2 ceil cos exp log log2 pow sin tan trunc abs min max clamp sign") +
+        fail(f, "a gpu fn calls std/math's " + std::string("acos asin atan atan2 ceil cos exp log log2 pow sin tan trunc abs min max clamp sign mix smoothstep") +
                     " and reads math.pi and math.e, not " + *m + "." + fn);
       }
     }

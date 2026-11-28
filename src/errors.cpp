@@ -25,14 +25,14 @@ const ErrCode codes[] = {
     {"import", "An import can't be resolved, crosses a package boundary, or forms a cycle.", "Import files by path inside a package and packages by name (with a dep line in fut.pkg)."},
     {"manifest", "A fut.pkg line is malformed.", "Fix the line: name, version, root, dep, js, wasm or c."},
     {"extern", "An extern declaration can't bind: an unknown module, function, library or parameter type.", "List the module in fut.pkg for this build, and use the types the message names."},
-    {"gpu", "A gpu fn uses something the GPU doesn't have (strings, lists, maps, globals, recursion, an untyped parameter, ...), or a gpu var is assigned.", "Use num, u32, bool, vector, matrix and struct values, locals, parameters and gpu vars, and call only gpu fns, sqrt, floor, int, vector and matrix constructors and std/math."},
+    {"gpu", "A gpu fn uses something the GPU doesn't have (strings, lists, maps, globals, recursion, an untyped parameter, ...), or a gpu var is assigned.", "Use num, u32, bool, vector, matrix and struct values, locals, parameters and gpu vars, and call only gpu fns, sqrt, floor, int, vector and matrix constructors, unpack4x8unorm and std/math; match only on a u32."},
     {"limit", "A fixed limit is exceeded (parameters, fields, effects).", "Pass a map or list instead of more parameters; split the class or effect."},
     // compile time or run time
     {"type", "A value doesn't have the declared type of a parameter, result, field or var.", "Pass or store a value of that type, or change the declaration (T? allows nil)."},
     {"atomic", "Something that can't be undone (io, yield) happens inside atomic { }.", "Do it after the block, or handle the io inside the block."},
     {"effect", "A function performs or calls something its declared effects don't allow.", "Add the effect to the declaration (and its callers'), or handle it."},
     {"unhandled", "An operation of a declared effect is performed with no handler for it.", "Wrap the call in handle { } with Effect.op(...) { }."},
-    {"match", "A match leaves out variants of its enum with no else arm, or its value is not one of the enum's variants.", "Add an arm for each variant the message lists (or else { }), and match only values of that enum."},
+    {"match", "A match leaves out variants of its enum with no else arm, its value is not one of the enum's variants, or a range arm (a..b) holds no number.", "Add an arm for each variant the message lists (or else { }), and match only values of that enum."},
     {"no-field", "A field is read or written that the object doesn't have (or, in a closed class, didn't declare).", "Declare it in the class (var name) or the shape, or fix the spelling."},
     // run time
     {"operand", "An operator got operand types it doesn't take.", "Convert first: str(x) for text, int(x) for whole numbers; check for nil."},

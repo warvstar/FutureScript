@@ -1123,6 +1123,21 @@ struct Compiler : Gen, Namespaces {
     collect(base + 1, n, H_PRINTARGS), st(0, slot());
     callWindow(base, 1, 0, false);
   }
+  static int vecSize(int sym) {  // vec2f, vec3f, vec4f: 2, 3, 4
+    const std::string& n = symName(sym);
+    return n.size() == 5 && n.compare(0, 3, "vec") == 0 && n[3] >= '2' && n[3] <= '4' && n[4] == 'f' ? n[3] - '0' : 0;
+  }
+  // vec3f(x, y, z) calls the native; any other count, like vec3f(0) or vec3f(v.xy, 1), goes through vec@of(size, args),
+  // which spreads one number to every component, or joins numbers and vectors as WGSL's constructors do.
+  void vecCall(Global& g, int size) {
+    int base = slot();
+    gmem(0, g.slot), st(0, base);
+    int n = exprList(')');
+    if (n == size) return callWindow(base, n, 0, false);
+    collect(base + 1, n, H_LIST), st(0, slot());
+    imm(0, box((double)size)), st(0, slot());
+    gmem(0, findGlobal(intern("vec@of"))->slot), st(0, base), callWindow(base, 2, 0, false);
+  }
   void construct(Global& g) {  // C(args) for a top-level class C
     int base = slot();
     gmem(0, g.slot), st(0, base);
@@ -1543,7 +1558,7 @@ struct Compiler : Gen, Namespaces {
     Tok n = peek();
     return !n.nl && n.t != '=' && n.t != '.' && n.t != T_EOF && n.t != '{' && !(n.t >= T_ADDEQ && n.t <= T_DIVEQ);
   }
-  struct MatchAt { Tok at; int subject, esym = -1; std::vector<bool> seen; };
+  struct MatchAt { Tok at; int subject, esym = -1; std::vector<bool> seen; bool nums = false; std::vector<std::pair<double, double>> taken; };
   void callRt2(const char* nm, int subject, int cls) {  // nm(subject, the class cls)
     int base = slot();
     ldl(0, subject), st(0, slot()), gmem(0, global(cls).slot), st(0, slot());
@@ -1560,12 +1575,13 @@ struct Compiler : Gen, Namespaces {
     });
   }
   void matchArms(MatchAt& m) {
-    if (bool end = accept('}'); end || (atKw(K_else) && m.esym >= 0)) {
+    if (bool end = accept('}'); end || (atKw(K_else) && (m.esym >= 0 || m.nums))) {
       if (!end) {
         next(), block();
         if (!accept('}')) fail("@syntax the else arm is the last arm of a match: expected '}'");
         return;
       }
+      if (m.nums) return;  // no arm holds the number: nothing happens
       if (m.esym < 0) failAt(m.at.p, m.at.line, "@syntax a match needs arms: Variant(fields) { ... }");
       std::string miss;
       for (size_t i = 0; i < m.seen.size(); i++) if (!m.seen[i]) add(miss, symName(enumDefs[m.esym].vs[i].raw));
@@ -1573,6 +1589,7 @@ struct Compiler : Gen, Namespaces {
       callRt2("match@fail", m.subject, m.esym), F->live = false;
       return;
     }
+    if (m.nums || (m.esym < 0 && (at(T_NUM) || (at('-') && peek().t == T_NUM)))) return numArms(m);
     Tok pt = cur;
     int esym = -1;
     if (at(T_ID) && peekIs('.')) {  // Shape.Circle, geom.Shape.Circle
@@ -1634,6 +1651,54 @@ struct Compiler : Gen, Namespaces {
       }
       block();
     });
+    auto f1 = F->facts;
+    bool l1 = F->live;
+    int e = elseBegin(no, true);
+    F->facts = f0, F->live = true;
+    matchArms(m);
+    ifEnd(e);
+    if (!l1) return;
+    if (!F->live) return (void)(F->facts = f1, F->live = true);
+    F->facts &= f1;
+  }
+  // match n { 0 { } 1, 2 { } 4..8 { } else { } }: an arm holds numbers and ranges (a..b: from a up to, not including,
+  // b), and runs when the value is == one of them; arms nest like else-if. No arm holding it runs nothing.
+  void numArms(MatchAt& m) {
+    m.nums = true;
+    auto number = [&] {
+      bool neg = accept('-');
+      if (!at(T_NUM)) fail("@syntax a match on numbers has arms of numbers (1), several (1, 2) and ranges (1..4), then else");
+      next();
+      return neg ? -prev.n : prev.n;
+    };
+    std::vector<std::pair<double, double>> vs;  // [lo, hi); a single number is [n, n]
+    do {
+      Tok vt = cur;
+      double a = number(), b = a;
+      if (accept(T_DOTDOT)) {
+        b = number();
+        if (!(b > a)) failAt(vt.p, vt.line, "@match %g..%g holds nothing: a range a..b runs from a up to, not including, b", a, b);
+      }
+      for (auto [lo, hi] : m.taken)
+        if (lo == hi ? (a == b ? a == lo : lo >= a && lo < b) : (a == b ? a >= lo && a < hi : a < hi && lo < b))
+          failAt(vt.p, vt.line, "@duplicate an earlier arm of this match already holds %s", std::string(vt.p, prevEnd).c_str());
+      vs.push_back({a, b}), m.taken.push_back({a, b});
+    } while (accept(','));
+    std::vector<int> ors;
+    for (size_t i = 0; i < vs.size(); i++) {  // the value == a || (lo <= the value && the value < hi) || ...
+      if (i) ors.push_back(shortBegin(false));
+      auto [a, b] = vs[i];
+      ldl(0, m.subject), imm(1, box(a)), binop(a == b ? O_EQ : O_GE);
+      if (a != b) {
+        int j = shortBegin(true);
+        ldl(0, m.subject), imm(1, box(b)), binop(O_LT), shortEnd(j);
+      }
+    }
+    for (size_t i = ors.size(); i-- > 0;) shortEnd(ors[i]);
+    Cond no = truthyCond();
+    thenBegin(no);
+    auto f0 = F->facts;
+    scope([&] { block(); });
     auto f1 = F->facts;
     bool l1 = F->live;
     int e = elseBegin(no, true);
@@ -1711,6 +1776,8 @@ struct Compiler : Gen, Namespaces {
              pubContract, name(prev.sym));
     if (nav) indexGlobal(t, useRole(cur));
     if (g->kind == 'n' && at('(') && !cur.nl && symName(t.sym) == "print") return next(), printCall(t, *g), LV{};
+    if (g->kind == 'n' && at('(') && !cur.nl)
+      if (int size = vecSize(t.sym)) return next(), vecCall(*g, size), LV{};
     if (g->kind == 'f' && at('(') && !cur.nl) return next(), directCall(t, *g), t.sym == F->self || returnsNum(t.sym) ? NUM : LV{};
     if (g->kind == 'c' && enumDefs.count(t.sym)) {
       if (at('.') && !cur.nl) return next(), variantValue(t), LV{};

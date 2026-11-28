@@ -981,6 +981,41 @@ static V v_cross(V v, V w) {
 }
 // v.x = e in a gpu fn: v becomes a new vector with that component changed (op: -1 for =, else O_ADD.. for += ..), so
 // a vector another variable also holds never changes, as on the GPU, where vectors are values.
+// vec3f(0), vec4f(v.xyz, 1): one number for every component, or numbers and vectors whose components add up to n
+static V n_vecOf(V args, V size) {
+  int n = (int)num(size);
+  char name[] = "vec?f";
+  name[3] = char('0' + n);
+  const std::vector<V>& a = as<List>(args)->v;
+  double d[4];
+  if (a.size() == 1 && isNum(a[0])) {
+    for (int i = 0; i < n; i++) d[i] = num(a[0]);
+    return vecOf(d, n);
+  }
+  int k = 0;
+  for (V x : a) {
+    if (isNum(x)) {
+      if (k < n) d[k] = num(x);
+      k++;
+      continue;
+    }
+    if (!is(x, K::Buf) || as<Buf>(x)->et != 'f' || as<Buf>(x)->n < 2 || as<Buf>(x)->n > 4)
+      ERR("@argument %s() takes numbers and vectors, got %s", name, typeName(x));
+    Buf* b = as<Buf>(x);
+    for (size_t i = 0; i < b->n; i++, k++) if (k < n) d[k] = ((float*)b->p)[i];
+  }
+  if (k != n) ERR("@argument %s() takes one number for every component, or numbers and vectors of %d components in all, got %d", name, n, k);
+  return vecOf(d, n);
+}
+// unpack4x8unorm(x): the 4 bytes of a u32, low byte first, each as a number from 0 to 1 (WGSL's)
+static V n_unpack4x8unorm(V x) {
+  double v = vnum(x, "unpack4x8unorm");
+  if (!(v >= 0 && v <= 4294967295.0 && v == std::floor(v))) ERR("@argument unpack4x8unorm() takes a u32, a whole number from 0 to 4294967295, got %g", v);
+  uint32_t u = (uint32_t)v;
+  double d[4];
+  for (int i = 0; i < 4; i++) d[i] = (double)((u >> (8 * i)) & 255) / 255.0;
+  return vecOf(d, 4);
+}
 static V n_vecSet(V v, V f, V op, V x) {
   Buf* b = vecArg(v, "a component's assignment");
   int at[4];
@@ -1223,6 +1258,7 @@ void rtInit() {
   method<l_push>(K::List, S_push), method<l_pop>(K::List, S_pop), method<n_len>(K::List, S_len);
   method<n_len>(K::Str, S_len), method<n_len>(K::Map, S_len), method<n_len>(K::Buf, S_len);
   native<n_vec2>("vec2f"), native<n_vec3>("vec3f"), native<n_vec4>("vec4f"), native<n_vecSet>("vec@set");
+  native<n_vecOf>("vec@of"), native<n_unpack4x8unorm>("unpack4x8unorm");
   native<n_mat2>("mat2x2f"), native<n_mat3>("mat3x3f"), native<n_mat4>("mat4x4f");
   method<v_length>(K::Buf, intern("length")), method<v_dot>(K::Buf, intern("dot"));
   method<v_normalize>(K::Buf, intern("normalize")), method<v_cross>(K::Buf, intern("cross"));

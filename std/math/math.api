@@ -46,6 +46,9 @@ pub fn max(a: num, b: num): num !
 pub fn min(a: num, b: num): num !
   ensures result <= a && result <= b
 
+// a blended into b by t: a at 0, b at 1, as WGSL's mix. Numbers, or vectors with t a number or a vector of their size.
+pub fn mix(a, b, t) !
+
 pub var pi
 
 pub extern fn pow(num, num): num !
@@ -58,6 +61,9 @@ pub fn round(n: num): num !
 pub fn sign(n: num): num !
 
 pub extern fn sin(num): num !
+
+// 0 at or below lo, 1 at or above hi, and an S-shaped rise between, as WGSL's smoothstep.
+pub fn smoothstep(lo: num, hi: num, x: num): num !
 
 pub extern fn tan(num): num !
 

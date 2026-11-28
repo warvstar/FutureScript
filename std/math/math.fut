@@ -55,6 +55,17 @@ pub fn clamp(n: num, lo: num, hi: num): num !
   return n
 }
 
+// a blended into b by t: a at 0, b at 1, as WGSL's mix. Numbers, or vectors with t a number or a vector of their size.
+pub fn mix(a, b, t) ! {
+  return a * (1 - t) + b * t
+}
+
+// 0 at or below lo, 1 at or above hi, and an S-shaped rise between, as WGSL's smoothstep.
+pub fn smoothstep(lo: num, hi: num, x: num): num ! {
+  var t = clamp((x - lo) / (hi - lo), 0, 1)
+  return t * t * (3 - 2 * t)
+}
+
 // -1, 0 or 1.
 pub fn sign(n: num): num ! {
   if n > 0 { return 1 }

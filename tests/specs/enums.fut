@@ -123,3 +123,34 @@ test "match is an ordinary name where one is defined" {
   var match = 2
   expect match + 1 == 3
 }
+
+fn size(n) {
+  var r = "none"
+  match n {
+    0 { r = "zero" }
+    1, 2, 3 { r = "few" }
+    10..20 { r = "teens" }  // from 10 up to, not including, 20
+    -1 { r = "minus" }
+    else { r = "other" }
+  }
+  return r
+}
+
+test "match on a number: arms of numbers and ranges, then else" {
+  expect size(0) == "zero"
+  expect size(3) == "few"
+  expect size(10) == "teens"
+  expect size(19.5) == "teens"
+  expect size(20) == "other"
+  expect size(-1) == "minus"
+  var hit = 0
+  match 7 { 1 { hit = 1 } 5..7 { hit = 2 } }
+  expect hit == 0               // no arm holds it, and no else: nothing runs
+}
+
+test "match on a number: compile errors" {
+  expect err("fn f(v) \{ match v \{ 1 \{ } 0..4 \{ } } }").has("an earlier arm of this match already holds 0..4 [duplicate]")
+  expect err("fn f(v) \{ match v \{ 1, 1 \{ } } }").has("already holds 1 [duplicate]")
+  expect err("fn f(v) \{ match v \{ 4..4 \{ } } }").has("4..4 holds nothing")
+  expect err("fn f(v) \{ match v \{ 1 \{ } Circle(r) \{ } } }").has("arms of numbers (1), several (1, 2) and ranges (1..4)")
+}

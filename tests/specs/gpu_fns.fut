@@ -191,3 +191,43 @@ test "u32, mat and a struct of a file are types on the CPU too" {
   expect err(fn() { mat2x2f(vec2f(1, 0), vec3f(0, 1, 0)) }).has("each a vector of 2")
   expect err(fn() { pose({center: vec3f(0, 0, 0)}, 0, 0) }).has("must be Box")
 }
+
+gpu fn tint(part: u32, packed: u32, t: num): vec3f {
+  var rgb = vec3f(0)                     // one number for every component
+  match part {
+    0 { rgb = unpack4x8unorm(packed).rgb }
+    1, 2 { rgb = math.mix(vec3f(1, 0, 0), vec3f(0, 0, 1), t) }
+    4..8 { rgb = vec3f(vec2f(t, 1), math.smoothstep(0, 1, t)) }
+  }
+  return rgb
+}
+
+test "match, vector shorthands, unpack4x8unorm, mix and smoothstep: the same on the CPU as in WGSL" {
+  expect vec3f(2) == vec3f(2, 2, 2)
+  expect vec4f(vec2f(1, 2), 3, 4) == vec4f(1, 2, 3, 4)
+  expect vec4f(1, vec3f(2, 3, 4)) == vec4f(1, 2, 3, 4)
+  expect unpack4x8unorm(0x80ff00) == vec4f(0, 1, 128 / 255, 0)
+  expect tint(0, 0x0000ff, 0) == vec3f(1, 0, 0)
+  expect tint(2, 0, 0.25) == vec3f(0.75, 0, 0.25)
+  expect tint(5, 0, 0.5) == vec3f(0.5, 1, 0.5)
+  expect tint(8, 0, 0.5) == vec3f(0, 0, 0)  // no arm: nothing runs
+  var w = wgsl(tint).wgsl
+  expect w.has("switch (l_part) \{")
+  expect w.has("case 1u, 2u: \{") && w.has("case 4u, 5u, 6u, 7u: \{") && w.has("default: \{}")
+  expect w.has("var l_rgb: vec3f = vec3f(0.0);")
+  expect w.has("unpack4x8unorm(l_packed).rgb") && w.has("mix(vec3f(1.0, 0.0, 0.0), vec3f(0.0, 0.0, 1.0), l_t)")
+  expect w.has("vec3f(vec2f(l_t, 1.0), smoothstep(0.0, 1.0, l_t))")
+  expect err(fn() { vec3f(1, 2) }).has("vec3f() takes one number for every component, or numbers and vectors of 3 components in all, got 2")
+  expect err(fn() { unpack4x8unorm(-1) }).has("takes a u32")
+}
+
+test "match and the shorthands: what doesn't mean the same on both is a compile error" {
+  var m = "import \"std/math\" as math\n"
+  expect compileErr("gpu fn f(x: num): num \{ match x \{ 1 \{ return 1 } } return 0 }").has("matches a u32 (WGSL's switch), not f32: declare it u32")
+  expect compileErr("gpu fn f(k: u32): num \{ match k \{ 1.5 \{ return 1 } } return 0 }").has("matches whole numbers from 0 to 4294967295")
+  expect compileErr("gpu fn f(k: u32): num \{ match k \{ 0..1000 \{ return 1 } } return 0 }").has("at most 256 numbers")
+  expect compileErr("gpu fn f(k: u32): num \{ while true \{ match k \{ 1 \{ break } } } return 0 }").has("match arm doesn't break its loop")
+  expect compileErr("gpu fn f(x: num): vec3f \{ return vec3f(x, x) }").has("vec3f() takes one number for every component")
+  expect compileErr(m + "gpu fn f(a: vec2f, b: vec3f): vec2f \{ return math.mix(a, b, 0.5) }").has("mix() blends values of one type")
+  expect compileErr(m + "gpu fn f(a: vec2f): num \{ return math.smoothstep(0, 1, a) }").has("smoothstep() takes numbers")
+}
