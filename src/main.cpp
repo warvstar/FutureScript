@@ -510,14 +510,14 @@ static int initCommand(int argc, char** argv) {
   return 0;
 }
 
-// fut map [--pub] [--json] file.fut [package | file]: the packages, files and declarations the program uses
-static int mapCommand(bool pubOnly, bool json, bool effects, const std::string& only) {
+// fut map [--pub] [--json] [--effects] [--budget n] file.fut [name...]: the packages, files and declarations the program uses
+static int mapCommand(bool pubOnly, bool json, bool effects, long budget, const std::string& query) {
   Compiled c;
   inferEffectsWanted = effects;  // --effects: and what each function does
   try {
     c = compile(path, false, false);
   } catch (std::exception& e) { return fflush(stdout), fprintf(stderr, "%s\n", e.what()), 2; }
-  return printMap(c, pubOnly, json, only, path) || only.empty() ? 0 : (fprintf(stderr, "nothing matches '%s'\n", only.c_str()), 1);
+  return printMap(c, pubOnly, json, query, path, budget) || query.empty() ? 0 : (fprintf(stderr, "nothing matches '%s'\n", query.c_str()), 1);
 }
 
 static int repl() {
@@ -633,13 +633,14 @@ int main(int argc, char** argv) {
   bool apiMode = argc > 1 && std::string(argv[1]) == "api", apiCheck = false;
   bool mapMode = argc > 1 && std::string(argv[1]) == "map", mapPub = false, mapJson = false, mapEffects = false;
   std::string mapOnly;
+  long mapBudget = 64000;  // tokens: past it, fut map shows less (top-level declarations, files, packages)
   TestRun topts;
   std::vector<std::string> testFiles;
   std::string replayLog;
   bool record = false;
   const char* usage = "usage: fut [-w | -v | --asm | --isolates n | --seed n | --threads n | --record log | --replay log] [file.fut]   (no file: REPL)\n"
                       "       fut test [--changed] [--json] [--filter text] [--timeout s] [--jobs n] [--isolates n] [--seed n] file.fut...\n"
-                      "       fut check file.fut\n       fut refs file.fut Class.field [--writes]\n       fut init [dir]   (a new package)\n       fut api [--check] file.fut\n       fut map [--pub] [--json] [--effects] file.fut [package | file]\n       fut explain [code]\n"
+                      "       fut check file.fut\n       fut refs file.fut Class.field [--writes]\n       fut init [dir]   (a new package)\n       fut api [--check] file.fut\n       fut map [--pub] [--json] [--effects] [--budget n] file.fut [name...]\n       fut explain [code]\n"
                       "       fut fmt [--check] [--stdin] [file.fut | dir ...]\n"
                       "       fut lsp   (language server over stdio)\n       fut worker build ...   (Cloudflare Workers: node web/worker.mjs)\n";
   if (argc > 1 && std::string_view(argv[1]) == "fmt") return fmtCommand(argc - 2, argv + 2);
@@ -650,8 +651,14 @@ int main(int argc, char** argv) {
       if (a == "--pub") mapPub = true;
       else if (a == "--json") mapJson = true;
       else if (a == "--effects") mapEffects = true;
+      else if (a == "--budget" && i + 1 < argc) {  // tokens: 64000, 64k, or 0 (no limit)
+        char* end;
+        mapBudget = strtol(argv[++i], &end, 10) * (*end == 'k' || *end == 'K' ? 1000 : 1);
+        if (end == argv[i] || mapBudget < 0 || (*end && strcmp(end, "k") && strcmp(end, "K"))) return fputs(usage, stderr), 2;
+      }
       else if (a[0] == '-') return fputs(usage, stderr), 2;
-      else (path.empty() ? path : mapOnly) = a;
+      else if (path.empty()) path = a;
+      else mapOnly += (mapOnly.empty() ? "" : " ") + a;
     } else if (apiMode) {
       if (a == "--check") apiCheck = true;
       else if (a[0] == '-') return fputs(usage, stderr), 2;
@@ -701,7 +708,7 @@ int main(int argc, char** argv) {
   if (watch) isolateSeed = 0;  // -w: a reload stops pool isolates at their polls (seeded ones share the main thread)  // a test's isolates interleave the same way every run
   rtInit();
   if ((testMode || apiMode || mapMode) && path.empty()) return fputs(usage, stderr), 2;
-  if (mapMode) return mapCommand(mapPub, mapJson, mapEffects, mapOnly);
+  if (mapMode) return mapCommand(mapPub, mapJson, mapEffects, mapBudget, mapOnly);
   if (testMode) return runTests(topts);
   if (apiMode) return apiCommand(apiCheck);
   if (path.empty()) return repl();

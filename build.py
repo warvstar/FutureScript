@@ -606,6 +606,42 @@ def runner_map(exe):
     return ok, f"text: {t.stdout!r}\n  pub: {p.stdout!r}\n  json: {j.stdout[:400]!r}\n  filtered: {f.stdout!r}\n  contracts marked: {marked!r}"
 
 
+def runner_map_budget(exe):
+    """fut map within a token budget (--budget, 4 bytes a token): all of it if it fits, else top-level declarations (members
+    counted), else files, else packages, with a note saying so; and names to show: several, exact ones first (saying which
+    names they hid), else every name a term is part of, else a name with its letters in order; globs; a note for a term that matches nothing."""
+    d = ROOT / "build" / "mapbudget"
+    tree(d, {**PKG_TREE, "solo.fut": "fn draw() { }\nfn drawAll() { }\nclass Pen {\n  var ink = 0\n  fn draw() { }\n}\n"})
+    run = lambda *a: subprocess.run([*runner(exe), "map", *a], capture_output=True, text=True, timeout=60)
+    main = str(d / "app" / "main.fut")
+    body = lambda out: "".join(l for l in out.splitlines(True) if not l.startswith("// the whole map") and not l.startswith("// For more"))
+    full, nolimit = run(main), run("--budget", "0", main)
+    top = run("--budget", str(len(full.stdout) // 4 - 1), main)
+    files = run("--budget", str((len(body(top.stdout)) + 3) // 4 - 1), main)
+    pkgs, tiny = run("--budget", str((len(body(files.stdout)) + 3) // 4 - 1), main), run("--budget", "1", main)
+    two, member, part = run(main, "len", "hidden"), run(main, "Vec.len"), run(main, "uni")
+    letters, glob, some = run(main, "hddn"), run(main, "*it"), run(main, "len", "zzz")
+    exact, js = run(str(d / "solo.fut"), "draw"), run("--json", main, "len")
+    recs = [json.loads(l) for l in js.stdout.splitlines() if l.startswith("{")]
+    ok = (full.stdout == nolimit.stdout and not full.stdout.startswith("//")
+          and "shows top-level declarations" in top.stdout and re.search(r"pub class Vec +// 1-4, 2 methods\n", top.stdout) and "fn len()" not in top.stdout
+          and 'import "./util.fut"' not in top.stdout and 'pub import "./vec.fut"' in top.stdout
+          and "shows files only" in files.stdout and re.search(r"  geom.fut  // root, 4 lines, 4 declarations\n", files.stdout) and "fn " not in files.stdout
+          and "shows packages only" in pkgs.stdout and "pkg geom 0.3.0  // ../geom/fut.pkg, 3 files, 10 lines, " in pkgs.stdout and ".fut  //" not in pkgs.stdout
+          and "and still doesn't fit" in tiny.stdout and "and still" not in pkgs.stdout
+          and "fn len()" in two.stdout and "fn hidden()" in two.stdout and "pub class Vec" in two.stdout and "area" not in two.stdout and "fn init" not in two.stdout
+          and "fn len()" in member.stdout and "pub class Vec" in member.stdout and "init" not in member.stdout
+          and "pub fn unit()" in part.stdout and "len" not in part.stdout
+          and "letters in order" in letters.stdout and "fn hidden()" in letters.stdout and "area" not in letters.stdout
+          and "fn init(x, y)" in glob.stdout and "pub fn unit()" in glob.stdout and "len" not in glob.stdout
+          and some.returncode == 0 and "// nothing matches 'zzz'" in some.stdout and "fn len()" in some.stdout
+          and re.search(r"fn draw\(\) +// 1\n", exact.stdout) and re.search(r"fn draw\(\) +// 5\n", exact.stdout) and "fn drawAll()" not in exact.stdout
+          and "1 more name contains 'draw' (*draw* shows them): drawAll" in exact.stdout and "var ink" not in exact.stdout
+          and {r.get("name") for r in recs if r["type"] in ("class", "method")} == {"Vec", "len"})
+    return ok, (f"top: {top.stdout!r}\n  files: {files.stdout!r}\n  packages: {pkgs.stdout!r}\n  tiny: {tiny.stdout!r}\n  two: {two.stdout!r}\n  member: {member.stdout!r}"
+                f"\n  part: {part.stdout!r}\n  letters: {letters.stdout!r}\n  glob: {glob.stdout!r}\n  some: {some.stdout!r}\n  exact: {exact.stdout!r}\n  json: {js.stdout!r}")
+
+
 EFFECTS_SRC = """effect Log { fn log(m: str) }
 class Hero {
   var hp: num = 10
@@ -1122,6 +1158,7 @@ RUNNER_TESTS = [("std/math: within 1 ulp of libm, exact cases exact", runner_fma
                 ("fut test: parallel processes, native fallback, timeouts", runner_parallel),
                 ("packages: names, interfaces, boundaries, versions", runner_packages),
                 ("fut map: packages, files, declarations", runner_map),
+                ("fut map --budget and names: less detail past the budget, fuzzy names", runner_map_budget),
                 ("fut map --effects: what each function does", runner_map_effects),
                 ("fut refs and check: field writes without execution", runner_refs),
                 ("fut lsp: diagnostics, navigation, rename and editor features over stdio", runner_lsp),

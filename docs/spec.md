@@ -9,7 +9,7 @@ fut test f.fut                 test blocks + contract property tests + .api chec
   --filter text  --changed     only tests named text / only tests whose inputs changed since the last run
 fut check f.fut                native: check the entry and its imports without running top-level code
 fut refs f.fut C.field [--writes]  native: resolved field uses and possible same-name dynamic uses
-fut map f.fut [--pub] [pkg]    where everything is: packages, files, declarations, line ranges
+fut map f.fut [--pub] [name...] where everything is: packages, files, declarations, line ranges (less past --budget, 64k tokens; names: parts and globs too)
   --effects                    and what each fn that declares none does (`// 3-5, does io`)
   --json                       one declaration per line, with a hash of its text
 fut explain [code]             an error code's rule and fix (no code: all codes)
@@ -266,7 +266,7 @@ expect strings.replace("a-b", "-", "+") == "a+b"
 
 ## Working on fut code
 
-- Find code with `fut map --pub`; read a package's `.api`, not its source, to use it.
+- Find code with `fut map --pub`; in a big program, follow its note: name what to see (`fut map f.fut world Hero.attack`). Read a package's `.api`, not its source, to use it.
 - Type and declare effects on `pub` functions (`fut map --effects f.fut file.fut`: `does io` is `! io`); keep `pub` small (private code is free to change).
 - Contract first: signature, `requires`/`ensures` (one per line), `todo()` body; then tests; then the body.
 - Errors end with a stable code (`index 3 out of range (len 1) [index]`); key on the code, not the wording. A caught error is the message alone.

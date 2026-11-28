@@ -514,7 +514,44 @@ static std::string doesText(const FnEffects& e) {
   if (e.via.size() > 3) via += ", ...";
   return s + "; " + via + " may do " + may;
 }
-int printMap(const Compiled& c, bool pubOnly, bool asJson, const std::string& only, const std::string& program) {
+// What fut map can match a name against, and how well: 3 the whole name (any case), 2 a part of it, 1 its letters in
+// order from the start of a word, close together (rndr: render, hhero: hitHero), 0 not at all. A term with a * is a
+// glob, and matches whole names only. A sentence (a test's name) has letters for any term: it only matches the first two ways.
+static std::string lowered(std::string s) {
+  for (auto& ch : s) ch = (char)tolower((unsigned char)ch);
+  return s;
+}
+static bool globMatch(const char* p, const char* s) {
+  if (!*p) return !*s;
+  if (*p == '*') return globMatch(p + 1, s) || (*s && globMatch(p, s + 1));
+  return *s && *p == *s && globMatch(p + 1, s + 1);
+}
+static bool letters(const std::string& term, const std::string& name) {
+  for (size_t s = 0; s < name.size(); s++) {
+    bool word = s == 0 || strchr("_./- ", name[s - 1]) || (isupper((unsigned char)name[s]) && islower((unsigned char)name[s - 1]));
+    if (!word || tolower((unsigned char)name[s]) != term[0]) continue;
+    size_t i = 1, e = s + 1;
+    for (; e < name.size() && i < term.size() && e - s < 3 * term.size(); e++) i += tolower((unsigned char)name[e]) == term[i];
+    if (i == term.size()) return true;
+  }
+  return false;
+}
+static int matchTier(const std::string& term, const std::vector<std::string>& whole, const std::vector<std::string>& parts, bool sentence = false) {
+  if (term.find('*') != std::string::npos) {
+    for (auto* l : {&whole, &parts}) for (auto& n : *l) if (globMatch(term.c_str(), lowered(n).c_str())) return 3;
+    return 0;
+  }
+  for (auto& n : whole) if (lowered(n) == term) return 3;
+  for (auto& n : parts) if (lowered(n).find(term) != std::string::npos) return 2;
+  if (!sentence) for (auto& n : parts) if (letters(term, n)) return 1;
+  return 0;
+}
+// About how many tokens a model reads the map as: 4 bytes each (tokenizers make 4.6 of it, the alignment included).
+static size_t tokensAbout(const std::string& s) { return (s.size() + 3) / 4; }
+static std::string thousands(size_t n) { return n >= 1000 ? std::to_string((n + 500) / 1000) + "k" : std::to_string(n); }
+static std::string counted(size_t n, const std::string& what) { return std::to_string(n) + " " + what + (n == 1 ? "" : "s"); }
+
+int printMap(const Compiled& c, bool pubOnly, bool asJson, const std::string& query, const std::string& program, long budget) {
   std::map<std::pair<std::string, int>, const FnEffects*> does;  // by file and line
   for (auto& e : c.effects) does[{e.file, e.line}] = &e;
   auto doesOf = [&](const std::string& f, const Decl& d) -> const FnEffects* {
@@ -522,94 +559,233 @@ int printMap(const Compiled& c, bool pubOnly, bool asJson, const std::string& on
     auto it = does.find({f, d.line});
     return it != does.end() && it->second->name == d.name ? it->second : nullptr;
   };
-  struct Group { const Package* pkg; std::vector<const std::pair<std::string, std::string>*> files; };
-  std::vector<Group> groups{{nullptr, {}}};  // first: the files outside any package
-  for (auto& d : c.packages) if (const Package* p = packageAt(d)) groups.push_back({p, {}});
-  for (auto& src : c.sources) {
-    if (src.first.empty() || src.first[0] == '<') continue;
-    const Package* p = packageOf(src.first);
-    for (auto& g : groups) if (g.pkg == p) g.files.push_back(&src);
-  }
   auto inInterface = [&](const Package* p, const std::string& f) {  // --pub: a package shows only its interface
     if (!p) return true;
     for (auto& u : c.apis) if (u.pkg == p->name) return std::find(u.parts.begin(), u.parts.end(), f) != u.parts.end();
     return false;
   };
-  int n = 0;
-  std::string o;
-  auto emit = [&] { fflush(stdout), fwrite(o.data(), 1, o.size(), stdout), o.clear(); };
-  for (auto& g : groups) {
-    const Package* p = g.pkg;
-    std::string dir = p ? p->dir + "/" : "";
-    auto rel = [&](const std::string& f) { return p && f.starts_with(dir) ? f.substr(dir.size()) : shown(f, program); };
-    std::vector<const std::pair<std::string, std::string>*> files;
-    for (auto* f : g.files)
-      if ((only.empty() || (p && only == p->name) || rel(f->first) == only || shown(f->first, program) == only || f->first == only) &&
-          (!pubOnly || inInterface(p, f->first)))
-        files.push_back(f);
-    if (files.empty() && !(p && only == p->name)) continue;
-    if (p) std::stable_partition(files.begin(), files.end(), [&](auto* f) { return canonicalPath(f->first) == p->root; });
-    std::vector<std::vector<Decl>> decls;
-    std::unordered_map<std::string, std::vector<std::string>> binds;  // module -> the extern fns bound to it
-    for (auto* f : files) {
-      decls.push_back(declsOf(f->second));
-      for (auto& d : decls.back()) if (d.kind == "extern" && !d.mod.empty()) binds[d.mod].push_back(d.name);
-    }
-    if (p) {
-      if (asJson) o += "{\"type\":\"package\",\"name\":" + quoteJson(p->name) + ",\"version\":" + quoteJson(p->version) + ",\"dir\":" + quoteJson(shown(p->dir, program)) +
-                       ",\"root\":" + quoteJson(shown(p->root, program)) + "}\n";
-      else o += "pkg " + p->name + " " + p->version + "  // " + shown(p->manifest, program) + "\n";
-      for (auto& m : p->mods) {
-        std::string t = m.kind == "c" && m.target.find('/') == std::string::npos ? m.target : rel(m.target), b;
-        if (asJson) {
-          for (auto& x : binds[m.name]) b += (b.empty() ? "" : ",") + quoteJson(x);
-          o += "{\"type\":\"module\",\"package\":" + quoteJson(p->name) + ",\"kind\":\"" + m.kind + "\",\"name\":" + quoteJson(m.name) + ",\"target\":" + quoteJson(t) + ",\"binds\":[" + b + "]}\n";
-        } else {
-          for (auto& x : binds[m.name]) b += (b.empty() ? "" : ", ") + x;
-          o += "  " + m.kind + " " + m.name + " " + t + (b.empty() ? "" : "  // " + b) + "\n";
-        }
-      }
-    }
-    std::string ind = p ? "  " : "";
-    for (size_t i = 0; i < files.size(); i++) {
-      const std::string& f = files[i]->first;
-      std::vector<const Decl*> shownDecls;  // (declarations only: contracts are in the source and the .api)
-      for (auto& d : decls[i]) if ((!pubOnly || d.pub) && d.kind != "invariant") shownDecls.push_back(&d);
-      if (asJson) {
-        o += "{\"type\":\"file\"" + (p ? ",\"package\":" + quoteJson(p->name) : "") + ",\"file\":" + quoteJson(shown(f, program)) + "}\n";
-        for (auto* d : shownDecls) {
-          o += "{\"type\":\"" + d->kind + "\"" + (p ? ",\"package\":" + quoteJson(p->name) : "") + ",\"file\":" + quoteJson(shown(f, program)) + ",\"name\":" + quoteJson(d->name);
-          if (!d->owner.empty()) o += ",\"in\":" + quoteJson(d->owner);
-          if (!d->mod.empty()) o += ",\"module\":" + quoteJson(d->mod);
-          o += std::string(",\"pub\":") + (d->pub ? "true" : "false") + ",\"sig\":" + quoteJson(d->sig) + ",\"line\":" + std::to_string(d->line) + ",\"end\":" + std::to_string(d->end) +
-               ",\"hash\":\"" + spanHash(files[i]->second, d->line, d->end) + "\"";
-          if (const FnEffects* e = doesOf(f, *d)) {  // what it does (it declares nothing)
-            auto list = [&](const std::vector<std::string>& l) { std::string a; for (auto& x : l) a += (a.empty() ? "" : ",") + quoteJson(x); return "[" + a + "]"; };
-            o += ",\"does\":" + list(e->does) + ",\"doesWhatParams\":" + list(e->params) + ",\"callsValues\":" + (e->unknown ? "true" : "false") +
-                 ",\"mayDo\":" + list(e->may) + ",\"mayVia\":" + list(e->via);
-          }
-          o += "}\n";
-          n++;
-        }
-        emit();
-        continue;
-      }
-      o += ind + rel(f) + (p && canonicalPath(f) == p->root ? "  // root" : "") + "\n";
-      size_t w = 0;
-      for (auto* d : shownDecls) w = std::max(w, d->sig.size() + (d->owner.empty() ? 0 : 2));
-      w = std::min<size_t>(w, 56);
-      for (auto* d : shownDecls) {
-        std::string l = ind + "  " + (d->owner.empty() ? "" : "  ") + d->sig;
-        size_t col = ind.size() + 2 + w + 2;
-        l += std::string(l.size() < col ? col - l.size() : 2, ' ');
-        l += "// " + std::to_string(d->line) + (d->end != d->line ? "-" + std::to_string(d->end) : "");
-        if (const FnEffects* e = doesOf(f, *d)) l += ", " + doesText(*e);
-        l += "\n";
-        o += l, n++;
-      }
-      emit();
-    }
-    emit();
+  struct File {
+    const std::string *path, *src;
+    std::string rel;
+    bool root = false, whole = false, show = false;
+    std::vector<Decl> decls;
+    std::vector<int> owner;           // a member's class, effect or enum (its index); -1 at the top level
+    std::vector<char> visible, keep;  // shown at all (--pub, no contracts); matched
+    size_t lines = 0, kept = 0;
+  };
+  struct Group { const Package* pkg; std::vector<File> files; bool whole = false; };
+  std::vector<Group> groups{{nullptr, {}}};  // first: the files outside any package
+  for (auto& d : c.packages) if (const Package* p = packageAt(d)) groups.push_back({p, {}});
+  for (auto& src : c.sources) {
+    if (src.first.empty() || src.first[0] == '<') continue;
+    const Package* p = packageOf(src.first);
+    if (pubOnly && !inInterface(p, src.first)) continue;
+    for (auto& g : groups) if (g.pkg == p) { g.files.push_back({&src.first, &src.second}); break; }
   }
+  auto relIn = [&](const Package* p, const std::string& f) {
+    std::string dir = p ? p->dir + "/" : "";
+    return p && f.starts_with(dir) ? f.substr(dir.size()) : shown(f, program);
+  };
+  for (auto& g : groups) {
+    for (auto& f : g.files) {
+      f.rel = relIn(g.pkg, *f.path), f.root = g.pkg && canonicalPath(*f.path) == g.pkg->root;
+      f.decls = declsOf(*f.src);
+      f.lines = std::count(f.src->begin(), f.src->end(), '\n') + (!f.src->empty() && f.src->back() != '\n');
+      for (int i = 0, top = -1; i < (int)f.decls.size(); i++) {  // members come right after what they are in
+        auto& d = f.decls[i];
+        f.owner.push_back(d.owner.empty() ? (top = i, -1) : top);
+        f.visible.push_back((!pubOnly || d.pub) && d.kind != "invariant");  // (contracts are in the source and the .api)
+      }
+      f.keep.assign(f.decls.size(), 0);
+    }
+    if (g.pkg) std::stable_partition(g.files.begin(), g.files.end(), [](const File& f) { return f.root; });
+  }
+
+  // What to show: everything, or what the terms name. A term's best matches win: a package, file or declaration
+  // named exactly that, else every name it is part of, else every name with its letters in order.
+  std::vector<std::string> terms, notes;
+  for (size_t i = 0, j; i < query.size(); i = j) {
+    i = query.find_first_not_of(" \t\n", i);
+    if (i == std::string::npos) break;
+    j = std::min(query.find_first_of(" \t\n", i), query.size());
+    terms.push_back(query.substr(i, j - i));
+  }
+  auto keepDecl = [](File& f, int i) {
+    f.keep[i] = 1;
+    if (f.owner[i] >= 0) f.keep[f.owner[i]] = 1;  // a member, in its class
+    else for (size_t j = i + 1; j < f.decls.size() && f.owner[j] == i; j++) f.keep[j] = 1;  // a class, with its members
+  };
+  if (terms.empty()) for (auto& g : groups) g.whole = true;
+  struct Hit { int tier; Group* g; File* f; int decl; std::string name; };
+  std::vector<std::pair<std::string, std::vector<Hit>>> partly;  // a term's matches that its exact ones hid
+  for (auto& term : terms) {
+    std::string t = lowered(term);
+    std::vector<Hit> hits;
+    for (auto& g : groups) {
+      if (g.pkg) if (int k = matchTier(t, {g.pkg->name}, {g.pkg->name})) hits.push_back({k, &g, nullptr, -1, "pkg " + g.pkg->name});
+      for (auto& f : g.files) {
+        std::string base = f.rel.substr(f.rel.rfind('/') + 1), stem = base.ends_with(".fut") ? base.substr(0, base.size() - 4) : base;
+        if (int k = matchTier(t, {f.rel, shown(*f.path, program), *f.path, base, stem}, {f.rel})) hits.push_back({k, &g, &f, -1, f.rel});
+        for (int i = 0; i < (int)f.decls.size(); i++) {
+          auto& d = f.decls[i];
+          if (!f.visible[i] || d.kind == "import") continue;  // an import's name is the file it imports
+          std::string qualified = d.owner.empty() ? d.name : d.owner + "." + d.name;
+          if (int k = matchTier(t, {d.name, qualified}, {qualified}, d.kind == "test")) hits.push_back({k, &g, &f, i, d.kind == "test" ? "test \"" + d.name + "\"" : qualified});
+        }
+      }
+    }
+    int best = 0;
+    for (auto& h : hits) best = std::max(best, h.tier);
+    if (!best) { notes.push_back("nothing matches '" + term + "'"); continue; }
+    if (best == 1) notes.push_back("no name contains '" + term + "': these have its letters in order");
+    partly.push_back({term, {}});
+    for (auto& h : hits) {
+      if (h.tier != best) { if (h.tier == 2) partly.back().second.push_back(h); continue; }
+      if (!h.f) h.g->whole = true;
+      else if (h.decl < 0) h.f->whole = true;
+      else keepDecl(*h.f, h.decl);
+    }
+  }
+  for (auto& [term, hid] : partly) {  // exact matches hide the names a term is only part of: say which aren't shown anyway
+    std::vector<std::string> also;
+    for (auto& h : hid)
+      if (!(h.g->whole || (h.f && (h.f->whole || (h.decl >= 0 && h.f->keep[h.decl])))) && std::find(also.begin(), also.end(), h.name) == also.end()) also.push_back(h.name);
+    if (also.empty()) continue;
+    std::string l;
+    for (size_t i = 0; i < also.size() && i < 4; i++) l += (i ? ", " : "") + also[i];
+    notes.push_back(counted(also.size(), "more name") + (also.size() == 1 ? " contains '" : " contain '") + term + "' (*" + term + "* shows them): " + l + (also.size() > 4 ? ", ..." : ""));
+  }
+  int n = 0;  // files and declarations shown
+  for (auto& g : groups)
+    for (auto& f : g.files) {
+      if (g.whole) f.whole = true;
+      if (f.whole) std::fill(f.keep.begin(), f.keep.end(), 1);
+      for (size_t i = 0; i < f.decls.size(); i++) f.kept += f.visible[i] && f.keep[i];
+      f.show = f.whole || std::count(f.keep.begin(), f.keep.end(), 1);
+      if (f.show) n += 1 + (int)f.kept;
+    }
+  auto shownFiles = [](const Group& g) {
+    std::vector<const File*> fs;
+    for (auto& f : g.files) if (f.show) fs.push_back(&f);
+    return fs;
+  };
+
+  // The map at a level of detail: 3 everything, 2 top-level declarations (members counted, no private imports), 1
+// files, 0 packages.
+  auto render = [&](int level) {
+    std::string o;
+    for (auto& g : groups) {
+      const Package* p = g.pkg;
+      auto fs = shownFiles(g);
+      if (fs.empty() && !g.whole) continue;
+      if (fs.empty() && !p) continue;
+      size_t lines = 0, decls = 0;
+      for (auto* f : fs) lines += f->lines, decls += f->kept;
+      std::string sizes = counted(fs.size(), "file") + ", " + counted(lines, "line") + ", " + counted(decls, "declaration");
+      if (asJson && p)
+        o += "{\"type\":\"package\",\"name\":" + quoteJson(p->name) + ",\"version\":" + quoteJson(p->version) + ",\"dir\":" + quoteJson(shown(p->dir, program)) +
+             ",\"root\":" + quoteJson(shown(p->root, program)) + "}\n";
+      else if (p) o += "pkg " + p->name + " " + p->version + "  // " + shown(p->manifest, program) + (level == 0 ? ", " + sizes : "") + "\n";
+      else if (level == 0) o += "// outside any package: " + sizes + "\n";
+      if (level == 0) continue;
+      if (p) {
+        std::unordered_map<std::string, std::vector<std::string>> binds;  // module -> the extern fns bound to it
+        for (auto* f : fs) for (size_t i = 0; i < f->decls.size(); i++) if (f->keep[i] && f->decls[i].kind == "extern" && !f->decls[i].mod.empty()) binds[f->decls[i].mod].push_back(f->decls[i].name);
+        for (auto& m : p->mods) {
+          std::string t = m.kind == "c" && m.target.find('/') == std::string::npos ? m.target : relIn(p, m.target), b;
+          if (asJson) {
+            for (auto& x : binds[m.name]) b += (b.empty() ? "" : ",") + quoteJson(x);
+            o += "{\"type\":\"module\",\"package\":" + quoteJson(p->name) + ",\"kind\":\"" + m.kind + "\",\"name\":" + quoteJson(m.name) + ",\"target\":" + quoteJson(t) + ",\"binds\":[" + b + "]}\n";
+          } else {
+            for (auto& x : binds[m.name]) b += (b.empty() ? "" : ", ") + x;
+            o += "  " + m.kind + " " + m.name + " " + t + (b.empty() ? "" : "  // " + b) + "\n";
+          }
+        }
+      }
+      std::string ind = p ? "  " : "", pkgField = p ? ",\"package\":" + quoteJson(p->name) : "";
+      size_t fw = 0;  // files only: their notes in a column
+      for (auto* f : fs) fw = std::max(fw, f->rel.size());
+      for (auto* f : fs) {
+        std::vector<int> ds;
+        for (int i = 0; i < (int)f->decls.size(); i++)
+          if (f->visible[i] && f->keep[i] && (level == 3 || (f->owner[i] < 0 && (f->decls[i].pub || f->decls[i].kind != "import")))) ds.push_back(i);
+        if (asJson) {
+          o += "{\"type\":\"file\"" + pkgField + ",\"file\":" + quoteJson(shown(*f->path, program)) + "}\n";
+          for (int i : ds) {
+            auto* d = &f->decls[i];
+            o += "{\"type\":\"" + d->kind + "\"" + pkgField + ",\"file\":" + quoteJson(shown(*f->path, program)) + ",\"name\":" + quoteJson(d->name);
+            if (!d->owner.empty()) o += ",\"in\":" + quoteJson(d->owner);
+            if (!d->mod.empty()) o += ",\"module\":" + quoteJson(d->mod);
+            o += std::string(",\"pub\":") + (d->pub ? "true" : "false") + ",\"sig\":" + quoteJson(d->sig) + ",\"line\":" + std::to_string(d->line) + ",\"end\":" + std::to_string(d->end) +
+                 ",\"hash\":\"" + spanHash(*f->src, d->line, d->end) + "\"";
+            if (const FnEffects* e = doesOf(*f->path, *d)) {  // what it does (it declares nothing)
+              auto list = [&](const std::vector<std::string>& l) { std::string a; for (auto& x : l) a += (a.empty() ? "" : ",") + quoteJson(x); return "[" + a + "]"; };
+              o += ",\"does\":" + list(e->does) + ",\"doesWhatParams\":" + list(e->params) + ",\"callsValues\":" + (e->unknown ? "true" : "false") +
+                   ",\"mayDo\":" + list(e->may) + ",\"mayVia\":" + list(e->via);
+            }
+            o += "}\n";
+          }
+          continue;
+        }
+        std::string note = f->root ? "root" : "";
+        if (level == 1) note += (note.empty() ? "" : ", ") + counted(f->lines, "line") + ", " + counted(f->kept, "declaration");
+        o += ind + f->rel + (note.empty() ? "" : std::string(level == 1 ? fw - f->rel.size() + 2 : 2, ' ') + "// " + note) + "\n";
+        if (level == 1) continue;
+        size_t w = 0;
+        for (int i : ds) w = std::max(w, f->decls[i].sig.size() + (f->decls[i].owner.empty() ? 0 : 2));
+        w = std::min<size_t>(w, 56);
+        for (int i : ds) {
+          auto* d = &f->decls[i];
+          std::string l = ind + "  " + (d->owner.empty() ? "" : "  ") + d->sig;
+          size_t col = ind.size() + 2 + w + 2;
+          l += std::string(l.size() < col ? col - l.size() : 2, ' ');
+          l += "// " + std::to_string(d->line) + (d->end != d->line ? "-" + std::to_string(d->end) : "");
+          if (level == 2) {  // its members, counted by kind
+            std::vector<std::pair<std::string, size_t>> kinds;
+            for (size_t j = i + 1; j < f->decls.size() && f->owner[j] == i; j++) {
+              if (!f->visible[j] || !f->keep[j]) continue;
+              auto k = std::find_if(kinds.begin(), kinds.end(), [&](auto& x) { return x.first == f->decls[j].kind; });
+              if (k == kinds.end()) kinds.push_back({f->decls[j].kind, 1});
+              else k->second++;
+            }
+            for (auto& [kind, count] : kinds) l += ", " + counted(count, kind);
+          }
+          if (const FnEffects* e = doesOf(*f->path, *d)) l += ", " + doesText(*e);
+          o += l + "\n";
+        }
+      }
+    }
+    return o;
+  };
+  std::string out = render(3), head;
+  if (asJson) {  // all of it: the budget is for readers, and a program filters what it reads
+    for (auto& s : notes) if (s.starts_with("nothing")) fprintf(stderr, "%s\n", s.c_str());
+    return fflush(stdout), fwrite(out.data(), 1, out.size(), stdout), fflush(stdout), n;
+  }
+  size_t full = tokensAbout(out);
+  int level = 3;
+  while (budget > 0 && level > 0 && tokensAbout(out) > (size_t)budget) out = render(--level);
+  if (!n) return 0;
+  for (auto& s : notes) head += "// " + s + "\n";
+  if (level < 3) {  // say what was left out, and how to see it, with the biggest packages or files as the example
+    std::vector<std::pair<size_t, std::string>> big;
+    for (auto& g : groups) {
+      size_t lines = 0;
+      for (auto* f : shownFiles(g)) {
+        lines += f->lines;
+        if (level > 0) big.push_back({f->lines, f->rel.substr(f->rel.rfind('/') + 1)});
+      }
+      if (level == 0 && g.pkg) big.push_back({lines, g.pkg->name});
+    }
+    std::stable_sort(big.begin(), big.end(), [](auto& a, auto& b) { return a.first > b.first; });
+    std::string example;
+    for (size_t i = 0; i < big.size() && i < 2; i++) example += " " + big[i].second;
+    static const char* what[] = {"packages only", "files only", "top-level declarations, with members counted"};
+    head += "// the whole map is about " + thousands(full) + " tokens, over the " + thousands(budget) + " budget, so this shows " + what[level] +
+            (tokensAbout(out) > (size_t)budget ? " (and still doesn't fit)" : "") + ".\n// For more, name packages, files or declarations (fut map " +
+            (pubOnly ? "--pub " : "") + program + example + "; parts of names and globs work too) or set --budget (0: no limit).\n";
+  }
+  out = head + out;
+  fflush(stdout), fwrite(out.data(), 1, out.size(), stdout), fflush(stdout);
   return n;
 }

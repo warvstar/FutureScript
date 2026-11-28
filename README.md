@@ -18,7 +18,7 @@ build/fut test --changed f.fut # rerun only the tests an edit can affect; the re
 build/fut -w file.fut          # run and hot-reload on save (file and its imports); type lines to run them inside it
 build/fut init [dir]           # a new package: fut.pkg, <dir>.fut (main and a test), its .api, .gitignore
 build/fut api file.fut         # write each imported file's .api (its pub declarations); `fut test` checks them
-build/fut map file.fut         # every package, file and declaration the program uses, with line ranges (--effects: what each fn does)
+build/fut map file.fut [name...] # every package, file and declaration the program uses, with line ranges, in 64k tokens (--effects: what each fn does)
 build/fut fmt file.fut         # format files in place (directories recurse); --check lists files that need formatting
 build/fut lsp                  # language server for editors, over stdio
 build/fut explain [code]       # an error code's rule and fix ([index], [requires], ...; no code: all of them)
@@ -571,7 +571,19 @@ fn says(h)       // 11, does nothing; .shout() may do io  (h's class isn't known
 
 A method call on a value whose class is known (a typed parameter, `self`, a local made by `C(...)`) counts that class's method and its subclasses' overrides. A function that declares effects does at most those, since the runtime holds it to them, so the map shows its declaration instead.
 
-Private names are included; contracts are not (the source and the `.api` have them). The map and the `.api` come from the same reading of the source, so they always agree. `--pub` shows only what other packages can use: each package's interface, and the `pub` names of files in no package. `--json` prints one object per line (`{"type":"fn", "package", "file", "name", "in", "pub", "sig", "line", "end", "hash"}`; `hash` is of the declaration's text, so it changes when the declaration is edited, not when it moves, plus `package`, `module` and `file` records). With `--effects`, a function that declares no effects also has `"does"` (effect names), `"doesWhatParams"` (parameter names), `"callsValues"`, `"mayDo"` and `"mayVia"` (method names). A last argument keeps one package (`fut map main.fut geom`) or one file.
+Private names are included; contracts are not (the source and the `.api` have them). The map and the `.api` come from the same reading of the source, so they always agree. `--pub` shows only what other packages can use: each package's interface, and the `pub` names of files in no package. `--json` prints one object per line (`{"type":"fn", "package", "file", "name", "in", "pub", "sig", "line", "end", "hash"}`; `hash` is of the declaration's text, so it changes when the declaration is edited, not when it moves, plus `package`, `module` and `file` records). With `--effects`, a function that declares no effects also has `"does"` (effect names), `"doesWhatParams"` (parameter names), `"callsValues"`, `"mayDo"` and `"mayVia"` (method names). `--json` prints all of what is asked for: the budget below is for reading.
+
+**Big programs.** The map fits in a budget, 64k tokens unless `--budget n` says otherwise (`--budget 8k`; `0` is no limit; a token is counted as 4 bytes). When all of it doesn't fit, it shows less, the most that fits of: top-level declarations (a class's members counted, not listed, and no private imports), then files (each with its lines and declarations counted), then packages (each with its files, lines and declarations counted). A note at the top says which, and how to see more:
+
+```
+// the whole map is about 180k tokens, over the 64k budget, so this shows files only.
+// For more, name packages, files or declarations (fut map main.fut world.fut crowd.fut; parts of names and globs work too) or set --budget (0: no limit).
+pkg rpghero 0.1.0  // fut.pkg
+  combat.fut  // 241 lines, 34 declarations
+  world.fut   // 961 lines, 122 declarations
+```
+
+**Names.** Words after the file keep what they name, all of it within the budget: `fut map main.fut world Hero.attack net`. Each word keeps a package (all of it), a file (by path, `net/wire.fut`, or by name, `wire`), or a declaration (`attack`, or `Hero.attack` for a member; a class comes with its members, and a member with its class). Case doesn't matter. A word's exact matches win; with none, it keeps every name it is part of (`att`: `attack`, `Hero.attackRange`, `combat/attacks.fut`); with none of those either, every name with its letters in order from the start of a word (`hatk`: `Hero.attack`), which the map's first line says it did. When exact matches hide names the word is part of, a note lists them; `*` makes a glob (`*attack*`, `fly*`, `Hero.*`) to ask for them. A test is found by words of its name, never by letters. A word that matches nothing gets a note (`// nothing matches 'nett'`); when no word matches, nothing is printed and the exit status is 1.
 
 ## Fibers
 
