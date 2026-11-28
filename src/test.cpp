@@ -613,6 +613,13 @@ void* testStart(const TestCase& t) {
   return t.code;
 }
 
+// A function's code broke its own ensures or its class's invariant (not a caller its requires): the contract states
+// what the code is meant to do, so the fix is in the code unless that intent changed.
+static const char* contractNote(const std::string& text) {
+  if (text.find(" broke its contract: ensures") == std::string::npos && text.find("'s invariant:") == std::string::npos) return nullptr;
+  return "the code and its contract disagree. The contract states what the code is meant to do: fix the code, "
+         "unless what it should do has changed (then change the contract, and run fut api)";
+}
 std::string testReport(const TestCase& t, bool err, const std::string& e, char& code, const std::string* output) {
   const std::string& printed = output ? *output : out;
   outSink = nullptr, endCaptures();
@@ -637,6 +644,7 @@ std::string testReport(const TestCase& t, bool err, const std::string& e, char& 
       std::string msg = e.substr(0, nl), c = splitCode(msg);
       j += ",\"message\":" + json(msg) + (c.empty() ? "" : ",\"code\":" + json(c)) + ",\"trace\":" + json(nl == std::string::npos ? "" : e.substr(nl + 1));
     }
+    if (const char* n = contractNote(failure.set ? failure.why : err ? e : "")) j += ",\"note\":" + json(n);
     if ((failure.set || err) && !isolateSeedNote().empty()) j += ",\"seed\":" + std::to_string(isolateSeed);
     return j + ",\"output\":" + json(printed) + "}\n" + traceReport(t);
   }
@@ -647,6 +655,7 @@ std::string testReport(const TestCase& t, bool err, const std::string& e, char& 
     for (auto& d : details(x, failure)) s += "    " + d + "\n";
   } else if (err) s += " (" + testLocation(t.file, t.line) + ")\n" + indent("runtime error: " + e.substr(0, e.find_last_not_of('\n') + 1), "  ");
   else s += "\n";
+  if (const char* n = contractNote(failure.set ? failure.why : err ? e : "")) s += "  note: " + std::string(n) + "\n";
   if ((failure.set || err) && !printed.empty()) s += "  output:\n" + indent(printed.substr(0, printed.size() - (printed.back() == '\n')), "    ");
   if (failure.set || err) s += indent(isolateSeedNote(), "  ");
   return s + traceReport(t);

@@ -252,3 +252,13 @@ test "property tests build class arguments with their init" {
   var never = "class Q \{ fn init(n: num) \{ throw \"no\" } }\nfn f(q: Q): num\n  ensures result == 0\n\{ return 0 }"
   expect props(never).has("1 test: 1 passed")  // none could be built: untested, as before, not a failure
 }
+test "a broken ensures or invariant says the contract states the intent; a broken requires doesn't" {
+  var note = "note: the code and its contract disagree. The contract states what the code is meant to do: fix the code"
+  expect props("fn ship(g: num): num\n  ensures g > 500 || result == 499\n\{ if g < 500 \{ return 499 } return 899 }").has(note)
+  var calls = "fn f(x)\n  ensures result > 0\n\{ return x }\ntest \"t\" \{ f(0) }"
+  expect props(calls).has("runtime error: f() broke its contract: ensures result > 0") && props(calls).has(note)
+  var invariant = "class C \{\n  var n = 0\n  invariant self.n >= 0\n  fn dec() \{ self.n -= 1 }\n}\ntest \"t\" \{ C().dec() }"
+  expect props(invariant).has(note)
+  var caller = "fn f(x)\n  requires x > 0\n\{ return x }\ntest \"t\" \{ f(0) }"
+  expect props(caller).has("broke f()'s contract") && !props(caller).has("note:")
+}
