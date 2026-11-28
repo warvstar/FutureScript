@@ -78,9 +78,10 @@ test "trees built and dropped while one is kept" { expect trees() == "1022000 81
 test "an object in a d register is seen by the collector" { expect dreg() == "[\"kept\", 1] [599999]" }
 test "a class gaining a field after its constructor sites cached it" { expect grow() == "22050010 2 50" }
 test "empty instances" { expect empties() == 400000 }
+fn makeWith(c, x) { return c(x) }  // a class the compiler can't see here: the arity is checked when it runs
 test "constructor arity errors" {
-  expect throws { Empty(1) } == "Empty takes no arguments (no init)"
-  expect throws { Node(1) } == "init expects 2 arguments, got 1"
+  expect throws { makeWith(Empty, 1) } == "Empty takes no arguments (no init)"
+  expect throws { makeWith(Node, 1) } == "init expects 2 arguments, got 1"
 }
 test "a large object kept while many are churned" { expect bigs() == "32769 32770890" }
 test "closures with many captures kept across collections" { expect closures() == 450550 }

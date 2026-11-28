@@ -550,6 +550,9 @@ void budgetFiberLeave(u32 outer);
 void budgetYieldCheck();
 void fmathInit();  // fmath.cpp: sin, cos, exp, log, pow, ... that give the same bits on every platform
 void method(K k, int sym, void* f, int arity);
+bool builtinMethod(K k, int sym);   // does a k (list, str, ...) have the method sym
+std::string builtinMethods(K k);    // its methods, for messages
+std::string memberHint(K k, const std::string& name, bool call, const std::string& x);  // "; use x.len() ..." or ""
 template <auto f> void native(const char* name) { native(name, callable<f>(), nargs(f)); }
 template <auto f> void method(K k, int sym) { method(k, sym, callable<f>(), nargs(f)); }
 void gpuInit();  // wgsl(f): a gpu fn's translation (wgsl.cpp)
