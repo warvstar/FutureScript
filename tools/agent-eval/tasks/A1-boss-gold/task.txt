@@ -1,0 +1,7 @@
+Please add a function to main.fut:
+
+    fn bestWeapon(p: Player): Item?
+
+It returns the strongest weapon in the player's bag (`p.inventory`, items whose kind is "weapon"), judged by `power`. The weapon the player is holding (`p.weapon`) doesn't count, only what's in the bag. If two weapons tie on power, return the one that comes first in the bag. If the bag has no weapon, return nil. It shouldn't change the player.
+
+Add a test block for it in main.fut. `fut test main.fut` must pass when you finish.

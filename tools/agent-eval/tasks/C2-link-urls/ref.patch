@@ -1,0 +1,40 @@
+--- a/main.fut
++++ b/main.fut
+@@ -54,3 +54,37 @@
+   expect page("# A & B\ntext") == "<title>A &amp; B</title>\n<h1>A &amp; B</h1>\n<p>text</p>"
+   expect page("just text").has("<title>Untitled</title>")
+ }
++
++// Each URL the document links to, once, in the order they first appear.
++fn linkUrls(doc: Doc): list {
++  var out = []
++  for n in doc.nodes {
++    match n {
++      Para(parts) { addUrls(parts, out) }
++      ListItem(_, _, parts) { addUrls(parts, out) }
++      else { }
++    }
++  }
++  return out
++}
++
++fn addUrls(parts: list, out: list) {
++  for p in parts {
++    match p {
++      Link(_, url) {
++        var seen = false
++        for u in out { if u == url { seen = true } }
++        if !seen { out.push(url) }
++      }
++      Em(inner) { addUrls(inner, out) }
++      Strong(inner) { addUrls(inner, out) }
++      else { }
++    }
++  }
++}
++
++test "linkUrls" {
++  expect linkUrls(parse(sample)) == ["https://mdlite.dev/guide", "https://mdlite.dev", "http://mdlite.org"]
++  expect linkUrls(parse("[a](x) **[b](y)** [c](x)")) == ["x", "y"]
++  expect linkUrls(parse("# none")) == []
++}

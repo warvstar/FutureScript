@@ -1,0 +1,8 @@
+{
+ "project": "D",
+ "bug": "logic",
+ "path": "on",
+ "file": "tasks.fut",
+ "line": 87,
+ "description": "nextUp breaks when out.len() > n instead of >= n, returning n+1 ids"
+}

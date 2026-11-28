@@ -1,0 +1,7 @@
+We're running a "buy 2, get 1 free" promotion. In main.fut, add
+
+    fn multibuySavings(cart: Cart): num
+
+It returns how many cents the promotion takes off the cart. It works per cart line: for every 3 units of the same line, one unit is free, priced at that line's unitCents. So a line with qty 7 gets 2 free units, qty 2 gets none, and units of different lines are never combined. An empty cart saves 0. Don't change buildInvoice and don't make the function pub.
+
+Add a test for it in main.fut. `fut test main.fut` must pass when you finish.

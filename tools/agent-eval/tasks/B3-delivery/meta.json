@@ -1,0 +1,1 @@
+{"project": "B", "bug": "no-field", "path": "on", "file": "pricing.fut", "line": 81, "description": "quoteShipping writes q.transitDays on its constructed ShippingQuote, which declares days, not transitDays."}

@@ -1,0 +1,1 @@
+{"project": "C", "kind": "feature", "description": "Front matter (--- key: value ---) parsed into Doc.meta, overriding the title, and written as <meta> lines by a new renderHead used by page."}

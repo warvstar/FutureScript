@@ -1,0 +1,11 @@
+--- a/entities.fut
++++ b/entities.fut
+@@ -100,7 +100,7 @@
+   var m = Monster(name, 30 + level * 15, 6 + level * 2, 2 + level)
+   m.speed = 3
+   m.xpReward = level * 25
+-  m.goldReward = level * 40
++  m.gold = level * 40
+   return m
+ }
+ 

@@ -1,0 +1,30 @@
+// The public interface of stats.fut, written by `fut api`. `fut test` fails while it is out of date.
+
+// A message for each link that looks wrong: an empty URL, a URL with a space, or plain http.
+pub fn checkLinks(doc: Doc): list
+
+pub fn countWords(s: str): num !
+
+// Links per 100 words of prose; 0 when there are no words.
+pub fn linkDensity(doc: Doc): num !
+
+// Parse src and count its words, timing the work: {words, ms}.
+pub fn profile(src: str): map ! clock
+
+// Whole minutes to read words at wpm words a minute, rounded up: 0 words take 0 minutes.
+pub fn readingMinutes(words: num, wpm: num): num !
+
+// The numbers for a document's info panel, at 200 words a minute.
+pub fn summarize(doc: Doc): Summary
+
+pub class Summary {
+  var headings: num = 0
+  var links: num = 0
+  var minutes: num = 0
+  var title: str
+  var words: num = 0
+  fn init(title: str)
+}
+
+// Words of prose in a document; code blocks don't count.
+pub fn wordCount(doc: Doc): num

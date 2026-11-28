@@ -1,0 +1,1 @@
+{"project": "A", "kind": "feature", "description": "A quest log in main.fut: Goal enum, Quest and QuestLog classes tracking kills and pickups (via addItem), turning in for gold and xp (via gainXp), and a status listing."}

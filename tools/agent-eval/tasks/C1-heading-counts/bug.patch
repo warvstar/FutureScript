@@ -1,0 +1,10 @@
+--- a/stats.fut
++++ b/stats.fut
+@@ -71,6 +71,7 @@
+   var words = wordCount(doc)
+   if words == 0 { return 0 }
+   var links = linksOf(doc).len()
++  print("linkDensity: {links} links / {words} words")
+   return links * 100 / words
+ }
+ 

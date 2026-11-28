@@ -1,0 +1,38 @@
+// The public interface of catalog.fut, written by `fut api`. `fut test` fails while it is out of date.
+
+// Can the shelf cover an order of qty units? Exactly enough counts.
+pub fn canFulfil(v: Variant, qty: num): bool !
+
+pub class Catalog {
+  var products: list<Product> = []
+  fn add(p: Product): Catalog
+}
+
+// The variant with this SKU, or nil.
+pub fn findVariant(cat: Catalog, sku: str): Variant? !
+
+// [lowest, highest] variant price of a product, in cents.
+pub fn priceRange(p: Product): list<num> !
+
+pub class Product {
+  var id: str
+  var name: str
+  var variants: list<Variant> = []
+  fn add(v: Variant): Product
+  fn init(id: str, name: str)
+}
+
+pub fn restock(v: Variant, qty: num) !
+
+// Take qty units off the shelf; throws when there aren't enough.
+pub fn takeStock(v: Variant, qty: num) !
+
+pub class Variant {
+  var name: str
+  var priceCents: num
+  var sku: str
+  var stock: num
+  var weightGrams: num
+  fn init(sku: str, name: str, priceCents: num, stock: num, weightGrams: num)
+  fn inStock(): bool
+}

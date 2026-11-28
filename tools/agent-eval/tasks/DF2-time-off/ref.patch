@@ -1,0 +1,125 @@
+--- a/main.fut
++++ b/main.fut
+@@ -1,4 +1,5 @@
+ // Website launch planner: the project, its schedule and reports.
++import "std/math"
+ import "tasks.fut"
+ import "graph.fut"
+ import "schedule.fut"
+@@ -31,4 +32,26 @@
+   expect remainingDays(p) == 13
+   expect criticalPath(p).len() == 4
+   expect summary(p) == "Website: 1/6 done, 13 days left, 11 days end to end"
++}
++
++// How many days longer the project runs end to end because of time off.
++fn leaveDelay(p: Project): num {
++  var end = 0
++  for span in earliestWithLeave(p).values() { end = math.max(end, span.finish) }
++  return end - projectLength(p)
++}
++
++test "time off" {
++  var p = demoProject()
++  var bo = p.person("bo")
++  bo.takeOff(4, 2)
++  expect bo.isAway(4) && bo.isAway(5) && !bo.isAway(6)
++  expect throws { bo.takeOff(1.5, 2) } == "bo: bad time off"
++  expect throws { bo.takeOff(3, 0) } == "bo: bad time off"
++  expect leaveDelay(p) == 0
++  assign(p, "backend", "bo")
++  var spans = earliestWithLeave(p)
++  expect spans["backend"] == {start: 3, finish: 10}
++  expect spans["release"] == {start: 12, finish: 13}
++  expect leaveDelay(p) == 2
+ }
+--- a/schedule.api
++++ b/schedule.api
+@@ -15,6 +15,11 @@
+ // starting as soon as all of its deps have finished.
+ pub fn earliest(p: Project): map !
+ 
++// Like earliest, but a task's work only happens on days its assignee isn't away:
++// it starts on the first such day once its deps have finished, and finishes
++// the day after its last day of work.
++pub fn earliestWithLeave(p: Project): map !
++
+ // Days from the start until the last task finishes.
+ pub fn projectLength(p: Project): num !
+ 
+--- a/schedule.fut
++++ b/schedule.fut
+@@ -19,6 +19,35 @@
+   return out
+ }
+ 
++// Like earliest, but a task's work only happens on days its assignee isn't away:
++// it starts on the first such day once its deps have finished, and finishes
++// the day after its last day of work.
++pub fn earliestWithLeave(p: Project): map ! {
++  var out = {}
++  for id in topoOrder(p) {
++    var t = taskOf(p, id)
++    var ready = 0
++    for d in t.deps {
++      if out.has(d) { ready = math.max(ready, out[d].finish) }
++    }
++    var who = t.assignee == nil ? nil : p.person(t.assignee)
++    if who == nil || t.durationDays == 0 {
++      out[id] = {start: ready, finish: ready + t.durationDays}
++      continue
++    }
++    var day = ready
++    while who.isAway(day) { day += 1 }
++    var start = day
++    var left = t.durationDays
++    while left > 0 {
++      if !who.isAway(day) { left -= 1 }
++      day += 1
++    }
++    out[id] = {start: start, finish: day}
++  }
++  return out
++}
++
+ // Days from the start until the last task finishes.
+ pub fn projectLength(p: Project): num ! {
+   var end = 0
+--- a/tasks.api
++++ b/tasks.api
+@@ -19,8 +19,12 @@
+ 
+ pub class Person {
+   var capacityPerWeek: num
++  var daysOff: map = {}
+   var name: str
+   fn init(name: str, capacityPerWeek: num)
++  fn isAway(day: num): bool
++  // Away for days days, starting on day first (day 0 is the project's first day).
++  fn takeOff(first: num, days: num)
+ }
+ 
+ pub class Project {
+--- a/tasks.fut
++++ b/tasks.fut
+@@ -3,9 +3,20 @@
+ pub class Person {
+   var name: str
+   var capacityPerWeek: num   // days of work they can take on per week
++  var daysOff: map = {}      // day number -> true for each day they're away
+   fn init(name: str, capacityPerWeek: num) {
+     self.name = name
+     self.capacityPerWeek = capacityPerWeek
++  }
++  // Away for days days, starting on day first (day 0 is the project's first day).
++  fn takeOff(first: num, days: num) {
++    if first < 0 || first != floor(first) || days < 1 || days != floor(days) {
++      throw "{self.name}: bad time off"
++    }
++    for d in first..first + days { self.daysOff[d] = true }
++  }
++  fn isAway(day: num): bool {
++    return self.daysOff.has(day)
+   }
+ }
+ 

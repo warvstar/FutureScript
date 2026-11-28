@@ -1,0 +1,11 @@
+--- a/stats.fut
++++ b/stats.fut
+@@ -52,7 +52,7 @@
+ // Whole minutes to read words at wpm words a minute, rounded up: 0 words take 0 minutes.
+ pub fn readingMinutes(words: num, wpm: num): num ! {
+   if words == 0 { return 0 }
+-  return math.ceil(words / wpm)
++  return int(words / wpm) + 1
+ }
+ 
+ // A message for each link that looks wrong: an empty URL, a URL with a space, or plain http.

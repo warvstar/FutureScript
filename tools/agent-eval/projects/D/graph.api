@@ -1,0 +1,14 @@
+// The public interface of graph.fut, written by `fut api`. `fut test` fails while it is out of date.
+
+// Each task id -> the ids of the tasks that list it as a dep, in project order.
+pub fn dependents(p: Project): map !
+
+// A cycle as a path that ends where it starts (["a", "b", "a"]), or [] when there is none.
+pub fn findCycle(p: Project): list<str> !
+
+// Every task id, each after all of its deps. Among tasks that are free at
+// the same time, the one added to the project first comes first.
+pub fn topoOrder(p: Project): list<str> !
+
+// "task -> dep" for every dep that names no task in the project.
+pub fn unknownDeps(p: Project): list<str> !

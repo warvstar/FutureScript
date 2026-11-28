@@ -1,0 +1,3 @@
+Add `fn blockedBy(p: Project, id: str): list<str>` to main.fut (not pub). It returns the ids of every task that can't start until task `id` is done, whether it lists `id` as a dep directly or waits on it through other tasks. Don't include `id` itself, list each task once, and put them in topological order (the order `topoOrder(p)` gives). Call `taskOf(p, id)` first so an unknown id raises the usual "no task ..." error. For example, in `demoProject()`, `blockedBy(p, "frontend")` is `["integrate", "release"]`.
+
+Add a test for it in main.fut. `fut test main.fut` must pass when you finish.

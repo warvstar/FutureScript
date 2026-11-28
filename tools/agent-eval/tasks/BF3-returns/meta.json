@@ -1,0 +1,1 @@
+{"project": "B", "kind": "feature", "description": "Returns against an invoice: restock the returned units, refund their discounted price plus tax, and record a CreditNote on the invoice, all or nothing."}

@@ -1,0 +1,10 @@
+--- a/report.fut
++++ b/report.fut
+@@ -25,6 +25,7 @@
+ pub fn gantt(p: Project): str ! {
+   var spans = earliest(p)
+   var width = projectLength(p)
++  print("gantt width", width)
+   var rows = []
+   for id in topoOrder(p) {
+     var span = spans[id]

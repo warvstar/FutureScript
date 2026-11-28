@@ -1,0 +1,25 @@
+We now ship from several warehouses, and an order may have to go out in more than one parcel when no single warehouse has everything. Each parcel pays its own shipping. Please add this to main.fut (none of it pub):
+
+1. A class `Warehouse` that knows how many units of each SKU it holds:
+   - constructor `Warehouse(name: str)`, a field `name: str`, starting with no stock;
+   - `fn put(sku: str, qty: num): Warehouse` adds `qty` units of `sku` and returns the warehouse itself, so calls chain: `Warehouse("East").put("TEE-S", 4).put("LAMP", 1)`. It throws when `qty` is not positive;
+   - `fn stockOf(sku: str): num` returns the units of `sku` on hand, 0 for a SKU it has never held.
+
+2. A class `Shipment`, one parcel from one warehouse, with fields `warehouse: str` (the warehouse's name), `units: map<str, num>` (units of each SKU in the parcel), `grams: num` (the parcel's weight) and `cost: num` (its shipping in cents).
+
+3. `fn splitShipments(cart: Cart, warehouses: list<Warehouse>, region: str): list<Shipment>`
+   - Goes through the cart's lines in order. Each line's units come from the warehouses in list order: as many as the first warehouse has (up to what the line still needs), then the next, and so on, until the line is covered.
+   - The units are taken out of the warehouses' stock.
+   - Returns one shipment for each warehouse that sends anything, in the order of `warehouses`. A shipment's `units` lists its SKUs in cart order; its `grams` is the weight of the units in it (the cart line's weightGrams per unit); its `cost` is shippingCents(grams, region).
+   - If the warehouses together can't cover the whole cart, it throws and no warehouse's stock changes.
+   - An empty cart gives [] and changes nothing.
+
+4. `fn shipmentsCost(shipments: list<Shipment>): num`: the shipping of all the shipments added up (0 for []).
+
+5. `fn describeShipment(s: Shipment): str` returns exactly
+
+       <warehouse>: <sku> x<qty>, <sku> x<qty> (<weight>, <cost>)
+
+   with the SKUs in the shipment's order, separated by ", ", <weight> formatted with formatKg and <cost> with formatMoney. For example "East: TEE-S x1, LAMP x1 (1.78 kg, $8.99)" or "West: MUG-BLU x1 (350 g, $4.99)".
+
+Add tests for it. `fut test main.fut` must pass when you finish.

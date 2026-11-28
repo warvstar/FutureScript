@@ -1,0 +1,11 @@
+--- a/stats.fut
++++ b/stats.fut
+@@ -88,7 +88,7 @@
+   var s = Summary(doc.title)
+   s.words = wordCount(doc)
+   s.headings = doc.headings().len()
+-  s.links = linksOf(doc).len()
++  s.linkCount = linksOf(doc).len()
+   s.minutes = readingMinutes(s.words, 200)
+   return s
+ }

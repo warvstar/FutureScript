@@ -1,0 +1,8 @@
+{
+ "project": "D",
+ "bug": "type",
+ "path": "on",
+ "file": "schedule.fut",
+ "line": 62,
+ "description": "weeksBusy passes who.name (str) to assignedDays, whose who param is Person"
+}

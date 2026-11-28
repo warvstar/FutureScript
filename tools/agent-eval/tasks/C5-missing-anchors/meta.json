@@ -1,0 +1,8 @@
+{
+  "project": "C",
+  "bug": "logic",
+  "path": "on",
+  "file": "render.fut",
+  "line": 88,
+  "description": "uniqueAnchor starts the repeat count at 1, so the second 'Setup' gets setup-2 instead of setup-1."
+}

@@ -1,0 +1,10 @@
+I'd like to track milestones: named groups of tasks (say "beta" = frontend + backend) with the day each is projected to land, so the weekly report can show them.
+
+- In tasks.fut, add `pub class Milestone` with fields `name: str` and `taskIds: list<str>`, made by `Milestone(name: str, taskIds: list<str>)`. Give `Project` a field `milestones: list<Milestone>` (empty to start) and a method `addMilestone(name: str, taskIds: list<str>): Milestone` that makes the milestone, appends it to `milestones` and returns it. It throws, checking in this order: `"duplicate milestone <name>"` if the project already has a milestone with that name; `"milestone <name> has no tasks"` if `taskIds` is empty; `"milestone <name>: no task <id>"` for the first id that names no task in the project. Nothing is added when it throws.
+- In schedule.fut, add `pub fn milestoneDay(p: Project, m: Milestone): num !`: the latest `finish` among the milestone's tasks in `earliest(p)`. Like `earliest`, it ignores whether tasks are done. For example, in `demoProject()` a milestone of ["frontend", "backend"] lands on day 8.
+- In report.fut, add `pub fn milestoneReport(p: Project): str !`: one line per milestone, in the order they were added, joined with "\n" (no trailing newline; "" when there are none). A milestone whose tasks are all done is `"<name>: reached"`; otherwise it's `"<name>: day <milestoneDay>, <done>/<total> done"`, e.g. `"beta: day 8, 1/2 done"`.
+- `printReport` should print the milestone report as one more print after the status table, but only when the project has milestones; without any, its output stays exactly as it is now.
+
+These change public interfaces: `fut api main.fut` updates the .api files.
+
+Add tests for it. `fut test main.fut` must pass when you finish.

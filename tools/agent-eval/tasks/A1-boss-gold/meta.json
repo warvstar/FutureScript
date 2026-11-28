@@ -1,0 +1,8 @@
+{
+ "project": "A",
+ "bug": "no-field",
+ "path": "off",
+ "file": "entities.fut",
+ "line": 103,
+ "description": "makeBoss writes m.gold on a locally constructed Monster; Monster's field is goldReward (gold is Player's)."
+}

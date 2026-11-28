@@ -1,0 +1,300 @@
+--- a/lexer.api
++++ b/lexer.api
+@@ -3,13 +3,17 @@
+ // Classify one line of source.
+ pub fn classify(raw: str, lineNo: num): Line
+ 
++// Whether s is a footnote label: one or more letters, digits, "-" or "_".
++pub fn isLabel(s: str): bool !
++
+ // The inline tokens of one line of text. A backtick with no closing one is plain text.
+ pub fn lexInline(s: str, line: num): list
+ 
+ // Every line of src, classified, numbered from 1.
+ pub fn lexLines(src: str): list
+ 
+-// One source line. kind is "heading", "bullet", "ordered", "fence", "rule", "blank" or "text".
++// One source line. kind is "heading", "bullet", "ordered", "fence", "rule", "footnote", "blank" or "text".
++// A footnote line's text is its definition, "label: text".
+ // text is what follows the marker, trimmed; level is the heading level, or the list depth (two spaces of indent per step).
+ pub class Line {
+   var kind: str
+--- a/lexer.fut
++++ b/lexer.fut
+@@ -12,7 +12,8 @@
+   fn init(kind: str, text: str, line: num, col: num) { self.kind = kind self.text = text self.line = line self.col = col }
+ }
+ 
+-// One source line. kind is "heading", "bullet", "ordered", "fence", "rule", "blank" or "text".
++// One source line. kind is "heading", "bullet", "ordered", "fence", "rule", "footnote", "blank" or "text".
++// A footnote line's text is its definition, "label: text".
+ // text is what follows the marker, trimmed; level is the heading level, or the list depth (two spaces of indent per step).
+ pub class Line {
+   var kind: str
+@@ -65,11 +66,24 @@
+   return n
+ }
+ 
++// Whether s is a footnote label: one or more letters, digits, "-" or "_".
++pub fn isLabel(s: str): bool ! {
++  if s == "" { return false }
++  for c in s {
++    if !((c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "-" || c == "_") { return false }
++  }
++  return true
++}
++
+ // Classify one line of source.
+ pub fn classify(raw: str, lineNo: num): Line {
+   var s = raw.trim()
+   if s == "" { return Line("blank", "", raw, lineNo, 0) }
+   if strings.startsWith(s, "```") { return Line("fence", s[3:].trim(), raw, lineNo, 0) }
++  var close = s.find("]:")
++  if strings.startsWith(s, "[^") && close > 2 && isLabel(s.slice(2, close)) {
++    return Line("footnote", s.slice(2, close) + ": " + s[close + 2:].trim(), raw, lineNo, 0)
++  }
+   var hashes = leading(s, "#")
+   if hashes >= 1 && hashes <= 6 && s.len() > hashes && s[hashes] == " " { return Line("heading", s[hashes:].trim(), raw, lineNo, hashes) }
+   if s.len() >= 3 && (leading(s, "-") == s.len() || leading(s, "*") == s.len()) { return Line("rule", "", raw, lineNo, 0) }
+@@ -97,6 +111,13 @@
+ 
+ test "lexInline keeps a stray backtick" {
+   expect lexInline("1 ` 3", 1)[0].text == "1 ` 3"
++}
++
++test "classify footnote definitions" {
++  var f = classify("[^n-1]:  A *note*", 3)
++  expect f.kind == "footnote" && f.text == "n-1: A *note*"
++  expect classify("[^a b]: no", 1).kind == "text" && classify("[^]: no", 1).kind == "text"
++  expect isLabel("x_2") && !isLabel("x.2")
+ }
+ 
+ test "classify headings, lists and rules" {
+--- a/parser.api
++++ b/parser.api
+@@ -2,12 +2,20 @@
+ 
+ pub class Doc {
+   var nodes: list
++  var notes: list = []
+   var title: str = ""
+   // The Heading nodes, in order.
+   fn headings(): list
+   fn init(nodes: list)
+ }
+ 
++// A footnote definition: its label and inline parts.
++pub class Footnote {
++  var label: str
++  var parts: list
++  fn init(label: str, parts: list)
++}
++
+ // Block nodes (Heading .. Rule) make up a document; inline nodes (Text .. Link) make up a block's parts.
+ pub enum Node {
+   Heading(level: num, text: str, line: num)
+@@ -20,6 +28,7 @@
+   Strong(parts: list)
+   Code(text: str)
+   Link(text: str, url: str)
++  FootnoteRef(label: str)
+ }
+ 
+ // Parse a whole document.
+--- a/parser.fut
++++ b/parser.fut
+@@ -1,5 +1,6 @@
+ // Building a document tree from Markdown source.
+ import "lexer.fut"
++import "std/strings"
+ 
+ // Block nodes (Heading .. Rule) make up a document; inline nodes (Text .. Link) make up a block's parts.
+ pub enum Node {
+@@ -13,11 +14,20 @@
+   Strong(parts: list)
+   Code(text: str)
+   Link(text: str, url: str)
++  FootnoteRef(label: str)
+ }
+ 
++// A footnote definition: its label and inline parts.
++pub class Footnote {
++  var label: str
++  var parts: list
++  fn init(label: str, parts: list) { self.label = label self.parts = parts }
++}
++
+ pub class Doc {
+   var nodes: list
+   var title: str = ""
++  var notes: list = []
+   fn init(nodes: list) {
+     self.nodes = nodes
+     for h in self.headings() { if h.level == 1 { self.title = h.text break } }
+@@ -68,6 +78,10 @@
+         i = close + 1 continue
+       }
+     }
++    if t.kind == "lbrack" && i + 2 < to && ts[i + 1].kind == "text" && ts[i + 2].kind == "rbrack" && strings.startsWith(ts[i + 1].text, "^") && isLabel(ts[i + 1].text[1:]) {
++      out.push(Node.FootnoteRef(ts[i + 1].text[1:]))
++      i += 3 continue
++    }
+     if t.kind == "lbrack" {
+       var rb = findKind(ts, "rbrack", i + 1, to)
+       if rb > 0 && rb + 1 < to && ts[rb + 1].kind == "lparen" {
+@@ -102,6 +116,8 @@
+   var lines = lexLines(src)
+   var nodes = []
+   var para = []
++  var notes = []
++  var labels = {}
+   var i = 0
+   while i < lines.len() {
+     var l = lines[i]
+@@ -112,6 +128,10 @@
+       nodes.push(Node.Heading(l.level, l.text, l.lineNo))
+     } else if l.kind == "bullet" || l.kind == "ordered" {
+       nodes.push(Node.ListItem(l.level, l.kind == "ordered", parseInline(l.text, l.lineNo)))
++    } else if l.kind == "footnote" {
++      var colon = l.text.find(": ")
++      var label = l.text.slice(0, colon)
++      if !labels.has(label) { labels[label] = true notes.push(Footnote(label, parseInline(l.text[colon + 2:], l.lineNo))) }
+     } else if l.kind == "rule" {
+       nodes.push(Node.Rule)
+     } else if l.kind == "fence" {
+@@ -122,7 +142,9 @@
+     }
+   }
+   if para.len() > 0 { nodes.push(paragraph(para)) }
+-  return Doc(nodes)
++  var doc = Doc(nodes)
++  doc.notes = notes
++  return doc
+ }
+ 
+ test "parseInline nests emphasis and finds links" {
+@@ -143,6 +165,13 @@
+   expect d.nodes[2:5] == [Node.ListItem(0, false, [Node.Text("one")]), Node.ListItem(1, false, [Node.Text("two")]), Node.ListItem(0, true, [Node.Text("first")])]
+   expect d.nodes[5:] == [Node.CodeBlock("fut", "var x = 1"), Node.Rule]
+   expect d.headings().len() == 1
++}
++
++test "parse collects footnotes" {
++  var d = parse("a[^x] [^ y] [^]\n[^x]: *one*\n[^z]: two\n[^x]: dup\nb")
++  expect d.nodes == [Node.Para([Node.Text("a"), Node.FootnoteRef("x"), Node.Text(" [^ y] [^]")]), Node.Para([Node.Text("b")])]
++  expect d.notes.len() == 2 && d.notes[0].label == "x" && d.notes[1].label == "z"
++  expect d.notes[0].parts == [Node.Em([Node.Text("one")])]
+ }
+ 
+ test "parse keeps a document without a top heading untitled" {
+--- a/render.fut
++++ b/render.fut
+@@ -27,14 +27,23 @@
+ }
+ 
+ pub fn renderInline(parts: list): str {
++  return inlineHtml(parts, {})
++}
++
++// Inline parts as HTML; numbers maps each defined footnote label to its number.
++fn inlineHtml(parts: list, numbers: map): str {
+   var s = ""
+   for p in parts {
+     match p {
+       Text(t) { s += escape(t) }
+-      Em(inner) { s += "<em>" + renderInline(inner) + "</em>" }
+-      Strong(inner) { s += "<strong>" + renderInline(inner) + "</strong>" }
++      Em(inner) { s += "<em>" + inlineHtml(inner, numbers) + "</em>" }
++      Strong(inner) { s += "<strong>" + inlineHtml(inner, numbers) + "</strong>" }
+       Code(t) { s += "<code>" + escape(t) + "</code>" }
+       Link(text, url) { s += "<a href=\"" + escape(url) + "\">" + escape(text) + "</a>" }
++      FootnoteRef(label) {
++        var n = numbers[label]
++        s += n == nil ? "[^{label}]" : "<sup><a href=\"#fn-{n}\">{n}</a></sup>"
++      }
+       else { }
+     }
+   }
+@@ -45,6 +54,8 @@
+ pub fn renderDoc(doc: Doc): str {
+   var out = []
+   var openList = ""
++  var numbers = {}
++  for note in doc.notes { numbers[note.label] = numbers.len() + 1 }
+   for n in doc.nodes {
+     var tag = ""
+     match n { ListItem(_, ordered, _) { tag = ordered ? "ol" : "ul" } else { } }
+@@ -52,8 +63,8 @@
+     if tag != "" && openList == "" { out.push("<{tag}>") openList = tag }
+     match n {
+       Heading(level, text, _) { out.push("<h{level}>" + escape(text) + "</h{level}>") }
+-      Para(parts) { out.push("<p>" + renderInline(parts) + "</p>") }
+-      ListItem(_, _, parts) { out.push("<li>" + renderInline(parts) + "</li>") }
++      Para(parts) { out.push("<p>" + inlineHtml(parts, numbers) + "</p>") }
++      ListItem(_, _, parts) { out.push("<li>" + inlineHtml(parts, numbers) + "</li>") }
+       CodeBlock(lang, text) {
+         var cls = lang == "" ? "" : " class=\"language-{lang}\""
+         out.push("<pre><code{cls}>" + escape(text) + "</code></pre>")
+@@ -63,6 +74,11 @@
+     }
+   }
+   if openList != "" { out.push("</{openList}>") }
++  if doc.notes.len() > 0 {
++    out.push("<ol class=\"footnotes\">")
++    for note in doc.notes { out.push("<li id=\"fn-{numbers[note.label]}\">" + inlineHtml(note.parts, numbers) + "</li>") }
++    out.push("</ol>")
++  }
+   return out.join("\n")
+ }
+ 
+@@ -124,6 +140,12 @@
+ test "renderDoc groups list items" {
+   var html = renderDoc(parse("# T\n- a\n- b\n1. c\n\npara\n```\n<x>\n```"))
+   expect html == "<h1>T</h1>\n<ul>\n<li>a</li>\n<li>b</li>\n</ul>\n<ol>\n<li>c</li>\n</ol>\n<p>para</p>\n<pre><code>&lt;x&gt;</code></pre>"
++}
++
++test "renderDoc numbers footnotes" {
++  var html = renderDoc(parse("- see[^b] and [^a] and [^c]\n[^b]: B *&*\n[^a]: A[^b]"))
++  expect html == "<ul>\n<li>see<sup><a href=\"#fn-1\">1</a></sup> and <sup><a href=\"#fn-2\">2</a></sup> and [^c]</li>\n</ul>\n<ol class=\"footnotes\">\n<li id=\"fn-1\">B <em>&amp;</em></li>\n<li id=\"fn-2\">A<sup><a href=\"#fn-1\">1</a></sup></li>\n</ol>"
++  expect renderInline(parseInline("x[^1]", 1)) == "x[^1]"
+ }
+ 
+ test "slug" {
+--- a/stats.api
++++ b/stats.api
+@@ -1,6 +1,7 @@
+ // The public interface of stats.fut, written by `fut api`. `fut test` fails while it is out of date.
+ 
+ // A message for each link that looks wrong: an empty URL, a URL with a space, or plain http.
++// Links in footnotes come after those in the body.
+ pub fn checkLinks(doc: Doc): list
+ 
+ pub fn countWords(s: str): num !
+--- a/stats.fut
++++ b/stats.fut
+@@ -56,9 +56,12 @@
+ }
+ 
+ // A message for each link that looks wrong: an empty URL, a URL with a space, or plain http.
++// Links in footnotes come after those in the body.
+ pub fn checkLinks(doc: Doc): list {
+   var problems = []
+-  for l in linksOf(doc) {
++  var links = linksOf(doc)
++  for note in doc.notes { collectLinks(note.parts, links) }
++  for l in links {
+     if l.url == "" { problems.push("'{l.text}': empty url") }
+     else if l.url.has(" ") { problems.push("'{l.text}': space in {l.url}") }
+     else if strings.startsWith(l.url, "http://") { problems.push("'{l.text}': insecure {l.url}") }
+@@ -112,6 +115,11 @@
+ test "checkLinks" {
+   var d = parse("[a]() and [b](http://x.io) and *[c](https://ok.io)*\n- [d](my file.md)")
+   expect checkLinks(d) == ["'a': empty url", "'b': insecure http://x.io", "'d': space in my file.md"]
++}
++
++test "checkLinks looks in footnotes" {
++  var d = parse("a[^1] [b](http://b.io)\n[^1]: see [c]()")
++  expect checkLinks(d) == ["'b': insecure http://b.io", "'c': empty url"]
+ }
+ 
+ test "profile times with the clock" {

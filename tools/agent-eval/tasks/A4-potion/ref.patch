@@ -1,0 +1,31 @@
+--- a/main.fut
++++ b/main.fut
+@@ -93,3 +93,28 @@
+   expect !r.won && r.rounds == 3 && r.log.len() == 6
+   expect isAlive(p) && isAlive(tough)
+ }
++
++// Drinks the first potion in the bag, healing up to max hp. False (and nothing changes) at full hp or with no potion.
++fn usePotion(p: Player): bool ! {
++  if p.hp >= p.maxHp { return false }
++  for it in p.inventory {
++    if it.kind == "potion" {
++      removeItem(p, it)
++      p.hp += it.power
++      if p.hp > p.maxHp { p.hp = p.maxHp }
++      return true
++    }
++  }
++  return false
++}
++
++test "potions heal up to max hp" {
++  var p = newHero("Ana")
++  expect !usePotion(p)
++  p.hp = 25
++  expect usePotion(p)
++  expect p.hp == 30 && p.inventory.len() == 0
++  p.hp = 5
++  expect !usePotion(p)
++  expect p.hp == 5
++}

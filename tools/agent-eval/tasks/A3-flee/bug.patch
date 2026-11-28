@@ -1,0 +1,10 @@
+--- a/combat.fut
++++ b/combat.fut
+@@ -51,6 +51,7 @@
+ // kept between 10% and 90%.
+ pub fn fleeChance(p: Player, m: Monster): num ! {
+   var chance = 0.5 + (p.speed - m.speed) * 0.1
++  print("flee chance vs {m.name}: {chance}")
+   return math.clamp(chance, 0.1, 0.9)
+ }
+ 

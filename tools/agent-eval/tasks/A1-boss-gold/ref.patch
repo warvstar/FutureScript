@@ -1,0 +1,30 @@
+--- a/main.fut
++++ b/main.fut
+@@ -93,3 +93,27 @@
+   expect !r.won && r.rounds == 3 && r.log.len() == 6
+   expect isAlive(p) && isAlive(tough)
+ }
++
++// The strongest weapon in the bag (not the one in hand): the earliest on ties, nil when there is none.
++fn bestWeapon(p: Player): Item? ! {
++  var best = nil
++  for it in p.inventory {
++    if it.kind == "weapon" && (best == nil || it.power > best.power) { best = it }
++  }
++  return best
++}
++
++test "best weapon in the bag" {
++  var p = Player("Ana")
++  expect bestWeapon(p) == nil
++  var dagger = Item("Dagger", "weapon", 2, 2, 12)
++  var axe = Item("Axe", "weapon", 5, 4, 30)
++  var club = Item("Club", "weapon", 5, 4, 8)
++  addItem(p, potion())
++  addItem(p, dagger)
++  addItem(p, axe)
++  addItem(p, club)
++  expect bestWeapon(p) == axe
++  equip(p, axe)
++  expect bestWeapon(p) == club
++}

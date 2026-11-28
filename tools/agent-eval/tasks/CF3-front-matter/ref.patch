@@ -1,0 +1,181 @@
+--- a/main.fut
++++ b/main.fut
+@@ -26,8 +26,7 @@
+ // A page: the document's title, then its HTML.
+ fn page(src: str): str {
+   var doc = parse(src)
+-  var title = doc.title == "" ? "Untitled" : doc.title
+-  return "<title>" + escape(title) + "</title>\n" + renderDoc(doc)
++  return renderHead(doc) + "\n" + renderDoc(doc)
+ }
+ 
+ test "sample parses into blocks" {
+@@ -53,4 +52,5 @@
+ test "page" {
+   expect page("# A & B\ntext") == "<title>A &amp; B</title>\n<h1>A &amp; B</h1>\n<p>text</p>"
+   expect page("just text").has("<title>Untitled</title>")
++  expect page("---\ntitle: Notes\nlang: en\n---\n# Big") == "<title>Notes</title>\n<meta name=\"lang\" content=\"en\">\n<h1>Big</h1>"
+ }
+--- a/parser.api
++++ b/parser.api
+@@ -1,11 +1,14 @@
+ // The public interface of parser.fut, written by `fut api`. `fut test` fails while it is out of date.
+ 
+ pub class Doc {
++  var meta: map = {}
+   var nodes: list
+   var title: str = ""
+   // The Heading nodes, in order.
+   fn headings(): list
+   fn init(nodes: list)
++  // The front matter's value for key, or "" if it has none.
++  fn metaValue(key: str): str
+ }
+ 
+ // Block nodes (Heading .. Rule) make up a document; inline nodes (Text .. Link) make up a block's parts.
+@@ -22,7 +25,7 @@
+   Link(text: str, url: str)
+ }
+ 
+-// Parse a whole document.
++// Parse a whole document, with its front matter if it has one.
+ pub fn parse(src: str): Doc
+ 
+ // The inline nodes of one piece of text. Unmatched markers stay as plain text.
+--- a/parser.fut
++++ b/parser.fut
+@@ -1,5 +1,6 @@
+ // Building a document tree from Markdown source.
+ import "lexer.fut"
++import "std/strings"
+ 
+ // Block nodes (Heading .. Rule) make up a document; inline nodes (Text .. Link) make up a block's parts.
+ pub enum Node {
+@@ -18,10 +19,16 @@
+ pub class Doc {
+   var nodes: list
+   var title: str = ""
++  var meta: map = {}
+   fn init(nodes: list) {
+     self.nodes = nodes
+     for h in self.headings() { if h.level == 1 { self.title = h.text break } }
+   }
++  // The front matter's value for key, or "" if it has none.
++  fn metaValue(key: str): str {
++    var v = self.meta[key]
++    return v == nil ? "" : v
++  }
+   // The Heading nodes, in order.
+   fn headings(): list {
+     var out = []
+@@ -97,12 +104,35 @@
+   return Node.Para(parseInline(texts.join(" "), lines[0].lineNo))
+ }
+ 
+-// Parse a whole document.
++// The index of the line closing the front matter that opens lines, or -1 if there is none.
++fn frontMatterEnd(lines: list): num {
++  if lines.len() == 0 || lines[0].raw.trim() != "---" { return -1 }
++  for j in 1..lines.len() { if lines[j].raw.trim() == "---" { return j } }
++  return -1
++}
++
++// The key: value pairs of front matter lines. Keys are lower case; a value loses one pair of surrounding double quotes.
++fn frontMatter(lines: list): map {
++  var meta = {}
++  for l in lines {
++    var colon = l.raw.find(":")
++    if colon < 0 { continue }
++    var key = strings.lower(l.raw.slice(0, colon).trim())
++    if key == "" { continue }
++    var value = l.raw[colon + 1:].trim()
++    if value.len() >= 2 && strings.startsWith(value, "\"") && strings.endsWith(value, "\"") { value = value.slice(1, value.len() - 1) }
++    meta[key] = value
++  }
++  return meta
++}
++
++// Parse a whole document, with its front matter if it has one.
+ pub fn parse(src: str): Doc {
+   var lines = lexLines(src)
+   var nodes = []
+   var para = []
+-  var i = 0
++  var end = frontMatterEnd(lines)
++  var i = end + 1
+   while i < lines.len() {
+     var l = lines[i]
+     i += 1
+@@ -122,7 +152,12 @@
+     }
+   }
+   if para.len() > 0 { nodes.push(paragraph(para)) }
+-  return Doc(nodes)
++  var doc = Doc(nodes)
++  if end > 0 {
++    doc.meta = frontMatter(lines.slice(1, end))
++    if doc.metaValue("title") != "" { doc.title = doc.metaValue("title") }
++  }
++  return doc
+ }
+ 
+ test "parseInline nests emphasis and finds links" {
+@@ -143,6 +178,14 @@
+   expect d.nodes[2:5] == [Node.ListItem(0, false, [Node.Text("one")]), Node.ListItem(1, false, [Node.Text("two")]), Node.ListItem(0, true, [Node.Text("first")])]
+   expect d.nodes[5:] == [Node.CodeBlock("fut", "var x = 1"), Node.Rule]
+   expect d.headings().len() == 1
++}
++
++test "parse reads front matter" {
++  var d = parse("---\nTitle: \"A: B\"\nno colon\n: empty key\nauthor:  Ann \n---\n# Heading")
++  expect d.meta == {title: "A: B", author: "Ann"}
++  expect d.title == "A: B" && d.metaValue("author") == "Ann" && d.metaValue("x") == ""
++  expect d.nodes == [Node.Heading(1, "Heading", 7)]
++  expect parse("---\n# Not closed").nodes == [Node.Rule, Node.Heading(1, "Not closed", 2)]
+ }
+ 
+ test "parse keeps a document without a top heading untitled" {
+--- a/render.api
++++ b/render.api
+@@ -9,6 +9,10 @@
+ // The HTML for a document, one block per line. Consecutive list items share one <ul> or <ol>.
+ pub fn renderDoc(doc: Doc): str
+ 
++// The head of a page: a <title> line (the document's title, or "Untitled"), then a <meta> line for each front matter key
++// but title, in order.
++pub fn renderHead(doc: Doc): str
++
+ pub fn renderInline(parts: list): str
+ 
+ // A heading's anchor: lower case, letters and digits kept, each run of spaces and hyphens made one "-",
+--- a/render.fut
++++ b/render.fut
+@@ -41,6 +41,16 @@
+   return s
+ }
+ 
++// The head of a page: a <title> line (the document's title, or "Untitled"), then a <meta> line for each front matter key
++// but title, in order.
++pub fn renderHead(doc: Doc): str {
++  var out = ["<title>" + escape(doc.title == "" ? "Untitled" : doc.title) + "</title>"]
++  for k in doc.meta.keys() {
++    if k != "title" { out.push("<meta name=\"" + escape(k) + "\" content=\"" + escape(doc.meta[k]) + "\">") }
++  }
++  return out.join("\n")
++}
++
+ // The HTML for a document, one block per line. Consecutive list items share one <ul> or <ol>.
+ pub fn renderDoc(doc: Doc): str {
+   var out = []
+@@ -124,6 +134,11 @@
+ test "renderDoc groups list items" {
+   var html = renderDoc(parse("# T\n- a\n- b\n1. c\n\npara\n```\n<x>\n```"))
+   expect html == "<h1>T</h1>\n<ul>\n<li>a</li>\n<li>b</li>\n</ul>\n<ol>\n<li>c</li>\n</ol>\n<p>para</p>\n<pre><code>&lt;x&gt;</code></pre>"
++}
++
++test "renderHead" {
++  expect renderHead(parse("---\nauthor: A & B\ntitle: T\ndate: 2026\n---\ntext")) == "<title>T</title>\n<meta name=\"author\" content=\"A &amp; B\">\n<meta name=\"date\" content=\"2026\">"
++  expect renderHead(parse("text")) == "<title>Untitled</title>"
+ }
+ 
+ test "slug" {

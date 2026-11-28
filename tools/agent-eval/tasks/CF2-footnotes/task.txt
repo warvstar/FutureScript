@@ -1,0 +1,18 @@
+I'd like mdlite to support footnotes: a reference like "[^src]" in the text, a definition line like "[^src]: Taken from the *2019* report." anywhere in the document, and the notes listed, numbered, at the end of the HTML.
+
+A footnote label is one or more ASCII letters, digits, "-" or "_".
+
+Lexer (lexer.fut): `classify` gives a line whose trimmed text starts with "[^label]:" (a valid label) the kind "footnote". Update the comment on Line that lists the kinds.
+
+Parser (parser.fut):
+- Add an inline variant `FootnoteRef(label: str)` to `Node`, right after `Link`. In inline text (`parseInline`, and so paragraphs and list items), "[^label]" with a valid label becomes `Node.FootnoteRef(label)`. Brackets that don't hold a valid label, such as "[^]" or "[^a b]", stay plain text as now.
+- Add `pub class Footnote` with fields `label: str` and `parts: list` and `fn init(label: str, parts: list)`.
+- Give `Doc` a field `notes: list`, empty by default (so `Doc(nodes)` still works), which `parse` fills with one Footnote per definition line, in source order. The note's parts are the text after the "[^label]:", trimmed and parsed as inline text. If a label is defined more than once, only its first definition counts. A definition line makes no node in `nodes`, and it ends a paragraph in progress. Lines inside a code fence stay code.
+
+Renderer (render.fut): footnotes are numbered 1, 2, 3, ... in the order of `doc.notes`. In `renderDoc`, a reference to a defined label is written `<sup><a href="#fn-N">N</a></sup>`, N being that footnote's number; a reference to a label with no definition is written as its source text, "[^label]". `renderInline(parts)` on its own knows of no definitions, so it writes every reference as "[^label]". When the document has notes, `renderDoc` ends with `<ol class="footnotes">`, then one `<li id="fn-N">...</li>` per note in order (its parts rendered as inline HTML, references in it numbered the same way), then `</ol>`, each on its own line after everything else (after an open list is closed). With no notes the output is as before.
+
+Stats (stats.fut): `checkLinks` also checks the links in footnotes (nested ones too), after all the links in the body, in note order.
+
+This changes public interfaces: `fut api main.fut` updates the .api files.
+
+Add tests for it. `fut test main.fut` must pass when you finish.

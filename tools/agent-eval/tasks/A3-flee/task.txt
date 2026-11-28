@@ -1,0 +1,7 @@
+Please add a function to main.fut for running away from a fight:
+
+    fn tryFlee(p: Player, ms: list, roll: num): bool
+
+`roll` is a number in [0, 1) that the caller has already rolled. The player gets away when `roll` is below `fleeChance(p, m)` (in combat.fut) for every monster m in `ms` that is still standing, i.e. below the smallest of those chances. Monsters that are down (hp 0) don't count; if none are standing, the player always gets away. It returns whether the player escaped and doesn't change anything.
+
+Add a test block for it in main.fut. `fut test main.fut` must pass when you finish.

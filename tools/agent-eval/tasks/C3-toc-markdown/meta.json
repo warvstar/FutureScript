@@ -1,0 +1,8 @@
+{
+  "project": "C",
+  "bug": "type",
+  "path": "on",
+  "file": "render.fut",
+  "line": 101,
+  "description": "tocEntry passes the Heading node h to slug(text: str) instead of h.text."
+}

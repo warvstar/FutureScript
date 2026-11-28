@@ -1,0 +1,32 @@
+// The public interface of loot.fut, written by `fut api`. `fut test` fails while it is out of date.
+
+// Puts it in the bag if the weight allows. Returns whether it went in.
+pub fn addItem(p: Player, it: Item): bool !
+
+// The weight of everything in the bag (equipped items don't count).
+pub fn bagWeight(p: Player): num !
+
+// How much weight the player can carry: 20, plus 5 per level.
+pub fn carryLimit(p: Player): num !
+
+// What a kind of monster can drop: a list of {item, chance}, chance in [0, 1].
+pub fn dropTable(kind: str): list !
+
+// Moves a weapon or armor from the bag into its slot. Whatever was in the slot goes back in the bag
+// and is returned (nil when the slot was empty).
+pub fn equip(p: Player, it: Item): Item? !
+
+// Where it sits in the bag (this very item, not an equal one), or -1.
+pub fn findItem(p: Player, it: Item): num !
+
+// A small healing potion.
+pub fn potion(): Item !
+
+// Takes it out of the bag. Returns whether it was there.
+pub fn removeItem(p: Player, it: Item): bool !
+
+// Each drop whose roll comes in under its chance, in table order.
+pub fn rollDrops(table: list): list ! random
+
+// Sells it out of the bag for half its value, rounded down. Returns the gold paid, 0 when it isn't in the bag.
+pub fn sellItem(p: Player, it: Item): num !

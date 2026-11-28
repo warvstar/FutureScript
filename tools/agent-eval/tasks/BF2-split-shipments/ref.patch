@@ -1,0 +1,115 @@
+diff -ruN a/main.fut b/main.fut
+--- a/main.fut	2026-11-28 00:34:39
++++ b/main.fut	2026-11-28 01:45:15
+@@ -35,6 +35,77 @@
+   return buildInvoice(number, cart, region)
+ }
+ 
++// A warehouse and how many units of each SKU it holds.
++class Warehouse {
++  var name: str
++  var stock: map<str, num> = {}
++  fn init(name: str) { self.name = name }
++  fn put(sku: str, qty: num): Warehouse {
++    if qty <= 0 { throw "put needs a positive quantity" }
++    self.stock[sku] = self.stockOf(sku) + qty
++    return self
++  }
++  fn stockOf(sku: str): num {
++    var n = self.stock[sku]
++    return n == nil ? 0 : n
++  }
++}
++
++// What one warehouse sends: units per SKU, the parcel's weight and its shipping.
++class Shipment {
++  var warehouse: str
++  var units: map<str, num> = {}
++  var grams: num = 0
++  var cost: num = 0
++  fn init(warehouse: str) { self.warehouse = warehouse }
++}
++
++// Split a cart across warehouses, taking each line from the first warehouses that have it.
++// Takes the units out of the warehouses; all or nothing.
++fn splitShipments(cart: Cart, warehouses: list<Warehouse>, region: str): list<Shipment> {
++  var parts = []
++  for w in warehouses { parts.push(Shipment(w.name)) }
++  atomic {
++    for l in cart.lines {
++      var left = l.qty
++      for i in 0..warehouses.len() {
++        var w = warehouses[i]
++        var take = w.stockOf(l.sku)
++        if take > left { take = left }
++        if take > 0 {
++          w.stock[l.sku] = w.stockOf(l.sku) - take
++          var s = parts[i]
++          s.units[l.sku] = take
++          s.grams += take * l.weightGrams
++          left -= take
++        }
++      }
++      if left > 0 { throw "the warehouses are {left} short of {l.sku}" }
++    }
++  }
++  var out = []
++  for s in parts {
++    if s.units.len() > 0 {
++      s.cost = shippingCents(s.grams, region)
++      out.push(s)
++    }
++  }
++  return out
++}
++
++fn shipmentsCost(shipments: list<Shipment>): num {
++  var t = 0
++  for s in shipments { t += s.cost }
++  return t
++}
++
++// "East: TEE-S x2, MUG-BLU x1 (710 g, $8.99)"
++fn describeShipment(s: Shipment): str {
++  var items = []
++  for sku in s.units { items.push("{sku} x{s.units[sku]}") }
++  return "{s.warehouse}: {items.join(", ")} ({formatKg(s.grams)}, {formatMoney(s.cost)})"
++}
++
+ test "invoice totals" {
+   var cat = sampleCatalog()
+   var cart = cartOf(cat, [["TEE-S", 2], ["MUG-BLU", 1]])
+@@ -81,4 +152,33 @@
+   expect text.has("Discount                    -$5.00")
+   expect rows[rows.len() - 1] == "Total                       $29.23"
+   expect prints { printInvoice(inv) } == text + "\n"
++}
++
++test "split shipments" {
++  var cat = sampleCatalog()
++  var east = Warehouse("East").put("TEE-S", 1).put("LAMP", 1)
++  var west = Warehouse("West").put("MUG-BLU", 4)
++  var north = Warehouse("North").put("TEE-S", 5).put("MUG-BLU", 2)
++  var cart = cartOf(cat, [["TEE-S", 3], ["MUG-BLU", 1], ["LAMP", 1]])
++  var parts = splitShipments(cart, [east, west, north], "CA")
++  expect parts.len() == 3
++  expect describeShipment(parts[0]) == "East: TEE-S x1, LAMP x1 (1.78 kg, $8.99)"
++  expect describeShipment(parts[1]) == "West: MUG-BLU x1 (350 g, $4.99)"
++  expect describeShipment(parts[2]) == "North: TEE-S x2 (360 g, $4.99)"
++  expect shipmentsCost(parts) == 899 + 499 + 499
++  expect east.stockOf("TEE-S") == 0
++  expect north.stockOf("TEE-S") == 3
++  expect north.stockOf("MUG-BLU") == 2
++  expect splitShipments(Cart(), [east], "CA") == []
++}
++
++test "split shipments are all or nothing" {
++  var cat = sampleCatalog()
++  var east = Warehouse("East").put("MUG-BLU", 2)
++  var west = Warehouse("West").put("LAMP", 1)
++  var cart = cartOf(cat, [["MUG-BLU", 2], ["LAMP", 2]])
++  expect throws { splitShipments(cart, [east, west], "NY") }
++  expect east.stockOf("MUG-BLU") == 2
++  expect west.stockOf("LAMP") == 1
++  expect west.stockOf("TEE-S") == 0
+ }

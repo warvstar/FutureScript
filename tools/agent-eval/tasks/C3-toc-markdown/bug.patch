@@ -1,0 +1,11 @@
+--- a/render.fut
++++ b/render.fut
+@@ -98,7 +98,7 @@
+ }
+ 
+ fn tocEntry(h: Node.Heading, seen: map): TocEntry {
+-  return TocEntry(h.text, h.level, uniqueAnchor(slug(h.text), seen))
++  return TocEntry(h.text, h.level, uniqueAnchor(slug(h), seen))
+ }
+ 
+ // One entry per heading, in order, each with a distinct anchor.

@@ -1,0 +1,11 @@
+The checkout page needs a one-line delivery estimate. In main.fut, add
+
+    fn deliveryEstimate(cart: Cart, region: str): str
+
+It quotes shipping for the cart's total weight (cartGrams) to `region` with quoteShipping from pricing.fut, and returns exactly
+
+    Arrives in <days> days, <cost> shipping
+
+where <days> is the quote's transit days and <cost> is the quote's cost formatted with formatMoney, e.g. "Arrives in 3 days, $8.99 shipping". Ignore any discount code on the cart. A cart with no lines returns "Nothing to ship". Don't make it pub.
+
+Add a test for it in main.fut. `fut test main.fut` must pass when you finish.

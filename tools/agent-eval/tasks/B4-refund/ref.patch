@@ -1,0 +1,22 @@
+--- a/main.fut
++++ b/main.fut
+@@ -82,3 +82,19 @@
+   expect rows[rows.len() - 1] == "Total                       $29.23"
+   expect prints { printInvoice(inv) } == text + "\n"
+ }
++
++// Remove the line for sku and return its refund (unit price x quantity), or 0 if it isn't in the cart.
++fn refundLine(cart: Cart, sku: str): num {
++  var l = lineFor(cart, sku)
++  if l == nil { return 0 }
++  removeItem(cart, sku)
++  return l.totalCents()
++}
++
++test "refund a line" {
++  var cat = sampleCatalog()
++  var cart = cartOf(cat, [["TEE-S", 2], ["MUG-BLU", 1]])
++  expect refundLine(cart, "TEE-S") == 3600
++  expect lineFor(cart, "TEE-S") == nil
++  expect refundLine(cart, "TEE-S") == 0
++}

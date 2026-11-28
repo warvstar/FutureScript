@@ -1,0 +1,7 @@
+Please add a function to main.fut that finds the longest paragraph of a document, so I can show it as a preview.
+
+Signature: `fn longestParagraph(doc: Doc): str` (non-pub, in main.fut).
+
+It returns the plain text of the paragraph (Para node) with the most words, where a paragraph's plain text is `plain(parts)` and words are counted with `countWords`. Only paragraphs count: not headings, list items or code blocks. On a tie, the earliest paragraph wins. A document with no paragraphs gives "".
+
+Add a test for it in main.fut. `fut test main.fut` must pass when you finish.

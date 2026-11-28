@@ -1,0 +1,8 @@
+{
+  "project": "C",
+  "bug": "no-field",
+  "path": "off",
+  "file": "stats.fut",
+  "line": 91,
+  "description": "summarize writes s.linkCount on a constructed Summary local; the field is `links`."
+}

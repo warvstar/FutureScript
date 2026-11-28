@@ -1,0 +1,170 @@
+--- a/main.fut
++++ b/main.fut
+@@ -32,3 +32,23 @@
+   expect criticalPath(p).len() == 4
+   expect summary(p) == "Website: 1/6 done, 13 days left, 11 days end to end"
+ }
++
++test "milestones" {
++  var p = demoProject()
++  var beta = p.addMilestone("beta", ["frontend", "backend"])
++  p.addMilestone("launch", ["release"])
++  expect milestoneDay(p, beta) == 8
++  markDone(p, "frontend")
++  expect milestoneReport(p) == "beta: day 8, 1/2 done\nlaunch: day 11, 0/1 done"
++  markDone(p, "backend")
++  expect milestoneReport(p) == "beta: reached\nlaunch: day 11, 0/1 done"
++  expect throws { p.addMilestone("beta", ["docs"]) } == "duplicate milestone beta"
++  expect throws { p.addMilestone("demo", ["docs", "qa"]) } == "milestone demo: no task qa"
++  expect throws { p.addMilestone("empty", []) } == "milestone empty has no tasks"
++}
++
++test "milestones in the printed report" {
++  var p = demoProject()
++  p.addMilestone("launch", ["release"])
++  expect prints { printReport(p) } == "Website: 0/6 done, 16 days left, 11 days end to end\ncritical path: design > backend > integrate > release\n" + statusTable(p) + "\nlaunch: day 11, 0/1 done\n"
++}
+--- a/report.api
++++ b/report.api
+@@ -8,6 +8,10 @@
+ // A bar per task, one column per day: "backend      |   #####   |".
+ pub fn gantt(p: Project): str !
+ 
++// A line per milestone, in the order they were added:
++// "beta: day 10, 1/3 done", or "beta: reached" once all its tasks are done.
++pub fn milestoneReport(p: Project): str !
++
+ pub fn printReport(p: Project) ! io
+ 
+ // The summary with the time it was made, in whole seconds since 1970.
+--- a/report.fut
++++ b/report.fut
+@@ -41,10 +41,27 @@
+   return "{p.name}: {done}/{p.tasks.len()} done, {formatDays(remainingDays(p))} left, {formatDays(projectLength(p))} end to end"
+ }
+ 
++// A line per milestone, in the order they were added:
++// "beta: day 10, 1/3 done", or "beta: reached" once all its tasks are done.
++pub fn milestoneReport(p: Project): str ! {
++  var lines = []
++  for m in p.milestones {
++    var done = 0
++    for id in m.taskIds { if taskOf(p, id).done { done += 1 } }
++    if done == m.taskIds.len() {
++      lines.push("{m.name}: reached")
++    } else {
++      lines.push("{m.name}: day {milestoneDay(p, m)}, {done}/{m.taskIds.len()} done")
++    }
++  }
++  return lines.join("\n")
++}
++
+ pub fn printReport(p: Project) ! io {
+   print(summary(p))
+   print("critical path: {criticalPath(p).join(" > ")}")
+   print(statusTable(p))
++  if p.milestones.len() > 0 { print(milestoneReport(p)) }
+ }
+ 
+ // The summary with the time it was made, in whole seconds since 1970.
+--- a/schedule.api
++++ b/schedule.api
+@@ -15,6 +15,9 @@
+ // starting as soon as all of its deps have finished.
+ pub fn earliest(p: Project): map !
+ 
++// The day m's last task finishes, on the earliest schedule.
++pub fn milestoneDay(p: Project, m: Milestone): num !
++
+ // Days from the start until the last task finishes.
+ pub fn projectLength(p: Project): num !
+ 
+--- a/schedule.fut
++++ b/schedule.fut
+@@ -48,6 +48,14 @@
+   return lists.reverse(path)
+ }
+ 
++// The day m's last task finishes, on the earliest schedule.
++pub fn milestoneDay(p: Project, m: Milestone): num ! {
++  var spans = earliest(p)
++  var day = 0
++  for id in m.taskIds { day = math.max(day, spans[id].finish) }
++  return day
++}
++
+ // Days of unfinished work assigned to who.
+ pub fn assignedDays(p: Project, who: Person): num ! {
+   var sum = 0
+--- a/tasks.api
++++ b/tasks.api
+@@ -10,6 +10,13 @@
+ 
+ pub fn markDone(p: Project, id: str)
+ 
++// A checkpoint that is reached when all of its tasks are done.
++pub class Milestone {
++  var name: str
++  var taskIds: list<str>
++  fn init(name: str, taskIds: list<str>)
++}
++
+ // The ids of the first n tasks that are ready to start, in project order.
+ pub fn nextUp(p: Project, n: num): list<str>
+ 
+@@ -24,10 +31,12 @@
+ }
+ 
+ pub class Project {
++  var milestones: list<Milestone> = []
+   var name: str
+   var tasks: list<Task> = []
+   var team: list<Person> = []
+   fn add(t: Task): Task
++  fn addMilestone(name: str, taskIds: list<str>): Milestone
+   fn find(id: str): Task?
+   fn hire(who: Person): Person
+   fn init(name: str)
+--- a/tasks.fut
++++ b/tasks.fut
+@@ -24,10 +24,21 @@
+   }
+ }
+ 
++// A checkpoint that is reached when all of its tasks are done.
++pub class Milestone {
++  var name: str
++  var taskIds: list<str>
++  fn init(name: str, taskIds: list<str>) {
++    self.name = name
++    self.taskIds = taskIds
++  }
++}
++
+ pub class Project {
+   var name: str
+   var tasks: list<Task> = []
+   var team: list<Person> = []
++  var milestones: list<Milestone> = []
+   fn init(name: str) { self.name = name }
+   fn add(t: Task): Task {
+     if self.find(t.id) != nil { throw "duplicate task id {t.id}" }
+@@ -45,6 +56,18 @@
+   fn person(name: str): Person? {
+     for who in self.team { if who.name == name { return who } }
+     return nil
++  }
++  fn addMilestone(name: str, taskIds: list<str>): Milestone {
++    for m in self.milestones {
++      if m.name == name { throw "duplicate milestone {name}" }
++    }
++    if taskIds.len() == 0 { throw "milestone {name} has no tasks" }
++    for id in taskIds {
++      if self.find(id) == nil { throw "milestone {name}: no task {id}" }
++    }
++    var m = Milestone(name, taskIds)
++    self.milestones.push(m)
++    return m
+   }
+ }
+ 

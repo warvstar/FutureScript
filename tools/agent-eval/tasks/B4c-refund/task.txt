@@ -1,0 +1,7 @@
+Customers can drop a line from a paid cart and get refunded. In main.fut, add
+
+    fn refundLine(cart: Cart, sku: str): num
+
+It removes the cart's line for `sku` and returns the refund in cents: that line's unit price (as captured in the cart, unitCents) times its quantity. Discounts, tax and shipping are not refunded. If the cart has no line for `sku`, it changes nothing and returns 0. Don't make it pub.
+
+Add a test for it in main.fut. `fut test main.fut` must pass when you finish.

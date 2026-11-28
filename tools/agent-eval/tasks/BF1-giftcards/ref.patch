@@ -1,0 +1,180 @@
+diff -ruN a/invoice.api b/invoice.api
+--- a/invoice.api	2026-11-28 00:34:39
++++ b/invoice.api	2026-11-28 01:44:57
+@@ -1,5 +1,8 @@
+ // The public interface of invoice.fut, written by `fut api`. `fut test` fails while it is out of date.
+ 
++// Pay as much of what's still due as the card's balance covers. Returns the cents taken off the card.
++pub fn applyGiftCard(inv: Invoice, card: GiftCard): num !
++
+ // Tax is charged on the discounted subtotal; shipping is not taxed.
+ // An unknown discount code is ignored.
+ pub fn buildInvoice(number: num, cart: Cart, region: str): Invoice !
+@@ -14,6 +17,8 @@
+ 
+ pub class Invoice {
+   var discount: num = 0
++  var due: num = 0
++  var giftCards: num = 0
+   var lines: list<InvoiceLine> = []
+   var number: num
+   var region: str
+diff -ruN a/invoice.fut b/invoice.fut
+--- a/invoice.fut	2026-11-28 00:33:40
++++ b/invoice.fut	2026-11-28 01:44:57
+@@ -22,6 +22,8 @@
+   var shipping: num = 0
+   var tax: num = 0
+   var total: num = 0
++  var giftCards: num = 0
++  var due: num = 0
+   fn init(number: num, region: str) {
+     self.number = number
+     self.region = region
+@@ -44,9 +46,18 @@
+   }
+   inv.tax = taxCents(inv.subtotal - inv.discount, region)
+   inv.total = inv.subtotal - inv.discount + inv.shipping + inv.tax
++  inv.due = inv.total
+   return inv
+ }
+ 
++// Pay as much of what's still due as the card's balance covers. Returns the cents taken off the card.
++pub fn applyGiftCard(inv: Invoice, card: GiftCard): num ! {
++  var paid = card.redeem(inv.due)
++  inv.giftCards += paid
++  inv.due -= paid
++  return paid
++}
++
+ // 1234 -> "$12.34", -500 -> "-$5.00"
+ pub fn formatMoney(cents: num): str ! {
+   var sign = cents < 0 ? "-" : ""
+@@ -74,6 +85,10 @@
+   out += row("Shipping", formatMoney(inv.shipping)) + "\n"
+   out += row("Tax ({inv.region})", formatMoney(inv.tax)) + "\n"
+   out += row("Total", formatMoney(inv.total))
++  if inv.giftCards > 0 {
++    out += "\n" + row("Gift cards", formatMoney(-inv.giftCards))
++    out += "\n" + row("Due", formatMoney(inv.due))
++  }
+   return out
+ }
+ 
+diff -ruN a/main.fut b/main.fut
+--- a/main.fut	2026-11-28 00:34:39
++++ b/main.fut	2026-11-28 01:44:57
+@@ -35,6 +35,16 @@
+   return buildInvoice(number, cart, region)
+ }
+ 
++// Pay an invoice with gift cards, in order, until nothing is due.
++// Returns the codes of the cards that paid something.
++fn payWithCards(inv: Invoice, cards: list<GiftCard>): list<str> {
++  var used = []
++  for c in cards {
++    if applyGiftCard(inv, c) > 0 { used.push(c.code) }
++  }
++  return used
++}
++
+ test "invoice totals" {
+   var cat = sampleCatalog()
+   var cart = cartOf(cat, [["TEE-S", 2], ["MUG-BLU", 1]])
+@@ -81,4 +91,33 @@
+   expect text.has("Discount                    -$5.00")
+   expect rows[rows.len() - 1] == "Total                       $29.23"
+   expect prints { printInvoice(inv) } == text + "\n"
++}
++
++test "gift cards pay invoices" {
++  var cat = sampleCatalog()
++  var inv = buildInvoice(8, cartOf(cat, [["TEE-S", 2], ["MUG-BLU", 1]]), "CA")
++  expect inv.due == inv.total
++  expect inv.total == 6047
++  var small = GiftCard("SMALL", 1000)
++  var empty = GiftCard("EMPTY", 0)
++  var big = GiftCard("BIG", 10000)
++  var spare = GiftCard("SPARE", 500)
++  expect payWithCards(inv, [small, empty, big, spare]) == ["SMALL", "BIG"]
++  expect inv.giftCards == 6047
++  expect inv.due == 0
++  expect small.balance == 0
++  expect big.balance == 10000 - 5047
++  expect spare.balance == 500
++  expect applyGiftCard(inv, spare) == 0
++}
++
++test "gift cards on the invoice text" {
++  var cat = sampleCatalog()
++  var inv = buildInvoice(9, cartOf(cat, [["MUG-BLU", 1]]), "OR")
++  expect !formatInvoice(inv).has("Gift cards")
++  applyGiftCard(inv, GiftCard("GC", 1000))
++  var rows = formatInvoice(inv).split("\n")
++  expect rows[rows.len() - 3] == "Total                       $16.99"
++  expect rows[rows.len() - 2] == "Gift cards                 -$10.00"
++  expect rows[rows.len() - 1] == "Due                          $6.99"
+ }
+diff -ruN a/pricing.api b/pricing.api
+--- a/pricing.api	2026-11-28 00:34:39
++++ b/pricing.api	2026-11-28 01:44:57
+@@ -9,6 +9,15 @@
+ // How much a discount takes off a subtotal. Never more than the subtotal.
+ pub fn discountCents(d: Discount, subtotal: num): num !
+ 
++// A prepaid gift card. Its balance is in cents and never goes below zero.
++pub class GiftCard {
++  var balance: num
++  var code: str
++  fn init(code: str, balance: num)
++  // Take up to cents off the balance and return how much was taken.
++  fn redeem(cents: num): num
++}
++
+ // The discount for a code (case-insensitive), or nil when the code is unknown.
+ pub fn lookupCode(code: str): Discount? !
+ 
+diff -ruN a/pricing.fut b/pricing.fut
+--- a/pricing.fut	2026-11-28 00:33:44
++++ b/pricing.fut	2026-11-28 01:44:57
+@@ -83,6 +83,24 @@
+   return q
+ }
+ 
++// A prepaid gift card. Its balance is in cents and never goes below zero.
++pub class GiftCard {
++  var code: str
++  var balance: num
++  fn init(code: str, balance: num) {
++    if balance < 0 { throw "a gift card can't have a negative balance" }
++    self.code = code
++    self.balance = balance
++  }
++  // Take up to cents off the balance and return how much was taken.
++  fn redeem(cents: num): num {
++    if cents < 0 { throw "can't redeem a negative amount" }
++    var taken = cents < self.balance ? cents : self.balance
++    self.balance -= taken
++    return taken
++  }
++}
++
+ test "discount codes" {
+   expect lookupCode("welcome10") == Discount.Percent(10)
+   expect lookupCode(" FiveOff ") == Discount.Fixed(500)
+@@ -100,4 +118,15 @@
+   expect shippingCents(1500, "NY") == 899
+   expect shippingCents(2001, "NY") == 1149
+   expect shippingCents(400, "INTL") == 1999
++}
++
++test "gift cards" {
++  var card = GiftCard("GC-1", 2500)
++  expect card.redeem(1000) == 1000
++  expect card.balance == 1500
++  expect card.redeem(4000) == 1500
++  expect card.balance == 0
++  expect card.redeem(100) == 0
++  expect throws { card.redeem(-1) }
++  expect throws { GiftCard("GC-2", -5) }
+ }

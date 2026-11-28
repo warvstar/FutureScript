@@ -1,0 +1,29 @@
+// The public interface of parser.fut, written by `fut api`. `fut test` fails while it is out of date.
+
+pub class Doc {
+  var nodes: list
+  var title: str = ""
+  // The Heading nodes, in order.
+  fn headings(): list
+  fn init(nodes: list)
+}
+
+// Block nodes (Heading .. Rule) make up a document; inline nodes (Text .. Link) make up a block's parts.
+pub enum Node {
+  Heading(level: num, text: str, line: num)
+  Para(parts: list)
+  ListItem(depth: num, ordered: bool, parts: list)
+  CodeBlock(lang: str, text: str)
+  Rule
+  Text(s: str)
+  Em(parts: list)
+  Strong(parts: list)
+  Code(text: str)
+  Link(text: str, url: str)
+}
+
+// Parse a whole document.
+pub fn parse(src: str): Doc
+
+// The inline nodes of one piece of text. Unmatched markers stay as plain text.
+pub fn parseInline(s: str, line: num): list

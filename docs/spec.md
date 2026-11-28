@@ -32,8 +32,9 @@ expect (1 > 0 ? "y" : "n") == "y" && 2 ** 3 == 8 && nil?.x == nil && "abc"[1:] =
 expect -7 % 3 == 2 && 7 / 2 == 3.5 // all numbers f64
 expect 2 + 3 & 6 == 4              // Python precedence; bitwise needs whole numbers
 expect "a" + 1 == "a1"             // + with a str concatenates
-var same = [1] == [1]
-expect !same                       // == on list/map is identity (expect's top-level == is deep)
+var p = [1]; var q = [1]
+expect !(p == q)                   // == on list/map is identity; an expect's top-level == (each part of an && chain) is deep
+expect p == q && p == [1]          // x == [...] elsewhere is a compile error [compare]: always false. Empty: len(x) == 0
 expect [1] + [2] == [1, 2]
 var m = {k: 1, "s": [2]}           // m.k is m["k"]; missing key: nil; insertion order
 expect m.zz == nil && m.remove("k") == 1 && m.has("s")

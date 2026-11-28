@@ -1,0 +1,30 @@
+I want quests: the player takes them on, they fill up as monsters are beaten and items are picked up, and finished ones can be turned in for gold and xp. Please add these to main.fut:
+
+    enum Goal {
+      Kill(kind: str, count: num)
+      Collect(item: str, count: num)
+    }
+
+    class Quest
+      fn init(title: str, goals: list<Goal>, gold: num, xp: num)
+      fn complete(): bool
+
+    class QuestLog
+      fn init()
+      fn accept(q: Quest): bool
+      fn recordKills(ms: list)
+      fn pickUp(p: Player, it: Item): bool
+      fn turnIn(p: Player): list
+      fn status(): list
+
+How it should work:
+
+- A quest has one or more goals, each with its own progress, starting at 0. A `Kill(kind, count)` goal counts beaten monsters whose `name` is `kind`; a `Collect(item, count)` goal counts picked-up items whose `name` is `item`. Progress never goes past the goal's count. `complete()` is true when every goal has reached its count.
+- `QuestLog()` starts with no quests. `accept(q)` adds q to the active quests (they stay in the order accepted) and returns true. If the log already has a quest with the same title, active or already turned in, it changes nothing and returns false.
+- Only active quests make progress, so kills and pickups from before a quest was accepted don't count for it. One kill or pickup counts for every matching goal of every active quest.
+- `recordKills(ms)` is called after a battle with its monsters: each monster in `ms` that is down (hp 0) counts as one kill. Monsters still standing don't count.
+- `pickUp(p, it)` puts the item in the player's bag with `addItem` (loot.fut). If it went in, it counts as one pickup and `pickUp` returns true. If it didn't fit, nothing counts and it returns false.
+- `turnIn(p)` turns in every active quest that is complete, in the order they were accepted: the player gets the quest's gold, and its xp through `gainXp` (entities.fut) so levels go up as usual, and the quest stops being active. It returns the titles of the quests turned in, in that order (empty if none).
+- `status()` returns one line per active quest, in order, like "Wolf Hunt: wolf 1/3, Wolf Pelt 0/2": the title, ": ", then each goal in order as its kind or item name, a space, and "progress/count", joined by ", ". A complete quest's line ends with " (ready)", like "Wolf Hunt: wolf 3/3, Wolf Pelt 2/2 (ready)".
+
+Add tests for it. `fut test main.fut` must pass when you finish.

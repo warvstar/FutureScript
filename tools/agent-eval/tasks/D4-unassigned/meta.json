@@ -1,0 +1,8 @@
+{
+ "project": "D",
+ "bug": "logic",
+ "path": "off",
+ "file": "tasks.fut",
+ "line": 104,
+ "description": "parseTeam rejects capacity == 7 (>= 7 instead of > 7), though its doc allows at most 7"
+}

@@ -1,0 +1,7 @@
+Can you add a Markdown table of contents to main.fut? I want to paste it at the top of a README.
+
+Signature: `fn tocMarkdown(doc: Doc): str` (non-pub, in main.fut).
+
+Build it from `toc(doc)`: one line per entry, in order. Each line is indented two spaces per level below 1 (level 1: no indent, level 2: two spaces, level 3: four spaces, and so on), followed by `- [text](#anchor)` using the entry's text and anchor. Join the lines with "\n", with no trailing newline. A document with no headings gives "".
+
+Add a test for it in main.fut. `fut test main.fut` must pass when you finish.

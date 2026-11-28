@@ -1,0 +1,11 @@
+--- a/main.fut
++++ b/main.fut
+@@ -46,7 +46,7 @@
+ 
+ // The two log lines of one exchange: the player's hit, then the monster's answer.
+ fn narrateRound(p: Player, m: Monster, dealt: num, taken: num): list ! {
+-  return [hitLine(p.name, m.name, dealt), hitLine(m.name, p.name, taken)]
++  return [hitLine(p.name, m.name, dealt), hitLine(m.name, taken, p.name)]
+ }
+ 
+ // One exchange with a single monster: the player strikes, and the monster answers if it still stands.

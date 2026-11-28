@@ -1,0 +1,35 @@
+We're starting to sell gift cards, and customers want to pay invoices with them. A card can pay part of an invoice and keep the rest of its balance for later, and one invoice can be paid with several cards.
+
+1. In pricing.fut, add a pub class
+
+       pub class GiftCard
+
+   with fields `code: str` and `balance: num` (cents), a constructor `GiftCard(code: str, balance: num)` that throws when the balance is negative, and a method
+
+       fn redeem(cents: num): num
+
+   that takes up to `cents` off the balance and returns how much it took: all of `cents` when the balance covers it, otherwise the whole balance (leaving 0). It throws when `cents` is negative. Redeeming 0, or from a card with a balance of 0, takes 0.
+
+2. In invoice.fut, give Invoice two new fields: `giftCards: num` (the cents gift cards have paid on it) and `due: num` (what the customer still owes). buildInvoice sets `giftCards` to 0 and `due` to the invoice's total. Then add
+
+       pub fn applyGiftCard(inv: Invoice, card: GiftCard): num
+
+   It pays as much of the invoice's `due` as the card's balance covers: that amount comes off the card's balance and off `due`, is added to `giftCards`, and is returned. When nothing is due, it takes nothing and returns 0. Gift cards pay after tax: they don't change the subtotal, discount, shipping, tax or total.
+
+3. formatInvoice: when gift cards have paid anything on the invoice, add two rows after the Total row, laid out like the other rows: "Gift cards" with the amount paid as a negative amount, then "Due" with what's still due. For example, a $16.99 invoice with $10.00 paid by gift card ends
+
+       Total                       $16.99
+       Gift cards                 -$10.00
+       Due                          $6.99
+
+   An invoice gift cards haven't paid anything on prints exactly as it does now.
+
+4. In main.fut, add
+
+       fn payWithCards(inv: Invoice, cards: list<GiftCard>): list<str>
+
+   It applies the cards to the invoice one after another, in list order, and returns the codes of the cards that paid something, in that order. Cards that paid nothing (an empty card, or any card once nothing is due) aren't listed and keep their balance. Don't make it pub.
+
+These change the public interfaces of pricing.fut and invoice.fut: run `fut api main.fut` to update the `.api` files.
+
+Add tests for it. `fut test main.fut` must pass when you finish.

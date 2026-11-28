@@ -1,0 +1,1 @@
+{"project": "B", "bug": "logic", "path": "on", "file": "pricing.fut", "line": 57, "description": "shippingCents uses < 500 instead of <= 500, so a parcel of exactly 500 g is charged 899 instead of 499."}

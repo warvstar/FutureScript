@@ -1,0 +1,29 @@
+--- a/main.fut
++++ b/main.fut
+@@ -54,3 +54,26 @@
+   expect page("# A & B\ntext") == "<title>A &amp; B</title>\n<h1>A &amp; B</h1>\n<p>text</p>"
+   expect page("just text").has("<title>Untitled</title>")
+ }
++
++// The plain text of the paragraph with the most words; the first of those tied; "" if none.
++fn longestParagraph(doc: Doc): str {
++  var best = ""
++  var bestWords = -1
++  for n in doc.nodes {
++    match n {
++      Para(parts) {
++        var text = plain(parts)
++        var words = countWords(text)
++        if words > bestWords { best = text bestWords = words }
++      }
++      else { }
++    }
++  }
++  return best
++}
++
++test "longestParagraph" {
++  expect longestParagraph(parse("a b\n\nc *d* e\n\n- f g h i")) == "c d e"
++  expect longestParagraph(parse("x y\n\nz w")) == "x y"
++  expect longestParagraph(parse("# Heading")) == ""
++}

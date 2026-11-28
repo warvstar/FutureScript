@@ -1,0 +1,21 @@
+I'd like the game to have shops: a shopkeeper with a limited stock of items, where the player can buy with their gold and sell what they carry. Please add a class to main.fut:
+
+    class Shop
+      fn init(name: str)
+      fn restock(it: Item, count: num)
+      fn stockOf(name: str): num
+      fn priceOf(name: str): num?
+      fn buy(p: Player, name: str): str
+      fn sell(p: Player, it: Item): num
+      fn listing(): list
+
+How it should work:
+
+- The shop identifies the items it carries by `name`. `restock(it, count)` adds `count` units of `it` to the stock. If the shop already carries an item with that name, only the count goes up: the item it already had keeps its stats (kind, power, weight, value). The shop remembers items in the order it first got them, even after it sells out of one.
+- `stockOf(name)` is how many units are left, 0 for an item it has never carried.
+- `priceOf(name)` is the item's `value` in gold. When only one unit is left, the price is 1.5 times the value, rounded down. When none are left (or the shop never carried it), it's nil.
+- `buy(p, name)` sells one unit to the player at `priceOf(name)`. The player gets a new Item with the same name, kind, power, weight and value as the shop's (a separate object each time), put in the bag with `addItem` from loot.fut, so the carry limit applies. The player's gold goes down by the price and the stock by 1, and it returns "ok". If the sale can't happen, nothing changes and it returns the reason, checked in this order: "out of stock" (none left, or never carried), "not enough gold" (the player has less gold than the price), "too heavy" (the item doesn't fit in the bag).
+- `sell(p, it)` buys that very item from the player's bag (the same object, as `findItem` in loot.fut finds it). The player gets half its value, rounded down, the item leaves the bag, and the shop's stock gains one unit of it, the same way as `restock(it, 1)`. It returns the gold paid. If the item isn't in the player's bag, nothing changes and it returns 0.
+- `listing()` gives one line per item the shop has in stock (count above 0), in the order it first got them, like "Potion x3 - 15g": the name, "x" and the count, then " - " and the current price followed by "g".
+
+Add tests for it. `fut test main.fut` must pass when you finish.

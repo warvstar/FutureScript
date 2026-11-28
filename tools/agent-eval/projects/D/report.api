@@ -1,0 +1,20 @@
+// The public interface of report.fut, written by `fut api`. `fut test` fails while it is out of date.
+
+pub fn formatDays(n: num): str !
+
+// "[x] design    Design pages (3 days, ann)"; [ ] while not done.
+pub fn formatTask(t: Task): str !
+
+// A bar per task, one column per day: "backend      |   #####   |".
+pub fn gantt(p: Project): str !
+
+pub fn printReport(p: Project) ! io
+
+// The summary with the time it was made, in whole seconds since 1970.
+pub fn stampedReport(p: Project): str ! clock
+
+// One formatTask line per task, in topological order.
+pub fn statusTable(p: Project): str !
+
+// "Website: 2/6 done, 12 days left, 11 days end to end"
+pub fn summary(p: Project): str !

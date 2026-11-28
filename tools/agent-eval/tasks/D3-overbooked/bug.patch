@@ -1,0 +1,11 @@
+--- a/schedule.fut
++++ b/schedule.fut
+@@ -59,7 +59,7 @@
+ 
+ // Weeks it would take who to finish everything assigned to them.
+ pub fn weeksBusy(p: Project, who: Person): num ! {
+-  return assignedDays(p, who) / who.capacityPerWeek
++  return assignedDays(p, who.name) / who.capacityPerWeek
+ }
+ 
+ // Give every unfinished, unassigned task (in topological order) to whoever

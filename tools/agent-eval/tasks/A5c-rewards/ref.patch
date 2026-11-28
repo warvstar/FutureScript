@@ -1,0 +1,31 @@
+--- a/main.fut
++++ b/main.fut
+@@ -93,3 +93,28 @@
+   expect !r.won && r.rounds == 3 && r.log.len() == 6
+   expect isAlive(p) && isAlive(tough)
+ }
++
++// Gold and xp from every monster in ms that is down; xp goes through gainXp. Returns {gold, xp, levels}.
++fn collectRewards(p: Player, ms: list): map ! {
++  var gold = 0
++  var xp = 0
++  for m in ms {
++    if !isAlive(m) {
++      gold += m.goldReward
++      xp += m.xpReward
++    }
++  }
++  p.gold += gold
++  var levels = gainXp(p, xp)
++  return {gold: gold, xp: xp, levels: levels}
++}
++
++test "rewards from beaten monsters" {
++  var p = Player("Ana")
++  var ms = [makeMonster("goblin", 1), makeMonster("slime", 1), makeMonster("wolf", 1)]
++  ms[0].hp = 0
++  ms[1].hp = 0
++  expect collectRewards(p, ms) == {gold: 7, xp: 12, levels: 1}
++  expect p.gold == 7 && p.xp == 12 && p.level == 2 && p.hp == 35
++  expect collectRewards(p, [ms[2]]) == {gold: 0, xp: 0, levels: 0}
++}

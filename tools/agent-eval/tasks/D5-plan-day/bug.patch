@@ -1,0 +1,11 @@
+--- a/tasks.fut
++++ b/tasks.fut
+@@ -84,7 +84,7 @@
+ pub fn nextUp(p: Project, n: num): list<str> {
+   var out = []
+   for t in p.tasks {
+-    if out.len() >= n { break }
++    if out.len() > n { break }
+     if isReady(p, t) { out.push(t.id) }
+   }
+   return out

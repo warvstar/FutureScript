@@ -13,6 +13,7 @@ test "compile errors" {
   expect err("fn f() ! iox \{ }").has(" [unknown-effect]\n")
   expect err("print(self)").has(" [misplaced]\n")
   expect err("fn f() \{ }\nfn f() \{ }").has(" [duplicate]\n")
+  expect err("fn f(x) \{ return x == [] }").has(" [compare]\n")
   expect err("class A \{ var x = [1] }").has(" [class]\n")
   expect err("class A \{ fn m() \{ } }\nclass B : A \{ fn m() \{ } }").has(" [override]\n")
   expect err("enum E \{ A B }\nfn f(e) \{ match e \{ A \{ } } }").has(" [match]\n")

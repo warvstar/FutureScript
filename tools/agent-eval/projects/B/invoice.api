@@ -1,0 +1,37 @@
+// The public interface of invoice.fut, written by `fut api`. `fut test` fails while it is out of date.
+
+// Tax is charged on the discounted subtotal; shipping is not taxed.
+// An unknown discount code is ignored.
+pub fn buildInvoice(number: num, cart: Cart, region: str): Invoice !
+
+pub fn formatInvoice(inv: Invoice): str !
+
+// Under 1000 g in grams ("350 g"), from 1000 g up in kilograms with two decimals ("1.25 kg").
+pub fn formatKg(grams: num): str !
+
+// 1234 -> "$12.34", -500 -> "-$5.00"
+pub fn formatMoney(cents: num): str !
+
+pub class Invoice {
+  var discount: num = 0
+  var lines: list<InvoiceLine> = []
+  var number: num
+  var region: str
+  var shipping: num = 0
+  var subtotal: num = 0
+  var tax: num = 0
+  var total: num = 0
+  fn init(number: num, region: str)
+}
+
+pub class InvoiceLine {
+  var cents: num
+  var label: str
+  var qty: num
+  fn init(label: str, qty: num, cents: num)
+}
+
+// What the warehouse picks: one line per SKU with its quantity and weight, then the parcel weight.
+pub fn packingSlip(cart: Cart): str !
+
+pub fn printInvoice(inv: Invoice) ! io

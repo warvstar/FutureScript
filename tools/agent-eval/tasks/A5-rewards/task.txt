@@ -1,0 +1,7 @@
+After a battle the player should collect what the beaten monsters carried. Please add a function to main.fut:
+
+    fn collectRewards(p: Player, ms: list): map
+
+For every monster in `ms` that is down (hp 0), add its `goldReward` to `p.gold` and give its `xpReward` to the player through `gainXp` (in entities.fut), so level-ups happen as usual. Monsters still standing give nothing. Return a map `{gold, xp, levels}`: the total gold and xp given and the number of levels gained.
+
+Add a test block for it in main.fut. `fut test main.fut` must pass when you finish.

@@ -1,0 +1,8 @@
+{
+  "project": "C",
+  "bug": "logic",
+  "path": "off",
+  "file": "stats.fut",
+  "line": 55,
+  "description": "readingMinutes rounds up with int(x) + 1, one minute too many when words is a multiple of wpm."
+}

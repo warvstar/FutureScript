@@ -1,0 +1,29 @@
+// The public interface of render.fut, written by `fut api`. `fut test` fails while it is out of date.
+
+// s with & < > " written as HTML entities.
+pub fn escape(s: str): str !
+
+// The text a reader sees in inline parts: markup dropped, a link's text kept, its URL dropped.
+pub fn plain(parts: list): str
+
+// The HTML for a document, one block per line. Consecutive list items share one <ul> or <ol>.
+pub fn renderDoc(doc: Doc): str
+
+pub fn renderInline(parts: list): str
+
+// A heading's anchor: lower case, letters and digits kept, each run of spaces and hyphens made one "-",
+// none at either end; everything else dropped. "Hello, World!" -> "hello-world".
+pub fn slug(text: str): str !
+
+// One entry per heading, in order, each with a distinct anchor.
+pub fn toc(doc: Doc): list
+
+pub class TocEntry {
+  var anchor: str
+  var level: num
+  var text: str
+  fn init(text: str, level: num, anchor: str)
+}
+
+// base the first time; then base-1, base-2, ... for each repeat. seen remembers how often each base came up.
+pub fn uniqueAnchor(base: str, seen: map): str

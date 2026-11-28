@@ -1,0 +1,7 @@
+Please add a function to main.fut for sharing loot gold among a party:
+
+    fn splitGold(total: num, n: num): list
+
+`total` is a whole number of gold (0 or more) and `n` is the number of party members (1 or more). Return a list of n whole-gold shares that add up to exactly `total` and differ from each other by at most 1. The larger shares go first. For example splitGold(10, 3) is [4, 3, 3] and splitGold(2, 4) is [1, 1, 0, 0].
+
+Add a test block for it in main.fut. `fut test main.fut` must pass when you finish.

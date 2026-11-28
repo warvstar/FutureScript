@@ -1,0 +1,8 @@
+{
+ "project": "D",
+ "bug": "no-field",
+ "path": "off",
+ "file": "tasks.fut",
+ "line": 104,
+ "description": "parseTeam reads person.capacity on a constructed local Person; the field is capacityPerWeek"
+}
