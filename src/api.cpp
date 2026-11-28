@@ -135,14 +135,14 @@ std::vector<Decl> declsOf(const std::string& text) {
     if (isKw(t, S_pub)) {
       Lexer save = L;
       Tok n = S.next();
-      bool gpu = [&] { Lexer s = L; return isGpu(n) && isKw(s.next(), K_fn); }();
+      bool gpu = [&] { Lexer s = L; Tok f = s.next(); return isGpu(n) && (isKw(f, K_fn) || isKw(f, K_var)); }();
       if (!pubDecl(n) && !gpu) { L = save; continue; }
       pub = true, k = n;
     }
     const char* from = pub ? t.p : k.p;
-    if (isGpu(k)) {  // gpu fn: a fn, which says so
+    if (isGpu(k)) {  // gpu fn, gpu var: a fn or var, which says so
       Lexer save = L;
-      if (Tok f = S.next(); isKw(f, K_fn) && !f.nl) k = f;
+      if (Tok f = S.next(); (isKw(f, K_fn) || isKw(f, K_var)) && !f.nl) k = f;
       else L = save;
     }
     std::string doc = docs(src, t.p, "");

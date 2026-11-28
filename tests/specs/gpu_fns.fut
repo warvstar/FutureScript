@@ -2,6 +2,7 @@
 // std/gpu runs. Its values are numbers (f32 on the GPU), u32 whole numbers, bools and vectors: vec2f, vec3f, vec4f,
 // which on the CPU are f32s of 2, 3 and 4. It reads its file's gpu vars: numbers, and tables of them, that never change.
 import "std/math" as math
+import "../lib/glow.fut" as glow
 fn err(f) { try { f() } catch e { return "{e}" } return "" }
 fn compileErr(src) { return run({source: src}).err }
 
@@ -230,4 +231,21 @@ test "match and the shorthands: what doesn't mean the same on both is a compile 
   expect compileErr("gpu fn f(x: num): vec3f \{ return vec3f(x, x) }").has("vec3f() takes one number for every component")
   expect compileErr(m + "gpu fn f(a: vec2f, b: vec3f): vec2f \{ return math.mix(a, b, 0.5) }").has("mix() blends values of one type")
   expect compileErr(m + "gpu fn f(a: vec2f): num \{ return math.smoothstep(0, 1, a) }").has("smoothstep() takes numbers")
+}
+
+// A gpu fn calls an imported file's gpu fns (x.name), reads its gpu vars and uses its types (x.Name). Their WGSL
+// comes along, named by that file's stem; a struct keeps its name.
+gpu fn bright(n: vec3f, k: u32): num {
+  var sun: glow.Light = {dir: vec3f(0, 1, 0), power: 2}
+  return glow.lit(sun, n) * (k % glow.LEVELS)
+}
+
+test "gpu fns, gpu vars and types of an imported file" {
+  expect bright(vec3f(0, 1, 0), 7) == 6 && bright(vec3f(0, -1, 0), 7) == 0
+  var w = wgsl(bright)
+  expect w.wgsl.has("struct Light \{\n  dir: vec3f,\n  power: f32,\n}") && w.wgsl.has("const glow_LEVELS: u32 = 4u;")
+  expect w.wgsl.has("fn glow_lit(p_l: Light, p_n: vec3f) -> f32 \{")
+  expect w.wgsl.has("var l_sun: Light = Light(vec3f(0.0, 1.0, 0.0), 2.0);")
+  expect w.wgsl.has("return (glow_lit(l_sun, l_n) * f32((l_k % glow_LEVELS)));")
+  expect w.wgsl.find("fn glow_lit") < w.wgsl.find("fn gpu_fns_bright")  // what it calls comes first
 }

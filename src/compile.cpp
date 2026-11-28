@@ -3409,6 +3409,13 @@ struct Compiler : Gen, Namespaces {
   bool gpuFreeze = false;               // the top-level var being compiled is a gpu var: freeze its value
   struct GpuDecl { std::string file; const char* src; size_t i; int q; };
   std::unordered_map<std::string, GpuFile> gpuFiles;  // by file: its gpu fns, gpu vars and types
+  std::vector<std::string> gpuOrder;                 // the files of gpuFiles, as first seen
+  GpuFile& gpuFile() {
+    auto [it, fresh] = gpuFiles.try_emplace(file);
+    if (fresh) gpuOrder.push_back(file), it->second.path = file;
+    it->second.src = srcStart;
+    return it->second;
+  }
   bool gpuBody = false;                              // compiling a gpu fn: v.x = e makes v a new vector
   std::vector<GpuDecl> gpuDecls;
   std::vector<std::pair<int, GpuInfo>> gpuInfos;
@@ -3420,29 +3427,35 @@ struct Compiler : Gen, Namespaces {
     gpuBody = true;
     fnDecl();
     gpuBody = false;
-    auto& fs = gpuFiles[file].fns;
+    auto& fs = gpuFile().fns;
     fs.push_back({n.sym, p, line});
     gpuDecls.push_back({file, srcStart, fs.size() - 1, qualify(n.sym)});
   }
   void checkGpu() {
+    if (gpuDecls.empty()) return;
+    std::unordered_set<std::string> stems;
+    for (auto& path : gpuOrder) {  // each file's name as a WGSL identifier, made unique: its gpu fns are stem_name
+      GpuFile& g = gpuFiles[path];
+      if (auto it = aliases.find(path); it != aliases.end()) g.aliases = &it->second;
+      if (g.fns.empty() && g.vars.empty()) continue;  // (types only: structs keep their names)
+      std::string b = path.substr(path.find_last_of("/\\") == std::string::npos ? 0 : path.find_last_of("/\\") + 1);
+      if (b.size() > 4 && b.compare(b.size() - 4, 4, ".fut") == 0) b.resize(b.size() - 4);
+      for (char& c : b) if (!isalnum((unsigned char)c)) c = '_';
+      g.stem = b.empty() || isdigit((unsigned char)b[0]) || b[0] == '_' ? "m" + b : b;
+      while (!stems.insert(g.stem).second) g.stem += "_";
+    }
+    GpuModule module = [&](const std::string& m) -> const GpuFile* {
+      for (auto& [ip, pre] : nsOf)
+        if (pre == m)
+          if (auto it = gpuFiles.find(ip); it != gpuFiles.end()) return &it->second;
+      return nullptr;
+    };
     for (auto& d : gpuDecls) {
-      auto alias = [&](int s) -> const std::string* {
-        auto f = aliases.find(d.file);
-        auto it = f == aliases.end() ? decltype(f->second.end()){} : f->second.find(s);
-        return f != aliases.end() && it != f->second.end() ? &it->second : nullptr;
-      };
-      auto fail = [&](const char* p, int line, const std::string& m) {
-        file = d.file, srcStart = d.src;
+      auto fail = [&](const GpuFile& in, const char* p, int line, const std::string& m) {
+        file = in.path, srcStart = in.src;
         failAt(p, line, "@gpu %s", m.c_str());
       };
-      GpuFile& g = gpuFiles[d.file];
-      if (g.stem.empty()) {  // the file's name, as a WGSL identifier: its gpu fns are stem_name
-        std::string b = d.file.substr(d.file.find_last_of("/\\") == std::string::npos ? 0 : d.file.find_last_of("/\\") + 1);
-        if (b.size() > 4 && b.compare(b.size() - 4, 4, ".fut") == 0) b.resize(b.size() - 4);
-        for (char& c : b) if (!isalnum((unsigned char)c)) c = '_';
-        g.stem = b.empty() || isdigit((unsigned char)b[0]) || b[0] == '_' ? "m" + b : b;
-      }
-      attempt([&] { gpuInfos.emplace_back(d.q, wgslOf(g, d.i, alias, fail)); });
+      attempt([&] { gpuInfos.emplace_back(d.q, wgslOf(gpuFiles[d.file], d.i, module, fail)); });
     }
   }
   void topLevel() {
@@ -3459,7 +3472,7 @@ struct Compiler : Gen, Namespaces {
       if (atKw(S_enum) && peek().t == T_ID && !peek().nl && peek().sym >= NKW) { next(), enumDecl(); if (trace) traceEnum(item); return; }
       if (atKw(S_test) && peekIs(T_STR)) { next(), testDecl(); if (trace) traceCuts.push_back({item, prevEnd}); return; }
       if (atKw(S_type) && isTypeDecl(lx)) {  // type Name = <type>: checked where it is used, by name
-        gpuFiles[file].types.push_back({peek().sym, cur.p, cur.line});  // (a gpu fn's struct, if one uses it)
+        gpuFile().types.push_back({peek().sym, cur.p, cur.line});  // (a gpu fn's struct, if one uses it)
         next();
         Tok n = cur;
         int s = qualify(ident());
@@ -3488,7 +3501,7 @@ struct Compiler : Gen, Namespaces {
       }
       if (at(T_ID) && [&] { Lexer s = lx; return gpuVar(cur, s.next()); }()) {
         next();
-        gpuFiles[file].vars.push_back({peek().sym, cur.p, cur.line});
+        gpuFile().vars.push_back({peek().sym, cur.p, cur.line});
         gpuFreeze = true;
       }
       // On reload, top-level statements are compiled (to validate them) and then dropped, except
