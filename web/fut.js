@@ -905,8 +905,9 @@ export async function createFut(opts) {
       const n = withStr(path, (p) => ex.fut_api(check ? 0 : 2, p));
       return (check && n) || n < 0 ? 1 : 0;  // n < 0: a breaking change held back until the version moves
     },
-    async map(file, pub, json, only) {  // fut map: the packages, files and declarations the program uses; exit status
+    async map(file, pub, json, only, effects) {  // fut map: the packages, files and declarations the program uses; exit status
       path = file;
+      ex.fut_infer_effects(effects ? 1 : 0);  // --effects: and what each function does
       if (!(await compileWith(() => withStr(path, (p) => ex.fut_compile(p, 0, 0, 0, 0))))) return 2;
       const n = withStr(only ?? "", (o) => withStr(path, (p) => ex.fut_map(pub ? 1 : 0, json ? 1 : 0, o, p)));
       if (!n && only) write(2, `nothing matches '${only}'\n`);

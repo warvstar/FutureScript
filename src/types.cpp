@@ -21,6 +21,10 @@ int typeSite(const std::string& what, const std::string& type) {
   if (fresh) sites.push_back({what, type});
   return it->second;
 }
+const std::string& typeSiteWhat(int site) {
+  static const std::string none;
+  return site >= 0 && site < (int)sites.size() ? sites[site].what : none;
+}
 
 // Compound types: a table that only grows, read by every isolate without a lock (an entry is complete before the
 // count that publishes it).

@@ -38,6 +38,7 @@ enum Req {
   Post(at: {x: num, y: num}, m: Method, tags: list<str>)
 }
 fn err(src) { return run({source: src}).err }
+fn id(v) { return v }
 
 test "variants are made by name, print as made, and compare by value" {
   expect area(Shape.Circle(2)) == 12
@@ -61,7 +62,8 @@ test "an enum and its variants are types" {
   var s: Shape = Shape.Circle(1)
   var c: Shape.Circle = Shape.Circle(2)
   s = c
-  expect throws { c = Shape.Empty } == "var 'c' must be Shape.Circle, got Shape.Empty"
+  expect throws { c = id(Shape.Empty) } == "var 'c' must be Shape.Circle, got Shape.Empty"
+  expect err("enum E \{ A(x: num) B }\nfn f() \{ var a: E.A = E.A(1) a = E.B }").has("var 'a' must be E.A, got E.B [type]")
   expect throws { Shape.Circle("x") } == "field 'r' of Shape.Circle must be num, got the string \"x\""
 }
 

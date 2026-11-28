@@ -1,5 +1,8 @@
 // Types are optional: where one is written (a parameter, a result, a declared field) it is checked at run time.
+// A value whose type the compiler knows (a literal) and no declared type could take is a compile error
+// (specs/clashes.fut), so these go through opaque(), which hides what they are.
 import "mods/bank.fut" as bank
+fn opaque(v) { return v }
 var a = bank.Account("ann")
 var b = bank.Savings("bob")
 a.deposit(50)
@@ -7,7 +10,7 @@ bank.transfer(a, b, 20)
 print("{a.balance} {b.balance}")                 // expect: 30 20
 print(bank.find([a, b], "bob").owner)            // expect: bob
 print(bank.find([a, b], "cy"))                   // expect: nil
-try { bank.transfer(a, "bob", 5) } catch e { print(e) }   // expect: argument 'to' of bank.transfer() must be bank.Account, got the string "bob"
+try { bank.transfer(a, opaque("bob"), 5) } catch e { print(e) }   // expect: argument 'to' of bank.transfer() must be bank.Account, got the string "bob"
 try { a.deposit("5") } catch e { print(e) }               // expect: argument 'n' of bank.Account.deposit() must be num, got the string "5"
 try { a.balance = nil } catch e { print(e) }              // expect: field 'balance' of bank.Account must be num, got nil
 a.note = "vip"
@@ -31,14 +34,14 @@ print(mean([1, 2, 3]))                           // expect: 2
 print(maybe(false))                              // expect: nil
 try { wrong("w") } catch e { print(e) }          // expect: the result of wrong() must be num, got the string "w"
 try { noReturn() } catch e { print(e) }          // expect: the result of noReturn() must be str, got nil
-try { flag(0) } catch e { print(e) }             // expect: argument 'b' of flag() must be bool, got the number 0
-try { first([], 1) } catch e { print(e) }        // expect: argument 'f' of first() must be fn, got the number 1
-try { keys([]) } catch e { print(e) }            // expect: argument 'm' of keys() must be map, got a list
+try { flag(opaque(0)) } catch e { print(e) }         // expect: argument 'b' of flag() must be bool, got the number 0
+try { first([], opaque(1)) } catch e { print(e) }   // expect: argument 'f' of first() must be fn, got the number 1
+try { keys(opaque([])) } catch e { print(e) }       // expect: argument 'm' of keys() must be map, got a list
 var g = fn(n: num): num { return n + 1 }
-try { g("x") } catch e { print(e) }              // expect: argument 'n' of the function at line 37 must be num, got the string "x"
+try { g("x") } catch e { print(e) }              // expect: argument 'n' of the function at line 40 must be num, got the string "x"
 
 // A result is checked as it leaves the function, after its own try and atomic blocks have closed.
-fn own(): num { try { return "x" } catch e { return 0 } }
+fn own(): num { try { return opaque("x") } catch e { return 0 } }
 try { own() } catch e { print("caller: {e}") }   // expect: caller: the result of own() must be num, got the string "x"
 class Mine : bank.Account { override fn withdraw(n: num): num { return 0 } }   // the same types, however they are written
 print(Mine("m").withdraw(5))                     // expect: 0

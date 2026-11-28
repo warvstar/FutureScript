@@ -30,10 +30,10 @@ const ErrCode codes[] = {
     // compile time or run time
     {"type", "A value doesn't have the declared type of a parameter, result, field or var.", "Pass or store a value of that type, or change the declaration (T? allows nil)."},
     {"atomic", "Something that can't be undone (io, yield) happens inside atomic { }.", "Do it after the block, or handle the io inside the block."},
-    {"effect", "A function performs or calls something its declared effects don't allow.", "Add the effect to the declaration (and its callers'), or handle it."},
+    {"effect", "A function performs or calls something its declared effects don't allow (a compile error where the operation or the declaring fn is called directly; otherwise when it runs).", "Add the effect to the declaration (and its callers'), or handle it. `fut map --effects file.fut` shows what each function does."},
     {"unhandled", "An operation of a declared effect is performed with no handler for it.", "Wrap the call in handle { } with Effect.op(...) { }."},
     {"match", "A match leaves out variants of its enum with no else arm, its value is not one of the enum's variants, or a range arm (a..b) holds no number.", "Add an arm for each variant the message lists (or else { }), and match only values of that enum."},
-    {"no-field", "A field is read or written that the object doesn't have (or, in a closed class, didn't declare).", "Declare it in the class (var name) or the shape, or fix the spelling."},
+    {"no-field", "A field is read or written that the object doesn't have (or, in a closed class, didn't declare). A compile error where the type is known: x: C, or a local var x = C(...).", "Declare it in the class (var name) or the shape, or fix the spelling."},
     // run time
     {"operand", "An operator got operand types it doesn't take.", "Convert first: str(x) for text, int(x) for whole numbers; check for nil."},
     {"no-method", "A method is called that the value doesn't have.", "Check the value's type; list, map, str and fiber have a fixed set of methods."},

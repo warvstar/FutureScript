@@ -230,7 +230,7 @@ constexpr int HOT = 1000;  // calls before a function is compiled again (tier 2)
 struct TryAt { int r = 0, pc = 0, done = 0; };  // a try being compiled: its record's first slot, branches to patch
 struct Fun {  // per-function emission state
   Code k;
-  struct Local { int sym, home; bool num = false; uint64_t ty = 0; int site = -1, symbol = -1, path = 0; };  // home: frame slot (>= 0) or arm64 register; symbol: editor declaration
+  struct Local { int sym, home; bool num = false; uint64_t ty = 0; int site = -1, symbol = -1, path = 0; bool made = false; };  // home: frame slot (>= 0) or arm64 register; symbol: editor declaration; made: holds a lambda made here (inferred effects)
   std::vector<Local> locals;                          // num: always holds a number (a range loop variable)
   std::vector<std::pair<int, LV>> caps;     // lambda captures: (sym, where it lives in the parent)
   Fun* parent = nullptr;
@@ -253,6 +253,7 @@ struct Fun {  // per-function emission state
   // which holds if every return is a proven number (retNum).
   bool tier2 = false, retNum = true;
   int npar = 0;
+  std::vector<int> paramHomes;  // a named function's declared parameters' homes, in order (inferred effects)
   u32 spec = 0;
   int lambdaName = -1;  // a named lambda resolves its own name to the incoming closure
   int lambdaSymbol = -1;
@@ -271,6 +272,10 @@ struct Fun {  // per-function emission state
   // Declared effects (`fn f() ! io`): where the caller's vm->allowed and vm->who are kept (arm64: two frame slots;
   // wasm: two locals) while the function runs; the epilogue every return goes through puts them back. -1: none.
   int effHome = -1;
+  // What it declares, for the compile-time check of what its body calls and performs (effDecl: it has a `!`, even a bare one).
+  bool effDecl = false;
+  uint64_t effMask = 0;
+  std::string effWho, effText;
   int fuelL = -1;  // wasm: an i64 local the step count passes through (gen_wasm.h fuel())
   // Its declared result type (`fn f(): num`; 0: none), checked in the epilogue every return goes through, so after
   // the function's own try blocks: a function never catches its own result's failed check.

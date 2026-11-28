@@ -35,12 +35,13 @@ test "stores are checked" {
   expect err(fn() { u8s([1, "2"]) }) != ""
 }
 
+fn id(v) { return v }
 fn total(xs: f32s): num { var t = 0 for x in xs { t += x } return t }
 
 test "a buffer type in annotations" {
   expect total(f32s([1, 2])) == 3
   expect err(fn() { total(u32s([1])) }).has("must be f32s, got")
-  expect err(fn() { total([1]) }).has("must be f32s")
+  expect err(fn() { total(id([1])) }).has("must be f32s")  // total([1]) itself is a compile error
 }
 
 extern fn memset(ptr, int, long): ptr
